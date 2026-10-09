@@ -1,0 +1,20 @@
+[package]
+name = "pdfcraft-edit"
+description = "Page content editing: headers and footers, watermarks, backgrounds, Bates numbers (ISO 32000-2 §14.8)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pdfcraft-cos = { workspace = true }
+pdfcraft-content = { workspace = true }
+pdfcraft-fonts = { workspace = true }
+pdfcraft-model = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+hayro-syntax = { workspace = true }
+pdfcraft-annot = { workspace = true }
