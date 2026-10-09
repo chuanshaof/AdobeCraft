@@ -12,11 +12,11 @@ The goal is stability: each project is frozen at a known-good commit and only ch
 |---|---|---|---|---|
 | `photocraft/` | Photoshop | [storytold/photocraft](https://github.com/storytold/photocraft) | `2515fa7ce` | 2026-10-09 |
 | `vectorcraft/` | Illustrator | [storytold/vectorcraft](https://github.com/storytold/vectorcraft) | `46e426237` | 2026-10-09 |
-| `filmcraft/` | Premiere | [storytold/filmcraft](https://github.com/storytold/filmcraft) | `523185244` (v0.4.0) | 2026-10-08 |
+| `filmcraft/` | Premiere | [storytold/filmcraft](https://github.com/storytold/filmcraft) | `523185244` | 2026-10-08 |
 | `lightcraft/` | Lightroom | [storytold/lightcraft](https://github.com/storytold/lightcraft) | `c435d143d` | 2026-10-09 |
 | `printcraft/` | Acrobat Pro | [storytold/printcraft](https://github.com/storytold/printcraft) | `a6bc63a49` | 2026-10-08 |
 | `effectcraft/` | After Effects | [storytold/effectcraft](https://github.com/storytold/effectcraft) | `cae67546d` | 2026-10-09 |
-| `designcraft/` | InDesign | [storytold/designcraft](https://github.com/storytold/designcraft) | `14e677b24` (v0.4.0) | 2026-10-08 |
+| `designcraft/` | InDesign | [storytold/designcraft](https://github.com/storytold/designcraft) | `14e677b24` | 2026-10-08 |
 
 All are taken from each upstream's `main` branch.
 
@@ -33,6 +33,4 @@ sh update.sh                # update all seven projects
 sh update-photocraft.sh     # update one project (likewise for the others)
 ```
 
-Each update pulls the upstream `main` and records it as a merge commit. Review it with `git show`; undo it with `git reset --hard HEAD~1`.
-
-After updating, bump the snapshot date and the table above to match.
+Each update pulls the upstream `main` as a merge commit, then rewrites the table above (and the snapshot date, if anything changed) in a follow-up commit. Review with `git log -p`; the script prints the exact `git reset --hard <commit>` to undo it.
