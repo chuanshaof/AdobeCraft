@@ -29,8 +29,8 @@ Each folder is a [git subtree](https://git-scm.com/book/en/v2/Git-Tools-Advanced
 Run from Git Bash (or any POSIX shell) in the repo root:
 
 ```sh
-sh update.sh                       # update all seven projects
-sh scripts/update-photocraft.sh   # update one project (likewise for the others)
+sh update.sh                              # update all seven projects
+sh update-scripts/update-photocraft.sh   # update one project (likewise for the others)
 ```
 
 Each update pulls the upstream `main` as a merge commit, then rewrites the table above (and the snapshot date, if anything changed) in a follow-up commit. Review with `git log -p`; the script prints the exact `git reset --hard <commit>` to undo it.
