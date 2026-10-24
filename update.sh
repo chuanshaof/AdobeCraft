@@ -19,9 +19,14 @@ for r in ${@:-$REPOS}; do
     git subtree add --prefix="$r" "$url" main
   fi
 
-  # Rewrite the Commit and Commit date columns of this project's README row.
-  sha=$(git rev-parse --short=9 FETCH_HEAD)
-  day=$(git log -1 --format=%cs FETCH_HEAD)
+  # Remember the pinned commit; README is edited after the loop because
+  # git subtree refuses to run on a dirty working tree.
+  pins="$pins$r $(git rev-parse --short=9 FETCH_HEAD) $(git log -1 --format=%cs FETCH_HEAD)
+"
+done
+
+# Rewrite the Commit and Commit date columns of each updated project's README row.
+printf '%s' "$pins" | while read -r r sha day; do
   sed -i -E "s#^([|] \`$r/\` [|][^|]*[|][^|]*[|]).*#\1 \`$sha\` | $day |#" README.md
 done
 
