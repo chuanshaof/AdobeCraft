@@ -70,6 +70,13 @@ impl Number {
 impl Skippable for Number {
     fn skip(r: &mut Reader<'_>, _: bool) -> Option<()> {
         let has_sign = r.forward_if(|b| b == b'+' || b == b'-').is_some();
+        // PdfCraft patch: one more sign, so that skipping a number covers what `read_inner`
+        // reads. `--280` was already covered by the `b'-'` arm below, but `-+280` and `++280`
+        // were not, and a skip that fails where a read succeeds puts the reader back where it
+        // started (#3630 review).
+        if has_sign {
+            r.forward_if(|b| b == b'+' || b == b'-');
+        }
 
         // Some PDFs have weird trailing minuses, so try to accept those as well.
         match r.peek_byte()? {
@@ -113,38 +120,49 @@ impl Readable<'_> for Number {
 
 #[inline(always)]
 fn read_inner(r: &mut Reader<'_>) -> Option<Number> {
-    let negative = match r.peek_byte()? {
-        b'-' => {
-            r.forward();
-            true
-        }
-        b'+' => {
-            r.forward();
-            false
-        }
-        _ => false,
-    };
+    // PdfCraft patch: a doubled sign is one number, not two. `--280` left `negative` set with no
+    // digits read, so it returned 0 and the reader stopped on `-280`, which became a second
+    // number: a `cm` with it got seven operands, kept the last six, and the matrix
+    // `0 0 1 0 -280 10` hid everything drawn under it (#3565). `Number::skip` above already
+    // consumes the whole token, so read and skip disagreed about where the number ended.
+    //
+    // One extra sign is absorbed and the value is negative if either sign was a minus, which is
+    // what the COS lexer does since #3299 (`--280` and `+-280` are both -280). A third sign is
+    // left to the digit loop's trailing-minus arm, as before.
+    let mut negative = false;
+    let mut signs = 0;
+    while signs < 2
+        && let Some(b @ (b'-' | b'+')) = r.peek_byte()
+    {
+        r.forward();
+        negative |= b == b'-';
+        signs += 1;
+    }
 
+    // PdfCraft patch: high-precision float mantissa overflow (jsPDF double-precision coordinates).
+    // Digits that don't fit in `mantissa` are dropped: past the dot they are only precision;
+    // before it, each one scales the value by ten (`extra_int_digits`).
     let mut mantissa: u64 = 0;
     let mut has_dot = false;
     let mut decimal_shift: u32 = 0;
     let mut has_digits = false;
+    let mut extra_int_digits: u32 = 0;
 
     loop {
         match r.peek_byte() {
             Some(b'0'..=b'9') => {
-                let d = r.read_byte().unwrap();
-                mantissa = mantissa
-                    // Using `saturating` would arguably be better here, but
-                    // profiling showed that it seems to be more expensive, at least
-                    // on ARM. Since such large numbers shouldn't appear anyway,
-                    // it doesn't really matter a lot what mode we use.
-                    .wrapping_mul(10)
-                    .wrapping_add((d - b'0') as u64);
+                let d = (r.read_byte().unwrap() - b'0') as u64;
                 has_digits = true;
-                if has_dot {
-                    decimal_shift += 1;
+                if let Some(next) = mantissa.checked_mul(10).and_then(|m| m.checked_add(d)) {
+                    mantissa = next;
+                    if has_dot {
+                        decimal_shift += 1;
+                    }
+                } else if !has_dot {
+                    extra_int_digits = extra_int_digits.saturating_add(1);
                 }
+                // If has_dot and adding the digit would overflow u64:
+                // Safely ignore excess trailing fractional digits (do not add, do not increment decimal_shift).
             }
             Some(b'.') if !has_dot => {
                 r.forward();
@@ -174,15 +192,34 @@ fn read_inner(r: &mut Reader<'_>) -> Option<Number> {
         return None;
     }
 
+    // A value whose integer part overflowed `u64` is a real, scaled by the digits dropped and
+    // kept finite.
+    let scaled = |value: f64| -> f64 {
+        let value = if extra_int_digits > 0 { value * powi_f64(10.0, extra_int_digits) } else { value };
+        if value.is_finite() { value } else { f64::MAX }
+    };
+
+    if !has_dot && extra_int_digits > 0 {
+        let value = scaled(mantissa as f64);
+        return Some(Number(InternalNumber::Real(if negative { -value } else { value })));
+    }
+
     if !has_dot {
-        let value = if negative {
-            (mantissa as i64).wrapping_neg()
+        let value = if mantissa <= i64::MAX as u64 {
+            let i = mantissa as i64;
+            if negative { -i } else { i }
+        } else if negative && mantissa == (i64::MIN as u64) {
+            i64::MIN
         } else {
-            mantissa as i64
+            let mut val = mantissa as f64;
+            if negative {
+                val = -val;
+            }
+            return Some(Number(InternalNumber::Real(val)));
         };
         Some(Number(InternalNumber::Integer(value)))
     } else {
-        let mut value = mantissa as f64;
+        let mut value = scaled(mantissa as f64);
 
         if decimal_shift > 0 {
             if decimal_shift < POWERS_OF_10.len() as u32 {
@@ -324,6 +361,30 @@ mod tests {
     use crate::object::Number;
     use crate::reader::Reader;
     use crate::reader::ReaderExt;
+
+    /// PdfCraft patch: a doubled sign is one number. `--280` returned 0 and left `-280` to be
+    /// read as a second number, so a `cm` carrying it got seven operands and a degenerate matrix
+    /// (#3565). The COS lexer reads these the same way since #3299.
+    #[test]
+    fn a_doubled_sign_is_one_number() {
+        for (src, want) in [("--280", -280), ("+-280", -280), ("-+280", -280), ("++280", 280), ("-280", -280), ("+280", 280)] {
+            let mut r = Reader::new(src.as_bytes());
+            assert_eq!(r.read_without_context::<i32>().unwrap(), want, "{src}");
+            assert!(r.at_end(), "{src}: the whole number was read, leaving nothing for a second one");
+        }
+        // The fraction too, and a lone sign is still zero.
+        assert_eq!(Reader::new("--280.5".as_bytes()).read_without_context::<f64>().unwrap(), -280.5);
+        assert_eq!(Reader::new("-".as_bytes()).read_without_context::<i32>().unwrap(), 0);
+
+        // Skipping covers what reading accepts: a skip that fails where a read succeeds puts the
+        // reader back where it started, so `Object::skip` would leave the number in place
+        // (#3630 review).
+        for src in ["--280", "+-280", "-+280", "++280", "-280", "+280", "--280.5"] {
+            let mut r = Reader::new(src.as_bytes());
+            assert!(r.skip::<Number>(false).is_some(), "{src}: not skipped");
+            assert!(r.at_end(), "{src}: only part of the number was skipped");
+        }
+    }
 
     #[test]
     fn int_1() {
@@ -536,5 +597,38 @@ mod tests {
                 .unwrap(),
             4294966260
         );
+    }
+
+    #[test]
+    fn high_precision_float_does_not_overflow_mantissa() {
+        let num1 = Reader::new("3874.9606299212600788".as_bytes())
+            .read_without_context::<f64>()
+            .unwrap();
+        assert!((num1 - 3874.96062992126).abs() < 1e-6, "got {num1}");
+
+        let num2 = Reader::new("5493.5433070866147318".as_bytes())
+            .read_without_context::<f64>()
+            .unwrap();
+        assert!((num2 - 5493.543307086615).abs() < 1e-6, "got {num2}");
+
+        // Verify extreme fractional precision (50 decimal places) truncates safely
+        let num3 = Reader::new("0.12345678901234567890123456789012345678901234567890".as_bytes())
+            .read_without_context::<f64>()
+            .unwrap();
+        assert!((num3 - 0.12345678901234568).abs() < 1e-15, "got {num3}");
+
+        // Integer digits past `u64` scale the value instead of being dropped.
+        let num4 = Reader::new("123456789012345678901.5".as_bytes())
+            .read_without_context::<f64>()
+            .unwrap();
+        assert!((num4 / 1.2345678901234568e20 - 1.0).abs() < 1e-12, "got {num4}");
+        let num5 = Reader::new("-123456789012345678901".as_bytes())
+            .read_without_context::<f64>()
+            .unwrap();
+        assert!((num5 / -1.2345678901234568e20 - 1.0).abs() < 1e-12, "got {num5}");
+        // Hundreds of digits stay finite.
+        let huge = "9".repeat(400);
+        let num6 = Reader::new(huge.as_bytes()).read_without_context::<f64>().unwrap();
+        assert!(num6.is_finite() && num6 > 1e300, "got {num6}");
     }
 }

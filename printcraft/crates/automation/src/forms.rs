@@ -1,8 +1,8 @@
 //! Form tools: list fields, fill them (several at once, one undo step), clear the form, and
-//! prepare a form (add, change and delete fields).
+//! prepare a form (add fields one at a time or as a table, change and delete them).
 
 use pdfcraft_engine::form_scripts::{CalcOp, Calculate, Format, Validate};
-use pdfcraft_engine::{Edit, FieldProps, FieldValue, FormField, FormFieldKind, NewField, field_flags};
+use pdfcraft_engine::{CalculationIssue, Edit, FieldProps, FieldValue, FormField, FormFieldKind, NewField, field_flags};
 use serde_json::{Value, json};
 
 use crate::{Args, Automation, Result, ToolError, failed};
@@ -43,9 +43,14 @@ fn format_arg(v: &Value) -> Result<Format> {
 
 /// `{"border": "#FF0000" | "none", "fill": …, "width": 1-3, "style": "solid"|…, "text_color": …,
 /// "font": "helvetica"|"times"|"courier"}`, changing only what is given.
-fn look_arg(v: &Value, mut l: pdfcraft_engine::FieldLook) -> Result<pdfcraft_engine::FieldLook> {
-    use pdfcraft_engine::{BorderStyle, FieldFont};
+fn look_arg(v: &Value) -> Result<pdfcraft_engine::FieldLookPatch> {
+    use pdfcraft_engine::{BorderStyle, FieldFont, FieldLookPatch};
     let o = v.as_object().ok_or_else(|| bad("appearance must be an object"))?;
+    for key in o.keys() {
+        if !["border", "fill", "text_color", "width", "style", "font"].contains(&key.as_str()) {
+            return Err(bad(format!("unknown appearance property {key:?}")));
+        }
+    }
     let colour = |k: &str| -> Result<Option<Option<[f64; 3]>>> {
         match o.get(k) {
             None => Ok(None),
@@ -54,37 +59,39 @@ fn look_arg(v: &Value, mut l: pdfcraft_engine::FieldLook) -> Result<pdfcraft_eng
             Some(_) => Err(bad(format!("{k} must be a colour or \"none\""))),
         }
     };
-    if let Some(c) = colour("border")? {
-        l.border = c;
-    }
-    if let Some(c) = colour("fill")? {
-        l.fill = c;
-    }
-    if let Some(c) = colour("text_color")? {
-        l.text = c.unwrap_or([0.0; 3]);
-    }
-    if let Some(w) = o.get("width").and_then(Value::as_f64) {
-        l.width = w.clamp(0.0, 12.0);
-    }
-    if let Some(s) = o.get("style").and_then(Value::as_str) {
-        l.style = match s {
-            "solid" => BorderStyle::Solid,
-            "dashed" => BorderStyle::Dashed,
-            "beveled" => BorderStyle::Beveled,
-            "inset" => BorderStyle::Inset,
-            "underline" => BorderStyle::Underline,
-            x => return Err(bad(format!("unknown style {x:?}"))),
-        };
-    }
-    if let Some(f) = o.get("font").and_then(Value::as_str) {
-        l.font = match f {
-            "helvetica" => FieldFont::Helvetica,
-            "times" => FieldFont::Times,
-            "courier" => FieldFont::Courier,
-            x => return Err(bad(format!("unknown font {x:?} (helvetica, times, courier)"))),
-        };
-    }
-    Ok(l)
+    let string =
+        |k: &str| -> Result<Option<&str>> { o.get(k).map(|v| v.as_str().ok_or_else(|| bad(format!("appearance.{k} must be a string")))).transpose() };
+    Ok(FieldLookPatch {
+        border: colour("border")?,
+        fill: colour("fill")?,
+        text: colour("text_color")?.map(|c| c.unwrap_or([0.0; 3])),
+        width: o
+            .get("width")
+            .map(|v| {
+                v.as_f64()
+                    .filter(|v| v.is_finite() && (0.0..=12.0).contains(v))
+                    .ok_or_else(|| bad("appearance.width must be between 0 and 12 points"))
+            })
+            .transpose()?,
+        style: string("style")?
+            .map(|s| match s {
+                "solid" => Ok(BorderStyle::Solid),
+                "dashed" => Ok(BorderStyle::Dashed),
+                "beveled" => Ok(BorderStyle::Beveled),
+                "inset" => Ok(BorderStyle::Inset),
+                "underline" => Ok(BorderStyle::Underline),
+                x => Err(bad(format!("unknown style {x:?}"))),
+            })
+            .transpose()?,
+        font: string("font")?
+            .map(|s| match s {
+                "helvetica" => Ok(FieldFont::Helvetica),
+                "times" => Ok(FieldFont::Times),
+                "courier" => Ok(FieldFont::Courier),
+                x => Err(bad(format!("unknown font {x:?} (helvetica, times, courier)"))),
+            })
+            .transpose()?,
+    })
 }
 
 /// `{"min": 0, "max": 100}` or `"none"`.
@@ -189,10 +196,12 @@ impl Automation {
                     "value": match f.kind {
                         FormFieldKind::CheckBox => json!(!f.value.is_empty()),
                         FormFieldKind::List if f.has(field_flags::MULTI_SELECT) => json!(f.value),
+                        FormFieldKind::Radio => json!(f.value.first().map(|v| f.export_for_state(v))),
                         _ => json!(f.value.first()),
                     },
                     "page": w.and_then(|w| w.page).map(|p| p + 1),
                     "rect": rect,
+                    "rotation": w.map(|w| w.rotation).unwrap_or(0),
                     "read_only": f.read_only(),
                     "required": f.has(field_flags::REQUIRED),
                 });
@@ -224,8 +233,21 @@ impl Automation {
                     o.insert("unsupported_scripts".into(), json!(f.actions.unsupported));
                 }
                 match f.kind {
+                    FormFieldKind::PushButton => {
+                        o.insert("caption".into(), json!(w.and_then(|w| w.caption.as_deref()).unwrap_or_default()));
+                        o.insert(
+                            "captions".into(),
+                            json!(
+                                f.widgets
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, w)| { json!({"widget": i.saturating_add(1), "caption": w.caption.as_deref().unwrap_or_default()}) })
+                                    .collect::<Vec<_>>()
+                            ),
+                        );
+                    }
                     FormFieldKind::Radio => {
-                        o.insert("options".into(), json!(f.widgets.iter().filter_map(|w| w.on_state.clone()).collect::<Vec<_>>()));
+                        o.insert("options".into(), json!((0..f.widgets.len()).filter_map(|i| f.export_of(i)).collect::<Vec<_>>()));
                     }
                     FormFieldKind::Combo | FormFieldKind::List => {
                         o.insert("options".into(), f.options.iter().map(|(e, d)| json!({ "value": e, "label": d })).collect());
@@ -317,8 +339,136 @@ impl Automation {
         Ok(out)
     }
 
+    /// A table of text fields: `rect` (points from the top-left of the displayed page) divided
+    /// into rows and columns, one field per cell, as one undo step.
+    pub(crate) fn form_add_field_table(&mut self, a: &Args) -> Result<Value> {
+        use pdfcraft_engine::field_table::{self, FieldTable, MAX_COLUMNS, TableColumn, TableError};
+        let page = self.page(a)?;
+        let rect = a
+            .get("rect")
+            .and_then(Value::as_array)
+            .and_then(|r| r.iter().map(Value::as_f64).collect::<Option<Vec<f64>>>())
+            .and_then(|r| <[f64; 4]>::try_from(r).ok())
+            .ok_or_else(|| bad("rect must be 4 numbers"))?;
+        let names = a.get("names").map(|_| a.strs("names")).transpose()?;
+        let widths = match a.get("widths") {
+            None => None,
+            Some(v) => Some(
+                v.as_array()
+                    .and_then(|w| w.iter().map(Value::as_f64).collect::<Option<Vec<f64>>>())
+                    .ok_or_else(|| bad("widths must be an array of numbers"))?,
+            ),
+        };
+        // A negative count is no count: the table refuses it with its own words.
+        let counts = [a.opt_int("columns")?.map(|n| usize::try_from(n).unwrap_or(0)), names.as_ref().map(Vec::len), widths.as_ref().map(Vec::len)];
+        let mut given = counts.into_iter().flatten();
+        let columns = given.next().unwrap_or(1);
+        if given.any(|n| n != columns) {
+            return Err(bad("columns, names and widths must agree on the number of columns"));
+        }
+        // Before anything is sized by it.
+        if !(1..=MAX_COLUMNS).contains(&columns) {
+            return Err(bad(TableError::Columns.to_string()));
+        }
+        let (edit, fields) = {
+            let doc = self.doc(a)?;
+            let base = field_table::free_base(doc.form.iter().map(|f| f.name.as_str()));
+            let mut table = FieldTable::new(rect, &base);
+            table.rows = usize::try_from(a.int("rows")?).unwrap_or(0);
+            table.columns = (0..columns)
+                .map(|c| TableColumn {
+                    pattern: names.as_ref().and_then(|n| n.get(c)).map_or_else(|| field_table::column_pattern(&base, c + 1), |p| (*p).to_owned()),
+                    width: widths.as_ref().and_then(|w| w.get(c)).copied().unwrap_or(1.0),
+                })
+                .collect();
+            table.row_gap = a.opt_num("row_gap")?.unwrap_or(0.0);
+            table.column_gap = a.opt_num("column_gap")?.unwrap_or(0.0);
+            table.first_row = a.opt_int("first_row")?.map_or(1, |n| usize::try_from(n).unwrap_or(usize::MAX));
+            let info = doc.info.pages.get(page).ok_or_else(|| bad(format!("page {} does not exist", page + 1)))?;
+            let edit = field_table::edit(&table, page, info, &doc.form).map_err(|e| bad(e.to_string()))?;
+            // The names the batch adds, in the order it adds them.
+            let fields: Vec<String> = match &edit {
+                Edit::Batch { edits, .. } => {
+                    edits.iter().filter_map(|e| if let Edit::AddField { name, .. } = e { name.clone() } else { None }).collect()
+                }
+                _ => Vec::new(),
+            };
+            (edit, fields)
+        };
+        let mut out = self.apply(a, edit)?;
+        out["fields"] = json!(fields);
+        Ok(out)
+    }
+
     pub(crate) fn form_set_props(&mut self, a: &Args) -> Result<Value> {
-        let name = a.str("field")?.to_owned();
+        if a.get("widget").is_some() && a.get("caption").is_none() {
+            return Err(bad("widget requires caption"));
+        }
+        let single = a.opt_str("field")?;
+        let bulk = a.get("fields").is_some();
+        if single.is_some() == bulk {
+            return Err(bad("give either field or fields, not both"));
+        }
+        let names: Vec<String> = if bulk {
+            let count = a.get("fields").and_then(Value::as_array).ok_or_else(|| bad("fields must be an array of field names"))?.len();
+            if count == 0 || count > 1_000 {
+                return Err(bad("fields must contain between 1 and 1000 names"));
+            }
+            let names = a.strs("fields")?;
+            let mut seen = std::collections::HashSet::new();
+            for name in &names {
+                if !seen.insert(*name) {
+                    return Err(bad(format!("field {name:?} is listed more than once")));
+                }
+            }
+            for key in ["name", "rect", "rotation", "caption", "widget"] {
+                if a.get(key).is_some() {
+                    return Err(bad(format!("{key} applies to one field; use field instead of fields")));
+                }
+            }
+            names.into_iter().map(str::to_owned).collect()
+        } else {
+            single.into_iter().map(str::to_owned).collect()
+        };
+        let mut edits = Vec::with_capacity(names.len());
+        let mut new_name = None;
+        for name in &names {
+            // Merge appearance changes separately for each field: changing just the border
+            // must not copy the first field's fill, font or text colour onto the others.
+            let props = self.field_props_arg(a, name)?;
+            if props == FieldProps::default() {
+                return Err(bad("nothing to change"));
+            }
+            new_name = Some(props.name.clone().unwrap_or_else(|| name.clone()));
+            edits.push(Edit::SetFieldProps { name: name.clone(), props: Box::new(props) });
+        }
+        let edit = if bulk {
+            Edit::Batch { label: "Change field properties".into(), edits }
+        } else {
+            edits.pop().ok_or_else(|| bad("give a field name"))?
+        };
+        // A rename also renames the field in the formulas that read it.
+        let before = if a.get("name").is_some() { Some(self.doc(a)?.form.clone()) } else { None };
+        let mut out = self.apply(a, edit)?;
+        if bulk {
+            out["fields"] = json!(names);
+        } else {
+            out["field"] = json!(new_name);
+        }
+        if let Some(before) = before {
+            let after = &self.doc(a)?.form;
+            // The renamed field itself, found by object: the name stored can differ from the
+            // argument (trimmed, kept under its parent's prefix).
+            let own =
+                names.first().and_then(|n| before.iter().find(|f| &f.name == n)).and_then(|f| after.iter().find(|g| g.obj == f.obj)).map(|g| &g.name);
+            let mut updated = pdfcraft_engine::form_calculations_changed(&before, after);
+            updated.retain(|f| Some(f) != own);
+            out["formulas_updated"] = json!(updated);
+        }
+        Ok(out)
+    }
+
+    fn field_props_arg(&self, a: &Args, name: &str) -> Result<FieldProps> {
         let doc = self.doc(a)?;
         let f = doc.form.iter().find(|f| f.name == name).ok_or_else(|| failed(format!("there is no field named {name:?} (see form_fields)")))?;
         // Position: top-left-origin points on the displayed page → user space.
@@ -328,15 +478,24 @@ impl Automation {
                 let r: Vec<f64> = v.as_array().map(|x| x.iter().filter_map(Value::as_f64).collect()).unwrap_or_default();
                 let r = <[f64; 4]>::try_from(r).map_err(|_| ToolError::InvalidArgs("rect must be 4 numbers".into()))?;
                 let page = f.widgets.first().and_then(|w| w.page).ok_or_else(|| failed(format!("{name} is not on a page")))?;
-                let p = &doc.info.pages[page];
+                let p = doc.info.pages.get(page).ok_or_else(|| failed(format!("{name} is on page {}, which could not be read", page + 1)))?;
                 let (u0, u1) = (p.view_to_user(r[0] as f32, r[1] as f32), p.view_to_user(r[2] as f32, r[3] as f32));
                 Some((0, [u0[0].min(u1[0]) as f64, u0[1].min(u1[1]) as f64, u0[0].max(u1[0]) as f64, u0[1].max(u1[1]) as f64]))
             }
         };
-        let props = FieldProps {
+        Ok(FieldProps {
             rect,
             name: a.opt_str("name")?.map(str::to_owned),
             tooltip: a.opt_str("tooltip")?.map(str::to_owned),
+            caption: a
+                .opt_str("caption")?
+                .map(|caption| -> Result<_> {
+                    let wi = a.opt_int("widget")?.unwrap_or(1);
+                    let wi =
+                        usize::try_from(wi).ok().and_then(|wi| wi.checked_sub(1)).ok_or_else(|| bad("widget must be a positive 1-based index"))?;
+                    Ok((wi, caption.to_owned()))
+                })
+                .transpose()?,
             read_only: a.opt_bool("read_only")?,
             required: a.opt_bool("required")?,
             multiline: a.opt_bool("multiline")?,
@@ -348,10 +507,8 @@ impl Automation {
             },
             options: a.get("options").map(|_| a.strs("options")).transpose()?.map(|v| v.into_iter().map(str::to_owned).collect()),
             font_size: a.opt_num("font_size")?,
-            look: match a.get("appearance") {
-                None => None,
-                Some(v) => Some(look_arg(v, self.doc(a)?.field_look(&name).ok_or_else(|| failed("this field has no widget"))?)?),
-            },
+            look: None,
+            appearance: a.get("appearance").map(look_arg).transpose()?.filter(|p| *p != pdfcraft_engine::FieldLookPatch::default()),
             format: a.get("format").map(format_arg).transpose()?,
             validate: a.get("validate").map(validate_arg).transpose()?,
             calculate: a.get("calculate").map(calculate_arg).transpose()?,
@@ -393,6 +550,11 @@ impl Automation {
                     out
                 }
             },
+            rotation: match a.opt_int("rotation")? {
+                None => None,
+                Some(r @ (0 | 90 | 180 | 270)) => Some((0, r)),
+                Some(r) => return Err(ToolError::InvalidArgs(format!("rotation must be 0, 90, 180 or 270, not {r}"))),
+            },
             actions: None,
             check_style: match a.opt_str("check_style")? {
                 None => None,
@@ -403,14 +565,7 @@ impl Automation {
                         .ok_or_else(|| bad(format!("unknown check style {s:?} (check, circle, cross, diamond, square, star)")))?,
                 ),
             },
-        };
-        if props == FieldProps::default() {
-            return Err(ToolError::InvalidArgs("nothing to change".into()));
-        }
-        let new_name = props.name.clone().unwrap_or(name.clone());
-        let mut out = self.apply(a, Edit::SetFieldProps { name, props: Box::new(props) })?;
-        out["field"] = json!(new_name);
-        Ok(out)
+        })
     }
 
     pub(crate) fn form_tab_order(&mut self, a: &Args) -> Result<Value> {
@@ -442,6 +597,54 @@ impl Automation {
         Ok(out)
     }
 
+    pub(crate) fn form_calculation_order(&mut self, a: &Args) -> Result<Value> {
+        let current = self.doc(a)?.calculation_order();
+        let fix = a.opt_bool("fix")?.unwrap_or(false);
+        let field = a.opt_str("field")?;
+        let order = a.get("order").map(|_| a.strs("order")).transpose()?;
+        if usize::from(fix) + usize::from(field.is_some()) + usize::from(order.is_some()) > 1 {
+            return Err(bad("give one change at a time: order, field with move, or fix"));
+        }
+        let names: Option<Vec<String>> = if let Some(order) = order {
+            Some(order.into_iter().map(str::to_owned).collect())
+        } else if let Some(field) = field {
+            let earlier = match a.opt_str("move")?.unwrap_or("earlier") {
+                "earlier" => true,
+                "later" => false,
+                m => return Err(bad(format!("move must be earlier or later, not {m:?}"))),
+            };
+            let mut names: Vec<String> = current.fields.iter().map(|f| f.name.clone()).collect();
+            let i = names.iter().position(|n| n == field).ok_or_else(|| bad(format!("{field:?} is not a calculated field")))?;
+            // Already first or last: nothing moves.
+            let j = if earlier { i.checked_sub(1) } else { Some(i + 1).filter(|j| *j < names.len()) };
+            j.map(|j| {
+                names.swap(i, j);
+                names
+            })
+        } else {
+            (fix && current.fixable()).then(|| current.fixed())
+        };
+        let mut out = match names {
+            Some(names) => self.apply(a, Edit::SetCalculationOrder { names })?,
+            None => json!({}),
+        };
+        let order = self.doc(a)?.calculation_order();
+        let issue = |i: &CalculationIssue| match i {
+            CalculationIssue::RunsTooEarly { field } => json!({ "issue": "runs_too_early", "field": field }),
+            CalculationIssue::Cycle { fields } => json!({ "issue": "cycle", "fields": fields }),
+            CalculationIssue::NotInOrder => json!({ "issue": "not_in_order" }),
+        };
+        out["calculation_order"] = json!(order.fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>());
+        out["fields"] = order
+            .fields
+            .iter()
+            .map(|f| json!({ "name": f.name, "reads": f.reads, "listed": f.listed, "issues": f.issues.iter().map(issue).collect::<Vec<_>>() }))
+            .collect();
+        out["extra"] = json!(order.extra);
+        out["fixable"] = json!(order.fixable());
+        Ok(out)
+    }
+
     fn tab_sequence(&self, a: &Args) -> Result<Value> {
         let doc = self.doc(a)?;
         let mut seq: Vec<(usize, &str)> =
@@ -463,7 +666,8 @@ impl Automation {
         let id = self.doc(a)?.id;
         let path = self.resolve(a.str("path")?, true)?;
         let ext = path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
-        let format = pdfcraft_engine::DataFormat::from_extension(&ext).ok_or_else(|| bad("the path must end in .xfdf, .fdf, .xml, .csv or .txt"))?;
+        let format =
+            pdfcraft_engine::DataFormat::from_extension(&ext).ok_or_else(|| bad("the path must end in .xfdf, .fdf, .xml, .xdp, .csv or .txt"))?;
         let (comments, fields) = match a.opt_str("what")?.unwrap_or("all") {
             "all" => (true, true),
             "comments" => (true, false),

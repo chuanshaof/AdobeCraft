@@ -6,14 +6,51 @@ use serde_json::{Value, json};
 
 use crate::{Args, Automation, Result, ToolError, failed, write_atomic};
 
+/// The job's two-sided setting for `doc_print`'s `duplex`: `printer` sends none, so the printer's
+/// own default applies (as the Print dialog's Printer default, #2422), except that cut and stack
+/// needs single-sided sheets.
+fn duplex(value: &str, cut_stack: bool) -> Result<Option<spool::Duplex>> {
+    Ok(match value {
+        "printer" if cut_stack => Some(spool::Duplex::Off),
+        "printer" => None,
+        "off" => Some(spool::Duplex::Off),
+        "long-edge" if cut_stack => return Err(bad("cut-and-stack printing needs duplex off (single-sided sheets)")),
+        "short-edge" if cut_stack => return Err(bad("cut-and-stack printing needs duplex off (single-sided sheets)")),
+        "long-edge" => Some(spool::Duplex::LongEdge),
+        "short-edge" => Some(spool::Duplex::ShortEdge),
+        d => return Err(bad(format!("unknown duplex {d:?}"))),
+    })
+}
+
 fn bad(m: impl Into<String>) -> ToolError {
     ToolError::InvalidArgs(m.into())
 }
 
 impl Automation {
     pub(crate) fn printers(&self) -> Result<Value> {
-        let list: Vec<Value> = spool::printers().into_iter().map(|p| json!({ "name": p.name, "default": p.default })).collect();
+        let list: Vec<Value> = spool::printers()
+            .into_iter()
+            .map(|p| {
+                let mut v = json!({ "name": p.name, "default": p.default });
+                if let Some(two_sided) = p.two_sided {
+                    v["two_sided"] = json!(two_sided);
+                }
+                v
+            })
+            .collect();
         Ok(json!({ "count": list.len(), "printers": list }))
+    }
+
+    pub(crate) fn printer_options(&self, a: &Args) -> Result<Value> {
+        let printer = a.str("printer")?;
+        let list: Vec<Value> = spool::printer_options(printer)
+            .into_iter()
+            .map(|o| {
+                let choices: Vec<Value> = o.choices.iter().map(|(value, label)| json!({ "value": value, "label": label })).collect();
+                json!({ "key": o.key, "label": o.label, "group": o.group, "default": o.default, "choices": choices })
+            })
+            .collect();
+        Ok(json!({ "printer": printer, "count": list.len(), "options": list }))
     }
 
     pub(crate) fn doc_print(&mut self, a: &Args) -> Result<Value> {
@@ -44,9 +81,10 @@ impl Automation {
                     o => return Err(bad(format!("unknown order {o:?}"))),
                 };
                 match Layout::multiple(per) {
-                    Layout::Multiple { cols, rows, .. } => Layout::Multiple {
+                    Layout::Multiple { cols, rows, per_sheet, .. } => Layout::Multiple {
                         cols,
                         rows,
+                        per_sheet,
                         order,
                         border: a.opt_bool("border")?.unwrap_or(false),
                         auto_rotate: a.opt_bool("auto_rotate")?.unwrap_or(true),
@@ -70,9 +108,7 @@ impl Automation {
             },
             l => return Err(bad(format!("unknown layout {l:?}"))),
         };
-        if matches!(layout, Layout::Multiple { order: PageOrder::CutStack, .. }) && a.opt_str("duplex")?.unwrap_or("off") != "off" {
-            return Err(bad("cut-and-stack printing needs duplex off (single-sided sheets)"));
-        }
+        let duplex = duplex(a.opt_str("duplex")?.unwrap_or("off"), matches!(layout, Layout::Multiple { order: PageOrder::CutStack, .. }))?;
         if a.opt_str("order")? == Some("cut-stack") && !matches!(layout, Layout::Multiple { .. }) {
             return Err(bad("cut-stack order needs layout multiple"));
         }
@@ -93,11 +129,28 @@ impl Automation {
             None => PAPERS[0].1,
             Some(p) => PAPERS
                 .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case(p) || n.replace("US ", "").eq_ignore_ascii_case(p))
+                .find(|(n, _)| {
+                    n.eq_ignore_ascii_case(p)
+                        || n.replace("US ", "").eq_ignore_ascii_case(p)
+                        || n.split(" (").next().is_some_and(|name| name.eq_ignore_ascii_case(p))
+                })
                 .map(|x| x.1)
-                .ok_or_else(|| bad(format!("unknown paper {p:?} (Letter, Legal, Tabloid, A3, A4, A5)")))?,
+                .ok_or_else(|| {
+                    bad(format!("unknown paper {p:?}; choose one of {}", PAPERS.iter().map(|(name, _)| *name).collect::<Vec<_>>().join(", ")))
+                })?,
         };
-        let settings = print::Settings { pages, paper, orientation, layout, content };
+        // Print as image (Acrobat's Advanced Print Setup): pictures at `dpi`, grey when
+        // `grayscale` is also asked for.
+        let raster = if a.opt_bool("as_image")?.unwrap_or(false) {
+            let dpi = a.opt_num("dpi")?.unwrap_or(300.0);
+            if !(72.0..=600.0).contains(&dpi) {
+                return Err(bad("dpi must be between 72 and 600"));
+            }
+            Some(print::Raster { dpi, grayscale: a.opt_bool("grayscale")?.unwrap_or(false) })
+        } else {
+            None
+        };
+        let settings = print::Settings { pages, paper, orientation, layout, content, raster, crops: Vec::new() };
         let sizes: Vec<(f64, f64)> = self.doc(a)?.info.pages.iter().map(|p| (p.width as f64, p.height as f64)).collect();
         let sheets = print::layout(&sizes, &settings).map_err(|e| bad(e.to_string()))?.len();
         let bytes = self.session.print_pdf(id, &settings).map_err(failed)?;
@@ -114,19 +167,44 @@ impl Automation {
                     printer: if printer == "default" { None } else { Some(printer.to_string()) },
                     copies: a.opt_int("copies")?.unwrap_or(1).clamp(1, 999) as u32,
                     collate: a.opt_bool("collate")?.unwrap_or(true),
-                    duplex: match a.opt_str("duplex")?.unwrap_or("off") {
-                        "off" => spool::Duplex::Off,
-                        "long-edge" => spool::Duplex::LongEdge,
-                        "short-edge" => spool::Duplex::ShortEdge,
-                        d => return Err(bad(format!("unknown duplex {d:?}"))),
-                    },
+                    duplex,
+                    scaling: spool::Scaling::Exact,
                     grayscale: a.opt_bool("grayscale")?.unwrap_or(false),
                     title: name,
+                    options: match a.get("options") {
+                        None => Vec::new(),
+                        Some(Value::Object(m)) => m
+                            .iter()
+                            .map(|(k, v)| match v.as_str() {
+                                Some(v) => Ok((k.clone(), v.to_string())),
+                                None => Err(bad(format!("options.{k} must be a string (a choice from printer_options)"))),
+                            })
+                            .collect::<Result<Vec<_>>>()?,
+                        Some(_) => return Err(bad("options must be an object of option keys and choices from printer_options")),
+                    },
                 };
                 out["job"] = json!(spool::submit(&bytes, &job).map_err(|e| failed(e.to_string()))?);
             }
             _ => return Err(bad("pass either path (save the print-ready PDF) or printer (a name from printers, or \"default\")")),
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `printer` leaves two-sided to the printer's own default (#2422); cut and stack still asks
+    /// for single-sided sheets, and refuses an explicit edge.
+    #[test]
+    fn duplex_printer_leaves_two_sided_to_the_printer() {
+        assert_eq!(duplex("printer", false).ok(), Some(None));
+        assert_eq!(duplex("printer", true).ok(), Some(Some(spool::Duplex::Off)));
+        assert_eq!(duplex("off", false).ok(), Some(Some(spool::Duplex::Off)));
+        assert_eq!(duplex("long-edge", false).ok(), Some(Some(spool::Duplex::LongEdge)));
+        assert_eq!(duplex("short-edge", false).ok(), Some(Some(spool::Duplex::ShortEdge)));
+        assert!(duplex("long-edge", true).is_err());
+        assert!(duplex("sideways", false).is_err());
     }
 }

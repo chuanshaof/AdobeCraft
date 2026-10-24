@@ -20,7 +20,22 @@ use std::sync::Arc;
 
 /// The input/output type of functions.
 pub(crate) type Values = SmallVec<[f32; 4]>;
+/// PdfCraft patch (backport of hayro 0.8): interior breakpoints of stitching functions.
+pub(crate) type StitchingBounds = SmallVec<[f32; 3]>;
 type TupleVec = SmallVec<[(f32, f32); 4]>;
+
+// PdfCraft patch: PDF functions are untrusted object graphs. A normal color/transfer function
+// has only a few nodes; cap both nesting and total construction work, including repeated
+// references, before creating their children. These are resource limits, not PDF format limits.
+const MAX_FUNCTION_DEPTH: usize = 64;
+const MAX_FUNCTION_NODES: usize = 10_000;
+
+struct ConstructionBudget {
+    remaining: usize,
+    // Stable backing-byte identity catches cycles without rejecting shared siblings. Looking
+    // at pointers only compares identities; no pointer is ever dereferenced.
+    path: Vec<(*const u8, usize)>,
+}
 
 #[derive(Debug)]
 enum FunctionType {
@@ -37,17 +52,45 @@ pub struct Function(Arc<FunctionType>);
 impl Function {
     /// Create a new function.
     pub fn new(obj: &Object<'_>) -> Option<Self> {
+        Self::new_inner(
+            obj,
+            &mut ConstructionBudget {
+                remaining: MAX_FUNCTION_NODES,
+                path: Vec::new(),
+            },
+            0,
+        )
+    }
+
+    fn new_inner(obj: &Object<'_>, budget: &mut ConstructionBudget, depth: usize) -> Option<Self> {
+        if depth >= MAX_FUNCTION_DEPTH {
+            warn!("PDF function nesting exceeds the limit of {MAX_FUNCTION_DEPTH} levels");
+            return None;
+        }
+        if budget.remaining == 0 {
+            warn!("PDF function construction exceeds the limit of {MAX_FUNCTION_NODES} nodes");
+            return None;
+        }
+        budget.remaining -= 1;
         let (dict, stream) = dict_or_stream(obj)?;
-
-        let function_type = match dict.get::<u8>(FUNCTION_TYPE)? {
-            0 => FunctionType::Type0(Type0::new(stream?)?),
-            2 => FunctionType::Type2(Type2::new(dict)?),
-            3 => FunctionType::Type3(Type3::new(dict)?),
-            4 => FunctionType::Type4(Type4::new(stream?)?),
-            _ => return None,
-        };
-
-        Some(Self(Arc::new(function_type)))
+        let identity = (dict.data().as_ptr(), dict.data().len());
+        if budget.path.contains(&identity) {
+            warn!("PDF function contains a cyclic stitching-function reference");
+            return None;
+        }
+        budget.path.push(identity);
+        let result = (|| {
+            let function_type = match dict.get::<u8>(FUNCTION_TYPE)? {
+                0 => FunctionType::Type0(Type0::new(stream?)?),
+                2 => FunctionType::Type2(Type2::new(dict)?),
+                3 => FunctionType::Type3(Type3::new(dict, budget, depth + 1)?),
+                4 => FunctionType::Type4(Type4::new(stream?)?),
+                _ => return None,
+            };
+            Some(Self(Arc::new(function_type)))
+        })();
+        budget.path.pop();
+        result
     }
 
     /// Evaluate the function with the given input.
@@ -57,6 +100,15 @@ impl Function {
             FunctionType::Type2(t2) => Some(t2.eval(*input.first()?)),
             FunctionType::Type3(t3) => t3.eval(*input.first()?),
             FunctionType::Type4(t4) => Some(t4.eval(input)?),
+        }
+    }
+
+    /// PdfCraft patch (backport of hayro 0.8): inputs where a stitching function switches
+    /// sub-function, so a gradient approximation can place a stop exactly there.
+    pub(crate) fn stitching_bounds(&self) -> StitchingBounds {
+        match self.0.as_ref() {
+            FunctionType::Type3(t3) => t3.stitching_bounds(),
+            _ => SmallVec::new(),
         }
     }
 }

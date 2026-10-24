@@ -7,25 +7,29 @@
 //!   ([`appearance`]); check boxes and radio buttons switch `/V` and each widget's `/AS` between
 //!   the states their appearances already define.
 //! - [`reset`]: Acrobat's Clear form (back to `/DV`).
+//! - [`table`]: a table of text fields, laid out and named before any of it is added.
 //!
 //! Not yet: JavaScript actions (format, keystroke, validate, calculate — M6.4/M6.5) and rich text
 //! values (`/RV`, which is removed when a value is set so it can't contradict `/V`).
 
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
-use pdfcraft_cos::{Dict, Document, ObjRef, Object, PdfString};
+use pdfcraft_cos::{DecodeBudget, Dict, Document, ObjRef, Object, PdfString};
 
 mod actions;
 pub mod af;
 pub mod appearance;
 mod author;
+mod calc_order;
 pub mod detect;
 mod scripting;
+pub mod table;
 pub use actions::{FieldAction, Trigger, field_actions, set_field_actions};
 pub use author::{
-    BorderStyle, CheckStyle, FieldFont, FieldProps, Look, NewField, add_field, check_style, delete_field, duplicate_field, look, redraw_field,
-    set_button_icon, set_props,
+    BorderStyle, CheckStyle, FieldFont, FieldProps, Look, LookPatch, MIN_FIELD_SIDE, NewField, add_field, check_style, delete_field,
+    delete_field_object, duplicate_field, look, redraw_field, set_button_icon, set_props,
 };
+pub use calc_order::{CalculatedField, CalculationIssue, CalculationOrder, calculation_order, set_calculation_order};
 pub use scripting::{
     FieldChange, FieldEvent, NoScripts, ScriptResult, Scripts, apply_script_changes, document_scripts, document_scripts_named, set_document_script,
     set_field_script,
@@ -101,6 +105,15 @@ pub struct Widget {
     pub locked: bool,
     /// The widget's Hidden or NoView flag (`/F` bit 2 or 6): it isn't shown and takes no input.
     pub hidden: bool,
+    /// Read-only: the field is, or the widget's own `/Ff` says so (a radio button of a group can
+    /// be locked on its own, as an XFA exclusion group's layout writes it).
+    pub read_only: bool,
+    /// `/MK /R` as 0, 90, 180 or 270 degrees counterclockwise. Anything else is stored as 0.
+    pub rotation: i64,
+    /// Push buttons: the normal label (`/MK /CA`), separate from the field's name.
+    pub caption: Option<String>,
+    /// List boxes: where the options are drawn, so a click can pick the one under the pointer.
+    pub list: Option<appearance::ListRows>,
 }
 
 /// A terminal form field.
@@ -144,6 +157,35 @@ impl Field {
         self.widgets.iter().any(|w| w.locked)
     }
 
+    /// Check boxes and radio groups with `/Opt` (PDF 1.4): one export value per widget, in widget
+    /// order. Their on states are then often just positions (`/0`, `/1` …), as pdf-lib writes them.
+    fn button_exports(&self) -> Option<&[(String, String)]> {
+        (matches!(self.kind, FieldKind::CheckBox | FieldKind::Radio) && !self.options.is_empty() && self.options.len() == self.widgets.len())
+            .then_some(self.options.as_slice())
+    }
+
+    /// The export value of widget `i` of a check box or radio group: its `/Opt` entry when the
+    /// field has one per widget, otherwise the widget's on-state name.
+    pub fn export_of(&self, i: usize) -> Option<&str> {
+        let on = self.widgets.get(i)?.on_state.as_deref()?;
+        Some(self.button_exports().and_then(|o| o.get(i)).map_or(on, |(e, _)| e.as_str()))
+    }
+
+    /// The on-state name that selects `choice` in a check box or radio group, where `choice` is an
+    /// on-state name or an export value from `/Opt`.
+    pub fn state_for(&self, choice: &str) -> Option<&str> {
+        self.widgets.iter().filter_map(|w| w.on_state.as_deref()).find(|s| *s == choice).or_else(|| {
+            let i = (0..self.widgets.len()).find(|&i| self.export_of(i) == Some(choice))?;
+            self.widgets.get(i)?.on_state.as_deref()
+        })
+    }
+
+    /// The export value for an on-state name such as the field's value; the name itself when the
+    /// field has no `/Opt`.
+    pub fn export_for_state<'a>(&'a self, state: &'a str) -> &'a str {
+        self.widgets.iter().position(|w| w.on_state.as_deref() == Some(state)).and_then(|i| self.export_of(i)).unwrap_or(state)
+    }
+
     /// The value as one string: text, the state name, or the selected display texts.
     pub fn display_value(&self) -> String {
         match self.kind {
@@ -175,16 +217,59 @@ pub enum FieldValue {
 fn text_of(o: &Object) -> Option<String> {
     match o {
         Object::String(s) => Some(s.to_text()),
-        Object::Name(n) => Some(String::from_utf8_lossy(n).into_owned()),
+        Object::Name(n) => Some(name_text(n)),
         _ => None,
     }
+}
+
+/// A name object's bytes as text that [`name_bytes`] turns back into the same bytes. UTF-8 names
+/// read as themselves; other bytes (Shift-JIS check box states such as 「はい」 in Japanese
+/// forms) and `#` are written `#XX`, as in PDF name syntax.
+pub fn name_text(bytes: &[u8]) -> String {
+    let escape = |b: u8| format!("#{b:02X}");
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.replace('#', "#23"),
+        Err(_) => bytes.iter().map(|&b| if (0x21..=0x7e).contains(&b) && b != b'#' { char::from(b).to_string() } else { escape(b) }).collect(),
+    }
+}
+
+/// The bytes of the name written as `text` by [`name_text`] (`#XX` is the byte XX).
+pub fn name_bytes(text: &str) -> Vec<u8> {
+    let b = text.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while let Some(&c) = b.get(i) {
+        let hex = |j: usize| b.get(j).and_then(|h| char::from(*h).to_digit(16));
+        match (c, hex(i + 1), hex(i + 2)) {
+            // Both digits are below 16, so the byte fits.
+            (b'#', Some(hi), Some(lo)) => {
+                out.push(u8::try_from(hi * 16 + lo).unwrap_or(b'#'));
+                i += 3;
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// A name object from text written by [`name_text`].
+fn name_obj(text: &str) -> Object {
+    Object::Name(name_bytes(text))
 }
 
 /// At most this many `/State` entries of a set-layer-visibility action are read.
 const MAX_LAYER_STATE: usize = 1024;
 
 /// A push button's mouse-up action (`/A`, or `/AA /U`, on the field or its widget).
-fn button_action(doc: &Document, d: &Dict, widgets: &[ObjRef]) -> Option<af::ButtonAction> {
+fn button_action(doc: &Document, d: &Dict, widgets: &[ObjRef], scripts: &mut DecodeBudget) -> Option<af::ButtonAction> {
+    // A button PdfCraft generated for an XFA image field (`/PCXfaImage true`, no PDF action):
+    // clicking it picks a picture, as `buttonImportIcon()` does.
+    if matches!(d.get(b"PCXfaImage").map(|o| doc.resolve(o)).as_deref(), Some(Object::Bool(true))) {
+        return Some(af::ButtonAction::ImportIcon);
+    }
     let pick = |dict: &Dict| -> Option<Object> {
         dict.get(b"A").cloned().or_else(|| dict.get(b"AA").map(|a| doc.resolve(a)).and_then(|a| a.as_dict().and_then(|aa| aa.get(b"U").cloned())))
     };
@@ -260,7 +345,7 @@ fn button_action(doc: &Document, d: &Dict, widgets: &[ObjRef]) -> Option<af::But
             let preserve_rb = !a.get(b"PreserveRB").is_some_and(|p| matches!(&*doc.resolve(p), Object::Bool(false)));
             af::ButtonAction::SetLayers { changes, preserve_rb }
         }
-        b"JavaScript" => af::button_script(&script(doc, &action)?),
+        b"JavaScript" => af::button_script(&script(doc, &action, scripts)?),
         _ => return None,
     })
 }
@@ -286,20 +371,30 @@ fn qualified_name(doc: &Document, r: ObjRef) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("."))
 }
 
-/// The JavaScript of an action dictionary (`/JS` string or stream).
-fn script(doc: &Document, action: &Object) -> Option<String> {
+/// JavaScript streams one reading of the form (its fields, or its document scripts) may decode
+/// in all, however many actions name the same stream.
+const MAX_SCRIPT_BYTES: usize = 64 << 20;
+
+/// A budget for the script streams of one reading of the form.
+fn script_budget() -> DecodeBudget {
+    DecodeBudget::new(MAX_SCRIPT_BYTES, 0)
+}
+
+/// The JavaScript of an action dictionary (`/JS` string or stream). A stream is decoded against
+/// `budget`, and is `None` once it is spent.
+fn script(doc: &Document, action: &Object, budget: &mut DecodeBudget) -> Option<String> {
     let a = doc.resolve(action);
     let js = a.as_dict()?.get(b"JS")?.clone();
     match &*doc.resolve(&js) {
         Object::String(s) => Some(s.to_text()),
-        Object::Stream(s) => s.decoded().ok().map(|b| String::from_utf8_lossy(&b).into_owned()),
+        Object::Stream(s) => budget.decode(s).ok().map(|b| String::from_utf8_lossy(&b).into_owned()),
         _ => None,
     }
 }
 
 /// A field's format/keystroke, validate and calculate scripts (field dictionary, or its only
 /// widget's when the field has none).
-fn actions_of(doc: &Document, d: &Dict, widgets: &[ObjRef]) -> af::Actions {
+fn actions_of(doc: &Document, d: &Dict, widgets: &[ObjRef], scripts: &mut DecodeBudget) -> af::Actions {
     let aa = d.get(b"AA").map(|a| doc.resolve(a)).and_then(|a| a.as_dict().cloned()).or_else(|| {
         (widgets.len() == 1)
             .then(|| doc.get(widgets[0]))
@@ -308,7 +403,7 @@ fn actions_of(doc: &Document, d: &Dict, widgets: &[ObjRef]) -> af::Actions {
     });
     let mut out = af::Actions::default();
     let Some(aa) = aa else { return out };
-    let js = |k: &[u8]| aa.get(k).and_then(|a| script(doc, a));
+    let mut js = |k: &[u8]| aa.get(k).and_then(|a| script(doc, a, scripts));
     if let Some(f) = js(b"F") {
         match af::parse_format(&f) {
             Some(fm) => out.format = fm,
@@ -374,25 +469,54 @@ fn nums(doc: &Document, o: Option<&Object>) -> Option<Vec<f64>> {
 pub(crate) fn page_refs(doc: &Document) -> Vec<ObjRef> {
     let Some(root) = doc.root() else { return Vec::new() };
     let Some(pages) = doc.get(root).as_dict().and_then(|d| d.reference(b"Pages")) else { return Vec::new() };
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut stack = vec![pages];
-    while let Some(node) = stack.pop() {
-        if !seen.insert(node) || seen.len() > 1_000_000 {
-            continue;
-        }
-        let obj = doc.get(node);
-        let Some(d) = obj.as_dict() else { continue };
-        match d.get(b"Kids").map(|k| doc.resolve(k)) {
-            Some(kids) if d.name(b"Type") != Some(b"Page") => {
-                if let Some(a) = kids.as_array() {
-                    stack.extend(a.iter().rev().filter_map(|k| k.as_ref()));
-                }
-            }
-            _ => out.push(node),
-        }
+    PageWalk::new(doc, pages).collect()
+}
+
+/// Depth-first walk over the leaf pages under `top`. It keeps one cursor per open `/Kids` array,
+/// never one entry per child, so a child listed many times or shared between nodes is skipped by
+/// the seen check without being queued first (`pdfcraft_model::pages` walks the same way).
+/// Cycles end at the seen check and at most a million nodes are visited.
+struct PageWalk<'a> {
+    doc: &'a Document,
+    seen: std::collections::HashSet<ObjRef>,
+    pending: Vec<(std::sync::Arc<Object>, usize)>,
+}
+
+impl<'a> PageWalk<'a> {
+    fn new(doc: &'a Document, top: ObjRef) -> Self {
+        let top = std::sync::Arc::new(Object::Array(vec![Object::Ref(top)]));
+        Self { doc, seen: Default::default(), pending: vec![(top, 0)] }
     }
-    out
+}
+
+impl Iterator for PageWalk<'_> {
+    type Item = ObjRef;
+
+    fn next(&mut self) -> Option<ObjRef> {
+        while let Some((kids, next)) = self.pending.last_mut() {
+            let Some(kid) = kids.as_array().and_then(|a| a.get(*next)) else {
+                self.pending.pop();
+                continue;
+            };
+            let node = kid.as_ref();
+            *next += 1;
+            let Some(node) = node else { continue };
+            if self.seen.len() >= 1_000_000 {
+                self.pending.clear();
+                return None;
+            }
+            if !self.seen.insert(node) {
+                continue;
+            }
+            let obj = self.doc.get(node);
+            let Some(d) = obj.as_dict() else { continue };
+            match d.get(b"Kids").map(|k| self.doc.resolve(k)) {
+                Some(kids) if d.name(b"Type") != Some(b"Page") => self.pending.push((kids, 0)),
+                _ => return Some(node),
+            }
+        }
+        None
+    }
 }
 
 /// The AcroForm dictionary.
@@ -415,9 +539,35 @@ struct Inherited {
     max_len: Option<usize>,
 }
 
-/// Every terminal field, in tree order.
+/// Every terminal field: the `/Fields` tree in order, then the fields reachable only through the
+/// page annotations (see [`adopt_page_fields`]).
 pub fn fields(doc: &Document) -> Vec<Field> {
-    let Some(af) = acroform(doc) else { return Vec::new() };
+    fields_with_adopted(doc).items
+}
+
+/// How many of [`fields`] were reachable only through the page annotations: the form's `/Fields`
+/// list names none or only some of them, so the leniency that adopts them is worth recording.
+pub fn adopted_page_fields(doc: &Document) -> usize {
+    fields_with_adopted(doc).adopted_page_fields
+}
+
+/// The terminal fields and page-only fields adopted while reading a form.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Fields {
+    /// Terminal fields in tree order, followed by adopted page-only fields.
+    pub items: Vec<Field>,
+    /// How many fields were reachable only through page annotations.
+    pub adopted_page_fields: usize,
+}
+
+/// Read all terminal fields and the page-only adoption count in one enumeration.
+pub fn fields_with_adopted(doc: &Document) -> Fields {
+    let (items, adopted_page_fields) = enumerate(doc);
+    Fields { items, adopted_page_fields }
+}
+
+fn enumerate(doc: &Document) -> (Vec<Field>, usize) {
+    let af = acroform(doc);
     let mut page_of = std::collections::HashMap::new();
     let mut annot_index = std::collections::HashMap::new();
     let pages = page_refs(doc);
@@ -431,20 +581,84 @@ pub fn fields(doc: &Document) -> Vec<Field> {
             }
         }
     }
-    let base = Inherited {
-        da: af.get(b"DA").and_then(|o| text_of(&doc.resolve(o))),
-        q: af.get(b"Q").and_then(|o| doc.resolve(o).as_int()),
-        ..Default::default()
+    let base = match &af {
+        Some(af) => Inherited {
+            da: af.get(b"DA").and_then(|o| text_of(&doc.resolve(o))),
+            q: af.get(b"Q").and_then(|o| doc.resolve(o).as_int()),
+            ..Default::default()
+        },
+        None => Inherited::default(),
     };
     let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for f in af.get(b"Fields").map(|o| doc.resolve(o)).and_then(|o| o.as_array().cloned()).unwrap_or_default() {
-        if let Some(r) = f.as_ref() {
-            walk(doc, r, &base, &page_of, &mut seen, &mut out, 0);
+    let mut seen = Seen { fields: std::collections::HashSet::new(), widgets: std::collections::HashSet::new(), scripts: script_budget() };
+    if let Some(af) = &af {
+        for f in af.get(b"Fields").map(|o| doc.resolve(o)).and_then(|o| o.as_array().cloned()).unwrap_or_default() {
+            if let Some(r) = f.as_ref() {
+                walk(doc, r, &base, &page_of, &mut seen, &mut out, 0);
+            }
         }
     }
+    let listed = out.len();
+    adopt_page_fields(doc, &pages, &base, &page_of, &mut seen, &mut out);
+    let adopted = out.len() - listed;
     rank_tabs(doc, &pages, &annot_index, &mut out);
-    out
+    (out, adopted)
+}
+
+/// Widget annotations no `/Fields` entry reaches are adopted as fields, as Acrobat and the
+/// browsers do: some writers list only some of the fields, or none at all. Each widget is adopted
+/// through its topmost unlisted `/Parent`, so a field split across several widgets stays one
+/// field. Tree-listed fields keep their order first; the rest follow in page-annotation order.
+fn adopt_page_fields(
+    doc: &Document,
+    pages: &[ObjRef],
+    base: &Inherited,
+    page_of: &std::collections::HashMap<ObjRef, usize>,
+    seen: &mut Seen,
+    out: &mut Vec<Field>,
+) {
+    for p in pages {
+        let Some(a) = doc.get(*p).as_dict().and_then(|d| d.get(b"Annots").cloned()) else { continue };
+        let annots = doc.resolve(&a);
+        let Some(annots) = annots.as_array() else { continue };
+        for e in annots {
+            let Some(r) = e.as_ref() else { continue };
+            if seen.fields.contains(&r) || seen.widgets.contains(&r) {
+                continue;
+            }
+            let obj = doc.get(r);
+            let Some(d) = obj.as_dict() else { continue };
+            if d.name(b"Subtype") != Some(b"Widget") {
+                continue;
+            }
+            if !d.contains(b"FT") && !d.contains(b"T") && !d.contains(b"Parent") {
+                continue;
+            }
+            if let Some(root) = unlisted_root(doc, r, &seen.fields) {
+                walk(doc, root, base, page_of, seen, out, 0);
+            }
+        }
+    }
+}
+
+/// The topmost field above `r` (itself without a `/Parent`), or `None` when `r` or an ancestor is
+/// already reachable from the `/Fields` tree, or a `/Parent` loop hides the top.
+fn unlisted_root(doc: &Document, r: ObjRef, seen: &std::collections::HashSet<ObjRef>) -> Option<ObjRef> {
+    let mut top = r;
+    let mut visited = std::collections::HashSet::from([r]);
+    loop {
+        let parent = doc.get(top).as_dict().and_then(|d| d.reference(b"Parent"));
+        let Some(p) = parent else {
+            return if seen.contains(&top) { None } else { Some(top) };
+        };
+        if !visited.insert(p) || visited.len() > 64 {
+            return None;
+        }
+        if seen.contains(&p) {
+            return None;
+        }
+        top = p;
+    }
 }
 
 /// A page's tab order (`/Tabs`).
@@ -550,16 +764,27 @@ pub fn set_tab_order(doc: &mut Document, pages: &[usize], order: TabOrder) -> Re
     Ok(())
 }
 
+/// What one reading of the form's fields has used: the field and widget dictionaries read, and
+/// the script budget their actions share.
+struct Seen {
+    fields: std::collections::HashSet<ObjRef>,
+    /// A widget belongs to the first field that lists it, however often it is listed.
+    widgets: std::collections::HashSet<ObjRef>,
+    scripts: DecodeBudget,
+}
+
+/// Read the field at `r` and the fields under it into `out`, with what they inherit from
+/// `parent`: kids with a name are fields of their own, kids without are this field's widgets.
 fn walk(
     doc: &Document,
     r: ObjRef,
     parent: &Inherited,
     page_of: &std::collections::HashMap<ObjRef, usize>,
-    seen: &mut std::collections::HashSet<ObjRef>,
+    seen: &mut Seen,
     out: &mut Vec<Field>,
     depth: usize,
 ) {
-    if depth > 64 || !seen.insert(r) {
+    if depth > 64 || !seen.fields.insert(r) {
         return;
     }
     let obj = doc.get(r);
@@ -571,8 +796,8 @@ fn walk(
     if let Some(ft) = d.name(b"FT") {
         inh.ft = Some(ft.to_vec());
     }
-    if let Some(ff) = d.get(b"Ff").and_then(|o| doc.resolve(o).as_int()) {
-        inh.ff = Some(ff as u32);
+    if let Some(ff) = field_flags(doc, d) {
+        inh.ff = Some(ff);
     }
     for (k, slot) in [(&b"V"[..], &mut inh.v), (b"DV", &mut inh.dv)] {
         if let Some(v) = d.get(k) {
@@ -586,7 +811,10 @@ fn walk(
         inh.q = Some(q);
     }
     if let Some(m) = d.get(b"MaxLen").and_then(|o| doc.resolve(o).as_int()) {
-        inh.max_len = usize::try_from(m).ok();
+        // Compatibility: some writers emit zero for an unlimited text field. Keep /MaxLen
+        // untouched in the object graph, but expose only positive limits to both UI and API.
+        // An explicit zero also clears an inherited limit rather than inheriting it again.
+        inh.max_len = usize::try_from(m).ok().filter(|limit| *limit > 0);
     }
     let kids: Vec<ObjRef> =
         d.get(b"Kids").map(|k| doc.resolve(k)).and_then(|k| k.as_array().cloned()).unwrap_or_default().iter().filter_map(|k| k.as_ref()).collect();
@@ -598,10 +826,8 @@ fn walk(
         }
         return;
     }
-    let widget_refs: Vec<ObjRef> = if d.contains(b"Rect") { vec![r] } else { kids };
-    let actions = actions_of(doc, d, &widget_refs);
-    let button =
-        (inh.ft.as_deref() == Some(b"Btn") && inh.ff.unwrap_or(0) & flags::PUSH_BUTTON != 0).then(|| button_action(doc, d, &widget_refs)).flatten();
+    // A field of no kind this reads is skipped before it claims widgets or scripts, which a later
+    // field listing them then reads.
     let ff = inh.ff.unwrap_or(0);
     let kind = match inh.ft.as_deref() {
         Some(b"Tx") => FieldKind::Text,
@@ -613,6 +839,12 @@ fn walk(
         Some(b"Sig") => FieldKind::Signature,
         _ => return,
     };
+    let widget_refs: Vec<ObjRef> = if d.contains(b"Rect") { vec![r] } else { kids };
+    let widget_refs: Vec<ObjRef> = widget_refs.into_iter().filter(|w| seen.widgets.insert(*w)).collect();
+    let actions = actions_of(doc, d, &widget_refs, &mut seen.scripts);
+    let button = (inh.ft.as_deref() == Some(b"Btn") && inh.ff.unwrap_or(0) & flags::PUSH_BUTTON != 0)
+        .then(|| button_action(doc, d, &widget_refs, &mut seen.scripts))
+        .flatten();
     let widgets = widget_refs
         .into_iter()
         .filter_map(|w| {
@@ -620,21 +852,32 @@ fn walk(
             let wd = wo.as_dict()?;
             let rect = nums(doc, wd.get(b"Rect")).filter(|r| r.len() == 4).unwrap_or_else(|| vec![0.0; 4]);
             let annot_flags = wd.get(b"F").and_then(|f| doc.resolve(f).as_int()).unwrap_or(0);
+            let own_ff = if w == r { 0 } else { field_flags(doc, wd).unwrap_or(0) };
             let on_state = wd
                 .get(b"AP")
                 .map(|ap| doc.resolve(ap))
                 .and_then(|ap| ap.as_dict().and_then(|a| a.get(b"N").cloned()))
                 .and_then(|n| doc.resolve(&n).as_dict().cloned())
-                .and_then(|n| n.iter().map(|(k, _)| String::from_utf8_lossy(k).into_owned()).find(|k| k != "Off"));
+                .and_then(|n| n.iter().map(|(k, _)| name_text(k)).find(|k| k != "Off"));
             Some(Widget {
                 obj: w,
                 page: page_of.get(&w).copied(),
                 rect: [rect[0].min(rect[2]), rect[1].min(rect[3]), rect[0].max(rect[2]), rect[1].max(rect[3])],
                 on_state: on_state.filter(|_| matches!(kind, FieldKind::CheckBox | FieldKind::Radio)),
-                state: wd.name(b"AS").map(|s| String::from_utf8_lossy(s).into_owned()),
+                state: wd.name(b"AS").map(name_text),
                 tab: usize::MAX,
                 locked: annot_flags & 128 != 0,
                 hidden: annot_flags & (2 | 32) != 0,
+                read_only: (ff | own_ff) & flags::READ_ONLY != 0,
+                rotation: appearance::mk_rotation(doc, wd),
+                caption: (kind == FieldKind::PushButton)
+                    .then(|| {
+                        let mk = doc.resolve(wd.get(b"MK")?);
+                        let value = doc.resolve(mk.as_dict()?.get(b"CA")?);
+                        value.as_string().map(|s| s.to_text())
+                    })
+                    .flatten(),
+                list: (kind == FieldKind::List).then(|| appearance::list_rows_of(doc, inh.da.as_deref().unwrap_or("/Helv 0 Tf 0 g"), Some(d), wd)),
             })
         })
         .collect();
@@ -667,6 +910,10 @@ fn walk(
     });
 }
 
+fn field_flags(doc: &Document, dict: &Dict) -> Option<u32> {
+    dict.get(b"Ff").and_then(|value| doc.resolve(value).as_int()).and_then(|value| u32::try_from(value).ok())
+}
+
 // ── writing ─────────────────────────────────────────────────────────────────────────────────
 
 /// Fill the field `name`.
@@ -685,8 +932,49 @@ pub fn set_value_with(doc: &mut Document, name: &str, value: &FieldValue, script
         return Err(FormError::ReadOnly(name.into()));
     }
     write_value(doc, f, value, scripts)?;
+    // Fields with the same fully qualified name are one field (§12.7.3.1). Writers that repeat a
+    // name as separate field dictionaries, instead of widgets under one parent, get the value
+    // the first one took after its scripts, without running them again.
+    let twins: Vec<&Field> = all.iter().filter(|t| t.name == name && t.obj != f.obj && t.kind == f.kind).collect();
+    if !twins.is_empty() {
+        let taken = fields(doc).into_iter().find(|x| x.obj == f.obj).map(|x| x.value).unwrap_or_default();
+        for t in twins {
+            share_value(doc, f.obj, t, &taken, scripts)?;
+        }
+    }
     recalculate_with(doc, scripts)?;
     Ok(())
+}
+
+/// Give `twin` the value `source` holds: its `/V` (and a choice's `/I`), drawn in the twin's own
+/// widgets.
+fn share_value(doc: &mut Document, source: ObjRef, twin: &Field, value: &[String], scripts: &mut dyn Scripts) -> Result<(), FormError> {
+    match twin.kind {
+        FieldKind::CheckBox => {
+            let state = twin.widgets.iter().find_map(|w| w.on_state.clone()).unwrap_or_else(|| "Yes".into());
+            set_states(doc, twin, (!value.is_empty()).then_some(state.as_str()))
+        }
+        FieldKind::Radio => {
+            let choice = value.first().filter(|c| twin.widgets.iter().any(|w| w.on_state.as_deref() == Some(c.as_str())));
+            set_states(doc, twin, choice.map(String::as_str))
+        }
+        FieldKind::Text | FieldKind::Combo | FieldKind::List => {
+            let src = doc.get(source).as_dict().cloned().unwrap_or_default();
+            doc.update_dict(twin.obj, |d| {
+                for key in [&b"V"[..], b"I"] {
+                    match src.get(key) {
+                        Some(v) => d.set(key.to_vec(), v.clone()),
+                        None => {
+                            d.remove(key);
+                        }
+                    }
+                }
+                d.remove(b"RV");
+            })?;
+            redraw(doc, twin, value, scripts)
+        }
+        FieldKind::PushButton | FieldKind::Signature => Ok(()),
+    }
 }
 
 /// Run every field's Calculate script in the form's calculation order (`/CO`, then the other
@@ -697,36 +985,26 @@ pub fn recalculate(doc: &mut Document) -> Result<usize, FormError> {
 
 /// [`recalculate`], running custom Calculate (and Format) scripts through `scripts`.
 pub fn recalculate_with(doc: &mut Document, scripts: &mut dyn Scripts) -> Result<usize, FormError> {
-    let all = fields(doc);
-    let calculated = |f: &Field| f.actions.calculate != af::Calculate::None || f.actions.scripts.calculate.is_some();
-    if !all.iter().any(calculated) {
+    let mut all = fields(doc);
+    if !all.iter().any(calc_order::is_calculated) {
         return Ok(0);
     }
-    let co: Vec<ObjRef> = acroform(doc)
-        .and_then(|af| af.get(b"CO").map(|c| doc.resolve(c)).and_then(|c| c.as_array().cloned()))
-        .unwrap_or_default()
-        .iter()
-        .filter_map(Object::as_ref)
-        .collect();
-    let mut order: Vec<String> = co.iter().filter_map(|r| all.iter().find(|f| f.obj == *r)).map(|f| f.name.clone()).collect();
-    for f in &all {
-        if calculated(f) && !order.contains(&f.name) {
-            order.push(f.name.clone());
-        }
-    }
+    // By object: two fields can share a name in a malformed form, and each calculates.
+    let order: Vec<ObjRef> = calc_order::run_order(doc, &all).0.into_iter().filter_map(|(i, _)| all.get(i)).map(|f| f.obj).collect();
     let mut changed = 0;
-    for name in order {
-        let now = fields(doc);
-        let Some(f) = now.iter().find(|f| f.name == name) else { continue };
+    for obj in order {
+        let Some(f) = all.iter().find(|f| f.obj == obj).cloned() else { continue };
         let lookup = |n: &str| -> Vec<String> {
             let prefix = format!("{n}.");
-            now.iter().filter(|x| x.name == n || x.name.starts_with(&prefix)).flat_map(|x| x.value.first().cloned()).collect()
+            all.iter().filter(|x| x.name == n || x.name.starts_with(&prefix)).flat_map(|x| x.value.first().cloned()).collect()
         };
         let current = f.value.first().cloned().unwrap_or_default();
         let v = if let Some(js) = &f.actions.scripts.calculate {
-            let f = f.clone();
-            let r = scripts.run(FieldEvent::Calculate, js, &f, &current, &now);
+            let r = scripts.run(FieldEvent::Calculate, js, &f, &current, &all);
             scripting::apply_changes(doc, &r.changes, &f.name)?;
+            if !r.changes.is_empty() {
+                all = fields(doc);
+            }
             if !r.rc {
                 continue;
             }
@@ -735,16 +1013,27 @@ pub fn recalculate_with(doc: &mut Document, scripts: &mut dyn Scripts) -> Result
             let Some(v) = af::calculate(&f.actions.calculate, &lookup) else { continue };
             v
         };
-        let now = fields(doc);
-        let Some(f) = now.iter().find(|f| f.name == name) else { continue };
         if current != v && matches!(f.kind, FieldKind::Text | FieldKind::Combo) {
-            let f = f.clone();
             doc.update_dict(f.obj, |d| d.set(b"V".to_vec(), PdfString::text(&v)))?;
             redraw(doc, &f, std::slice::from_ref(&v), scripts)?;
+            if let Some(target) = all.iter_mut().find(|x| x.obj == obj) {
+                target.value = vec![v];
+            }
             changed += 1;
         }
     }
     Ok(changed)
+}
+
+/// The fields whose calculation differs between two readings of a form, matched by field object
+/// and named as in `after`: the formulas an edit rewrote, such as a rename's.
+pub fn calculations_changed(before: &[Field], after: &[Field]) -> Vec<String> {
+    let before: std::collections::HashMap<ObjRef, &af::Actions> = before.iter().map(|f| (f.obj, &f.actions)).collect();
+    after
+        .iter()
+        .filter(|f| before.get(&f.obj).is_some_and(|b| b.calculate != f.actions.calculate || b.scripts.calculate != f.actions.scripts.calculate))
+        .map(|f| f.name.clone())
+        .collect()
 }
 
 fn invalid<T>(m: impl Into<String>) -> Result<T, FormError> {
@@ -780,7 +1069,7 @@ fn write_value(doc: &mut Document, f: &Field, value: &FieldValue, scripts: &mut 
                 // The on-state name or a yes/no word also work (agents, FDF-style data).
                 FieldValue::Text(t) | FieldValue::Radio(Some(t)) => {
                     let t = t.trim();
-                    if t == state || ["yes", "true", "on", "1", "x", "checked"].contains(&t.to_lowercase().as_str()) {
+                    if t == state || f.state_for(t).is_some() || ["yes", "true", "on", "1", "x", "checked"].contains(&t.to_lowercase().as_str()) {
                         true
                     } else if t.is_empty() || ["no", "false", "off", "0", "unchecked"].contains(&t.to_lowercase().as_str()) {
                         false
@@ -801,10 +1090,12 @@ fn write_value(doc: &mut Document, f: &Field, value: &FieldValue, scripts: &mut 
                 FieldValue::Check(false) => None,
                 _ => return invalid(format!("{:?} is a radio group: choose one of its options", f.name)),
             };
+            // An export value from /Opt selects its widget's on state.
+            let choice = choice.map(|c| f.state_for(&c).map(str::to_owned).unwrap_or(c));
             if let Some(c) = &choice
                 && !f.widgets.iter().any(|w| w.on_state.as_deref() == Some(c.as_str()))
             {
-                let opts: Vec<&str> = f.widgets.iter().filter_map(|w| w.on_state.as_deref()).collect();
+                let opts: Vec<&str> = (0..f.widgets.len()).filter_map(|i| f.export_of(i)).collect();
                 return invalid(format!("{:?} has no option {c:?} (options: {})", f.name, opts.join(", ")));
             }
             if choice.is_none() && f.has(flags::NO_TOGGLE_TO_OFF) && !f.value.is_empty() {
@@ -835,8 +1126,21 @@ fn write_value(doc: &mut Document, f: &Field, value: &FieldValue, scripts: &mut 
                     }
                 }
             }
-            let indices: Vec<Object> =
+            let mut indices: Vec<Object> =
                 exports.iter().filter_map(|e| f.options.iter().position(|(x, _)| x == e)).map(|i| Object::Int(i as i64)).collect();
+            // /I lists option indices in ascending order; /V keeps the caller's value order.
+            // Every entry above is an integer, so this sorts by its numeric option index.
+            indices.sort_unstable_by_key(Object::as_int);
+            // A list box scrolls (`/TI`) so the picked options are among the rows it draws, as
+            // in other viewers: a pick below the last visible row would otherwise not show (#1524).
+            let top = match (f.kind, f.widgets.first()) {
+                (FieldKind::List, Some(w)) => w.list.map(|rows| {
+                    let height = if matches!(w.rotation, 90 | 270) { w.rect[2] - w.rect[0] } else { w.rect[3] - w.rect[1] };
+                    let picked: Vec<usize> = indices.iter().filter_map(|i| i.as_int()).filter_map(|i| usize::try_from(i).ok()).collect();
+                    (rows.top, appearance::ListRows::top_showing(rows.top, &picked, rows.visible(height), f.options.len()))
+                }),
+                _ => None,
+            };
             doc.update_dict(f.obj, |d| {
                 match exports.as_slice() {
                     [] => {
@@ -850,7 +1154,22 @@ fn write_value(doc: &mut Document, f: &Field, value: &FieldValue, scripts: &mut 
                 } else {
                     d.set(b"I".to_vec(), Object::Array(indices));
                 }
+                if let Some((old, new)) = top
+                    && old != new
+                {
+                    d.set(b"TI".to_vec(), Object::Int(i64::try_from(new).unwrap_or(0)));
+                }
             })?;
+            // A widget with its own `/TI` (read before the field's) scrolls too.
+            if let Some((old, new)) = top
+                && old != new
+            {
+                for w in f.widgets.iter().filter(|w| w.obj != f.obj) {
+                    if doc.get(w.obj).as_dict().is_some_and(|d| d.contains(b"TI")) {
+                        doc.update_dict(w.obj, |d| d.set(b"TI".to_vec(), Object::Int(i64::try_from(new).unwrap_or(0))))?;
+                    }
+                }
+            }
             redraw(doc, f, &exports, scripts)
         }
         (FieldKind::PushButton, _) => invalid(format!("{:?} is a button; it has no value", f.name)),
@@ -862,7 +1181,7 @@ fn write_value(doc: &mut Document, f: &Field, value: &FieldValue, scripts: &mut 
 /// Check boxes and radio buttons: `/V` on the field, `/AS` on each widget.
 fn set_states(doc: &mut Document, f: &Field, on: Option<&str>) -> Result<(), FormError> {
     let v = on.unwrap_or("Off");
-    doc.update_dict(f.obj, |d| d.set(b"V".to_vec(), Object::name(v)))?;
+    doc.update_dict(f.obj, |d| d.set(b"V".to_vec(), name_obj(v)))?;
     for w in &f.widgets {
         let state = match (on, w.on_state.as_deref()) {
             (Some(c), Some(s)) if c == s => s,
@@ -875,9 +1194,52 @@ fn set_states(doc: &mut Document, f: &Field, on: Option<&str>) -> Result<(), For
             let ap = appearance::check_box_states(doc, w, f.kind, &on_name);
             doc.update_dict(w.obj, |d| d.set(b"AP".to_vec(), Object::Dict(ap)))?;
         }
-        doc.update_dict(w.obj, |d| d.set(b"AS".to_vec(), Object::name(state)))?;
+        doc.update_dict(w.obj, |d| d.set(b"AS".to_vec(), name_obj(state)))?;
     }
     Ok(())
+}
+
+/// Copy an existing appearance dictionary before replacing its normal appearance.
+fn appearance_dict(doc: &Document, widget: ObjRef) -> Dict {
+    doc.get(widget).as_dict().and_then(|d| d.get(b"AP").map(|a| doc.resolve(a))).and_then(|a| a.as_dict().cloned()).unwrap_or_default()
+}
+
+/// `widget`'s appearance dictionary (a copy, so a shared one is left alone) with the freshly
+/// drawn entries of `fresh` (its `/N`). Other entries are kept, but the old down and rollover
+/// appearances (`/D`, `/R`) would show the old value, caption or colour on press or hover, so
+/// they go — except, for check boxes and radio buttons (whose `/N` is a dictionary of states),
+/// the states the new `/N` still draws under the same names.
+pub(crate) fn merged_appearance(doc: &Document, widget: ObjRef, fresh: &Dict) -> Dict {
+    let mut apd = appearance_dict(doc, widget);
+    // Only a dictionary of states counts (`as_dict` would also see a stream's own dictionary).
+    let states_of = |o: &Object| match &*doc.resolve(o) {
+        Object::Dict(d) => Some(d.clone()),
+        _ => None,
+    };
+    let states: Option<Vec<Vec<u8>>> = fresh.get(b"N").and_then(states_of).map(|d| d.iter().map(|(k, _)| k.clone()).collect());
+    for key in [&b"D"[..], &b"R"[..]] {
+        if fresh.contains(key) {
+            continue;
+        }
+        let kept = states.as_ref().and_then(|names| {
+            let old = apd.get(key).and_then(states_of)?;
+            let mut d = Dict::new();
+            for (k, v) in old.iter().filter(|(k, _)| names.contains(k)) {
+                d.set(k.clone(), v.clone());
+            }
+            (!d.is_empty()).then_some(d)
+        });
+        match kept {
+            Some(d) => apd.set(key.to_vec(), Object::Dict(d)),
+            None => {
+                apd.remove(key);
+            }
+        }
+    }
+    for (k, v) in fresh.iter() {
+        apd.set(k.clone(), v.clone());
+    }
+    apd
 }
 
 /// Regenerate the normal appearance of every widget of a text or choice field.
@@ -886,20 +1248,231 @@ fn redraw(doc: &mut Document, f: &Field, values: &[String], scripts: &mut dyn Sc
         [one] if matches!(f.kind, FieldKind::Text | FieldKind::Combo) => scripting::formatted(doc, f, one, scripts),
         _ => None,
     };
+    let mut undrawn = false;
     for w in &f.widgets {
-        let stream = match &shown {
-            Some(s) => appearance::field_appearance_as(doc, f, w, std::slice::from_ref(s), false),
-            None => appearance::field_appearance(doc, f, w, values),
+        let (stream, missing) = match &shown {
+            Some(s) => appearance::field_appearance_drawn(doc, f, w, std::slice::from_ref(s), false),
+            None => appearance::field_appearance_drawn(doc, f, w, values, true),
         };
+        undrawn |= missing.is_some();
         let ap = doc.add(Object::Stream(stream));
-        let mut apd = Dict::new();
-        apd.set(b"N".to_vec(), Object::Ref(ap));
+        let mut fresh = Dict::new();
+        fresh.set(b"N".to_vec(), Object::Ref(ap));
+        let apd = merged_appearance(doc, w.obj, &fresh);
         doc.update_dict(w.obj, |d| {
             d.set(b"AP".to_vec(), Object::Dict(apd));
             d.remove(b"AS");
+            pdfcraft_fonts::set_undrawn_mark(d, missing);
         })?;
     }
+    if undrawn {
+        ask_viewers_to_redraw(doc)?;
+    }
     Ok(())
+}
+
+/// A value its widget's font can't show is stored as typed and drawn with `?` (as Acrobat keeps
+/// such a value): `/NeedAppearances` then asks other viewers to draw the fields from their values
+/// with fonts that have those characters (the interactive form dictionary, §12.7.3). Not in a
+/// document that declares PDF/A, which forbids it: there the widget's mark
+/// (`pdfcraft_fonts::UNDRAWN_MARK`) is all, and the edit's report says the `?` shows everywhere.
+pub(crate) fn ask_viewers_to_redraw(doc: &mut Document) -> Result<(), FormError> {
+    if declares_pdfa(doc) || need_appearances(doc) {
+        return Ok(());
+    }
+    let Some(root) = doc.root() else { return Ok(()) };
+    let entry = doc.get(root).as_dict().and_then(|c| c.get(b"AcroForm").cloned());
+    match entry {
+        Some(Object::Ref(r)) => doc.update_dict(r, |d| d.set(b"NeedAppearances".to_vec(), Object::Bool(true)))?,
+        Some(Object::Dict(mut af)) => {
+            af.set(b"NeedAppearances".to_vec(), Object::Bool(true));
+            doc.update_dict(root, |c| c.set(b"AcroForm".to_vec(), Object::Dict(af)))?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Whether the form asks viewers to draw its fields' appearances themselves (`/NeedAppearances`).
+pub fn need_appearances(doc: &Document) -> bool {
+    acroform(doc).is_some_and(|af| matches!(af.get(b"NeedAppearances").map(|o| doc.resolve(o)).as_deref(), Some(Object::Bool(true))))
+}
+
+/// A copy of `doc` in which text and choice fields are drawn from their values, for displaying
+/// the document (`None` when no widget needs it): every such widget when the form sets
+/// `/NeedAppearances` (ISO 32000-2 Table 224: the writer left the appearances to the viewer),
+/// and otherwise each widget without a normal appearance (`/AP /N`). Drawn as typing the value
+/// would draw it (#3470). `doc` is not changed: saving writes the file as it was.
+pub fn with_field_appearances(doc: &Document) -> Option<Document> {
+    with_field_appearances_cached(doc, &mut FieldAppearanceCache::default())
+}
+
+/// [`with_field_appearances`], reusing the appearances `cache` drew for widgets whose inputs are
+/// the same objects as then (see [`FieldAppearanceCache`]).
+pub fn with_field_appearances_cached(doc: &Document, cache: &mut FieldAppearanceCache) -> Option<Document> {
+    let all = need_appearances(doc);
+    let mut copy: Option<Document> = None;
+    for f in fields(doc).iter().filter(|f| matches!(f.kind, FieldKind::Text | FieldKind::Combo | FieldKind::List)) {
+        for w in &f.widgets {
+            let widget = doc.get(w.obj);
+            let drawn = widget.as_dict().and_then(|d| d.get(b"AP")).is_some_and(|ap| doc.resolve(ap).as_dict().is_some_and(|ap| ap.contains(b"N")));
+            if drawn && !all {
+                continue;
+            }
+            let inputs = appearance_inputs(doc, w);
+            let stream = match cache.get(w.obj, &inputs) {
+                Some(stream) => stream,
+                None => {
+                    let (stream, _) = appearance::field_appearance_drawn(doc, f, w, &f.value, true);
+                    cache.insert(w.obj, inputs, &stream);
+                    stream
+                }
+            };
+            let target = copy.get_or_insert_with(|| doc.clone());
+            let ap = target.add(Object::Stream(stream));
+            let mut fresh = Dict::new();
+            fresh.set(b"N".to_vec(), Object::Ref(ap));
+            let apd = merged_appearance(target, w.obj, &fresh);
+            // Fails only when the widget isn't a dictionary; that widget then keeps its own look.
+            target.update_dict(w.obj, |d| d.set(b"AP".to_vec(), Object::Dict(apd))).ok();
+        }
+    }
+    copy
+}
+
+/// The objects a widget's drawn appearance is built from, as the document holds them: the widget
+/// and the fields above it (value, `/DA`, `/Q`, flags, options, `/MK`, formatting actions), the
+/// form dictionary (`/DA`) and the fonts of its `/DR`, each with the objects its entries refer to
+/// (an indirect `/MK` or `/V`). Not the page: a field's rotation is its own `/MK /R`.
+fn appearance_inputs(doc: &Document, w: &Widget) -> Vec<std::sync::Arc<Object>> {
+    // The objects a dictionary's entries refer to. The tree links and the drawn appearance itself
+    // are not inputs, and `/Kids` and `/Fields` can be long.
+    let referred = |d: &Dict, inputs: &mut Vec<std::sync::Arc<Object>>| {
+        for (k, v) in d.iter() {
+            if !matches!(&k[..], b"Kids" | b"Fields" | b"P" | b"Parent" | b"AP")
+                && let Some(r) = v.as_ref()
+            {
+                inputs.push(doc.get(r));
+            }
+        }
+    };
+    let mut inputs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut node = Some(w.obj);
+    // The /Parent chain; the seen-set and the cap end a cycle or an absurd depth.
+    while let Some(r) = node.filter(|r| seen.insert(*r) && seen.len() <= 64) {
+        let obj = doc.get(r);
+        if let Some(d) = obj.as_dict() {
+            node = d.reference(b"Parent");
+            referred(d, &mut inputs);
+        } else {
+            node = None;
+        }
+        inputs.push(obj);
+    }
+    let Some(root) = doc.root() else { return inputs };
+    let catalog = doc.get(root);
+    let form = match catalog.as_dict().and_then(|c| c.reference(b"AcroForm")) {
+        Some(r) => doc.get(r),
+        None => catalog,
+    };
+    if let Some(f) = form.as_dict() {
+        referred(f, &mut inputs);
+        // The fonts of /DR. An indirect /DR or /Font is listed through the entries that refer to
+        // it; a direct one is part of the object that holds it. `held` only finds them: a copy
+        // of a direct object is a new one each time, never an input.
+        let held = |o: &Object| o.as_ref().map_or_else(|| std::sync::Arc::new(o.clone()), |r| doc.get(r));
+        if let Some(dr) = f.get(b"DR").map(held)
+            && let Some(dr) = dr.as_dict()
+        {
+            referred(dr, &mut inputs);
+            if let Some(font) = dr.get(b"Font").map(held)
+                && let Some(fonts) = font.as_dict()
+            {
+                referred(fonts, &mut inputs);
+            }
+        }
+    }
+    inputs.push(form);
+    inputs
+}
+
+/// Field appearances drawn for the display copy ([`with_field_appearances_cached`]), so a refresh
+/// redraws only the widgets whose inputs changed: a form that leaves every appearance to the
+/// viewer otherwise redrew all of its fields on each keystroke in any one of them (#3470). An
+/// entry holds the input objects it was drawn from and is used only while each is still the same
+/// object (`Arc::ptr_eq`); the document replaces an object it edits, so a changed input is a
+/// miss, never a stale hit.
+#[derive(Clone, Debug, Default)]
+pub struct FieldAppearanceCache {
+    entries: std::collections::HashMap<ObjRef, (Vec<std::sync::Arc<Object>>, pdfcraft_cos::Stream)>,
+    bytes: usize,
+    hits: u64,
+    builds: u64,
+}
+
+impl FieldAppearanceCache {
+    /// Cached appearance data restarts past this instead of growing without bound.
+    const MAX_BYTES: usize = 64 << 20;
+
+    /// Forget every entry.
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn get(&mut self, w: ObjRef, inputs: &[std::sync::Arc<Object>]) -> Option<pdfcraft_cos::Stream> {
+        let (from, stream) = self.entries.get(&w)?;
+        if from.len() != inputs.len() || !from.iter().zip(inputs).all(|(a, b)| std::sync::Arc::ptr_eq(a, b)) {
+            return None;
+        }
+        self.hits += 1;
+        Some(stream.clone())
+    }
+
+    fn insert(&mut self, w: ObjRef, inputs: Vec<std::sync::Arc<Object>>, stream: &pdfcraft_cos::Stream) {
+        self.builds += 1;
+        if self.bytes.saturating_add(stream.raw.len()) > Self::MAX_BYTES {
+            self.clear();
+        }
+        self.bytes = self.bytes.saturating_add(stream.raw.len());
+        if let Some((_, old)) = self.entries.insert(w, (inputs, stream.clone())) {
+            self.bytes = self.bytes.saturating_sub(old.raw.len());
+        }
+    }
+
+    /// Cache hits so far (reused appearances); for tests.
+    pub fn hits(&self) -> u64 {
+        self.hits
+    }
+
+    /// Appearances drawn so far; for tests.
+    pub fn builds(&self) -> u64 {
+        self.builds
+    }
+}
+
+/// Whether the document's XMP metadata declares PDF/A conformance (`pdfaid:part`).
+pub fn declares_pdfa(doc: &Document) -> bool {
+    let Some(root) = doc.root() else { return false };
+    let Some(m) = doc.get(root).as_dict().and_then(|c| c.get(b"Metadata").cloned()) else { return false };
+    let m = doc.resolve(&m);
+    match &*m {
+        Object::Stream(s) => s.decoded().is_ok_and(|b| b.windows(11).any(|w| w == b"pdfaid:part")),
+        _ => false,
+    }
+}
+
+/// Every field with a widget whose appearance PdfCraft drew with `?` for a character its font
+/// can't hold (`pdfcraft_fonts::UNDRAWN_MARK`): the field's name and that character, once per
+/// field.
+pub fn undrawn_fields(doc: &Document) -> Vec<(String, char)> {
+    fields(doc)
+        .into_iter()
+        .filter_map(|f| {
+            let c = f.widgets.iter().find_map(|w| doc.get(w.obj).as_dict().and_then(pdfcraft_fonts::undrawn_mark))?;
+            Some((f.name, c))
+        })
+        .collect()
 }
 
 /// Acrobat's Clear form: every field (or the named ones) back to its default value.

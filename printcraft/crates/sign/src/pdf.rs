@@ -21,7 +21,11 @@ use crate::cms::SignedData;
 use crate::der::Time;
 use crate::keys::DigestAlg;
 use crate::pkcs12::DigitalId;
-use crate::x509::{Certificate, build_chain};
+use crate::x509::{Certificate, build_chain, build_chain_noted};
+
+#[cfg(test)]
+#[path = "pdf_discovery_tests.rs"]
+mod discovery_tests;
 
 /// Digests of signed byte ranges (and parsed signed revisions), kept across revalidations of
 /// one document: incremental edits only append to the file, so the signed bytes and their
@@ -34,6 +38,50 @@ pub struct DigestCache {
     map: std::sync::Mutex<HashMap<RangeKey, Vec<u8>>>,
     /// Signed revisions opened for change classification, by length and fingerprint.
     revisions: std::sync::Mutex<HashMap<(usize, [u8; 32]), Document>>,
+    /// Candidate identities only: validation still uses current bytes and current trust.
+    discovery: std::sync::Mutex<Option<TimestampCandidates>>,
+    #[cfg(test)]
+    discovery_scans: std::sync::atomic::AtomicUsize,
+}
+
+/// Keep only the most recently visited source/overlay. In particular, this must not retain
+/// a Document, its bytes, or parsed signature dictionaries across edits and saves.
+#[derive(Debug)]
+struct TimestampCandidates {
+    source: pdfcraft_cos::SourceIdentity,
+    modified: Vec<u32>,
+    candidates: Vec<ObjRef>,
+}
+
+const DISCOVERY_CACHE_LIMIT: usize = 4096;
+
+fn is_document_timestamp(object: &Object) -> bool {
+    object.as_dict().is_some_and(|d| is_doc_timestamp(d) && d.contains(b"ByteRange"))
+}
+
+/// Only dictionary/null edits have a local effect on candidate membership. Changes to an
+/// object stream or a scalar used as an indirect /Length can affect unedited objects too.
+/// Checking both the original and current objects also covers freeing those dependencies.
+/// Unsupported or unreadable edits deliberately fall back to the complete bounded scan.
+fn changed_timestamp_candidates(doc: &Document, numbers: &[u32]) -> Option<Vec<ObjRef>> {
+    for (reference, object) in doc.scan_original_objects_subset(numbers.to_vec()) {
+        match object.ok()?.as_ref() {
+            Object::Dict(_) => {}
+            Object::Null if matches!(doc.xref_entry(reference.num), None | Some(pdfcraft_cos::XrefEntry::Free { .. })) => {}
+            _ => return None,
+        }
+    }
+    let mut candidates = Vec::new();
+    for (reference, object) in doc.scan_objects_subset(numbers.to_vec()) {
+        let object = object.ok()?;
+        if !matches!(object.as_ref(), Object::Dict(_) | Object::Null) {
+            return None;
+        }
+        if is_document_timestamp(&object) {
+            candidates.push(reference);
+        }
+    }
+    Some(candidates)
 }
 
 /// (end of first range, start of second, end of second, algorithm, fingerprint).
@@ -53,13 +101,70 @@ fn fingerprint(covered: &[u8]) -> [u8; 32] {
 }
 
 impl DigestCache {
-    /// The signed revision `bytes[..end]`, parsed (and kept).
-    fn revision(&self, bytes: &[u8], end: usize) -> Option<Document> {
+    fn timestamp_candidates(&self, doc: &Document) -> Vec<ObjRef> {
+        let mut slot = self.discovery.lock().ok();
+        let previous = slot.as_mut().and_then(|slot| slot.take());
+        let source = doc.source_identity();
+        let modified = doc.modified_objects();
+        // Reconstructed/unknown input and output-security changes take the original path.
+        let eligible = slot.is_some()
+            && doc.repair_log().is_empty()
+            && !doc.revisions().is_empty()
+            && !doc.encryption_changed()
+            && modified.len() <= DISCOVERY_CACHE_LIMIT;
+        if eligible && let Some(previous) = previous.filter(|previous| previous.source == source) {
+            // Undo/redo can remove overlays as well as add them. Revisit the union so an
+            // original candidate replaced or freed in the last snapshot can reappear.
+            let mut changed = previous.modified;
+            changed.extend_from_slice(&modified);
+            changed.sort_unstable();
+            changed.dedup();
+            if changed.len() <= DISCOVERY_CACHE_LIMIT
+                && let Some(mut candidates) = changed_timestamp_candidates(doc, &changed)
+            {
+                candidates.extend(previous.candidates.into_iter().filter(|r| changed.binary_search(&r.num).is_err()));
+                candidates.sort_unstable_by_key(|r| r.num);
+                if candidates.len() <= DISCOVERY_CACHE_LIMIT
+                    && let Some(slot) = slot.as_mut()
+                {
+                    **slot = Some(TimestampCandidates { source, modified, candidates: candidates.clone() });
+                }
+                return candidates;
+            }
+        }
+        #[cfg(test)]
+        self.discovery_scans.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut complete = true;
+        let candidates: Vec<_> = doc
+            .scan_objects_checked()
+            .filter_map(|(reference, object)| match object {
+                Ok(object) => is_document_timestamp(&object).then_some(reference),
+                Err(_) => {
+                    complete = false;
+                    None
+                }
+            })
+            .collect();
+        if eligible
+            && complete
+            && candidates.len() <= DISCOVERY_CACHE_LIMIT
+            && changed_timestamp_candidates(doc, &modified).is_some()
+            && let Some(slot) = slot.as_mut()
+        {
+            **slot = Some(TimestampCandidates { source, modified, candidates: candidates.clone() });
+        }
+        candidates
+    }
+
+    /// The signed revision `bytes[..end]`, parsed (and kept). An encrypted one is opened with
+    /// `doc`'s own key (the same `/Encrypt` and `/ID`), so a user password the document was
+    /// opened with is neither needed again nor kept here (#1808).
+    fn revision(&self, doc: &Document, bytes: &[u8], end: usize) -> Option<Document> {
         let key = (end, fingerprint(&bytes[..end]));
         if let Some(d) = self.revisions.lock().ok().and_then(|m| m.get(&key).cloned()) {
             return Some(d);
         }
-        let d = Document::open(Arc::new(bytes[..end].to_vec())).ok()?;
+        let d = doc.open_with_same_credentials(Arc::new(bytes[..end].to_vec())).ok()?;
         if let Ok(mut m) = self.revisions.lock() {
             if m.len() > 8 {
                 m.clear();
@@ -109,16 +214,205 @@ pub enum Status {
     Invalid,
 }
 
+/// What a change made after signing is called: the words [`Modification`] lists it by, and the
+/// vocabulary a signature's details speak of changes in.
+///
+/// They are words of ours, not the document's, so an interface reading in another language
+/// translates each of them; [`ALL`](kind::ALL) is the whole vocabulary.
+pub mod kind {
+    pub const PAGE_CONTENT: &str = "page content";
+    pub const FORM_FILL: &str = "form fill";
+    pub const COMMENTS: &str = "comments";
+    pub const SIGNATURE: &str = "signature";
+    pub const SECURITY_STORE: &str = "document security store";
+    pub const METADATA: &str = "metadata";
+    pub const LINKS: &str = "links";
+    pub const STRUCTURE: &str = "document structure";
+    pub const PAGES: &str = "pages added or removed";
+    pub const OTHER: &str = "other changes";
+    /// Not a change but the reason there is nothing to compare: the signed revision itself could not
+    /// be read, so what came after it cannot be allowed.
+    pub const UNREADABLE: &str = "the signed version could not be read";
+
+    /// Every word above, for an interface to translate.
+    pub const ALL: &[&str] = &[PAGE_CONTENT, FORM_FILL, COMMENTS, SIGNATURE, SECURITY_STORE, METADATA, LINKS, STRUCTURE, PAGES, OTHER, UNREADABLE];
+}
+
 /// Changes made after signing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Modification {
     /// The signature covers the whole file.
     None,
-    /// Later revisions only make changes the signature permits (listed).
-    Allowed(Vec<String>),
-    /// Later revisions make changes it doesn't permit (listed).
-    Disallowed(Vec<String>),
+    /// Later revisions only make changes the signature permits, listed in the words of [`kind`].
+    Allowed(Vec<&'static str>),
+    /// Later revisions make changes it doesn't permit, listed in the words of [`kind`].
+    Disallowed(Vec<&'static str>),
 }
+
+/// One of the sentences that explain a signature's verdict.
+///
+/// [`message`](Detail::message) is the sentence in English, ready to read. An interface that reads in
+/// another language says it with [`Detail::said`] instead, out of [`pattern`](Detail::pattern) —
+/// wording of ours, listed in [`WORDINGS`] — and [`fill`](Detail::fill), whatever goes in it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Detail {
+    /// The sentence in English.
+    pub message: String,
+    /// The sentence as it is worded here, with `{}` where the fill goes.
+    pub pattern: &'static str,
+    pub fill: Fill,
+}
+
+/// What goes where a [`Detail`]'s pattern has `{}`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Fill {
+    /// Nothing: the pattern is the whole sentence.
+    Nothing,
+    /// The changes made after signing, as [`Modification`] lists them: words of ours, each one in
+    /// [`kind::ALL`], said one after another.
+    Changes(Vec<&'static str>),
+    /// What a reader could not make of the signature, in its own words. It goes in as it stands: it
+    /// names the structure that is wrong, which is a developer's business and reads the same
+    /// everywhere.
+    Reason(String),
+    /// A value out of the signature itself — a time, the evidence a revocation came from — written
+    /// as it stands, the way a certificate's name or date is.
+    Value(String),
+    /// Two certificates' own names, for the wording that says one was not used to vouch for the
+    /// other. They go in the order the wording puts its two holes in, which a language may reverse.
+    Names(String, String),
+}
+
+impl Detail {
+    /// The sentence said in the language `words` translates into.
+    ///
+    /// The wording is translated, and what fills it goes in afterwards — the changes translated too —
+    /// so nothing put in can be mistaken for a hole of its own. With [`in_english`] this is
+    /// [`message`](Detail::message).
+    pub fn said(&self, words: Words) -> String {
+        let said = words(self.pattern);
+        match &self.fill {
+            Fill::Nothing => said,
+            Fill::Changes(c) => said.replacen("{}", &c.iter().map(|k| words(k)).collect::<Vec<_>>().join(", "), 1),
+            Fill::Reason(r) | Fill::Value(r) => said.replacen("{}", r, 1),
+            // Both holes are cut out of the wording first, so neither name can be taken for the other's.
+            Fill::Names(a, b) => {
+                let mut parts = said.splitn(3, "{}");
+                match (parts.next(), parts.next(), parts.next()) {
+                    (Some(p0), Some(p1), Some(p2)) => format!("{p0}{a}{p1}{b}{p2}"),
+                    // A wording with one hole, or none: say it as it is rather than guess.
+                    _ => said,
+                }
+            }
+        }
+    }
+
+    /// The whole sentence, with no hole in it.
+    pub(crate) fn plain(pattern: &'static str) -> Detail {
+        Detail::of(pattern, Fill::Nothing)
+    }
+
+    /// The sentence and what fills its hole. The English is said once, here, so it and
+    /// [`Detail::said`] cannot drift apart.
+    pub(crate) fn of(pattern: &'static str, fill: Fill) -> Detail {
+        let mut d = Detail { message: String::new(), pattern, fill };
+        d.message = d.said(&in_english);
+        d
+    }
+}
+
+/// How an interface says one of this crate's wordings in its own language: it is handed the English
+/// and gives back what it reads. [`in_english`] is the one that keeps the English.
+pub type Words<'a> = &'a dyn Fn(&str) -> String;
+
+/// [`Words`] that leaves the English as it is.
+pub fn in_english(wording: &str) -> String {
+    wording.to_owned()
+}
+
+/// Every sentence this crate says about a signature: what [`SignatureInfo::details`] can hold, and
+/// the summaries [`SignatureInfo::summary`] chooses between.
+///
+/// An interface reading in another language translates these and the words in [`kind::ALL`], which
+/// go into the two sentences that list changes. The rest of what it shows comes from elsewhere and
+/// goes through as it stands: the certificate's names and dates, and a reader's own detail in
+/// [`Fill::Reason`]. A test in this crate keeps the list in step with the code.
+pub const WORDINGS: &[&str] = &[
+    // What the signature's own structure says, before anything is verified.
+    "The signature has no valid byte range.",
+    "The signature's byte range does not match the file.",
+    "The signature's byte range does not exclude exactly its contents.",
+    "The signature contents are not hexadecimal.",
+    "The signature could not be read ({}).",
+    "PdfCraft can't check this signature yet: {}.",
+    "The signature uses the legacy adbe.x509.rsa_sha1 format.",
+    // What was read leniently on the way, each sentence worded where the reading happens.
+    "The signature is BER-encoded (indefinite lengths) rather than DER; it was read leniently.",
+    "The signed content is a constructed (segmented) OCTET STRING, as BER allows; it was read anyway.",
+    "The RSA signature value does not have the length of the key's modulus (leading zero bytes dropped or added); it was read anyway.",
+    "The RSA signature's DigestInfo has no NULL parameter (older signers write it so); it was read anyway.",
+    "The ECDSA signature is not in canonical DER (trailing bytes, padding or a missing sign byte); it was read anyway.",
+    "The ECDSA signature is the raw r and s values instead of a DER sequence; it was read anyway.",
+    "The signature algorithm and the SignerInfo's digest algorithm name different hashes; the signature was made with the SignerInfo's.",
+    "The signature's signed attributes have no content type, which CMS requires; it was read anyway.",
+    // What a signature that validates with an old hash or a small key still does not prove.
+    "This signature uses SHA-1, a weak hash algorithm: collisions in it have been demonstrated. It still validates because many documents signed years ago use it, but it should not be relied on.",
+    "This signature uses RIPEMD-160, a legacy 160-bit hash algorithm that is no longer recommended for signatures. It still validates, but it should not be relied on.",
+    "This signature uses an RSA key shorter than 2048 bits, which is no longer considered strong enough for signatures. It still validates, but it should not be relied on.",
+    // Whether the signed bytes and the signature still agree.
+    "The signature's signed attributes have no message digest, so the signature does not cover the document.",
+    "The signature's signed attributes name a content type other than data, so it is not a signature of the document.",
+    "The document has been altered or corrupted since the signature was applied.",
+    "The signer's certificate is not in the signature.",
+    "The signature value does not match the signer's certificate: the signature is corrupt.",
+    "The signature could not be checked ({}).",
+    "The signature could not be verified ({}).",
+    // What came after the signature.
+    "This document has not been modified since this signature was applied.",
+    "The document has been modified since this signature was applied, but the changes are permitted ({}).",
+    "The document has been altered since this signature was applied in ways it does not permit ({}).",
+    // Who signed, and when.
+    "The signer's certificate was not valid at the time of signing.",
+    "The signer's certificate does not allow digital signatures (its key usage has neither digital signature nor non-repudiation).",
+    "The signer's certificate is not issued for signing documents (its extended key usage has no document-signing purpose).",
+    "The signer's certificate has critical extensions PdfCraft does not recognize ({}).",
+    // Why a certificate that matched the issuer was not used to build the chain.
+    "The certificate of {} is not a CA certificate that may issue certificates, so it is not used to vouch for {}.",
+    "The certificate of {} has critical extensions PdfCraft does not recognize, so it is not used to vouch for {}.",
+    "The certificate of {} does not allow this many CA certificates below it (path length), so it is not used to vouch for {}.",
+    "The certificate of {} was not valid at the time of signing, so it is not used to vouch for {}.",
+    "The signer's identity is unknown because it has not been included in your list of trusted certificates and none of its parent certificates are trusted certificates.",
+    "The signer's identity is valid.",
+    "The signature includes an embedded timestamp.",
+    "Signing time is from the clock on the signer's computer.",
+    // What the signature's own timestamp token proves, if it carries one.
+    "The signature's timestamp token does not cover the signature value.",
+    "The signature's timestamp token could not be verified ({}).",
+    "The embedded timestamp token is valid and its authority is trusted; trusted time is {}.",
+    "The signature carries an unverified timestamp ({}): the timestamp authority is not in your list of trusted certificates, so the signing time claimed by the signer is used instead.",
+    // What the document's own revocation evidence says about the signer.
+    "The signer's certificate has been revoked ({}).",
+    "The document's embedded revocation information shows that the signer's certificate has not been revoked.",
+    // A standalone document timestamp, which is checked on its own.
+    "The timestamp has no valid byte range.",
+    "The timestamp's byte range does not match the file.",
+    "The timestamp's byte range does not exclude exactly its contents.",
+    "The timestamp contents are not hexadecimal.",
+    "The timestamp token could not be read ({}).",
+    "The document has been altered or corrupted since the timestamp was applied.",
+    "The timestamp authority's certificate was not valid at the time of timestamping.",
+    "The timestamp authority's certificate is not issued for time stamping.",
+    "This document has not been modified since this timestamp was applied.",
+    "The document has been modified since this timestamp was applied, but the changes are permitted ({}).",
+    "The document has been altered since this timestamp was applied in ways it does not permit ({}).",
+    "The timestamp token is valid and its authority is trusted.",
+    "The timestamp token is valid, but the timestamp authority is not in your list of trusted certificates.",
+    // The one line that stands for all of it.
+    "Unsigned signature field",
+    "Signature is valid",
+    "Signature validity is unknown",
+    "Signature is invalid",
+];
 
 /// One signature field.
 #[derive(Clone, Debug)]
@@ -160,12 +454,14 @@ pub struct SignatureInfo {
     pub timestamp_time: Option<Time>,
     pub status: Status,
     pub modification: Modification,
-    /// Acrobat-style sentences explaining the verdict.
-    pub details: Vec<String>,
+    /// Acrobat-style sentences explaining the verdict, each one ready to read in English and ready to
+    /// be said in another language (see [`Detail`]).
+    pub details: Vec<Detail>,
 }
 
 impl SignatureInfo {
-    /// The one-line summary under the signature in the Signatures panel.
+    /// The one-line summary under the signature in the Signatures panel, in English and listed in
+    /// [`WORDINGS`] for an interface to say in its own language.
     pub fn summary(&self) -> &'static str {
         if !self.signed {
             return "Unsigned signature field";
@@ -178,7 +474,7 @@ impl SignatureInfo {
     }
 }
 
-fn text(doc: &Document, d: &Dict, key: &[u8]) -> Option<String> {
+pub(crate) fn text(doc: &Document, d: &Dict, key: &[u8]) -> Option<String> {
     let o = doc.resolve(d.get(key)?);
     let s = match &*o {
         Object::String(s) => s.to_text(),
@@ -195,6 +491,20 @@ struct Field {
     r: Option<ObjRef>,
     dict: Dict,
     widgets: Vec<(Option<ObjRef>, Dict)>,
+}
+
+impl Field {
+    /// The signature dictionary in /V. A field without one is unsigned, whether /V is missing,
+    /// null or not a dictionary.
+    fn signature(&self, doc: &Document) -> Option<Dict> {
+        self.dict.get(b"V").map(|v| doc.resolve(v)).and_then(|v| v.as_dict().cloned())
+    }
+
+    /// True when /V holds something that is neither null nor a signature dictionary: signing the
+    /// field would overwrite a value we can't read as a signature.
+    fn has_foreign_value(&self, doc: &Document) -> bool {
+        self.dict.get(b"V").map(|v| doc.resolve(v)).is_some_and(|v| !matches!(*v, Object::Null) && v.as_dict().is_none())
+    }
 }
 
 /// Every signature field, depth first in `/Fields` order.
@@ -261,7 +571,8 @@ pub fn list(doc: &Document, bytes: &[u8], trust: &TrustStore) -> Vec<SignatureIn
     list_cached(doc, bytes, trust, &DigestCache::default())
 }
 
-/// [`list`], reusing digests from `cache`.
+/// [`list`], reusing digests and standalone-timestamp discovery from `cache`. Field/widget
+/// structure and validation against `bytes` and `trust` are read again on every call.
 pub fn list_cached(doc: &Document, bytes: &[u8], trust: &TrustStore, cache: &DigestCache) -> Vec<SignatureInfo> {
     let pages = annot_pages(doc);
     let mut out = Vec::new();
@@ -276,8 +587,11 @@ pub fn list_cached(doc: &Document, bytes: &[u8], trust: &TrustStore, cache: &Dig
             .and_then(|(_, w)| nums(doc, w, b"Rect"))
             .filter(|r| r.len() == 4)
             .map(|r| [r[0].min(r[2]), r[1].min(r[3]), r[0].max(r[2]), r[1].max(r[3])]);
-        let visible = rect.is_some_and(|r| r[2] - r[0] > 0.5 && r[3] - r[1] > 0.5);
-        let v = f.dict.get(b"V").map(|v| doc.resolve(v)).and_then(|v| v.as_dict().cloned());
+        // Shown when it has a box, and its widget isn't Hidden (2) or NoView (32), as the forms
+        // crate reads a widget's flags.
+        let flags = widget.and_then(|(_, w)| w.get(b"F")).and_then(|o| doc.resolve(o).as_int()).unwrap_or(0);
+        let visible = rect.is_some_and(|r| r[2] - r[0] > 0.5 && r[3] - r[1] > 0.5) && flags & (2 | 32) == 0;
+        let v = f.signature(doc);
         let mut info = SignatureInfo {
             field: f.name.clone(),
             signed: v.is_some(),
@@ -311,14 +625,14 @@ pub fn list_cached(doc: &Document, bytes: &[u8], trust: &TrustStore, cache: &Dig
         out.push(info);
     }
     // Standalone document timestamps (ISO 32000-2 §12.8.2.2) live outside AcroForm fields.
-    for num in doc.object_numbers() {
-        let r = ObjRef { num, generation: doc.generation(num) };
+    let candidates = cache.timestamp_candidates(doc).into_iter().map(|r| r.num).collect();
+    for (r, o) in doc.scan_objects_subset(candidates) {
         if field_values.contains(&r) {
             continue;
         }
-        let o = doc.get(r);
+        let Ok(o) = o else { continue };
         let Some(d) = o.as_dict() else { continue };
-        if d.name(b"Type") != Some(b"Sig") || d.name(b"SubFilter") != Some(b"ETSI.RFC3161") || !d.contains(b"ByteRange") {
+        if !is_document_timestamp(&o) {
             continue;
         }
         let mut info = SignatureInfo {
@@ -358,6 +672,17 @@ fn page_index(doc: &Document, p: ObjRef) -> Option<usize> {
     pdfcraft_annot::page_refs(doc).ok()?.iter().position(|r| *r == p)
 }
 
+/// A widget's `/MK /R` as a quarter turn (0, 90, 180 or 270); missing, malformed or not a
+/// multiple of 90 counts as 0, as `pdfcraft-forms` reads it for the fields it draws.
+fn mk_rotation(doc: &Document, widget: &Dict) -> i64 {
+    let r = widget
+        .get(b"MK")
+        .map(|mk| doc.resolve(mk))
+        .and_then(|mk| mk.as_dict().and_then(|mk| mk.get(b"R")).map(|r| doc.resolve(r)))
+        .and_then(|r| r.as_int().or_else(|| r.as_f64().filter(|v| v.is_finite() && v.abs() <= 1.0e6).map(|v| v.round() as i64)));
+    r.map(|r| r.rem_euclid(360)).filter(|q| matches!(q, 90 | 180 | 270)).unwrap_or(0)
+}
+
 /// Validate one signature dictionary.
 pub fn validate(doc: &Document, bytes: &[u8], trust: &TrustStore, field: &str) -> Option<SignatureInfo> {
     list(doc, bytes, trust).into_iter().find(|s| s.field == field)
@@ -369,54 +694,83 @@ fn unhex(s: &[u8]) -> Option<Vec<u8>> {
     digits.chunks(2).map(|p| Some(val(p[0])? << 4 | p.get(1).map_or(Some(0), |c| val(*c))?)).collect()
 }
 
-fn validate_into(doc: &Document, bytes: &[u8], trust: &TrustStore, v: &Dict, info: &mut SignatureInfo, cache: &DigestCache) {
-    info.date = text(doc, v, b"M");
-    info.reason = text(doc, v, b"Reason");
-    info.location = text(doc, v, b"Location");
-    info.contact = text(doc, v, b"ContactInfo");
-    info.sub_filter = v.name(b"SubFilter").map(|s| String::from_utf8_lossy(s).into_owned());
-    info.signer = text(doc, v, b"Name");
-    info.certify = v
-        .get(b"Reference")
+/// A document timestamp dictionary: `/SubFilter /ETSI.RFC3161`, typed `/DocTimeStamp`
+/// (ISO 32000-2 §12.8.5) or, as older writers have it, `/Sig`.
+fn is_doc_timestamp(d: &Dict) -> bool {
+    d.name(b"SubFilter") == Some(b"ETSI.RFC3161") && matches!(d.name(b"Type"), Some(b"DocTimeStamp" | b"Sig"))
+}
+
+/// The DocMDP permission level (`/P`, 1–3) of signature value `v`, or `None` for an approval
+/// signature.
+fn docmdp(doc: &Document, v: &Dict) -> Option<u8> {
+    v.get(b"Reference")
         .map(|r| doc.resolve(r))
         .and_then(|r| r.as_array().cloned())
         .into_iter()
         .flatten()
         .filter_map(|r| doc.resolve(&r).as_dict().cloned())
         .find(|r| r.name(b"TransformMethod") == Some(b"DocMDP"))
-        .map(|r| {
-            r.get(b"TransformParams").map(|p| doc.resolve(p)).and_then(|p| p.as_dict().and_then(|p| p.int(b"P"))).unwrap_or(2).clamp(1, 3) as u8
-        });
-    let invalid = |info: &mut SignatureInfo, why: &str| {
+        .map(|r| r.get(b"TransformParams").map(|p| doc.resolve(p)).and_then(|p| p.as_dict().and_then(|p| p.int(b"P"))).unwrap_or(2).clamp(1, 3) as u8)
+}
+
+fn validate_into(doc: &Document, bytes: &[u8], trust: &TrustStore, v: &Dict, info: &mut SignatureInfo, cache: &DigestCache) {
+    // A document timestamp can also be the value of a signature field (Documenso writes
+    // `Timestamp_1` that way). Its `/Contents` is a bare RFC 3161 token, not a signature over the
+    // document, so it must not be read as one.
+    if is_doc_timestamp(v) {
+        info.sub_filter = Some("ETSI.RFC3161".to_string());
+        info.doc_timestamp = true;
+        info.timestamp = true;
+        validate_doc_timestamp(doc, bytes, v, info, cache, trust);
+        return;
+    }
+    info.date = text(doc, v, b"M");
+    info.reason = text(doc, v, b"Reason");
+    info.location = text(doc, v, b"Location");
+    info.contact = text(doc, v, b"ContactInfo");
+    info.sub_filter = v.name(b"SubFilter").map(|s| String::from_utf8_lossy(s).into_owned());
+    info.signer = text(doc, v, b"Name");
+    info.certify = docmdp(doc, v);
+    let invalid = |info: &mut SignatureInfo, why: Detail| {
         info.status = Status::Invalid;
-        info.details.push(why.to_string());
+        info.details.push(why);
     };
     // Byte ranges: [0 a b c] with the gap holding exactly the hex /Contents.
     let Some(br) = nums(doc, v, b"ByteRange").filter(|b| b.len() == 4 && b.iter().all(|x| *x >= 0.0)) else {
-        return invalid(info, "The signature has no valid byte range.");
+        return invalid(info, Detail::plain("The signature has no valid byte range."));
     };
     let [o0, l0, o1, l1] = [br[0] as usize, br[1] as usize, br[2] as usize, br[3] as usize];
     if o0 != 0 || o1 < l0 || o1.checked_add(l1).is_none_or(|end| end > bytes.len()) || o1 - l0 < 2 {
-        return invalid(info, "The signature's byte range does not match the file.");
+        return invalid(info, Detail::plain("The signature's byte range does not match the file."));
     }
     let gap = &bytes[l0..o1];
     if gap.first() != Some(&b'<') || gap.last() != Some(&b'>') {
-        return invalid(info, "The signature's byte range does not exclude exactly its contents.");
+        return invalid(info, Detail::plain("The signature's byte range does not exclude exactly its contents."));
     }
-    let Some(contents) = unhex(&gap[1..gap.len() - 1]) else { return invalid(info, "The signature contents are not hexadecimal.") };
+    let Some(contents) = unhex(&gap[1..gap.len() - 1]) else { return invalid(info, Detail::plain("The signature contents are not hexadecimal.")) };
     let covered = o1 + l1;
     info.signed_len = covered;
     // The signed revision's number: its cross-reference sections (1 for a reconstructed file).
-    info.revision = cache.revision(bytes, covered).map_or(1, |d| d.revisions().len().max(1));
+    info.revision = cache.revision(doc, bytes, covered).map_or(1, |d| d.revisions().len().max(1));
+    // What can't be checked is unknown, not invalid: only data that is wrong or fails its check
+    // is "invalid".
+    let unsupported = |info: &mut SignatureInfo, why: &str| {
+        info.status = Status::Unknown;
+        // What is not supported yet is named by the reader, in its own words.
+        info.details.push(Detail::of("PdfCraft can't check this signature yet: {}.", Fill::Reason(why.to_owned())));
+    };
     if info.sub_filter.as_deref() == Some("adbe.x509.rsa_sha1") {
-        info.details.push("This signature uses the legacy adbe.x509.rsa_sha1 format, which PdfCraft does not validate yet.".into());
-        return;
+        return validate_x509_rsa_sha1(doc, bytes, trust, v, info, cache, (l0, o1, covered), &contents);
     }
     let sd = match SignedData::parse(&contents) {
         Ok(sd) => sd,
-        Err(e) => return invalid(info, &format!("The signature could not be read ({e}).")),
+        Err(SignError::Unsupported(e)) => return unsupported(info, &e),
+        // What the reader made of it goes in as it stands: it is a developer's detail, not a sentence.
+        Err(e) => return invalid(info, Detail::of("The signature could not be read ({}).", Fill::Reason(e.to_string()))),
     };
     let s = &sd.signer;
+    // A quirk is a whole sentence the reader words for itself, so it goes on the list in `WORDINGS`.
+    info.details.extend(sd.quirks.iter().copied().map(Detail::plain));
     info.digest = Some(s.digest);
     info.timestamp = s.timestamp;
     let mut unverified_time = None;
@@ -425,23 +779,27 @@ fn validate_into(doc: &Document, bytes: &[u8], trust: &TrustStore, v: &Dict, inf
             Ok(t) => {
                 let imprint = t.digest.digest(&[&s.signature]);
                 if imprint != t.imprint {
-                    info.details.push("The signature's timestamp token does not cover the signature value.".into());
+                    info.details.push(Detail::plain("The signature's timestamp token does not cover the signature value."));
                 } else {
                     // Only a token from a trusted authority (valid when it stamped) is trusted
                     // time; otherwise its time is reported but validation uses the signer's
                     // own claimed time, as without a timestamp.
                     let mut pool = crate::timestamp::token_certs(raw);
                     pool.extend(trust.certs.iter().cloned());
-                    let trusted_tsa =
-                        t.signer_certificate().is_some_and(|c| c.valid_at(t.gen_time) && build_chain(&c, &pool).iter().any(|x| trust.trusts(x)));
-                    if trusted_tsa {
+                    let tsa = t.signer_certificate();
+                    let trusted_tsa = tsa
+                        .as_ref()
+                        .is_some_and(|c| c.valid_at(t.gen_time) && build_chain(c, &pool, Some(t.gen_time)).iter().any(|x| trust.trusts(x)));
+                    if !trusted_tsa {
+                        unverified_time = Some(t.gen_time);
+                    } else if tsa.as_ref().is_some_and(Certificate::may_timestamp) {
                         info.timestamp_time = Some(t.gen_time);
                     } else {
-                        unverified_time = Some(t.gen_time);
+                        info.details.push(Detail::plain("The timestamp authority's certificate is not issued for time stamping."));
                     }
                 }
             }
-            Err(e) => info.details.push(format!("The signature's timestamp token could not be verified ({e}).")),
+            Err(e) => info.details.push(Detail::of("The signature's timestamp token could not be verified ({}).", Fill::Reason(e.to_string()))),
         }
     }
     // The digest the signature commits to.
@@ -449,116 +807,275 @@ fn validate_into(doc: &Document, bytes: &[u8], trust: &TrustStore, v: &Dict, inf
         // adbe.pkcs7.sha1: the document's SHA-1 digest is the signed content.
         Some(c) => {
             if *c != cache.digest(DigestAlg::Sha1, bytes, l0, o1, covered) {
-                return invalid(info, "The document has been altered or corrupted since the signature was applied.");
+                return invalid(info, Detail::plain("The document has been altered or corrupted since the signature was applied."));
             }
             s.digest.digest(&[c])
         }
         None => cache.digest(s.digest, bytes, l0, o1, covered),
     };
+    // With signed attributes the signature is made over them, not over the document: their
+    // message digest is what ties it to the signed bytes, and their content type says what those
+    // bytes are (data, for a document). RFC 5652 §5.3 requires both.
+    if s.signed_attrs.is_some() {
+        match s.content_type.as_deref() {
+            Some(crate::cms::DATA) => {}
+            Some(_) => {
+                return invalid(
+                    info,
+                    Detail::plain("The signature's signed attributes name a content type other than data, so it is not a signature of the document."),
+                );
+            }
+            None => {
+                info.details.push(Detail::plain("The signature's signed attributes have no content type, which CMS requires; it was read anyway."))
+            }
+        }
+        if s.message_digest.is_none() {
+            return invalid(
+                info,
+                Detail::plain("The signature's signed attributes have no message digest, so the signature does not cover the document."),
+            );
+        }
+    }
+    // A PDF signature signs data: the document, or (adbe.pkcs7.sha1) its digest. A content-type
+    // attribute was checked above, and `SignedData::parse` refuses one that differs from
+    // `eContentType`; without that attribute, `eContentType` is the only place that says so.
+    if sd.econtent_type != crate::cms::DATA {
+        let why = SignError::Malformed("CMS: the encapsulated content is not data".into());
+        return invalid(info, Detail::of("The signature could not be read ({}).", Fill::Reason(why.to_string())));
+    }
     if let Some(md) = &s.message_digest
         && *md != content_digest
     {
-        return invalid(info, "The document has been altered or corrupted since the signature was applied.");
+        return invalid(info, Detail::plain("The document has been altered or corrupted since the signature was applied."));
     }
     let Some(cert) = sd.signer_certificate().cloned() else {
-        return invalid(info, "The signer's certificate is not in the signature.");
+        return invalid(info, Detail::plain("The signer's certificate is not in the signature."));
     };
     info.algorithm = Some(format!("{} with {}", cert.public_key.describe(), s.scheme_digest.unwrap_or(s.digest).name()));
     info.signer = Some(cert.display_name());
-    if !sd.verify_signature(&cert, &content_digest) {
-        info.certificate = Some(cert);
-        return invalid(info, "The signature value does not match the signer's certificate: the signature is corrupt.");
+    let mut notes = Vec::new();
+    match sd.verify_signature_noting(&cert, &content_digest, &mut notes) {
+        // A note is a whole sentence the reader words for itself, like a quirk.
+        Ok(true) => info.details.extend(notes.into_iter().map(Detail::plain)),
+        Ok(false) => {
+            info.certificate = Some(cert);
+            return invalid(info, Detail::plain("The signature value does not match the signer's certificate: the signature is corrupt."));
+        }
+        Err(SignError::Unsupported(e)) => {
+            info.certificate = Some(cert);
+            return unsupported(info, &e);
+        }
+        Err(e) => {
+            info.certificate = Some(cert);
+            return invalid(info, Detail::of("The signature could not be checked ({}).", Fill::Reason(e.to_string())));
+        }
     }
-    info.signing_time = s.signing_time.or_else(|| info.date.as_deref().and_then(Time::from_pdf));
-    let mut pool = sd.certificates.clone();
+    finish_validation(doc, bytes, trust, info, cache, covered, cert, &sd.certificates, s.signing_time, unverified_time);
+}
+
+/// The verdict once the signature value has been checked: chain and trust, the signing time
+/// against the certificate's validity, and what later revisions changed.
+#[allow(clippy::too_many_arguments)]
+fn finish_validation(
+    doc: &Document,
+    bytes: &[u8],
+    trust: &TrustStore,
+    info: &mut SignatureInfo,
+    cache: &DigestCache,
+    covered: usize,
+    cert: Certificate,
+    embedded: &[Certificate],
+    cms_time: Option<Time>,
+    unverified_time: Option<Time>,
+) {
+    info.signing_time = cms_time.or_else(|| info.date.as_deref().and_then(Time::from_pdf));
+    let mut pool = embedded.to_vec();
     pool.extend(trust.certs.iter().cloned());
-    let chain: Vec<Certificate> = build_chain(&cert, &pool).into_iter().cloned().collect();
+    // The time the chain is judged at: trusted timestamp, else the signer's claimed time.
+    let at = info.timestamp_time.or(info.signing_time);
+    let (chain, refused) = build_chain_noted(&cert, &pool, at);
+    let chain: Vec<Certificate> = chain.into_iter().cloned().collect();
     let trusted = chain.iter().any(|c| trust.trusts(c));
     info.chain = chain;
     info.certificate = Some(cert.clone());
+    if let Some(why) = refused
+        && !trusted
+    {
+        info.details.push(why);
+    }
     // Revocation evidence embedded in the document security store, if any. A verified
     // revocation is final: later blocks must not soften the verdict.
-    let at = info.timestamp_time.or(info.signing_time);
     let signer = info.chain.first().cloned();
-    let revoked = check_dss_revocation(doc, signer.as_ref(), &at, info);
+    let revocation = check_dss_revocation(doc, signer.as_ref(), &at, info);
+    let revoked = revocation == DssRevocation::Revoked;
     // Changes after signing.
     info.modification = if covered == bytes.len() || bytes[covered..].iter().all(|b| b.is_ascii_whitespace() || *b == 0) {
         Modification::None
     } else {
-        classify_changes(doc, cache.revision(bytes, covered), info.certify)
+        // The permissions are the signed revision's: a later one can rewrite `/P` (#1788). This
+        // signature is the one whose byte range ends that revision.
+        let old = cache.revision(doc, bytes, covered);
+        if let Some(old) = &old
+            && let Some(v) = sig_fields(old)
+                .iter()
+                .filter_map(|f| f.signature(old))
+                .find(|v| nums(old, v, b"ByteRange").is_some_and(|b| b.len() == 4 && b[2] + b[3] == covered as f64))
+        {
+            info.certify = docmdp(old, &v);
+        }
+        classify_changes(doc, old, info.certify)
     };
     let mut problems = false;
+    // The changes are handed over as the words they are, not stitched into the sentence, so an
+    // interface can say both in its own language.
     match &info.modification {
-        Modification::None => info.details.push("This document has not been modified since this signature was applied.".into()),
-        Modification::Allowed(kinds) => info
-            .details
-            .push(format!("The document has been modified since this signature was applied, but the changes are permitted ({}).", kinds.join(", "))),
+        Modification::None => info.details.push(Detail::plain("This document has not been modified since this signature was applied.")),
+        Modification::Allowed(kinds) => info.details.push(Detail::of(
+            "The document has been modified since this signature was applied, but the changes are permitted ({}).",
+            Fill::Changes(kinds.clone()),
+        )),
         Modification::Disallowed(kinds) => {
+            let said = Detail::of(
+                "The document has been altered since this signature was applied in ways it does not permit ({}).",
+                Fill::Changes(kinds.clone()),
+            );
             info.status = Status::Invalid;
-            info.details
-                .push(format!("The document has been altered since this signature was applied in ways it does not permit ({}).", kinds.join(", ")));
+            info.details.push(said);
             problems = true;
         }
+    }
+    if revocation == DssRevocation::Incomplete {
+        if !problems {
+            info.status = Status::Unknown;
+        }
+        problems = true;
     }
     if let Some(t) = info.timestamp_time.or(info.signing_time)
         && !cert.valid_at(t)
     {
-        info.details.push("The signer's certificate was not valid at the time of signing.".into());
+        info.details.push(Detail::plain("The signer's certificate was not valid at the time of signing."));
         // A verified revocation already made the signature invalid; keep it that way.
         if !problems && !revoked {
             info.status = Status::Unknown;
         }
         problems = true;
     }
+    if let Some(why) = cert.signing_problem() {
+        info.details.push(why);
+        if !problems && !revoked {
+            info.status = Status::Unknown;
+        }
+        problems = true;
+    }
     if !trusted {
-        info.details.push(
-            "The signer's identity is unknown because it has not been included in your list of trusted certificates and none of its parent certificates are trusted certificates."
-                .into(),
-        );
+        info.details.push(Detail::plain(
+            "The signer's identity is unknown because it has not been included in your list of trusted certificates and none of its parent certificates are trusted certificates.",
+        ));
         if !problems && !revoked {
             info.status = Status::Unknown;
         }
     } else {
-        info.details.push("The signer's identity is valid.".into());
+        info.details.push(Detail::plain("The signer's identity is valid."));
         if !problems && !revoked {
             info.status = Status::Valid;
         }
     }
     if info.timestamp {
-        info.details.push("The signature includes an embedded timestamp.".into());
+        info.details.push(Detail::plain("The signature includes an embedded timestamp."));
     } else {
-        info.details.push("Signing time is from the clock on the signer's computer.".into());
+        info.details.push(Detail::plain("Signing time is from the clock on the signer's computer."));
     }
     if let Some(t) = info.timestamp_time {
-        info.details.push(format!("The embedded timestamp token is valid and its authority is trusted; trusted time is {t}."));
+        info.details
+            .push(Detail::of("The embedded timestamp token is valid and its authority is trusted; trusted time is {}.", Fill::Value(t.to_string())));
     } else if let Some(t) = unverified_time {
-        info.details.push(format!(
-            "The signature carries an unverified timestamp ({t}): the timestamp authority is not in your list of trusted certificates, so the signing time claimed by the signer is used instead."
+        info.details.push(Detail::of(
+            "The signature carries an unverified timestamp ({}): the timestamp authority is not in your list of trusted certificates, so the signing time claimed by the signer is used instead.",
+            Fill::Value(t.to_string()),
         ));
     }
 }
 
+/// Distinct evidence streams read from one `/DSS` array.
+const MAX_DSS_ENTRIES: usize = 1024;
+/// Decoded bytes read from one `/DSS` array; real CRLs and OCSP responses are kilobytes each.
+const MAX_DSS_BYTES: usize = 64 << 20;
+
+/// The decoded streams of the `/DSS` evidence array `key` (`/CRLs`, `/OCSPs`), one at a time so
+/// each is checked before the next decodes: each stream once and within the evidence size cap,
+/// at most [`MAX_DSS_ENTRIES`] distinct ones and [`MAX_DSS_BYTES`] together. A stream past a cap
+/// sets [`DssEvidence::cut`] and ends the iteration.
+struct DssEvidence<'a> {
+    doc: &'a Document,
+    items: std::vec::IntoIter<Object>,
+    seen: HashSet<ObjRef>,
+    taken: usize,
+    left: usize,
+    /// A cap stopped the array being read in full.
+    cut: bool,
+}
+
+impl<'a> DssEvidence<'a> {
+    fn new(doc: &'a Document, dss: &Dict, key: &[u8]) -> Self {
+        let items = dss.get(key).map(|o| doc.resolve(o)).and_then(|o| o.as_array().cloned()).unwrap_or_default();
+        DssEvidence { doc, items: items.into_iter(), seen: HashSet::new(), taken: 0, left: MAX_DSS_BYTES, cut: false }
+    }
+}
+
+impl Iterator for DssEvidence<'_> {
+    type Item = Vec<u8>;
+
+    fn next(&mut self) -> Option<Vec<u8>> {
+        if self.cut {
+            return None;
+        }
+        // Repeats are skipped before the caps count anything, so repeating one stream cannot use
+        // them up; the scan of the array itself is bounded by the parser's cap on array length.
+        for item in self.items.by_ref() {
+            if item.as_ref().is_some_and(|r| !self.seen.insert(r)) {
+                continue;
+            }
+            let o = self.doc.resolve(&item);
+            let Object::Stream(s) = o.as_ref() else { continue };
+            if self.taken >= MAX_DSS_ENTRIES {
+                self.cut = true;
+                return None;
+            }
+            self.taken += 1;
+            // A stream past the evidence cap would not parse as evidence either.
+            let Ok(bytes) = s.decoded_within(crate::revocation::MAX_EVIDENCE) else { continue };
+            let Some(left) = self.left.checked_sub(bytes.len()) else {
+                self.cut = true;
+                return None;
+            };
+            self.left = left;
+            return Some(bytes);
+        }
+        None
+    }
+}
+
+/// What the catalog's `/DSS` says about the signer's certificate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DssRevocation {
+    /// Verified evidence revokes it.
+    Revoked,
+    /// A cap stopped the evidence being read in full, and what was read does not revoke it.
+    Incomplete,
+    /// All of the evidence was read, and none of it revokes it.
+    NotRevoked,
+}
+
 /// Check the revocation evidence in the catalog's `/DSS` against the signer's chain at `at`.
 /// Only evidence whose signature verifies against the issuer counts; returns whether the
-/// certificate is revoked (which invalidates the signature).
-fn check_dss_revocation(doc: &Document, signer: Option<&Certificate>, at: &Option<Time>, info: &mut SignatureInfo) -> bool {
+/// certificate is revoked (which invalidates the signature), or whether a cap kept the check from
+/// reading all of the evidence.
+fn check_dss_revocation(doc: &Document, signer: Option<&Certificate>, at: &Option<Time>, info: &mut SignatureInfo) -> DssRevocation {
     use crate::revocation::{CertificateList, OcspResponse, RevocationStatus};
-    let (Some(signer), Some(at)) = (signer, *at) else { return false };
-    let Some(root) = doc.root() else { return false };
+    let (Some(signer), Some(at)) = (signer, *at) else { return DssRevocation::NotRevoked };
+    let Some(root) = doc.root() else { return DssRevocation::NotRevoked };
     let Some(dss) = doc.get(root).as_dict().and_then(|c| c.get(b"DSS").cloned()).map(|d| doc.resolve(&d)).and_then(|d| d.as_dict().cloned()) else {
-        return false;
-    };
-    let pull = |key: &[u8]| -> Vec<Vec<u8>> {
-        let mut out = Vec::new();
-        for item in dss.get(key).map(|o| doc.resolve(o)).and_then(|o| o.as_array().cloned()).unwrap_or_default() {
-            let o = doc.resolve(&item);
-            if let pdfcraft_cos::Object::Stream(s) = &*o
-                && let Ok(bytes) = s.decoded()
-            {
-                out.push(bytes);
-            }
-        }
-        out
+        return DssRevocation::NotRevoked;
     };
     let issuer = info.chain.get(1).unwrap_or(signer);
     // A verified revocation wins; "good" from any covering evidence is reported, but never
@@ -566,7 +1083,8 @@ fn check_dss_revocation(doc: &Document, signer: Option<&Certificate>, at: &Optio
     let mut revoked = None;
     let mut covered = false;
     let mut sources = Vec::new();
-    for r in pull(b"CRLs") {
+    let mut crls = DssEvidence::new(doc, &dss, b"CRLs");
+    for r in crls.by_ref() {
         let Ok(list) = CertificateList::parse(&r) else { continue };
         sources.push("CRL");
         match list.check(signer, issuer, at) {
@@ -578,8 +1096,10 @@ fn check_dss_revocation(doc: &Document, signer: Option<&Certificate>, at: &Optio
             RevocationStatus::Unknown => {}
         }
     }
+    let mut cut = crls.cut;
     if revoked.is_none() {
-        for r in pull(b"OCSPs") {
+        let mut ocsps = DssEvidence::new(doc, &dss, b"OCSPs");
+        for r in ocsps.by_ref() {
             let Ok(resp) = OcspResponse::parse(&r) else { continue };
             sources.push("OCSP");
             match resp.check(signer, issuer, at) {
@@ -591,18 +1111,30 @@ fn check_dss_revocation(doc: &Document, signer: Option<&Certificate>, at: &Optio
                 RevocationStatus::Unknown => {}
             }
         }
+        cut |= ocsps.cut;
     }
     match revoked {
         Some(at) => {
             info.status = Status::Invalid;
-            info.details.push(format!("The signer's certificate has been revoked ({}, {}).", sources.join(", "), at));
-            true
+            // The evidence and the date go in together: one hole, so a reader can put the
+            // sentence's parts in whatever order its language wants.
+            info.details.push(Detail::of("The signer's certificate has been revoked ({}).", Fill::Value(format!("{}, {at}", sources.join(", ")))));
+            DssRevocation::Revoked
+        }
+        // Evidence past a cap may revoke the certificate, so a partial check proves nothing.
+        None if cut => {
+            info.details.push(Detail::of(
+                "The signature could not be checked ({}).",
+                Fill::Reason("the /DSS holds more revocation evidence than PdfCraft reads".into()),
+            ));
+            DssRevocation::Incomplete
         }
         None if covered => {
-            info.details.push("The document's embedded revocation information shows that the signer's certificate has not been revoked.".into());
-            false
+            info.details
+                .push(Detail::plain("The document's embedded revocation information shows that the signer's certificate has not been revoked."));
+            DssRevocation::NotRevoked
         }
-        None => false,
+        None => DssRevocation::NotRevoked,
     }
 }
 
@@ -610,58 +1142,67 @@ fn check_dss_revocation(doc: &Document, signer: Option<&Certificate>, at: &Optio
 /// cryptographically valid and its message imprint must cover the file's signed bytes.
 fn validate_doc_timestamp(doc: &Document, bytes: &[u8], v: &Dict, info: &mut SignatureInfo, cache: &DigestCache, trust: &TrustStore) {
     info.date = text(doc, v, b"M");
-    let invalid = |info: &mut SignatureInfo, why: &str| {
+    let invalid = |info: &mut SignatureInfo, why: Detail| {
         info.status = Status::Invalid;
-        info.details.push(why.to_string());
+        info.details.push(why);
     };
     let Some(br) = nums(doc, v, b"ByteRange").filter(|b| b.len() == 4 && b.iter().all(|x| *x >= 0.0)) else {
-        return invalid(info, "The timestamp has no valid byte range.");
+        return invalid(info, Detail::plain("The timestamp has no valid byte range."));
     };
     let [o0, l0, o1, l1] = [br[0] as usize, br[1] as usize, br[2] as usize, br[3] as usize];
     if o0 != 0 || o1 < l0 || o1.checked_add(l1).is_none_or(|end| end > bytes.len()) || o1 - l0 < 2 {
-        return invalid(info, "The timestamp's byte range does not match the file.");
+        return invalid(info, Detail::plain("The timestamp's byte range does not match the file."));
     }
     let gap = &bytes[l0..o1];
     if gap.first() != Some(&b'<') || gap.last() != Some(&b'>') {
-        return invalid(info, "The timestamp's byte range does not exclude exactly its contents.");
+        return invalid(info, Detail::plain("The timestamp's byte range does not exclude exactly its contents."));
     }
-    let Some(contents) = unhex(&gap[1..gap.len() - 1]) else { return invalid(info, "The timestamp contents are not hexadecimal.") };
+    let Some(contents) = unhex(&gap[1..gap.len() - 1]) else {
+        return invalid(info, Detail::plain("The timestamp contents are not hexadecimal."));
+    };
     let covered = o1 + l1;
     info.signed_len = covered;
-    info.revision = cache.revision(bytes, covered).map_or(1, |d| d.revisions().len().max(1));
+    info.revision = cache.revision(doc, bytes, covered).map_or(1, |d| d.revisions().len().max(1));
     let token = match crate::timestamp::parse_token(&contents) {
         Ok(t) => t,
-        Err(e) => return invalid(info, &format!("The timestamp token could not be read ({e}).")),
+        Err(e) => return invalid(info, Detail::of("The timestamp token could not be read ({}).", Fill::Reason(e.to_string()))),
     };
     info.digest = Some(token.digest);
     info.timestamp_time = Some(token.gen_time);
     info.algorithm = Some(format!("RFC 3161 timestamp ({})", token.digest.name()));
     let doc_digest = token.digest.digest(&[&bytes[..l0], &bytes[o1..covered]]);
     if doc_digest != token.imprint {
-        return invalid(info, "The document has been altered or corrupted since the timestamp was applied.");
+        return invalid(info, Detail::plain("The document has been altered or corrupted since the timestamp was applied."));
     }
     if let Some(cert) = token.signer_certificate() {
         info.signer = Some(cert.display_name());
         info.certificate = Some(cert.clone());
         if !cert.valid_at(token.gen_time) {
             info.status = Status::Unknown;
-            info.details.push("The timestamp authority's certificate was not valid at the time of timestamping.".into());
+            info.details.push(Detail::plain("The timestamp authority's certificate was not valid at the time of timestamping."));
+        }
+        if !cert.may_timestamp() {
+            info.status = Status::Unknown;
+            info.details.push(Detail::plain("The timestamp authority's certificate is not issued for time stamping."));
         }
     }
     info.modification = if covered == bytes.len() || bytes[covered..].iter().all(|b| b.is_ascii_whitespace() || *b == 0) {
         Modification::None
     } else {
-        classify_changes(doc, cache.revision(bytes, covered), None)
+        classify_changes(doc, cache.revision(doc, bytes, covered), None)
     };
     match &info.modification {
-        Modification::None => info.details.push("This document has not been modified since this timestamp was applied.".into()),
-        Modification::Allowed(kinds) => info
-            .details
-            .push(format!("The document has been modified since this timestamp was applied, but the changes are permitted ({}).", kinds.join(", "))),
+        Modification::None => info.details.push(Detail::plain("This document has not been modified since this timestamp was applied.")),
+        Modification::Allowed(kinds) => info.details.push(Detail::of(
+            "The document has been modified since this timestamp was applied, but the changes are permitted ({}).",
+            Fill::Changes(kinds.clone()),
+        )),
         Modification::Disallowed(kinds) => {
             info.status = Status::Invalid;
-            info.details
-                .push(format!("The document has been altered since this timestamp was applied in ways it does not permit ({}).", kinds.join(", ")));
+            info.details.push(Detail::of(
+                "The document has been altered since this timestamp was applied in ways it does not permit ({}).",
+                Fill::Changes(kinds.clone()),
+            ));
         }
     }
     if info.status != Status::Invalid {
@@ -669,13 +1210,20 @@ fn validate_doc_timestamp(doc: &Document, bytes: &[u8], v: &Dict, info: &mut Sig
         // ordinary signature from an unknown signer.
         let mut pool = crate::timestamp::token_certs(&contents);
         pool.extend(trust.certs.iter().cloned());
-        let trusted_tsa = token.signer_certificate().map(|c| build_chain(&c, &pool).iter().any(|x| trust.trusts(x))).unwrap_or(false);
-        if trusted_tsa {
+        // A trusted authority whose certificate was not valid at the time it stamped proves
+        // nothing either (its detail is already recorded above): never upgrade that to Valid.
+        // Nor does one whose certificate is not issued for time stamping.
+        let may_stamp = token.signer_certificate().is_some_and(|c| c.valid_at(token.gen_time) && c.may_timestamp());
+        let trusted_tsa = token.signer_certificate().is_some_and(|c| build_chain(&c, &pool, Some(token.gen_time)).iter().any(|x| trust.trusts(x)));
+        if trusted_tsa && may_stamp {
             info.status = Status::Valid;
-            info.details.push("The timestamp token is valid and its authority is trusted.".into());
+            info.details.push(Detail::plain("The timestamp token is valid and its authority is trusted."));
+        } else if trusted_tsa {
+            info.status = Status::Unknown;
         } else {
             info.status = Status::Unknown;
-            info.details.push("The timestamp token is valid, but the timestamp authority is not in your list of trusted certificates.".into());
+            info.details
+                .push(Detail::plain("The timestamp token is valid, but the timestamp authority is not in your list of trusted certificates."));
         }
     }
 }
@@ -707,22 +1255,83 @@ pub(crate) fn signature_contents(doc: &Document) -> Vec<Vec<u8>> {
             }
         }
     }
-    for num in doc.object_numbers() {
-        let r = ObjRef { num, generation: doc.generation(num) };
-        let o = doc.get(r);
+    for (r, o) in doc.scan_objects() {
         let Some(d) = o.as_dict() else { continue };
-        if d.name(b"Type") == Some(b"Sig") && d.name(b"SubFilter") == Some(b"ETSI.RFC3161") {
+        if is_doc_timestamp(d) {
             add(d, Some(r));
         }
     }
     out
 }
 
+/// `adbe.x509.rsa_sha1` (ISO 32000-2 §12.8.3.2, deprecated): `/Contents` is the PKCS #1
+/// signature as a DER OCTET STRING over the SHA-1 digest of the byte ranges, and `/Cert` holds the
+/// signer's certificate (then any others) as DER byte strings.
+#[allow(clippy::too_many_arguments)]
+fn validate_x509_rsa_sha1(
+    doc: &Document,
+    bytes: &[u8],
+    trust: &TrustStore,
+    v: &Dict,
+    info: &mut SignatureInfo,
+    cache: &DigestCache,
+    (l0, o1, covered): (usize, usize, usize),
+    contents: &[u8],
+) {
+    let fail = |info: &mut SignatureInfo, why: Detail| {
+        info.status = Status::Invalid;
+        info.details.push(why);
+    };
+    let certs: Vec<Certificate> = match v.get(b"Cert").map(|c| doc.resolve(c)).as_deref() {
+        Some(Object::Array(a)) => a.iter().filter_map(|c| doc.resolve(c).as_string().map(|s| s.bytes.clone())).collect::<Vec<_>>(),
+        Some(Object::String(s)) => vec![s.bytes.clone()],
+        _ => Vec::new(),
+    }
+    .iter()
+    .filter_map(|raw| Certificate::parse(raw).ok())
+    .collect();
+    let Some(cert) = certs.first().cloned() else { return fail(info, Detail::plain("The signer's certificate is not in the signature.")) };
+    let signature = match crate::der::Tlv::parse_ber(contents).and_then(|(t, _)| t.octets("signature").map(|o| o.into_owned())) {
+        Ok(sig) => sig,
+        // What the reader made of it goes in as it stands: it is a developer's detail, not a sentence.
+        Err(e) => return fail(info, Detail::of("The signature could not be read ({}).", Fill::Reason(e.to_string()))),
+    };
+    info.digest = Some(DigestAlg::Sha1);
+    info.algorithm = Some(format!("{} with SHA-1", cert.public_key.describe()));
+    info.signer = Some(cert.display_name());
+    let digest = cache.digest(DigestAlg::Sha1, bytes, l0, o1, covered);
+    let mut notes = Vec::new();
+    match cert.public_key.verify_noting(crate::keys::Scheme::RsaPkcs1, DigestAlg::Sha1, &digest, &signature, &mut notes) {
+        // A note is a whole sentence the reader words for itself, so it goes on the list in `WORDINGS`.
+        Ok(true) => info.details.extend(notes.into_iter().map(Detail::plain)),
+        Ok(false) => {
+            info.certificate = Some(cert);
+            return fail(info, Detail::plain("The document has been altered or corrupted since the signature was applied."));
+        }
+        // Only what PdfCraft doesn't support yet is "can't check"; a key or value that is
+        // malformed is a signature that doesn't verify (as on the CMS path).
+        Err(SignError::Unsupported(e)) => {
+            info.certificate = Some(cert);
+            info.status = Status::Unknown;
+            // What is not supported yet is named by the reader, in its own words.
+            info.details.push(Detail::of("PdfCraft can't check this signature yet: {}.", Fill::Reason(e.to_string())));
+            return;
+        }
+        Err(e) => {
+            info.certificate = Some(cert);
+            return fail(info, Detail::of("The signature could not be verified ({}).", Fill::Reason(e.to_string())));
+        }
+    }
+    info.details.push(Detail::plain("The signature uses the legacy adbe.x509.rsa_sha1 format."));
+    info.details.extend(DigestAlg::Sha1.weakness().map(Detail::plain));
+    finish_validation(doc, bytes, trust, info, cache, covered, cert, &certs, None, None);
+}
+
 /// What later revisions changed, classified as Acrobat reports it, under DocMDP `p` (or none:
 /// an approval signature permits form fill, comments and further signatures).
 fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>) -> Modification {
     let Some(old) = old else {
-        return Modification::Disallowed(vec!["the signed version could not be read".into()]);
+        return Modification::Disallowed(vec![kind::UNREADABLE]);
     };
     let old_content: HashSet<ObjRef> = pdfcraft_annot::page_refs(&old)
         .unwrap_or_default()
@@ -741,7 +1350,18 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>) -> Mod
         .collect();
     // The signed revision's document-level XMP stream.
     let old_metadata = old.root().and_then(|root| old.get(root).as_dict().and_then(|c| c.get(b"Metadata").and_then(Object::as_ref)));
-    let (mut allowed, mut disallowed): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
+    // The signed revision's XFA data packets: filling the form rewrites them.
+    let old_xfa_data = xfa_data_packets(&old);
+    // What each object was in the signed revision: its pages, and its trailer /Info. A changed
+    // object is judged by the role it held when signed, never by the labels or keys its new,
+    // attacker-written version carries (relabelling a signed page /Type /Sig, or dropping its
+    // /Type and adding /ModDate, must not reclassify it away from page content).
+    let signed_pages: HashSet<ObjRef> = pdfcraft_annot::page_refs(&old).unwrap_or_default().into_iter().collect();
+    // What each signed page draws from, by the role it held when signed (#1787).
+    let signed_resources = signed_page_resources(&old, &signed_pages);
+    let old_info = old.trailer().get(b"Info").and_then(Object::as_ref);
+    let (mut allowed, mut disallowed): (Vec<&'static str>, Vec<&'static str>) = (Vec::new(), Vec::new());
+    let dss = dss_parts(doc, &old);
     // Stored at the same place in both (and not edited since): the same bytes, unchanged.
     let same_place = |num: u32| -> bool {
         use pdfcraft_cos::XrefEntry;
@@ -756,6 +1376,23 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>) -> Mod
             _ => false,
         }
     };
+    // A later cross-reference section may carry an entry this reader sets aside (an in-use entry
+    // at offset 0, a second entry for one object, a reserved entry type). The renderer may follow
+    // it and draw another object than the one compared below, so the page could show new content
+    // while every comparison here finds the signed object untouched. No writer has a reason to
+    // add such an entry after signing: it is never a permitted change.
+    for (_, num) in doc.xref_oddities().iter().filter(|o| !old.xref_oddities().contains(o)) {
+        let r = ObjRef { num: *num, generation: doc.generation(*num) };
+        let what = if old_content.contains(&r) || signed_pages.contains(&r) { kind::PAGE_CONTENT } else { kind::OTHER };
+        if !disallowed.contains(&what) {
+            disallowed.push(what);
+        }
+    }
+    // The trailer chooses the catalog. A later revision that points it at another catalog (one
+    // already in the signed file, so no object changes) shows another document.
+    if doc.root() != old.root() {
+        disallowed.push(kind::STRUCTURE);
+    }
     for num in doc.object_numbers() {
         if same_place(num) {
             continue;
@@ -764,44 +1401,237 @@ fn classify_changes(doc: &Document, old: Option<Document>, p: Option<u8>) -> Mod
         let new = doc.get(r);
         let before = old.try_get(num).ok().filter(|o| !matches!(**o, Object::Null));
         if before.as_deref() == Some(&*new) {
+            // The same content at a new place. That is true for the renderer as well only when
+            // the entry locates the object itself: where this reader had to search for the
+            // object, another reader may arrive at a different one.
+            if !doc.is_edited(num) && !doc.xref_entry_is_exact(num) && !disallowed.contains(&kind::OTHER) {
+                disallowed.push(kind::OTHER);
+            }
             continue;
         }
-        let kind = match &*new {
-            Object::Dict(d) => change_kind(doc, &old, d, before.as_deref().and_then(Object::as_dict)),
-            Object::Stream(s) => {
-                if old_content.contains(&r) {
-                    "page content"
-                } else if s.dict.name(b"Type") == Some(b"XRef") || s.dict.name(b"Type") == Some(b"ObjStm") || before.is_none() {
-                    continue;
-                } else if s.dict.name(b"Type") == Some(b"Metadata")
-                    && (Some(r) == old_metadata || matches!(before.as_deref(), Some(Object::Stream(b)) if b.dict.name(b"Type") == Some(b"Metadata")))
-                {
-                    // Only the signed catalog's XMP stream, or a stream that was already
-                    // metadata when signed: a later /Type /Metadata label on anything else
-                    // (a page's Form XObject) does not make rewriting it a metadata change.
-                    "metadata"
+        // A resource of a signed page is page content whatever keys its new version carries
+        // (#1787): a /FT or /Subtype /Widget written by whoever rewrote a font, an XObject or a
+        // graphics state does not make that a form fill. A container (the resources dictionary,
+        // a category dictionary) that kept every entry it had and only gained names changes
+        // nothing the signed content draws, and is judged as before.
+        let kept_entries = |d: &Dict| before.as_deref().and_then(Object::as_dict).is_some_and(|b| b.iter().all(|(k, v)| d.get(k) == Some(v)));
+        let resource_kind = match (signed_resources.get(&r), &*new) {
+            (Some(false), _) => Some(kind::PAGE_CONTENT),
+            (Some(true), Object::Dict(d)) if kept_entries(d) => None,
+            (Some(true), _) => Some(kind::PAGE_CONTENT),
+            (None, _) => None,
+        };
+        let what = match (resource_kind, &*new) {
+            (Some(k), _) => k,
+            // The Document Security Store's own arrays and dictionaries, when they only grew.
+            (_, _) if dss.contains(&num) => kind::SECURITY_STORE,
+            (_, Object::Dict(d)) => {
+                let was = before.as_deref().and_then(Object::as_dict);
+                if signed_pages.contains(&r) {
+                    // A signed page is always judged by what the page shows, whatever it is now
+                    // relabelled: a rewritten /Contents or /Resources is a page content change.
+                    page_change_kind(doc, &old, d, was)
+                } else if was.is_some() && Some(r) == old_info {
+                    // Only the signed revision's own /Info dictionary is a metadata change.
+                    kind::METADATA
                 } else {
-                    "other changes"
+                    change_kind(doc, &old, d, was)
+                }
+            }
+            (_, Object::Stream(s)) => {
+                // File plumbing is what the stream was when signed: the /Type it has now is
+                // written by whoever changed it, and the renderer ignores /Type (a page's Form
+                // XObject relabelled /ObjStm still draws its new content).
+                let was_plumbing = matches!(before.as_deref(), Some(Object::Stream(b)) if matches!(b.dict.name(b"Type"), Some(b"XRef" | b"ObjStm")));
+                if old_content.contains(&r) {
+                    kind::PAGE_CONTENT
+                } else if before.is_none() || was_plumbing {
+                    continue;
+                } else if s.dict.name(b"Type") == Some(b"Metadata") && Some(r) == old_metadata {
+                    // Only the signed catalog's XMP stream. A /Type /Metadata label on anything
+                    // else, even one it already had when signed (a page's Form XObject: the
+                    // renderer ignores /Type), does not make rewriting it a metadata change.
+                    kind::METADATA
+                } else if old_xfa_data.contains(&r) {
+                    // The form's XFA data (`datasets`) or state (`form`) as the signed revision
+                    // named it: filling an XFA form rewrites these, as a Reader Extensions (UR3)
+                    // save of a certified form does (#2759). The role comes from the signed
+                    // revision, so a later one can't name page content as XFA data.
+                    kind::FORM_FILL
+                } else {
+                    kind::OTHER
                 }
             }
             _ if before.is_none() => continue,
-            _ => "other changes",
+            _ => kind::OTHER,
         };
-        let ok = match (kind, p) {
-            ("signature" | "document security store", _) => true,
-            ("form fill", Some(2 | 3) | None) => true,
-            ("comments", Some(3) | None) => true,
+        let ok = match (what, p) {
+            (kind::SIGNATURE | kind::SECURITY_STORE, _) => true,
+            (kind::FORM_FILL, Some(2 | 3) | None) => true,
+            (kind::COMMENTS, Some(3) | None) => true,
             // Every save updates /Info (ModDate), signing included.
-            ("metadata", _) => true,
+            (kind::METADATA, _) => true,
             _ => false,
         };
         let list = if ok { &mut allowed } else { &mut disallowed };
-        if !list.contains(&kind) {
-            list.push(kind);
+        if !list.contains(&what) {
+            list.push(what);
         }
     }
-    let own = |v: Vec<&str>| v.into_iter().map(str::to_string).collect::<Vec<_>>();
-    if disallowed.is_empty() { Modification::Allowed(own(allowed)) } else { Modification::Disallowed(own(disallowed)) }
+    // An object the signed revision had and this one frees is a change too, and the loop above
+    // only sees objects that still exist. File plumbing (cross-reference and object streams) is
+    // rewritten by every save and is not a change.
+    let current: HashSet<u32> = doc.object_numbers().into_iter().collect();
+    for num in old.object_numbers().into_iter().filter(|n| !current.contains(n)) {
+        let r = ObjRef { num, generation: old.generation(num) };
+        let was = old.get(r);
+        let signed_role = old_content.contains(&r) || signed_pages.contains(&r) || signed_resources.contains_key(&r);
+        // A signed page's content or resource is judged by that role, whatever /Type its stream carried.
+        if !signed_role && matches!(&*was, Object::Stream(s) if matches!(s.dict.name(b"Type"), Some(b"XRef" | b"ObjStm"))) {
+            continue;
+        }
+        let what = if signed_role { kind::PAGE_CONTENT } else { kind::OTHER };
+        if !disallowed.contains(&what) {
+            disallowed.push(what);
+        }
+    }
+    if disallowed.is_empty() { Modification::Allowed(allowed) } else { Modification::Disallowed(disallowed) }
+}
+
+/// The streams of `doc`'s XFA form that hold its data and state: the `datasets` and `form`
+/// packets of the AcroForm's `/XFA` array (name, stream, name, stream, …). A form given as one
+/// XFA stream holds its template too, and is not listed.
+fn xfa_data_packets(doc: &Document) -> HashSet<ObjRef> {
+    let Some(form) = acroform(doc) else { return HashSet::new() };
+    let Some(xfa) = form.get(b"XFA").map(|x| doc.resolve(x)) else { return HashSet::new() };
+    let Object::Array(xfa) = &*xfa else { return HashSet::new() };
+    xfa.as_chunks::<2>()
+        .0
+        .iter()
+        .filter(|[name, _]| doc.resolve(name).as_string().is_some_and(|s| matches!(s.to_text().as_str(), "datasets" | "form")))
+        .filter_map(|[_, packet]| packet.as_ref())
+        .collect()
+}
+
+/// Where an object sits in the Document Security Store (ISO 32000-2 §12.8.4.3).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DssRole {
+    /// The `/DSS` dictionary.
+    Dss,
+    /// A `/Certs`, `/CRLs`, `/OCSPs` (or a VRI entry's `/Cert`, `/CRL`, `/OCSP`) array.
+    DataArray,
+    /// A certificate, CRL, OCSP response or timestamp token stream.
+    Data,
+    /// The `/VRI` dictionary.
+    VriMap,
+    /// One entry of `/VRI`.
+    VriEntry,
+}
+
+/// The indirect objects the catalog's `/DSS` reaches by the keys the standard defines, and the
+/// role each plays there. Any other key is not followed: `/DSS << /X 5 0 R >>` does not make
+/// object 5 part of the store.
+fn dss_walk(doc: &Document) -> Vec<(ObjRef, DssRole)> {
+    const LIMIT: usize = 100_000;
+    let mut out = Vec::new();
+    let Some(dss) = doc.root().and_then(|r| doc.get(r).as_dict().and_then(|c| c.get(b"DSS").cloned())) else { return out };
+    // The roles nest at most four deep (DSS, VRI, entry, array, data), so no seen-set is needed.
+    let mut stack = vec![(dss, DssRole::Dss)];
+    let mut steps = 0usize;
+    while let Some((o, role)) = stack.pop() {
+        steps += 1;
+        if steps > LIMIT {
+            break;
+        }
+        if let Object::Ref(r) = &o {
+            out.push((*r, role));
+        }
+        match (role, &*doc.resolve(&o)) {
+            (DssRole::Dss, Object::Dict(d)) => {
+                for (k, v) in d.iter() {
+                    match k.as_slice() {
+                        b"Certs" | b"CRLs" | b"OCSPs" => stack.push((v.clone(), DssRole::DataArray)),
+                        b"VRI" => stack.push((v.clone(), DssRole::VriMap)),
+                        _ => {}
+                    }
+                }
+            }
+            (DssRole::DataArray, Object::Array(a)) => stack.extend(a.iter().map(|v| (v.clone(), DssRole::Data))),
+            (DssRole::VriMap, Object::Dict(d)) => stack.extend(d.iter().map(|(_, v)| (v.clone(), DssRole::VriEntry))),
+            (DssRole::VriEntry, Object::Dict(d)) => {
+                for (k, v) in d.iter() {
+                    match k.as_slice() {
+                        b"Cert" | b"CRL" | b"OCSP" => stack.push((v.clone(), DssRole::DataArray)),
+                        b"TS" => stack.push((v.clone(), DssRole::Data)),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether `now` only adds to `before`: an array keeps every element, a dictionary keeps every
+/// entry (an entry that is an array or dictionary may itself have grown).
+fn only_grew(doc: &Document, old: &Document, before: &Object, now: &Object, depth: u8) -> bool {
+    /// Arrays of anything but references are compared element by element (quadratic), so only
+    /// up to this size; a store's `/Certs`/`/CRLs`/`/OCSPs` are references, compared as sets.
+    const MAX_COMPARED: usize = 10_000;
+    match (before, now) {
+        (Object::Array(b), Object::Array(n)) => {
+            if b.len() > n.len() {
+                return false;
+            }
+            let refs = |a: &[Object]| a.iter().map(Object::as_ref).collect::<Option<HashSet<ObjRef>>>();
+            match (refs(b), refs(n)) {
+                (Some(b), Some(n)) => b.is_subset(&n),
+                _ => b.len() <= MAX_COMPARED && n.len() <= MAX_COMPARED && b.iter().all(|x| n.contains(x)),
+            }
+        }
+        (Object::Dict(b), Object::Dict(n)) => b.iter().all(|(k, v)| match n.get(k) {
+            Some(nv) => nv == v || (depth < 4 && only_grew(doc, old, &old.resolve(v), &doc.resolve(nv), depth + 1)),
+            None => false,
+        }),
+        _ => before == now,
+    }
+}
+
+/// The objects of the Document Security Store that count as validation data added after
+/// signing: its dictionary, `/Certs`/`/CRLs`/`/OCSPs` arrays, `/VRI` and its entries, when
+/// - they are reached by the standard's keys and have the shape of their role, and
+/// - they are new, or were already part of the signed store and have only grown.
+///
+/// An existing object is never made "document security store" by pointing the store at it: the
+/// page's `/Contents` array, or a dictionary labelled `/Type /DSS`, keep being judged as what they
+/// are. The data streams need no entry here: new objects are not changes, and rewriting an
+/// existing one is judged on its own.
+fn dss_parts(doc: &Document, old: &Document) -> HashSet<u32> {
+    let signed: HashSet<u32> = dss_walk(old).into_iter().map(|(r, _)| r.num).collect();
+    let is_stream = |o: &Object| matches!(&*doc.resolve(o), Object::Stream(_));
+    let mut parts = HashSet::new();
+    for (r, role) in dss_walk(doc) {
+        let now = doc.get(r);
+        let shaped = match (role, &*now) {
+            (DssRole::Dss, Object::Dict(d)) => d.iter().all(|(k, _)| matches!(k.as_slice(), b"Type" | b"Certs" | b"CRLs" | b"OCSPs" | b"VRI")),
+            (DssRole::DataArray, Object::Array(a)) => a.iter().all(|e| matches!(e, Object::Ref(_)) && is_stream(e)),
+            (DssRole::VriMap, Object::Dict(d)) => d.iter().all(|(_, v)| matches!(&*doc.resolve(v), Object::Dict(_))),
+            (DssRole::VriEntry, Object::Dict(d)) => {
+                d.iter().all(|(k, _)| matches!(k.as_slice(), b"Type" | b"Cert" | b"CRL" | b"OCSP" | b"TU" | b"TS"))
+            }
+            _ => false,
+        };
+        let before = old.try_get(r.num).ok().filter(|o| !matches!(**o, Object::Null));
+        let history = match before {
+            None => true,
+            Some(b) => signed.contains(&r.num) && only_grew(doc, old, &b, &now, 0),
+        };
+        if shaped && history {
+            parts.insert(r.num);
+        }
+    }
+    parts
 }
 
 /// What adding `added` annotations amounts to: signing (signature widgets only), form fill
@@ -816,11 +1646,11 @@ fn added_annots(doc: &Document, added: &[ObjRef]) -> &'static str {
         })
         .collect();
     if !kinds.is_empty() && kinds.iter().all(|(w, s)| *w && *s) {
-        "signature"
+        kind::SIGNATURE
     } else if !kinds.is_empty() && kinds.iter().all(|(w, _)| *w) {
-        "form fill"
+        kind::FORM_FILL
     } else {
-        "comments"
+        kind::COMMENTS
     }
 }
 
@@ -846,79 +1676,193 @@ fn acroform_kind(doc: &Document, old: &Document, now: &Dict, before: Option<&Dic
         v
     };
     if strip(now) != strip(before) {
-        return "form fill";
+        return kind::FORM_FILL;
     }
     let old_fields = refs(old, before.get(b"Fields"));
     let added: Vec<ObjRef> = refs(doc, now.get(b"Fields")).into_iter().filter(|r| !old_fields.contains(r)).collect();
-    if added.is_empty() || added_annots(doc, &added) == "signature" { "signature" } else { "form fill" }
+    if added.is_empty() || added_annots(doc, &added) == kind::SIGNATURE { kind::SIGNATURE } else { kind::FORM_FILL }
+}
+
+/// Dictionary entries in a stable order, without `keys`.
+fn without(x: &Dict, keys: &[&[u8]]) -> Vec<(Vec<u8>, Object)> {
+    let mut v: Vec<(Vec<u8>, Object)> = x.iter().filter(|(k, _)| !keys.contains(&k.as_slice())).map(|(k, o)| (k.to_vec(), o.clone())).collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+/// Whether a dictionary was a signature object: a signature or timestamp value, a signature
+/// reference or its transform parameters, or a signature form field. Used to decide from the
+/// signed revision, so a later relabel of some other object cannot pose as a signature change.
+fn is_signature_dict(d: &Dict) -> bool {
+    matches!(d.name(b"Type"), Some(b"Sig" | b"DocTimeStamp" | b"SigRef" | b"TransformParams")) || d.name(b"FT") == Some(b"Sig")
+}
+
+/// The objects the signed pages draw from, by reference, with the role each held when signed
+/// (#1787): `true` for a container (a page's resources dictionary, or one of its category
+/// dictionaries), where a name added later can't be reached by unchanged content; `false` for
+/// everything reached from a container's entries (fonts and their files, XObjects and their own
+/// resources, graphics states and soft masks, colour spaces, patterns, shadings, optional-content
+/// properties), where any change changes what the page shows. Resources are the page's own or
+/// inherited. Bounded by depth and by the number of objects visited; past the bound the rest is
+/// judged as before.
+fn signed_page_resources(old: &Document, pages: &HashSet<ObjRef>) -> HashMap<ObjRef, bool> {
+    const CATEGORIES: [&[u8]; 7] = [b"Font", b"XObject", b"ExtGState", b"ColorSpace", b"Pattern", b"Shading", b"Properties"];
+    const MAX_VISITED: usize = 50_000;
+    const MAX_DEPTH: u8 = 32;
+    const MAX_INHERITANCE: usize = 64;
+
+    /// Everything reachable from `o` is content the page draws (a leaf role, overriding a
+    /// container one reached by another path). A signed page or the catalog reached this way
+    /// (a `/P` or `/Parent` back-reference) keeps the role of its own: the walk stops there.
+    fn reach(old: &Document, o: &Object, depth: u8, stop: &HashSet<ObjRef>, roles: &mut HashMap<ObjRef, bool>) {
+        if roles.len() >= MAX_VISITED || depth > MAX_DEPTH {
+            return;
+        }
+        let resolved;
+        let o = match o {
+            Object::Ref(r) => {
+                if stop.contains(r) || roles.insert(*r, false).is_some() {
+                    return;
+                }
+                resolved = old.get(*r);
+                &*resolved
+            }
+            other => other,
+        };
+        match o {
+            Object::Dict(d) => d.iter().for_each(|(_, v)| reach(old, v, depth + 1, stop, roles)),
+            Object::Stream(s) => s.dict.iter().for_each(|(_, v)| reach(old, v, depth + 1, stop, roles)),
+            Object::Array(a) => a.iter().for_each(|v| reach(old, v, depth + 1, stop, roles)),
+            _ => {}
+        }
+    }
+
+    /// A page's `/Resources`, its own or the nearest ancestor's.
+    fn resources(old: &Document, page: ObjRef) -> Option<Object> {
+        let mut seen = HashSet::new();
+        let mut cur = page;
+        while seen.insert(cur) && seen.len() <= MAX_INHERITANCE {
+            let d = old.get(cur);
+            let d = d.as_dict()?;
+            if let Some(r) = d.get(b"Resources") {
+                return Some(r.clone());
+            }
+            cur = d.get(b"Parent").and_then(Object::as_ref)?;
+        }
+        None
+    }
+
+    let mut roles = HashMap::new();
+    let mut stop = pages.clone();
+    stop.extend(old.root());
+    for page in pages {
+        let Some(res) = resources(old, *page) else { continue };
+        let container = |o: &Object, roles: &mut HashMap<ObjRef, bool>| -> Arc<Object> {
+            match o {
+                Object::Ref(r) => {
+                    roles.entry(*r).or_insert(true);
+                    old.get(*r)
+                }
+                other => Arc::new(other.clone()),
+            }
+        };
+        let res = container(&res, &mut roles);
+        let Some(d) = res.as_dict() else { continue };
+        for category in CATEGORIES {
+            let Some(v) = d.get(category) else { continue };
+            let category = container(v, &mut roles);
+            if let Some(entries) = category.as_dict() {
+                entries.iter().for_each(|(_, entry)| reach(old, entry, 0, &stop, &mut roles));
+            }
+        }
+    }
+    roles
+}
+
+/// A changed object that was a page in the signed revision, judged by what the page shows rather
+/// than by any `/Type` its new version carries. Only added annotations are permitted; any other
+/// difference (content, resources, a relabelled or dropped `/Type`) is a page content change.
+fn page_change_kind(doc: &Document, old: &Document, d: &Dict, before: Option<&Dict>) -> &'static str {
+    match before {
+        Some(b) if without(d, &[b"Annots"]) != without(b, &[b"Annots"]) => kind::PAGE_CONTENT,
+        Some(b) => {
+            let was = refs(old, b.get(b"Annots"));
+            let added: Vec<ObjRef> = refs(doc, d.get(b"Annots")).into_iter().filter(|r| !was.contains(r)).collect();
+            added_annots(doc, &added)
+        }
+        None => kind::PAGE_CONTENT,
+    }
 }
 
 fn change_kind(doc: &Document, old: &Document, d: &Dict, before: Option<&Dict>) -> &'static str {
     let ty = d.name(b"Type");
-    let without = |x: &Dict, keys: &[&[u8]]| -> Vec<(Vec<u8>, Object)> {
-        let mut v: Vec<(Vec<u8>, Object)> = x.iter().filter(|(k, _)| !keys.contains(&k.as_slice())).map(|(k, o)| (k.to_vec(), o.clone())).collect();
-        v.sort_by(|a, b| a.0.cmp(&b.0));
-        v
-    };
+    // A later revision cannot make an existing object a signature by relabelling it: a signature
+    // change is only a brand-new object, or one that was already a signature object when signed.
+    let signature_ok = before.is_none_or(is_signature_dict);
+    // A signature widget that already held a signature is what the signature shows: moving it or
+    // swapping its appearance can hide the signed page under it. Judged by the signed revision,
+    // so relabelling the widget now does not change that.
+    if before.is_some_and(|b| {
+        b.name(b"Subtype") == Some(b"Widget") && b.name(b"FT") == Some(b"Sig") && b.get(b"V").is_some_and(|v| old.resolve(v).as_dict().is_some())
+    }) && before != Some(d)
+    {
+        return kind::PAGE_CONTENT;
+    }
     match ty {
-        Some(b"Sig" | b"DocTimeStamp" | b"SigRef" | b"TransformParams") => return "signature",
-        Some(b"DSS") => return "document security store",
+        // Only a new signature value or policy: rewriting a signed one is not a signature (#1788).
+        Some(b"Sig" | b"DocTimeStamp" | b"SigRef" | b"TransformParams") if before.is_none() => return kind::SIGNATURE,
         Some(b"Catalog") => {
             let keys: &[&[u8]] = &[b"AcroForm", b"DSS", b"Perms", b"Metadata", b"NeedsRendering"];
             return match before {
-                Some(b) if without(d, keys) != without(b, keys) => "document structure",
+                Some(b) if without(d, keys) != without(b, keys) => kind::STRUCTURE,
                 Some(b) => {
                     if d.get(b"AcroForm") != b.get(b"AcroForm") {
                         // Compare the forms themselves, inline or not.
                         let now = acroform(doc).unwrap_or_default();
                         acroform_kind(doc, old, &now, None)
                     } else if b.get(b"Perms") != d.get(b"Perms") {
-                        "signature"
+                        kind::SIGNATURE
                     } else {
-                        "metadata"
+                        kind::METADATA
                     }
                 }
-                None => "form fill",
+                None => kind::FORM_FILL,
             };
         }
         Some(b"Page") => {
             return match before {
-                Some(b) if without(d, &[b"Annots"]) != without(b, &[b"Annots"]) => "page content",
+                Some(b) if without(d, &[b"Annots"]) != without(b, &[b"Annots"]) => kind::PAGE_CONTENT,
                 Some(b) => {
                     let was = refs(old, b.get(b"Annots"));
                     let added: Vec<ObjRef> = refs(doc, d.get(b"Annots")).into_iter().filter(|r| !was.contains(r)).collect();
                     added_annots(doc, &added)
                 }
-                None => "comments",
+                None => kind::COMMENTS,
             };
         }
-        Some(b"Pages") => return if before.is_some() { "pages added or removed" } else { "document structure" },
-        Some(b"Metadata") => return "metadata",
+        Some(b"Pages") => return if before.is_some() { kind::PAGES } else { kind::STRUCTURE },
         _ => {}
     }
     match d.name(b"Subtype") {
-        Some(b"Widget") => return if d.name(b"FT") == Some(b"Sig") { "signature" } else { "form fill" },
-        Some(b"Link") => return "links",
-        Some(_) if ty == Some(b"Annot") || d.contains(b"Rect") => return "comments",
+        Some(b"Widget") => return if d.name(b"FT") == Some(b"Sig") && signature_ok { kind::SIGNATURE } else { kind::FORM_FILL },
+        Some(b"Link") => return kind::LINKS,
+        Some(_) if ty == Some(b"Annot") || d.contains(b"Rect") => return kind::COMMENTS,
         _ => {}
     }
-    if d.name(b"FT") == Some(b"Sig") {
-        return "signature";
+    if d.name(b"FT") == Some(b"Sig") && signature_ok {
+        return kind::SIGNATURE;
     }
     if d.contains(b"Fields") {
         return acroform_kind(doc, old, d, before);
     }
     if d.contains(b"FT") || (d.contains(b"T") && d.contains(b"Kids")) || d.contains(b"DR") {
-        return "form fill";
-    }
-    if d.contains(b"Producer") || d.contains(b"ModDate") || d.contains(b"CreationDate") {
-        return "metadata";
+        return kind::FORM_FILL;
     }
     if before.is_none() {
         // New objects referenced by changed ones (fonts, appearance resources).
-        return "form fill";
+        return kind::FORM_FILL;
     }
-    "other changes"
+    kind::OTHER
 }
 
 // ── signing ─────────────────────────────────────────────────────────────────────────────────
@@ -940,6 +1884,52 @@ impl Default for Appearance {
     }
 }
 
+/// The words of the labels of a visible signature.
+///
+/// They are stamped into the document, so the caller chooses them: an interface that speaks
+/// another language passes them in that language. The defaults are the English ones.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppearanceLabels {
+    pub signed_by: String,
+    pub distinguished_name: String,
+    pub reason: String,
+    pub location: String,
+    pub date: String,
+}
+
+impl Default for AppearanceLabels {
+    fn default() -> Self {
+        Self {
+            signed_by: "Digitally signed by".into(),
+            distinguished_name: "DN: ".into(),
+            reason: "Reason: ".into(),
+            location: "Location: ".into(),
+            date: "Date: ".into(),
+        }
+    }
+}
+
+impl AppearanceLabels {
+    /// Each label with its field name (`signed_by`, `distinguished_name`, `reason`, `location`,
+    /// `date`), in the order the visible signature shows them.
+    pub fn fields(&self) -> [(&'static str, &str); 5] {
+        [
+            ("signed_by", self.signed_by.as_str()),
+            ("distinguished_name", self.distinguished_name.as_str()),
+            ("reason", self.reason.as_str()),
+            ("location", self.location.as_str()),
+            ("date", self.date.as_str()),
+        ]
+    }
+
+    /// The first label, with its field name, that has a character the visible signature's font
+    /// can't draw, and that character. Signing refuses such a label when it is shown, so an
+    /// interface checks its translated labels here and falls back to [`Default`] if one fails.
+    pub fn first_undrawable(&self) -> Option<(&'static str, char)> {
+        self.fields().into_iter().find_map(|(field, text)| pdfcraft_fonts::first_undrawable(text).map(|c| (field, c)))
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct SignOptions {
     /// Sign this existing, unsigned signature field.
@@ -957,6 +1947,37 @@ pub struct SignOptions {
     /// Certify with these DocMDP permissions (1 no changes, 2 form fill and signing, 3 also comments).
     pub certify: Option<u8>,
     pub appearance: Appearance,
+    /// The words of the labels the visible signature shows.
+    pub appearance_labels: AppearanceLabels,
+    /// A drawing, typed signature or image shown where the large name would be.
+    pub graphic: Option<crate::graphic::Graphic>,
+}
+
+/// What an encrypted document's permissions (ISO 32000-2 §7.6.4.2, Table 22) allow when it was
+/// opened with the user password (the owner may do anything): signing an existing, empty
+/// signature field is filling in a form field (bit 9, or bit 6); creating a new signature
+/// field needs bits 6 and 4; certifying sets the catalog's `/Perms`, a document change (bit 4).
+/// The signature's `/Contents` stays unencrypted (`pdfcraft-cos` exempts it, §7.6.2), so the
+/// placeholder can be patched after hashing exactly as in an unencrypted file.
+fn check_signing_permissions(doc: &Document, opts: &SignOptions) -> Result<(), SignError> {
+    let Some(p) = doc.permissions() else { return Ok(()) };
+    let refuse = |what: &str| {
+        Err(SignError::Pdf(format!(
+            "the document's security settings don't allow {what}; open it with the permissions password, or sign an existing signature field"
+        )))
+    };
+    if opts.field.is_some() && !p.fill_forms() {
+        return Err(SignError::Pdf(
+            "the document's security settings don't allow filling in form fields or signing; open it with the permissions password to sign it".into(),
+        ));
+    }
+    if opts.field.is_none() && !(p.annotate() && p.modify()) {
+        return refuse("adding new signature fields");
+    }
+    if opts.certify.is_some() && !p.modify() {
+        return refuse("certifying it");
+    }
+    Ok(())
 }
 
 /// Placeholder `/ByteRange` values: fixed width, patched after writing.
@@ -989,9 +2010,12 @@ fn sign_inner(
     opts: &SignOptions,
     tsa: Option<&dyn crate::timestamp::TimestampAuthority>,
 ) -> Result<Vec<u8>, SignError> {
-    if doc.security().is_some() || doc.output_handler().is_some() {
-        return Err(SignError::Unsupported("signing encrypted documents".into()));
+    // A pending security change would make the incremental save a full rewrite that applies
+    // or removes protection as it signs (and breaks existing signatures): save it first.
+    if doc.encryption_changed() {
+        return Err(SignError::Pdf("save the document's new security settings before signing it".into()));
     }
+    check_signing_permissions(doc, opts)?;
     let mut doc = doc.clone();
     let root = doc.root().ok_or_else(|| SignError::Pdf("the document has no catalog".into()))?;
     let alg = id.key.preferred_digest();
@@ -1041,17 +2065,23 @@ fn sign_inner(
         .field
         .as_deref()
         .map(|n| sig_fields(&doc).into_iter().find(|f| f.name == n).ok_or_else(|| SignError::Pdf(format!("there is no signature field {n:?}"))));
-    let (widget, rect) = match existing {
+    // `turn`: how far the appearance is turned to read upright (`/MK /R`, counterclockwise).
+    let (widget, rect, turn) = match existing {
         Some(f) => {
             let f = f?;
-            if f.dict.contains(b"V") {
+            if f.signature(&doc).is_some() {
                 return Err(SignError::Pdf(format!("the field {:?} is already signed", f.name)));
+            }
+            if f.has_foreign_value(&doc) {
+                return Err(SignError::Pdf(format!("the value of the field {:?} is not a signature", f.name)));
             }
             let fr = f.r.ok_or_else(|| SignError::Pdf("the field is not an indirect object".into()))?;
             doc.update_dict(fr, |d| d.set(b"V".to_vec(), Object::Ref(sig)))?;
             let (wr, wd) = f.widgets.first().cloned().ok_or_else(|| SignError::Pdf("the field has no widget".into()))?;
             let rect = nums(&doc, &wd, b"Rect").filter(|r| r.len() == 4).map(|r| [r[0].min(r[2]), r[1].min(r[3]), r[0].max(r[2]), r[1].max(r[3])]);
-            (wr.unwrap_or(fr), rect.unwrap_or([0.0; 4]))
+            // The field's own rotation, as a form author set it: an existing field is not
+            // reoriented, so one without `/MK /R` is drawn as before.
+            (wr.unwrap_or(fr), rect.unwrap_or([0.0; 4]), mk_rotation(&doc, &wd))
         }
         None => {
             let page = *pages.get(opts.page).ok_or_else(|| SignError::Pdf(format!("page {} does not exist", opts.page + 1)))?;
@@ -1071,6 +2101,14 @@ fn sign_inner(
             w.set(b"P".to_vec(), Object::Ref(page));
             // Print + Locked.
             w.set(b"F".to_vec(), Object::Int(4 | 128));
+            // On a page shown turned, the signature reads upright as the page is displayed: the
+            // widget is turned back by the page's rotation (ISO 32000-2 §12.5.6.19, `/MK /R`).
+            let turn = pdfcraft_model::pages(&doc).get(opts.page).map_or(0, |p| p.rotation(&doc));
+            if turn != 0 {
+                let mut mk = Dict::new();
+                mk.set(b"R".to_vec(), Object::Int(turn));
+                w.set(b"MK".to_vec(), Object::Dict(mk));
+            }
             let wr = doc.add(Object::Dict(w));
             // Page /Annots (indirect arrays are updated in place).
             let pd = doc.get(page).as_dict().cloned().unwrap_or_default();
@@ -1106,7 +2144,7 @@ fn sign_inner(
                 // Inline (or new) AcroForms stay in the catalog.
                 None => doc.update_dict(root, |c| c.set(b"AcroForm".to_vec(), Object::Dict(af)))?,
             }
-            (wr, rect)
+            (wr, rect, turn)
         }
     };
     if opts.field.is_some() {
@@ -1120,7 +2158,7 @@ fn sign_inner(
         }
     }
     // The appearance.
-    let ap = appearance(rect, &name, &id.certificate, opts);
+    let ap = appearance(&mut doc, rect, turn, &name, &id.certificate, opts)?;
     let ap_ref = doc.add(Object::Stream(ap));
     let mut apd = Dict::new();
     apd.set(b"N".to_vec(), Object::Ref(ap_ref));
@@ -1164,12 +2202,19 @@ fn sign_inner(
 /// whose `/Contents` is an RFC 3161 token covering the whole current file (`/ETSI.RFC3161`).
 /// The transport is the caller's; a rejected or malformed token produces no file.
 pub fn timestamp_document(doc: &Document, tsa: &dyn crate::timestamp::TimestampAuthority, date: &str) -> Result<Vec<u8>, SignError> {
-    if doc.security().is_some() || doc.output_handler().is_some() {
-        return Err(SignError::Unsupported("timestamping encrypted documents".into()));
+    // A pending security change would make the incremental save a full rewrite that applies
+    // or removes protection as it signs (and breaks existing signatures): save it first.
+    if doc.encryption_changed() {
+        return Err(SignError::Pdf("save the document's new security settings before signing it".into()));
+    }
+    if doc.permissions().is_some_and(|p| !p.fill_forms()) {
+        return Err(SignError::Pdf(
+            "the document's security settings don't allow signing; open it with the permissions password to timestamp it".into(),
+        ));
     }
     let mut doc = doc.clone();
     let mut v = Dict::new();
-    v.set(b"Type".to_vec(), Object::name("Sig"));
+    v.set(b"Type".to_vec(), Object::name("DocTimeStamp"));
     v.set(b"Filter".to_vec(), Object::name("Adobe.PPKLite"));
     v.set(b"SubFilter".to_vec(), Object::name("ETSI.RFC3161"));
     v.set(b"ByteRange".to_vec(), Object::Array([0].iter().chain(BR_MARK.iter()).map(|n| Object::Int(*n)).collect()));
@@ -1233,53 +2278,142 @@ pub fn display_date(pdf: &str) -> String {
     format!("{}.{}.{} {}:{}:{}{tz}", g(0..4), g(4..6), g(6..8), g(8..10), g(10..12), g(12..14))
 }
 
-/// The visible signature: the signer's name large on the left, the details on the right
-/// (Acrobat's standard layout), in Helvetica.
-fn appearance(rect: [f64; 4], name: &str, cert: &Certificate, opts: &SignOptions) -> Stream {
-    use pdfcraft_fonts::{helvetica_width, literal, win_ansi, wrap};
-    let (w, h) = ((rect[2] - rect[0]).max(0.0), (rect[3] - rect[1]).max(0.0));
+/// The visible signature: the signer's name large on the left, or the graphic in its place, and
+/// the details on the right (Acrobat's standard layout), in Helvetica, or in the bundled Inter
+/// font when a detail needs characters beyond Western European. A graphic with no details beside
+/// it fills the box. An error, before anything is drawn, when a detail it writes (the signer's
+/// name, the certificate's subject, the reason or the location) has a character neither font can
+/// draw: signing invisibly, or leaving that part out, still works. A graphic doesn't change this:
+/// the name it replaces on the left is still among the details. A label that is drawn
+/// ([`AppearanceLabels`], the caller's words) must be drawable in Helvetica, and is refused otherwise.
+///
+/// `turn` is the widget's `/MK /R` (0, 90, 180 or 270; anything else counts as 0): the layout is
+/// drawn upright in the box as turned by it, and a `/Matrix` maps that box onto `rect`.
+fn appearance(doc: &mut Document, rect: [f64; 4], turn: i64, name: &str, cert: &Certificate, opts: &SignOptions) -> Result<Stream, SignError> {
+    use pdfcraft_fonts::{first_undrawable, helvetica_width, inter_width, literal, undrawable_message, win_ansi, wrap, wrap_with};
+    let turn = if matches!(turn, 90 | 180 | 270) { turn } else { 0 };
+    let (rw, rh) = ((rect[2] - rect[0]).max(0.0), (rect[3] - rect[1]).max(0.0));
+    // The upright layout box: a quarter turn swaps its sides.
+    let (w, h) = if turn % 180 == 0 { (rw, rh) } else { (rh, rw) };
     let a = &opts.appearance;
+    let dn = cert.subject.display();
+    let mut needs_unicode = false;
+    if w > 1.0 && h > 1.0 {
+        let shown = [
+            (a.name, "the signer's name", Some(name)),
+            (a.distinguished_name, "the certificate's subject", Some(dn.as_str())),
+            (a.reason, "the reason", opts.reason.as_deref()),
+            (a.location, "the location", opts.location.as_deref()),
+        ];
+        for (on, what, text) in shown {
+            if on
+                && let Some(s) = text
+                && first_undrawable(s).is_some()
+            {
+                for c in s.chars() {
+                    if matches!(c, '\n' | '\r') {
+                        continue;
+                    }
+                    if !pdfcraft_fonts::embedding::covers(pdfcraft_fonts::INTER_REGULAR, &c.to_string()) {
+                        return Err(SignError::Unsupported(format!(
+                            "{}; sign without a visible appearance, or leave {what} out of it",
+                            undrawable_message(&format!("{what} of the visible signature"), c)
+                        )));
+                    }
+                }
+                needs_unicode = true;
+            }
+        }
+        // The labels are the caller's words (a translation), checked as the details are: only
+        // those that are drawn, as each is drawn only beside its detail.
+        let has = |v: Option<&str>| v.is_some_and(|v| !v.is_empty());
+        let drawn = [a.name, a.distinguished_name, a.reason && has(opts.reason.as_deref()), a.location && has(opts.location.as_deref()), a.date];
+        let mut labels = opts.appearance_labels.fields().into_iter().zip(drawn).filter(|&(_, on)| a.labels && on);
+        if let Some((field, c)) = labels.find_map(|((field, text), _)| first_undrawable(text).map(|c| (field, c))) {
+            return Err(SignError::Unsupported(format!(
+                "{}; pass that label in Western European characters, or leave the labels out of the visible signature",
+                undrawable_message(&format!("the {field} label of the visible signature"), c)
+            )));
+        }
+    }
     let mut lines: Vec<String> = Vec::new();
     let label = |l: &str, v: &str| if a.labels { format!("{l}{v}") } else { v.to_string() };
+    // The labels are the caller's words, so a signature signed in another language reads in it.
+    let wording = &opts.appearance_labels;
     if a.name {
-        lines.push(if a.labels { "Digitally signed by".into() } else { String::new() });
+        lines.push(if a.labels { wording.signed_by.clone() } else { String::new() });
         lines.push(name.to_string());
     }
     if a.distinguished_name {
-        lines.push(label("DN: ", &cert.subject.display()));
+        lines.push(label(&wording.distinguished_name, &dn));
     }
     if a.reason
         && let Some(r) = opts.reason.as_deref().filter(|r| !r.is_empty())
     {
-        lines.push(label("Reason: ", r));
+        lines.push(label(&wording.reason, r));
     }
     if a.location
         && let Some(l) = opts.location.as_deref().filter(|l| !l.is_empty())
     {
-        lines.push(label("Location: ", l));
+        lines.push(label(&wording.location, l));
     }
     if a.date {
-        lines.push(label("Date: ", &display_date(&opts.date)));
+        lines.push(label(&wording.date, &display_date(&opts.date)));
     }
     lines.retain(|l| !l.is_empty());
     let mut out = Vec::new();
+    let mut image = None;
+    let mut fonts = Dict::new();
+    let (font_tag, metrics) = if needs_unicode {
+        let tag = pdfcraft_fonts::embedding::embed(doc, &mut fonts, pdfcraft_fonts::INTER_REGULAR, "Inter")
+            .map_err(|e| SignError::Pdf(format!("failed to embed signature font: {e}")))?;
+        let font_dict = fonts
+            .get(tag.as_bytes())
+            .map(|o| doc.resolve(o))
+            .and_then(|o| o.as_dict().cloned())
+            .ok_or_else(|| SignError::Pdf("embedded signature font dictionary not found".into()))?;
+        let m = pdfcraft_fonts::pdf::Metrics::from_dict(doc, &font_dict);
+        (tag, Some(m))
+    } else {
+        let mut font = Dict::new();
+        font.set(b"Type".to_vec(), Object::name("Font"));
+        font.set(b"Subtype".to_vec(), Object::name("Type1"));
+        font.set(b"BaseFont".to_vec(), Object::name("Helvetica"));
+        font.set(b"Encoding".to_vec(), Object::name("WinAnsiEncoding"));
+        fonts.set(b"Helv".to_vec(), Object::Dict(font));
+        ("Helv".to_string(), None)
+    };
+    let measure = |s: &str, sz: f64| -> f64 { if needs_unicode { inter_width(s, sz) } else { helvetica_width(s, sz) } };
+    let wrap_text =
+        |s: &str, sz: f64, max_w: f64| -> Vec<String> { if needs_unicode { wrap_with(s, sz, max_w, inter_width) } else { wrap(s, sz, max_w) } };
+    let encode_line =
+        |l: &str| -> Vec<u8> { if let Some(m) = &metrics { literal(&m.encode(l).unwrap_or_else(|| win_ansi(l))) } else { literal(&win_ansi(l)) } };
     if w > 1.0 && h > 1.0 {
         let pad = (h * 0.06).clamp(1.0, 6.0);
-        let (left_w, right_x) = if a.name { (w * 0.5, w * 0.5 + pad) } else { (0.0, pad) };
+        let (left_w, right_x) = match (&opts.graphic, a.name) {
+            (Some(_), _) if lines.is_empty() => (w, pad),
+            (Some(_), _) | (None, true) => (w * 0.5, w * 0.5 + pad),
+            (None, false) => (0.0, pad),
+        };
         let right_w = (w - right_x - pad).max(1.0);
+        if let Some(g) = &opts.graphic {
+            let (ops, im) = g.draw(doc, [pad, pad, (left_w - 2.0 * pad).max(0.0), (h - 2.0 * pad).max(0.0)])?;
+            out.extend(ops.bytes());
+            image = im;
+        }
         out.extend_from_slice(b"BT\n0 g\n");
-        if a.name {
+        if a.name && opts.graphic.is_none() {
             // The name fills the left half.
             let mut size = (h * 0.4).min(36.0);
             let fit = (left_w - 2.0 * pad).max(1.0);
-            let longest = helvetica_width(name, 1.0).max(0.01);
+            let longest = measure(name, 1.0).max(0.01);
             size = size.min(fit / longest).max(4.0);
-            let words = wrap(name, size, fit);
+            let words = wrap_text(name, size, fit);
             let total = words.len() as f64 * size * 1.1;
             let mut y = (h + total) / 2.0 - size * 0.85;
             for l in &words {
-                out.extend(format!("/Helv {} Tf 1 0 0 1 {} {} Tm ", fmt(size), fmt(pad), fmt(y)).bytes());
-                out.extend(literal(&win_ansi(l)));
+                out.extend(format!("/{font_tag} {} Tf 1 0 0 1 {} {} Tm ", fmt(size), fmt(pad), fmt(y)).bytes());
+                out.extend(encode_line(l));
                 out.extend_from_slice(b" Tj\n");
                 y -= size * 1.1;
             }
@@ -1287,7 +2421,7 @@ fn appearance(rect: [f64; 4], name: &str, cert: &Certificate, opts: &SignOptions
         // The details, shrunk to fit the right side.
         let mut size = (h / (lines.len().max(1) as f64 * 1.15)).min(12.0);
         let wrapped = loop {
-            let all: Vec<String> = lines.iter().flat_map(|l| wrap(l, size, right_w)).collect();
+            let all: Vec<String> = lines.iter().flat_map(|l| wrap_text(l, size, right_w)).collect();
             if all.len() as f64 * size * 1.15 <= h - 2.0 * pad || size <= 3.0 {
                 break all;
             }
@@ -1295,8 +2429,8 @@ fn appearance(rect: [f64; 4], name: &str, cert: &Certificate, opts: &SignOptions
         };
         let mut y = h - pad - size * 0.9;
         for l in &wrapped {
-            out.extend(format!("/Helv {} Tf 1 0 0 1 {} {} Tm ", fmt(size), fmt(right_x), fmt(y)).bytes());
-            out.extend(literal(&win_ansi(l)));
+            out.extend(format!("/{font_tag} {} Tf 1 0 0 1 {} {} Tm ", fmt(size), fmt(right_x), fmt(y)).bytes());
+            out.extend(encode_line(l));
             out.extend_from_slice(b" Tj\n");
             y -= size * 1.15;
         }
@@ -1306,20 +2440,28 @@ fn appearance(rect: [f64; 4], name: &str, cert: &Certificate, opts: &SignOptions
     d.set(b"Type".to_vec(), Object::name("XObject"));
     d.set(b"Subtype".to_vec(), Object::name("Form"));
     d.set(b"BBox".to_vec(), Object::Array([0.0, 0.0, w, h].iter().map(|x| Object::Real(*x)).collect()));
-    let mut font = Dict::new();
-    font.set(b"Type".to_vec(), Object::name("Font"));
-    font.set(b"Subtype".to_vec(), Object::name("Type1"));
-    font.set(b"BaseFont".to_vec(), Object::name("Helvetica"));
-    font.set(b"Encoding".to_vec(), Object::name("WinAnsiEncoding"));
-    let mut fonts = Dict::new();
-    fonts.set(b"Helv".to_vec(), Object::Dict(font));
+    if turn != 0 {
+        // Viewers fit the box, transformed by `/Matrix`, to the widget's `/Rect` (ISO 32000-2
+        // §12.5.5); this one lands on `rect` exactly, turned as `/MK /R` says.
+        let mut m = pdfcraft_model::view_matrix_for(turn, [rect[0], rect[1], rect[0] + rw, rect[1] + rh]);
+        if !m.iter().all(|x| x.is_finite()) {
+            // A caller's non-finite corner: the turn alone, which viewers fit to `/Rect` the same.
+            m = pdfcraft_model::view_matrix_for(turn, [0.0; 4]);
+        }
+        d.set(b"Matrix".to_vec(), Object::Array(m.iter().map(|x| Object::Real(*x)).collect()));
+    }
     let mut res = Dict::new();
     res.set(b"Font".to_vec(), Object::Dict(fonts));
+    if let Some(im) = image {
+        let mut xobjects = Dict::new();
+        xobjects.set(b"Im1".to_vec(), Object::Ref(im));
+        res.set(b"XObject".to_vec(), Object::Dict(xobjects));
+    }
     d.set(b"Resources".to_vec(), Object::Dict(res));
-    Stream::flate(d, &out)
+    Ok(Stream::flate(d, &out))
 }
 
-fn fmt(v: f64) -> String {
+pub(crate) fn fmt(v: f64) -> String {
     let s = format!("{v:.2}");
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }

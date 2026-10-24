@@ -50,8 +50,19 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) -> bool
     ui.label(egui::RichText::new("PDF/A").font(theme::semibold(18.0)));
     ui.add_space(6.0);
     let declared = app.active_ids().and_then(|(_, id)| app.session.get(id)).map(|d| d.standards()).unwrap_or_default();
-    let shown = declared.pdfa.as_ref().map_or(tl!("none").to_string(), |(p, c)| format!("PDF/A-{p}{}", c.to_lowercase()));
-    ui.label(crate::i18n::fmt(tl!("Declared conformance: {shown}"), &[("shown", &shown)]));
+    let mut standards: Vec<String> = declared.pdfa.iter().map(|(p, c)| format!("PDF/A-{p}{}", c.to_lowercase())).collect();
+    standards.extend(declared.pdfua.map(|p| format!("PDF/UA-{p}")));
+    let shown = if standards.is_empty() { tl!("none").to_string() } else { standards.join(", ") };
+    let removal = pdfcraft_engine::Edit::RemoveStandardId { standard: pdfcraft_engine::Standard::PdfA };
+    let mut remove = false;
+    ui.horizontal(|ui| {
+        ui.label(crate::i18n::fmt(tl!("Declared conformance: {shown}"), &[("shown", &shown)]));
+        // Worded as Edit ▸ Undo will name it.
+        remove = declared.pdfa.is_some() && widgets::pill_button(ui, &crate::i18n::edit_label(&removal.label()), false).clicked();
+    });
+    if remove && app.apply_edit(removal) {
+        app.pdfa.issues = None;
+    }
     if !declared.output_intents.is_empty() {
         ui.label(
             egui::RichText::new(crate::i18n::fmt(tl!("Output intent: {list}"), &[("list", &declared.output_intents.join(", "))])).color(t.text_muted),
@@ -86,7 +97,9 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) -> bool
                     for i in v {
                         let page = i.page.map(|p| crate::i18n::fmt(tl!(" (page {p})"), &[("p", &(p + 1).to_string())])).unwrap_or_default();
                         let fix = if i.fixable { String::new() } else { tl!("  · not fixable here").to_string() };
-                        ui.label(format!("{}{page}", i.message));
+                        // The verifier hands the wording over whole, with the document's own name
+                        // apart from it, so the problem reads in this language and the name as it is.
+                        ui.label(format!("{}{page}", i.said(&crate::i18n::words)));
                         ui.label(egui::RichText::new(format!("ISO 19005 {}{fix}", i.clause)).small().color(t.text_muted));
                     }
                 }

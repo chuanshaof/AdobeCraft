@@ -4,9 +4,9 @@
 
 use crate::CacheKey;
 use crate::cache::Cache;
-use crate::color::{ColorComponents, ColorSpace};
-use crate::function::{Function, Values, interpolate};
-use crate::util::{Float32Ext, PointExt, RectExt};
+use crate::color::{ColorComponents, ColorSpace, DefaultColorSpaces, DeviceFamily};
+use crate::function::{Function, StitchingBounds, Values, interpolate};
+use crate::util::{Float32Ext, PointExt, RectExt, hash128};
 use hayro_syntax::bit_reader::BitReader;
 use hayro_syntax::object::Array;
 use hayro_syntax::object::Dict;
@@ -47,6 +47,24 @@ impl ShadingFunction {
                 Some(out)
             }
         }
+    }
+
+    /// PdfCraft patch (backport of hayro 0.8): stitching breakpoints of all component functions.
+    pub(crate) fn stitching_bounds(&self) -> StitchingBounds {
+        let mut bounds = StitchingBounds::new();
+
+        match self {
+            Self::Single(function) => bounds.extend(function.stitching_bounds()),
+            Self::Multiple(functions) => {
+                for function in functions {
+                    bounds.extend(function.stitching_bounds());
+                }
+            }
+        }
+
+        bounds.sort_by(f32::total_cmp);
+        bounds.dedup_by(|a, b| (*a - *b).abs() <= f32::EPSILON);
+        bounds
     }
 }
 
@@ -121,12 +139,24 @@ pub struct Shading {
 }
 
 impl Shading {
-    pub(crate) fn new(dict: &Dict<'_>, stream: Option<&Stream<'_>>, cache: &Cache) -> Option<Self> {
-        let cache_key = dict.cache_key();
-
+    /// PdfCraft patch (38): a shading in a device space is drawn in its default colour space
+    /// from `defaults`, the resources it is painted with (ISO 32000-2 §8.6.5.6), and keyed by
+    /// it as an image is.
+    pub(crate) fn new(
+        dict: &Dict<'_>,
+        stream: Option<&Stream<'_>>,
+        cache: &Cache,
+        defaults: &DefaultColorSpaces<'_, '_>,
+    ) -> Option<Self> {
         let shading_num = dict.get::<u8>(SHADING_TYPE)?;
 
-        let color_space = ColorSpace::new(dict.get(COLORSPACE)?, cache)?;
+        let color_space_obj = dict.get::<Object<'_>>(COLORSPACE)?;
+        let default =
+            DeviceFamily::of_object(&color_space_obj).and_then(|family| defaults.get(family));
+        let (color_space, cache_key) = match default {
+            Some((space, key)) => (space, hash128(&(dict.cache_key(), key))),
+            None => (ColorSpace::new(color_space_obj, cache)?, dict.cache_key()),
+        };
 
         let shading_type = match shading_num {
             1 => {
@@ -357,6 +387,24 @@ impl Triangle {
         self.kurbo_tri.winding(pos) != 0
     }
 
+    /// PdfCraft patch (36): whether the point is inside the triangle or on one of its edges.
+    /// Two triangles of a mesh share an edge; a sample on it belongs to both (their colours
+    /// agree there), where `contains_point` can give it to neither and leave a seam. A
+    /// degenerate triangle covers nothing.
+    pub fn covers(&self, pos: Point) -> bool {
+        // Relative to the barycentric coordinates' scale (1), well above f64 rounding.
+        const EDGE: f64 = 1e-9;
+        let (a, b, c) = (self.p0.point, self.p1.point, self.p2.point);
+        let (v0, v1, v2) = (b - a, c - a, pos - a);
+        let denom = self.d00 * self.d11 - self.d01 * self.d01;
+        let (d20, d21) = (v2.dot(v0), v2.dot(v1));
+        let v = (self.d11 * d20 - self.d01 * d21) / denom;
+        let w = (self.d00 * d21 - self.d01 * d20) / denom;
+        // A degenerate triangle divides by zero: NaN fails every comparison, and infinite
+        // coordinates can't sum to at most one.
+        v >= -EDGE && w >= -EDGE && v + w <= 1.0 + EDGE
+    }
+
     /// Return the bounding box of the triangle.
     pub fn bounding_box(&self) -> kurbo::Rect {
         self.kurbo_tri.bounding_box()
@@ -545,6 +593,13 @@ impl TensorProductPatch {
     }
 }
 
+/// PdfCraft patch: the most triangles a free-form or lattice mesh, and the most patches a
+/// patch mesh, may hold. Each was read without limit: a patch can be 19 bits, a triangle 216
+/// bytes in memory, so a small stream made gigabytes. Real meshes are far smaller (a 200 × 200
+/// gradient mesh is 40 thousand patches).
+const MAX_MESH_TRIANGLES: usize = 1 << 20;
+const MAX_MESH_PATCHES: usize = 1 << 16;
+
 fn read_free_form_triangles(
     data: &[u8],
     bpf: u8,
@@ -594,6 +649,11 @@ fn read_free_form_triangles(
             continue;
         }
 
+        // PdfCraft patch: see `MAX_MESH_TRIANGLES`.
+        if triangles.len() >= MAX_MESH_TRIANGLES {
+            warn!("free-form mesh has over {MAX_MESH_TRIANGLES} triangles; the rest is not drawn");
+            break;
+        }
         triangles.push(Triangle::new(a.clone()?, b.clone()?, c.clone()?));
     }
 
@@ -701,6 +761,10 @@ where
 {
     const GRID_SIZE: usize = 20;
     let mut grid = vec![vec![Point::ZERO; GRID_SIZE]; GRID_SIZE];
+    // PdfCraft patch (33): each grid point's colours, interpolated once. Every cell below
+    // interpolated its four corners itself, so an inner point was interpolated four times
+    // (1,444 interpolations a patch instead of 400) for the same values.
+    let mut colors = vec![vec![ColorComponents::new(); GRID_SIZE]; GRID_SIZE];
 
     // Create grid by mapping unit square coordinates.
     for i in 0..GRID_SIZE {
@@ -711,6 +775,7 @@ where
             // Map unit square coordinate to patch coordinate.
             let unit_point = Point::new(u, v);
             grid[i][j] = map_coordinate(unit_point);
+            colors[i][j] = interpolate(unit_point);
         }
     }
 
@@ -721,32 +786,26 @@ where
             let p01 = grid[i][j + 1];
             let p11 = grid[i + 1][j + 1];
 
-            // Calculate unit square coordinates for color interpolation.
-            let u0 = i as f64 / (GRID_SIZE - 1) as f64;
-            let u1 = (i + 1) as f64 / (GRID_SIZE - 1) as f64;
-            let v0 = j as f64 / (GRID_SIZE - 1) as f64;
-            let v1 = (j + 1) as f64 / (GRID_SIZE - 1) as f64;
-
-            // Create triangle vertices with interpolated colors.
+            // Create triangle vertices with their grid points' colors.
             let v00 = TriangleVertex {
                 flag: 0,
                 point: p00,
-                colors: interpolate(Point::new(u0, v0)),
+                colors: colors[i][j].clone(),
             };
             let v10 = TriangleVertex {
                 flag: 0,
                 point: p10,
-                colors: interpolate(Point::new(u1, v0)),
+                colors: colors[i + 1][j].clone(),
             };
             let v01 = TriangleVertex {
                 flag: 0,
                 point: p01,
-                colors: interpolate(Point::new(u0, v1)),
+                colors: colors[i][j + 1].clone(),
             };
             let v11 = TriangleVertex {
                 flag: 0,
                 point: p11,
-                colors: interpolate(Point::new(u1, v1)),
+                colors: colors[i + 1][j + 1].clone(),
             };
 
             let inflate_point = |p: Point, mid: Point| -> Point {
@@ -765,16 +824,9 @@ where
                 triangle
             };
 
-            buffer.push(inflate(Triangle::new(
-                v00.clone(),
-                v10.clone(),
-                v01.clone(),
-            )));
-            buffer.push(inflate(Triangle::new(
-                v10.clone(),
-                v11.clone(),
-                v01.clone(),
-            )));
+            // PdfCraft patch (33): the second triangle takes the vertices the first copied.
+            buffer.push(inflate(Triangle::new(v00, v10.clone(), v01.clone())));
+            buffer.push(inflate(Triangle::new(v10, v11, v01)));
         }
     }
 }
@@ -787,6 +839,15 @@ fn read_lattice_triangles(
     vertices_per_row: u32,
     decode: &[f32],
 ) -> Option<Vec<Triangle>> {
+    // PdfCraft patch: ISO 32000-2 8.7.4.5.6 requires at least two vertices per row; with none,
+    // the loop below pushed empty rows for ever, and one row of 4294967295 read the whole stream
+    // into memory before any cap (see `MAX_MESH_TRIANGLES`).
+    if !(2..=(MAX_MESH_TRIANGLES / 2) as u32).contains(&vertices_per_row) {
+        warn!("lattice-form mesh with {vertices_per_row} vertices per row");
+
+        return None;
+    }
+
     let mut lattices = vec![];
 
     let ([x_min, x_max, y_min, y_max], decode) = split_decode(decode)?;
@@ -806,6 +867,11 @@ fn read_lattice_triangles(
     };
 
     'outer: loop {
+        // PdfCraft patch: see `MAX_MESH_TRIANGLES` (two triangles per vertex at most).
+        if lattices.len().saturating_mul(vertices_per_row as usize) >= MAX_MESH_TRIANGLES / 2 {
+            warn!("lattice-form mesh has too many vertices; the rest is not drawn");
+            break;
+        }
         let mut single_row = vec![];
 
         for _ in 0..vertices_per_row {
@@ -895,6 +961,11 @@ where
     let mut patches = vec![];
 
     while let Some(flag) = reader.read(bpf) {
+        // PdfCraft patch: see `MAX_MESH_PATCHES`.
+        if patches.len() >= MAX_MESH_PATCHES {
+            warn!("patch mesh has over {MAX_MESH_PATCHES} patches; the rest is not drawn");
+            break;
+        }
         let mut control_points = vec![Point::ZERO; 16]; // Always allocate 16, use subset as needed.
         let mut colors = [smallvec![], smallvec![], smallvec![], smallvec![]];
 

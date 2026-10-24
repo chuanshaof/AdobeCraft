@@ -4,13 +4,15 @@
 //!   as the file's last one (table or stream) and a trailer with `/Prev`. The original bytes are
 //!   never modified, which keeps digital signatures over earlier revisions valid.
 //! * `write_full` writes only objects reachable from the trailer, renumbered densely, with a
-//!   classic cross-reference table — the "Save As" / garbage-collecting path.
+//!   cross-reference table or stream — the "Save As" / garbage-collecting path. Unknown trailer
+//!   entries are copied, including objects reachable only from them.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
 
 use crate::CosError;
-use crate::document::Document;
+use crate::document::{Document, ObjectReader};
 use crate::object::{Dict, ObjRef, Object, PdfString, Stream};
 
 /// Serialize one object. Deterministic: same object → same bytes.
@@ -47,8 +49,10 @@ fn write_real(r: f64, out: &mut Vec<u8>) {
         out.push(b'0');
         return;
     }
-    if r.fract() == 0.0 && r.abs() < 1e15 {
-        let _ = write!(out, "{}", r as i64);
+    // A whole number is written as an integer only within the integer range Annex C gives
+    // (±2³¹−1), so `4e9` or `1e30` stays a real token for readers with 32-bit integers.
+    if r.fract() == 0.0 && r.abs() <= f64::from(i32::MAX) {
+        let _ = write!(out, "{}", r as i32);
         return;
     }
     // Plain decimal notation (§7.3.3 has no exponents). Rust's `Display` for f64 prints the
@@ -56,6 +60,10 @@ fn write_real(r: f64, out: &mut Vec<u8>) {
     // round-trip exactly (rounding to a fixed number of places visibly shifted shading colours).
     let s = format!("{r}");
     out.extend_from_slice(if s == "-0" { b"0" } else { s.as_bytes() });
+    // A whole number past that range prints without a point; the trailing `.` keeps it a real.
+    if !s.contains('.') && s != "-0" {
+        out.push(b'.');
+    }
 }
 
 fn write_name(n: &[u8], out: &mut Vec<u8>) {
@@ -122,10 +130,13 @@ fn write_stream(s: &Stream, out: &mut Vec<u8>) {
 
 /// The object as written: encrypted with its (output) number when the document is encrypted,
 /// except the `/Encrypt` dictionary itself (`source_num` is its number in the source document).
-fn prepared(doc: &Document, source_num: u32, num: u32, generation: u16, o: &Object) -> Object {
+fn prepared<'a>(doc: &Document, source_num: u32, num: u32, generation: u16, o: &'a Object) -> Cow<'a, Object> {
     match doc.output_security() {
-        (Some(h), encrypt_num) if Some(source_num) != encrypt_num => crate::security::transform(h, o, num, generation, false),
-        _ => o.clone(),
+        (Some(h), encrypt_num) if Some(source_num) != encrypt_num => {
+            let pass = if doc.encryption_changed() { crate::security::Pass::EncryptReplacing } else { crate::security::Pass::Encrypt };
+            Cow::Owned(crate::security::transform(h, o, num, generation, pass))
+        }
+        _ => Cow::Borrowed(o),
     }
 }
 
@@ -155,6 +166,9 @@ impl Default for SaveOptions {
 
 /// Objects per object stream (Acrobat and qpdf use 100–200).
 const OBJSTM_SIZE: usize = 100;
+/// Keep a batch's serialized body small as well as limiting its object count. One object
+/// may exceed this target; it is emitted in its own object stream without retaining a batch.
+const OBJSTM_BYTES: usize = 8 * 1024 * 1024;
 
 /// Where an object lives, for the cross-reference section.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -173,24 +187,32 @@ enum Row {
 /// incrementally — other readers would follow the broken chain — so it is rewritten in full,
 /// which also repairs the file (what users expect after "the file was damaged and repaired").
 pub fn write_incremental(doc: &Document, opts: &SaveOptions) -> Result<Vec<u8>, CosError> {
+    if doc.stream_limited() {
+        return Err(CosError::ReadOnlyLimit);
+    }
     // Reconstructed files have no chain to append to; added or removed encryption must
     // rewrite every object; redaction must not leave the old revision behind. All need a full save.
-    if doc.revisions().is_empty() || doc.encryption_changed() || doc.full_save_required() {
+    if doc.reconstructed() || doc.encryption_changed() || doc.full_save_required() {
         return write_full(doc, opts);
     }
     let mut doc = doc.clone();
     stamp_mod_date(&mut doc, opts);
     let original = doc.bytes().clone();
-    let mut out = Vec::with_capacity(original.len() + 4096);
-    out.extend_from_slice(&original);
-    if !matches!(out.last(), Some(b'\n' | b'\r')) {
-        out.push(b'\n');
-    }
+    // The revision is written on its own and joined to the original at the end, so the result is
+    // allocated once at its exact size: growing a buffer that holds a large original past a
+    // guessed capacity would copy the whole file again and keep up to as much again unused.
+    let newline = !matches!(original.last(), Some(b'\n' | b'\r'));
+    // A file with bytes before its `%PDF-` header may count its offsets from the header. The new
+    // section then has to as well: readers take `/Prev` and `startxref` in one convention, and a
+    // mix sends them into reconstruction (#2364).
+    let shift = if doc.revisions().last().is_some_and(|r| r.header_relative) { doc.header_offset() } else { 0 };
+    let base = (original.len() + usize::from(newline)).saturating_sub(shift) as u64;
+    let mut out = Vec::new();
     let mut offsets: BTreeMap<u32, (u64, u16, bool)> = BTreeMap::new(); // num → (offset, gen, in use)
-    for (num, generation, obj) in doc.overlay_entries().collect::<Vec<_>>() {
+    for (num, generation, obj) in doc.overlay_entries() {
         match obj {
             Some(o) => {
-                offsets.insert(num, (out.len() as u64, generation, true));
+                offsets.insert(num, (base + out.len() as u64, generation, true));
                 write_indirect(num, generation, &prepared(&doc, num, num, generation, &o), &mut out);
             }
             None => {
@@ -210,26 +232,38 @@ pub fn write_incremental(doc: &Document, opts: &SaveOptions) -> Result<Vec<u8>, 
     let size = doc.next_num().max(trailer.int(b"Size").unwrap_or(0) as u32);
     if as_stream {
         let rows = offsets.iter().map(|(n, (o, g, used))| (*n, if *used { Row::InFile(*o, *g) } else { Row::Free(*g) })).collect();
-        write_xref_stream(&mut out, &mut trailer, rows, size);
+        write_xref_stream(&mut out, base, &mut trailer, rows, size);
     } else {
         trailer.set(b"Size".to_vec(), Object::Int(size as i64));
-        let xref_at = out.len();
+        let xref_at = base + out.len() as u64;
         write_xref_table(&mut out, &offsets, prev.is_none());
         out.extend_from_slice(b"trailer\n");
         write_dict(&trailer, &mut out);
         let _ = write!(out, "\nstartxref\n{xref_at}\n%%EOF\n");
     }
-    Ok(out)
+    let mut file = Vec::with_capacity(original.len() + usize::from(newline) + out.len());
+    file.extend_from_slice(&original);
+    if newline {
+        file.push(b'\n');
+    }
+    file.extend_from_slice(&out);
+    Ok(file)
 }
 
-/// Write only reachable objects, renumbered from 1, with a classic cross-reference table.
+/// Write only reachable objects, renumbered from 1, with a table or cross-reference stream.
 pub fn write_full(doc: &Document, opts: &SaveOptions) -> Result<Vec<u8>, CosError> {
-    let mut doc = doc.clone();
-    stamp_mod_date(&mut doc, opts);
-    let trailer_in = doc.trailer().clone();
+    if doc.stream_limited() {
+        return Err(CosError::ReadOnlyLimit);
+    }
+    // A full traversal must not fill the editor's shared caches (which undo snapshots also
+    // own). Parsed objects and decoded object streams are temporary working data here.
+    let mut reader = doc.object_reader();
+    stamp_mod_date(&mut reader.document, opts);
+    let trailer_in = reader.document.trailer().clone();
     // Breadth-first walk from the trailer, assigning new numbers in visit order.
     let mut map: HashMap<ObjRef, u32> = HashMap::new();
-    let mut order: Vec<ObjRef> = Vec::new();
+    // Record the type while traversing so classifying packed objects needs no second parse.
+    let mut order: Vec<(ObjRef, bool)> = Vec::new();
     let mut queue: VecDeque<ObjRef> = VecDeque::new();
     let visit_refs = |o: &Object, queue: &mut VecDeque<ObjRef>| collect_refs(o, &mut |r| queue.push_back(r));
     for key in [&b"Root"[..], b"Info", b"Encrypt"] {
@@ -237,19 +271,26 @@ pub fn write_full(doc: &Document, opts: &SaveOptions) -> Result<Vec<u8>, CosErro
             queue.push_back(r);
         }
     }
+    // Unknown trailer entries are document data. Objects they alone reference must be written
+    // too, or a full rewrite would keep the key and drop its value.
+    for (key, value) in trailer_in.iter() {
+        if !trailer_key_rewritten(key) {
+            collect_refs(value, &mut |r| queue.push_back(r));
+        }
+    }
     while let Some(r) = queue.pop_front() {
         if map.contains_key(&r) {
             continue;
         }
-        let o = doc.get(r);
+        let o = reader.get(r);
         if matches!(*o, Object::Null) {
             continue; // dangling reference: written as null by renumbering below
         }
-        map.insert(r, (order.len() + 1) as u32);
-        order.push(r);
+        map.insert(r, output_number(order.len())?);
+        order.push((r, matches!(*o, Object::Stream(_))));
         visit_refs(&o, &mut queue);
     }
-    let version = doc.version().chars().take(3).collect::<String>();
+    let version = reader.document.version().chars().take(3).collect::<String>();
     let version = if opts.object_streams && version.as_str() < "1.5" { "1.5".to_string() } else { version };
     let mut out = Vec::new();
     let _ = writeln!(out, "%PDF-{version}");
@@ -261,46 +302,50 @@ pub fn write_full(doc: &Document, opts: &SaveOptions) -> Result<Vec<u8>, CosErro
     let mut pending: Vec<ObjRef> = trailer_in.reference(b"Encrypt").into_iter().collect();
     while let Some(r) = pending.pop() {
         if encryption_objects.insert(r) {
-            collect_refs(&doc.get(r), &mut |x| pending.push(x));
+            collect_refs(&reader.get(r), &mut |x| pending.push(x));
         }
     }
+    // Acrobat refuses an encrypted file whose catalog sits in an object stream ("the file is
+    // damaged and could not be repaired", before it even asks for the password), while other
+    // readers accept it. qpdf keeps the catalog out of object streams too. Verified with
+    // Acrobat DC on macOS (#774).
+    let root_outside = if reader.document.output_security().0.is_some() { trailer_in.reference(b"Root") } else { None };
     let mut rows: BTreeMap<u32, Row> = BTreeMap::new();
-    let mut packed: Vec<(u32, Object)> = Vec::new(); // objects bound for object streams
-    for (i, r) in order.iter().enumerate() {
-        let num = (i + 1) as u32;
-        let o = renumber(&doc.get(*r), &map);
-        let in_stream = opts.object_streams && !matches!(o, Object::Stream(_)) && !encryption_objects.contains(r);
+    // Keep only references, not renamed copies of the entire object graph. Standalone
+    // objects still precede object streams, preserving the established output order.
+    let mut packed: Vec<(u32, ObjRef)> = Vec::new();
+    for (i, (r, is_stream)) in order.iter().enumerate() {
+        let num = output_number(i)?;
+        let in_stream = opts.object_streams && !is_stream && !encryption_objects.contains(r) && root_outside != Some(*r);
         if in_stream {
-            packed.push((num, o));
+            packed.push((num, *r));
         } else {
+            let o = renumber(&*reread(&mut reader, *r, *is_stream)?, &map);
             rows.insert(num, Row::InFile(out.len() as u64, 0));
-            write_indirect(num, 0, &prepared(&doc, r.num, num, 0, &o), &mut out);
+            write_indirect(num, 0, &prepared(&reader.document, r.num, num, 0, &o), &mut out);
         }
     }
     // Object streams take the numbers after the last object. Their contents are not encrypted
     // individually: the whole stream is (§7.5.7, §7.6.2).
-    let mut next = order.len() as u32 + 1;
-    for chunk in packed.chunks(OBJSTM_SIZE) {
-        let stm_num = next;
-        next += 1;
-        let mut header = Vec::new();
-        let mut body = Vec::new();
-        for (index, (num, o)) in chunk.iter().enumerate() {
-            let _ = write!(header, "{} {} ", num, body.len());
-            serialize(o, &mut body);
-            body.push(b'\n');
-            rows.insert(*num, Row::InStream(stm_num, index as u32));
+    let mut next = output_number(order.len())?;
+    let mut batch = ObjectStreamBatch::default();
+    for (num, reference) in packed {
+        let mut encoded = Vec::new();
+        serialize(&renumber(&*reread(&mut reader, reference, false)?, &map), &mut encoded);
+        if batch.count > 0 && batch.body.len().saturating_add(encoded.len()).saturating_add(1) > OBJSTM_BYTES {
+            batch.flush(&reader.document, &mut next, &mut rows, &mut out)?;
         }
-        let first = header.len();
-        header.extend_from_slice(&body);
-        let mut d = Dict::new();
-        d.set(b"Type".to_vec(), Object::name("ObjStm"));
-        d.set(b"N".to_vec(), Object::Int(chunk.len() as i64));
-        d.set(b"First".to_vec(), Object::Int(first as i64));
-        let stm = Object::Stream(Stream::flate(d, &header));
-        rows.insert(stm_num, Row::InFile(out.len() as u64, 0));
-        write_indirect(stm_num, 0, &prepared(&doc, u32::MAX, stm_num, 0, &stm), &mut out);
+        let _ = write!(batch.header, "{} {} ", num, batch.body.len());
+        batch.body.extend_from_slice(&encoded);
+        batch.body.push(b'\n');
+        drop(encoded);
+        rows.insert(num, Row::InStream(next, batch.count as u32));
+        batch.count += 1;
+        if batch.count == OBJSTM_SIZE || batch.body.len() >= OBJSTM_BYTES {
+            batch.flush(&reader.document, &mut next, &mut rows, &mut out)?;
+        }
     }
+    batch.flush(&reader.document, &mut next, &mut rows, &mut out)?;
     let mut trailer = Dict::new();
     for key in [&b"Root"[..], b"Info", b"Encrypt"] {
         if let Some(r) = trailer_in.reference(key).and_then(|r| map.get(&r)) {
@@ -313,11 +358,16 @@ pub fn write_full(doc: &Document, opts: &SaveOptions) -> Result<Vec<u8>, CosErro
     if let Some(id) = trailer_in.get(b"ID") {
         trailer.set(b"ID".to_vec(), id.clone());
     }
-    if doc.output_security().0.is_none() {
-        ensure_id(&mut trailer, opts, doc.bytes());
+    for (key, value) in trailer_in.iter() {
+        if !trailer_key_rewritten(key) {
+            trailer.set(key.clone(), renumber(value, &map));
+        }
+    }
+    if reader.document.output_security().0.is_none() {
+        ensure_id(&mut trailer, opts, reader.document.bytes());
     }
     if opts.object_streams {
-        write_xref_stream(&mut out, &mut trailer, rows, next);
+        write_xref_stream(&mut out, 0, &mut trailer, rows, next);
     } else {
         trailer.set(b"Size".to_vec(), Object::Int(next as i64));
         let offsets: BTreeMap<u32, (u64, u16, bool)> =
@@ -328,7 +378,65 @@ pub fn write_full(doc: &Document, opts: &SaveOptions) -> Result<Vec<u8>, CosErro
         write_dict(&trailer, &mut out);
         let _ = write!(out, "\nstartxref\n{xref_at}\n%%EOF\n");
     }
+    // The size isn't known until the end, and the buffer grew by doubling. The result is often
+    // kept as a document's working bytes for as long as it's open: drop the unused capacity.
+    out.shrink_to_fit();
     Ok(out)
+}
+
+/// Object `r` read again for writing. The traversal read it once and only kept its number, so
+/// a second read that fails, finds nothing or finds a different kind of object must fail the
+/// save rather than write `null` in its place.
+fn reread(reader: &mut ObjectReader, r: ObjRef, is_stream: bool) -> Result<std::sync::Arc<Object>, CosError> {
+    let o = reader.try_get(r)?;
+    if matches!(*o, Object::Null) || matches!(*o, Object::Stream(_)) != is_stream {
+        return Err(CosError::Syntax { offset: 0, detail: format!("object {} read differently while saving; nothing was written", r.num) });
+    }
+    Ok(o)
+}
+
+#[derive(Default)]
+struct ObjectStreamBatch {
+    header: Vec<u8>,
+    body: Vec<u8>,
+    count: usize,
+}
+
+impl ObjectStreamBatch {
+    fn flush(&mut self, doc: &Document, next: &mut u32, rows: &mut BTreeMap<u32, Row>, out: &mut Vec<u8>) -> Result<(), CosError> {
+        if self.count == 0 {
+            return Ok(());
+        }
+        let following = next.checked_add(1).ok_or_else(|| CosError::Syntax { offset: 0, detail: "too many objects to save".into() })?;
+        // Release capacity after each batch too: an unusually large object must not leave
+        // a large scratch buffer alive for the rest of the save.
+        let Self { mut header, body, count } = std::mem::take(self);
+        let first = header.len();
+        header.extend_from_slice(&body);
+        drop(body);
+        let mut d = Dict::new();
+        d.set(b"Type".to_vec(), Object::name("ObjStm"));
+        d.set(b"N".to_vec(), Object::Int(count as i64));
+        d.set(b"First".to_vec(), Object::Int(first as i64));
+        let stm = Object::Stream(Stream::flate(d, &header));
+        rows.insert(*next, Row::InFile(out.len() as u64, 0));
+        write_indirect(*next, 0, &prepared(doc, u32::MAX, *next, 0, &stm), out);
+        *next = following;
+        Ok(())
+    }
+}
+
+/// Trailer keys a full rewrite generates itself. Everything else is copied, with references
+/// renumbered, so a save does not drop metadata the reader accepted.
+fn trailer_key_rewritten(key: &[u8]) -> bool {
+    matches!(
+        key,
+        b"Size" | b"Prev" | b"XRefStm" | b"Type" | b"W" | b"Index" | b"Filter" | b"DecodeParms" | b"Length" | b"Root" | b"Info" | b"Encrypt" | b"ID"
+    )
+}
+
+fn output_number(index: usize) -> Result<u32, CosError> {
+    u32::try_from(index).ok().and_then(|n| n.checked_add(1)).ok_or_else(|| CosError::Syntax { offset: 0, detail: "too many objects to save".into() })
 }
 
 fn collect_refs(o: &Object, f: &mut impl FnMut(ObjRef)) {
@@ -358,6 +466,15 @@ fn write_xref_table(out: &mut Vec<u8>, offsets: &BTreeMap<u32, (u64, u16, bool)>
     if include_zero {
         all.insert(0, (0, (0, 65535, false)));
     }
+    // A section is one or more subsections. `xref` followed immediately by `trailer` is not a
+    // table (qpdf: "xref syntax invalid") and is what an incremental save of a classic-table
+    // file used to append when nothing was edited. A zero-length subsection names no objects,
+    // so the free list and every in-use entry stay as they were, while a trailer-only change
+    // (a missing `/ID`, or a caller edit of the trailer) is still written.
+    if all.is_empty() {
+        let _ = writeln!(out, "0 0");
+        return;
+    }
     let mut i = 0;
     while i < all.len() {
         let start = all[i].0;
@@ -374,9 +491,10 @@ fn write_xref_table(out: &mut Vec<u8>, offsets: &BTreeMap<u32, (u64, u16, bool)>
 }
 
 /// A cross-reference stream section (§7.5.8) that takes object number `num`, ending the file.
-/// Rows are Flate-compressed with the PNG Up predictor, and field widths fit the largest value.
-fn write_xref_stream(out: &mut Vec<u8>, trailer: &mut Dict, mut rows: BTreeMap<u32, Row>, num: u32) {
-    let xref_at = out.len() as u64;
+/// `out` holds the file from byte offset `base` on. Rows are Flate-compressed with the PNG Up
+/// predictor, and field widths fit the largest value.
+fn write_xref_stream(out: &mut Vec<u8>, base: u64, trailer: &mut Dict, mut rows: BTreeMap<u32, Row>, num: u32) {
+    let xref_at = base + out.len() as u64;
     rows.insert(num, Row::InFile(xref_at, 0));
     if trailer.get(b"Prev").is_none() {
         rows.entry(0).or_insert(Row::Free(65535));
@@ -390,27 +508,33 @@ fn write_xref_stream(out: &mut Vec<u8>, trailer: &mut Dict, mut rows: BTreeMap<u
     let (w2, w3) = rows.values().map(fields).fold((1, 1), |(a, b), (_, x, y)| (width(x).max(a), width(y).max(b)));
     let cols = 1 + w2 + w3;
     let mut index = Vec::new();
-    let nums: Vec<u32> = rows.keys().copied().collect();
-    let mut i = 0;
-    while i < nums.len() {
-        let mut j = i;
-        while j + 1 < nums.len() && nums[j + 1] == nums[j] + 1 {
-            j += 1;
+    let mut numbers = rows.keys().copied().peekable();
+    while let Some(start) = numbers.next() {
+        let mut last = start;
+        let mut count = 1i64;
+        while numbers.peek().copied().is_some_and(|next| last.checked_add(1) == Some(next)) {
+            if let Some(next) = numbers.next() {
+                last = next;
+                count += 1;
+            }
         }
-        index.push(Object::Int(nums[i] as i64));
-        index.push(Object::Int((j - i + 1) as i64));
-        i = j + 1;
+        index.push(Object::Int(i64::from(start)));
+        index.push(Object::Int(count));
     }
-    let mut data = Vec::with_capacity(rows.len() * (cols + 1));
-    let mut prev = vec![0u8; cols];
+    let mut data = Vec::with_capacity(rows.len().saturating_mul(cols + 1));
+    // Type is one byte, and each remaining field is at most one u64. Reuse the
+    // predictor row on the stack instead of allocating a Vec for every xref entry.
+    let mut prev = [0u8; 17];
     for r in rows.values() {
         let (t, a, b) = fields(r);
-        let mut row = vec![t as u8];
-        row.extend_from_slice(&a.to_be_bytes()[8 - w2..]);
-        row.extend_from_slice(&b.to_be_bytes()[8 - w3..]);
+        let a = a.to_be_bytes();
+        let b = b.to_be_bytes();
+        let fields = std::iter::once(t as u8).chain(a.into_iter().skip(8 - w2)).chain(b.into_iter().skip(8 - w3));
         data.push(2); // PNG "Up"
-        data.extend(row.iter().zip(&prev).map(|(c, p)| c.wrapping_sub(*p)));
-        prev = row;
+        for (value, previous) in fields.zip(&mut prev) {
+            data.push(value.wrapping_sub(*previous));
+            *previous = value;
+        }
     }
     let mut d = trailer.clone();
     d.set(b"Type".to_vec(), Object::name("XRef"));
@@ -463,20 +587,31 @@ fn ensure_id(trailer: &mut Dict, opts: &SaveOptions, content: &[u8]) {
 
 /// A PDF date string for "now" given seconds since the Unix epoch (UTC).
 pub fn pdf_date(unix_secs: i64) -> String {
-    let days = unix_secs.div_euclid(86_400);
-    let secs = unix_secs.rem_euclid(86_400);
-    // Civil-from-days (Howard Hinnant's algorithm).
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
+    let (days, secs) = (unix_secs.div_euclid(86_400), unix_secs.rem_euclid(86_400));
+    let (y, m, d) = civil_from_days(days);
+    // `{y:04}` rather than `%Y`, which writes a `+` before years past 9999 (and a PDF date is a
+    // bare four-plus-digit year, never signed). No year clamp — the old code wrote `y` as-is.
     format!("D:{y:04}{m:02}{d:02}{:02}{:02}{:02}Z", secs / 3600, secs / 60 % 60, secs % 60)
+}
+
+/// Days since 1970-01-01 → proleptic Gregorian (year, month, day).
+///
+/// A `from_timestamp` epoch fallback would change dates past `NaiveDate`'s ±262143-year range,
+/// which the old hand-rolled converter formatted directly. The Gregorian calendar repeats every
+/// 400 years (146_097 days), so chrono converts the day within one cycle and whole cycles go back
+/// into the year (an `i128` so the extremes can't overflow), keeping chrono as the only calendar
+/// logic and reproducing the old result exactly. 1970-01-01 is `num_days_from_ce` 719_163.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    use chrono::Datelike;
+    let (cycles, rest) = (days.div_euclid(146_097), days.rem_euclid(146_097));
+    // `rest + 719_163` is 719_163..865_259, always a valid CE day.
+    match i32::try_from(rest + 719_163).ok().and_then(chrono::NaiveDate::from_num_days_from_ce_opt) {
+        Some(d) => {
+            let y = i128::from(d.year()) + i128::from(cycles) * 400;
+            (i64::try_from(y).unwrap_or(if y < 0 { i64::MIN } else { i64::MAX }), d.month(), d.day())
+        }
+        None => (1970, 1, 1), // unreachable
+    }
 }
 
 #[cfg(test)]
@@ -493,6 +628,75 @@ mod tests {
     }
 
     #[test]
+    fn a_second_read_that_differs_fails_the_save_instead_of_writing_null() {
+        let mut doc = Document::new_empty();
+        let dict = doc.add(Object::Dict(Dict::new()));
+        let mut reader = doc.object_reader();
+        assert!(reread(&mut reader, dict, false).is_ok());
+        assert!(reread(&mut reader, dict, true).is_err(), "a dictionary where a stream was traversed");
+        assert!(reread(&mut reader, ObjRef::new(9999, 0), false).is_err(), "nothing where an object was traversed");
+    }
+
+    #[test]
+    fn xref_predictor_rows_preserve_variable_width_fields_and_sparse_runs() {
+        for offset in [0, 255, 256, 65535, 65536, u32::MAX as u64, u32::MAX as u64 + 1, u64::MAX] {
+            for index in [0, 255, 256, u32::MAX] {
+                for incremental in [false, true] {
+                    let mut trailer = Dict::new();
+                    if incremental {
+                        trailer.set(b"Prev".to_vec(), Object::Int(17));
+                    }
+                    let rows = BTreeMap::from([(1, Row::InFile(offset, 32768)), (2, Row::Free(65535)), (4, Row::InStream(65536, index))]);
+                    let mut bytes = Vec::new();
+                    write_xref_stream(&mut bytes, 0, &mut trailer, rows, 5);
+                    let (_, object) = crate::parser::parse_indirect(&bytes, 0, &|_| None).unwrap();
+                    let Object::Stream(stream) = object else { panic!("xref stream") };
+                    let widths: Vec<_> = stream.dict.get(b"W").unwrap().as_array().unwrap().iter().map(|o| o.as_int().unwrap() as usize).collect();
+                    assert_eq!(widths[0], 1);
+                    assert!((3..=8).contains(&widths[1]));
+                    assert!((2..=4).contains(&widths[2]));
+                    let runs: Vec<_> = stream.dict.get(b"Index").unwrap().as_array().unwrap().iter().map(|o| o.as_int().unwrap()).collect();
+                    assert_eq!(runs, if incremental { vec![1, 2, 4, 2] } else { vec![0, 3, 4, 2] });
+                    let mut expected = vec![(1, offset, 32768), (0, 0, 65535), (2, 65536, u64::from(index)), (1, 0, 0)];
+                    if !incremental {
+                        expected.insert(0, (0, 0, 65535));
+                    }
+                    let decoded = stream.decoded().unwrap();
+                    let columns: usize = widths.iter().sum();
+                    assert_eq!(decoded.len(), columns * expected.len());
+                    for (row, (kind, first, second)) in decoded.chunks_exact(columns).zip(expected) {
+                        let values: Vec<_> = [0..1, 1..1 + widths[1], 1 + widths[1]..columns]
+                            .into_iter()
+                            .map(|range| row[range].iter().fold(0u64, |value, byte| value * 256 + u64::from(*byte)))
+                            .collect();
+                        assert_eq!(values, vec![kind, first, second]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pdf_dates_are_utc_and_byte_identical() {
+        // `D:YYYYMMDDHHmmSSZ` (ISO 32000-2 §7.9.4), the same strings the hand-rolled code wrote.
+        assert_eq!(pdf_date(0), "D:19700101000000Z");
+        assert_eq!(pdf_date(1_790_000_000), "D:20260921141320Z");
+        // Leap days, including the 400-year rule, and the last second of a year.
+        assert_eq!(pdf_date(1_709_164_800), "D:20240229000000Z");
+        assert_eq!(pdf_date(951_782_400), "D:20000229000000Z");
+        assert_eq!(pdf_date(1_767_225_599), "D:20251231235959Z");
+        // Before the epoch (seconds into a day are counted forward from midnight UTC).
+        assert_eq!(pdf_date(-1), "D:19691231235959Z");
+        // Years past 9999 keep the plain zero-padded year (no `+`), as the hand-rolled code did.
+        assert_eq!(pdf_date(253_402_300_800), "D:100000101000000Z");
+        // Past chrono's ±262143-year range the proleptic Gregorian date is kept, not the epoch.
+        // Pinned to the old hand-rolled output (which had no year clamp — a negative year keeps
+        // its sign, exactly as before).
+        assert_eq!(pdf_date(10_000_000_000_000), "D:3188570520174640Z");
+        assert_eq!(pdf_date(-10_000_000_000_000), "D:-3149180813061320Z");
+    }
+
+    #[test]
     fn reals_keep_full_precision_without_exponents() {
         for r in [0.1, -0.000_000_123_456_789, 1e-12, 123_456.789_012_345, 1.0 / 3.0, -2.5e7 + 0.25] {
             let mut out = Vec::new();
@@ -502,14 +706,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn whole_reals_past_the_integer_limit_stay_reals() {
+        for (r, text) in [
+            (2_147_483_647.0, "2147483647"),
+            (-2_147_483_647.0, "-2147483647"),
+            (2_147_483_648.0, "2147483648."),
+            (4e9, "4000000000."),
+            (-4e9, "-4000000000."),
+            (1e30, "1000000000000000000000000000000."),
+            (595.0, "595"),
+            (-0.0, "0"),
+        ] {
+            let mut out = Vec::new();
+            serialize(&Object::Real(r), &mut out);
+            assert_eq!(String::from_utf8_lossy(&out), text, "{r}");
+            let back = roundtrip(&Object::Real(r));
+            if r.abs() > f64::from(i32::MAX) {
+                assert_eq!(back, Object::Real(r), "{r} must read back as a real");
+            }
+        }
+    }
+
     proptest! {
         #[test]
         fn any_finite_real_round_trips(r in proptest::num::f64::NORMAL | proptest::num::f64::SUBNORMAL | proptest::num::f64::ZERO) {
-            prop_assume!(r.abs() < 1e15 || r.fract() == 0.0);
             let back = roundtrip(&Object::Real(r));
             match back {
                 Object::Real(b) => prop_assert_eq!(b, r),
-                Object::Int(i) => prop_assert_eq!(i as f64, r),
+                Object::Int(i) => {
+                    prop_assert!(i.unsigned_abs() <= i32::MAX as u64, "{r} came back as integer {i}");
+                    prop_assert_eq!(i as f64, r);
+                }
                 other => prop_assert!(false, "unexpected {other:?}"),
             }
         }

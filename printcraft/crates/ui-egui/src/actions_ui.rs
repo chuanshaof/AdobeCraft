@@ -28,6 +28,36 @@ pub struct RunProgress {
     pub message: Option<String>,
 }
 
+/// Keep each desktop result, including when input basenames repeat or an earlier run already
+/// used the name. The search is bounded and never falls back to an occupied destination.
+#[cfg(not(target_arch = "wasm32"))]
+fn write_result(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {
+    use std::io::{Error, ErrorKind};
+    let source = std::path::Path::new(name);
+    let filename = source.file_name().ok_or_else(|| Error::from(ErrorKind::InvalidInput))?;
+    let stem = source.file_stem().unwrap_or(filename).to_string_lossy();
+    for number in 1..=10_000 {
+        let path = if number == 1 {
+            dir.join(filename)
+        } else {
+            let suffix = match source.extension() {
+                Some(ext) => format!("{stem} ({number}).{}", ext.to_string_lossy()),
+                None => format!("{stem} ({number})"),
+            };
+            dir.join(suffix)
+        };
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => continue,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                crate::editing::write_atomically(&path.to_string_lossy(), bytes)?;
+                return Ok(path);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(Error::from(ErrorKind::AlreadyExists))
+}
+
 impl PdfCraftApp {
     /// Built-in actions, then the user's.
     pub fn all_actions(&self) -> Vec<Action> {
@@ -75,7 +105,7 @@ impl PdfCraftApp {
                 }
                 let r = pdfcraft_engine::actions::run_on(&action, &name, Arc::new(bytes), |_, _| {}).and_then(|r| {
                     #[cfg(not(target_arch = "wasm32"))]
-                    crate::editing::write_atomically(&dir.join(&name).to_string_lossy(), &r.bytes).map_err(|e| e.to_string())?;
+                    write_result(&dir, &name, &r.bytes).map_err(|e| e.to_string())?;
                     #[cfg(target_arch = "wasm32")]
                     crate::editing::download(&name, &r.bytes)?;
                     Ok(())
@@ -277,10 +307,10 @@ fn edit_body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) -> bool {
     ui.add_space(8.0);
     egui::Grid::new("action-edit").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
         ui.label(tl!("Action name:"));
-        ui.add(egui::TextEdit::singleline(&mut a.name).desired_width(320.0).id_salt("action-name"));
+        ui.add(crate::widgets::line(&mut a.name).desired_width(320.0).id_salt("action-name"));
         ui.end_row();
         ui.label(tl!("Description:"));
-        ui.add(egui::TextEdit::singleline(&mut a.description).desired_width(320.0).id_salt("action-description"));
+        ui.add(crate::widgets::line(&mut a.description).desired_width(320.0).id_salt("action-description"));
         ui.end_row();
     });
     ui.add_space(6.0);
@@ -296,7 +326,7 @@ fn edit_body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) -> bool {
                 ui.horizontal(|ui| {
                     ui.label(format!("{}. {}", i + 1, tl!(s.label())));
                     if let Some(arg) = s.arg_mut() {
-                        ui.add(egui::TextEdit::singleline(arg).desired_width(220.0));
+                        ui.add(crate::widgets::line(arg).desired_width(220.0));
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if ui.button(tl!("Remove")).clicked() {

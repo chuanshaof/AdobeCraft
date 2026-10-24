@@ -11,8 +11,8 @@
 //! Helvetica's proportions by character class (no font program or metrics file is bundled).
 
 use pdfcraft_cos::{Dict, Object, PdfString, Stream};
+use pdfcraft_fonts::{first_undrawable, literal, win_ansi};
 pub use pdfcraft_fonts::{helvetica_width as text_width, wrap};
-use pdfcraft_fonts::{literal, win_ansi};
 
 use crate::{NOTE_SIZE, Rgb, n};
 
@@ -26,23 +26,77 @@ pub fn cloud_radius(w: f64) -> f64 {
     6.0 + 1.5 * w.max(0.0)
 }
 
-/// Draw a line ending (`/LE`) at `tip`, for a line arriving from `from`. Open and closed arrows only.
-fn line_end(c: &mut String, kind: &[u8], tip: (f64, f64), from: (f64, f64), w: f64) {
+/// One of the ten `/LE` names (ISO 32000-2 Table 217). Unknown names are not drawn.
+pub(crate) fn known_ending(kind: &[u8]) -> bool {
+    std::str::from_utf8(kind).ok().and_then(crate::LineEnding::parse).is_some()
+}
+
+/// Draw a line ending (`/LE`) at `tip`, for a line arriving from `from`.
+///
+/// Returns false for an unknown style or a non-finite direction, so the caller keeps the
+/// previous appearance instead of writing `NaN`. `None` and a zero-length direction draw nothing.
+fn line_end(c: &mut String, kind: &[u8], tip: (f64, f64), from: (f64, f64), w: f64) -> bool {
     if kind == b"None" {
-        return;
+        return true;
+    }
+    if !known_ending(kind) {
+        return false;
     }
     let (dx, dy) = (from.0 - tip.0, from.1 - tip.1);
-    let len = dx.hypot(dy);
-    if len == 0.0 {
-        return;
+    if !dx.is_finite() || !dy.is_finite() {
+        return false;
     }
-    let (ux, uy) = (dx / len, dy / len);
+    let len = dx.hypot(dy);
+    if !len.is_finite() {
+        return false;
+    }
+    if len == 0.0 {
+        return true;
+    }
     let s = arrow_size(w);
-    let (cos, sin) = (30f64.to_radians().cos(), 30f64.to_radians().sin());
-    let a = (tip.0 + s * (ux * cos - uy * sin), tip.1 + s * (ux * sin + uy * cos));
-    let b = (tip.0 + s * (ux * cos + uy * sin), tip.1 + s * (-ux * sin + uy * cos));
-    let op = if kind == b"ClosedArrow" { "h B" } else { "S" };
-    c.push_str(&format!("{} {} m {} {} l {} {} l {op}\n", n(a.0), n(a.1), n(tip.0), n(tip.1), n(b.0), n(b.1)));
+    if !s.is_finite() {
+        return false;
+    }
+    let (ix, iy) = (dx / len, dy / len);
+    match kind {
+        b"OpenArrow" | b"ClosedArrow" | b"ROpenArrow" | b"RClosedArrow" => {
+            // Open and closed arrows keep their original geometry. A reverse arrow uses the same
+            // head, pointing back along the line.
+            let (ux, uy) = if kind.starts_with(b"R") { (-ix, -iy) } else { (ix, iy) };
+            let (cos, sin) = (30f64.to_radians().cos(), 30f64.to_radians().sin());
+            let a = (tip.0 + s * (ux * cos - uy * sin), tip.1 + s * (ux * sin + uy * cos));
+            let b = (tip.0 + s * (ux * cos + uy * sin), tip.1 + s * (-ux * sin + uy * cos));
+            let op = if kind.ends_with(b"ClosedArrow") { "h B" } else { "S" };
+            c.push_str(&format!("{} {} m {} {} l {} {} l {op}\n", n(a.0), n(a.1), n(tip.0), n(tip.1), n(b.0), n(b.1)));
+        }
+        b"Square" | b"Circle" | b"Diamond" => {
+            let h = s / 2.0;
+            if kind == b"Square" {
+                c.push_str(&format!("{} {} {} {} re h B\n", n(tip.0 - h), n(tip.1 - h), n(s), n(s)));
+            } else if kind == b"Circle" {
+                c.push_str(&ellipse(tip.0 - h, tip.1 - h, tip.0 + h, tip.1 + h));
+                c.push_str("B\n");
+            } else {
+                let (px, py) = (-iy, ix);
+                let v = |along: f64, across: f64| (tip.0 + ix * along + px * across, tip.1 + iy * along + py * across);
+                let (a, b, d, e) = (v(h, 0.0), v(0.0, h), v(-h, 0.0), v(0.0, -h));
+                c.push_str(&format!("{} {} m {} {} l {} {} l {} {} l h B\n", n(a.0), n(a.1), n(b.0), n(b.1), n(d.0), n(d.1), n(e.0), n(e.1)));
+            }
+        }
+        _ => {
+            // Butt is perpendicular to the line. Slash is that stroke turned 45 degrees.
+            let (px, py) = (-iy, ix);
+            let (sx, sy) = if kind == b"Slash" {
+                let q = std::f64::consts::FRAC_1_SQRT_2;
+                (px * q - py * q, px * q + py * q)
+            } else {
+                (px, py)
+            };
+            let h = s / 2.0;
+            c.push_str(&format!("{} {} m {} {} l S\n", n(tip.0 - sx * h), n(tip.1 - sy * h), n(tip.0 + sx * h), n(tip.1 + sy * h)));
+        }
+    }
+    true
 }
 
 /// The cubic Bézier segments (first control point, second control point, end) of a smooth curve
@@ -50,7 +104,7 @@ fn line_end(c: &mut String, kind: &[u8], tip: (f64, f64), from: (f64, f64), w: f
 /// point parallel to the chord between its neighbours (an end uses itself as the missing
 /// neighbour). Ink is drawn so, as Acrobat draws it, rather than as straight segments. The curve
 /// stays within its points and these control points.
-pub(crate) fn smooth_segments(pts: &[(f64, f64)]) -> Vec<[(f64, f64); 3]> {
+pub fn smooth_segments(pts: &[(f64, f64)]) -> Vec<[(f64, f64); 3]> {
     let Some(&last) = pts.last() else { return Vec::new() };
     let at = |i: usize| pts.get(i).copied().unwrap_or(last);
     (0..pts.len().saturating_sub(1))
@@ -66,12 +120,18 @@ fn smooth_curve(pts: &[(f64, f64)]) -> String {
     smooth_segments(pts).iter().map(|[a, b, e]| format!("{} {} {} {} {} {} c\n", n(a.0), n(a.1), n(b.0), n(b.1), n(e.0), n(e.1))).collect()
 }
 
+/// Bumps one cloudy outline draws at most (plus one per edge); past it the bumps grow.
+pub(crate) const MAX_CLOUD_BUMPS: usize = 20_000;
+
 /// A closed cloudy outline through `pts` (§12.5.4 `/BE /S /C`): each edge becomes a row of
 /// half-circle bumps of about `r`, bulging outwards.
 pub fn cloud_path(pts: &[(f64, f64)], r: f64) -> String {
     let area: f64 = pts.iter().zip(pts.iter().cycle().skip(1)).map(|(a, b)| a.0 * b.1 - b.0 * a.1).sum();
     // Outward normal of an edge: to the right of travel for counter-clockwise outlines.
     let sign = if area >= 0.0 { 1.0 } else { -1.0 };
+    let perimeter: f64 = pts.iter().zip(pts.iter().cycle().skip(1)).map(|(a, b)| (b.0 - a.0).hypot(b.1 - a.1)).sum();
+    // Each edge rounds to at least one bump, so the total stays within the budget plus one per edge.
+    let r = r.max(perimeter / (2.0 * MAX_CLOUD_BUMPS as f64));
     let mut c = String::new();
     for (i, (a, b)) in pts.iter().zip(pts.iter().cycle().skip(1)).enumerate() {
         let (dx, dy) = (b.0 - a.0, b.1 - a.1);
@@ -116,7 +176,11 @@ fn color(d: &Dict, key: &[u8]) -> Option<Option<Rgb>> {
     })
 }
 
-fn border_width(d: &Dict) -> f64 {
+fn interior_color(d: &Dict, fallback: Option<Rgb>) -> Option<Rgb> {
+    color(d, b"IC").flatten().or(fallback)
+}
+
+pub(crate) fn border_width(d: &Dict) -> f64 {
     if let Some(w) = d.get(b"BS").and_then(|b| b.as_dict()).and_then(|b| b.get(b"W")).and_then(|w| w.as_f64()) {
         return w.max(0.0);
     }
@@ -200,7 +264,44 @@ fn form(bbox: [f64; 4], content: &[u8], resources: Dict) -> Stream {
     Stream::flate(d, content)
 }
 
+/// The page `/Rotate` an image signature's picture is turned back by (`/PCPictureRotate`, written
+/// when the signature is added to a turned page): 0, 90, 180 or 270.
+pub(crate) fn picture_turn(d: &Dict) -> i64 {
+    d.get(b"PCPictureRotate").and_then(Object::as_int).unwrap_or(0).rem_euclid(360) / 90 * 90
+}
+
+/// The page `/Rotate` a rubber stamp's label is turned back by (`/PCStampRotate`).
+fn stamp_turn(d: &Dict) -> i64 {
+    d.get(b"PCStampRotate").and_then(Object::as_int).unwrap_or(0).rem_euclid(360) / 90 * 90
+}
+
+/// The page `/Rotate` a text box's or Fill & Sign text's lines are turned back by
+/// (`/PCTextRotate`, written when it is added to a turned page).
+fn text_turn(d: &Dict) -> i64 {
+    d.get(b"PCTextRotate").and_then(Object::as_int).unwrap_or(0).rem_euclid(360) / 90 * 90
+}
+
+/// The first text [`build`] would draw in the standard fonts (Helvetica, WinAnsiEncoding) that
+/// they can't, which would come out as `?`: what it is (for the message) and the character. The
+/// text of a text box, callout or Fill & Sign text, a measurement's label, a dynamic stamp's
+/// "By …" line, and a redaction mark's overlay text (drawn when it is applied). `None` when all of
+/// it can be drawn.
+pub fn undrawable_text(d: &Dict) -> Option<(&'static str, char)> {
+    let text = |key: &[u8]| d.get(key).and_then(Object::as_string).map(PdfString::to_text);
+    let (what, text) = match d.name(b"Subtype")? {
+        b"FreeText" => ("the comment's text", text(b"Contents")?),
+        b"Line" | b"PolyLine" | b"Polygon" => ("the measurement label", text(b"PCMeasureValue")?),
+        b"Stamp" if matches!(d.get(b"PCStamp"), Some(Object::Bool(true))) => ("the stamp's \"By\" line", text(b"PCByLine")?),
+        // Drawn in Helvetica when the redaction is applied: refused when it is marked.
+        b"Redact" => ("the redaction's overlay text", text(b"OverlayText")?),
+        _ => return None,
+    };
+    Some((what, first_undrawable(&text)?))
+}
+
 /// Draw the normal appearance of an annotation, or `None` if this subtype/variant isn't supported.
+/// Text the standard fonts can't draw comes out as `?`: [`undrawable_text`] says which, and
+/// [`crate::set_appearance`] marks the annotation with it (`pdfcraft_fonts::UNDRAWN_MARK`).
 pub fn build(d: &Dict) -> Option<Stream> {
     // Imported measurement appearances may include leaders, captions and formatting that
     // this builder cannot reproduce. Preserve them rather than silently losing detail.
@@ -309,7 +410,7 @@ pub fn build(d: &Dict) -> Option<Stream> {
             }
         }
         b"Square" | b"Circle" => {
-            let fill = color(d, b"IC")?;
+            let fill = interior_color(d, None);
             if stroke.is_none() && fill.is_none() {
                 return Some(form(rect, c.as_bytes(), res));
             }
@@ -334,32 +435,45 @@ pub fn build(d: &Dict) -> Option<Stream> {
             });
         }
         b"Line" => {
-            let l = nums(d, b"L").filter(|l| l.len() == 4)?;
+            let l = nums(d, b"L").filter(|l| l.len() == 4 && l.iter().all(|x| x.is_finite()))?;
             let col = stroke?;
             let ends: Vec<Vec<u8>> = match d.get(b"LE") {
                 None => vec![b"None".to_vec(), b"None".to_vec()],
                 Some(o) => o.as_array()?.iter().map(|e| e.as_name().map(<[u8]>::to_vec)).collect::<Option<_>>()?,
             };
-            if ends.len() != 2 || ends.iter().any(|e| !matches!(e.as_slice(), b"None" | b"OpenArrow" | b"ClosedArrow")) {
+            if ends.len() != 2 || ends.iter().any(|e| !known_ending(e)) {
                 return None;
             }
-            let fill = color(d, b"IC")?.unwrap_or(col);
+            let fill = interior_color(d, Some(col)).unwrap_or(col);
             c.push_str(&format!("{}{}{} w 1 J 1 j\n{}", rg_stroke(col), rg(fill), n(w), dash(d)));
             c.push_str(&format!("{} {} m {} {} l S\n[] 0 d\n", n(l[0]), n(l[1]), n(l[2]), n(l[3])));
             for (end, (tip, from)) in ends.iter().zip([((l[0], l[1]), (l[2], l[3])), ((l[2], l[3]), (l[0], l[1]))]) {
-                line_end(&mut c, end, tip, from, w);
+                if !line_end(&mut c, end, tip, from, w) {
+                    return None;
+                }
             }
         }
         b"Polygon" | b"PolyLine" => {
-            let v = nums(d, b"Vertices").filter(|v| v.len() >= 4 && v.len() % 2 == 0)?;
+            let v = nums(d, b"Vertices").filter(|v| v.len() >= 4 && v.len() % 2 == 0 && v.iter().all(|x| x.is_finite()))?;
             let pts: Vec<(f64, f64)> = v.as_chunks::<2>().0.iter().map(|p| (p[0], p[1])).collect();
             let col = stroke;
             let closed = subtype == b"Polygon";
-            let fill = if closed { color(d, b"IC")? } else { None };
-            if subtype == b"PolyLine" && d.get(b"LE").is_some_and(|e| e.as_array().is_none_or(|a| a.iter().any(|x| x.as_name() != Some(b"None")))) {
-                // Line endings on connected lines aren't drawn yet.
-                return None;
-            }
+            let fill = if closed { interior_color(d, None) } else { None };
+            let ends = if subtype == b"PolyLine" {
+                match d.get(b"LE") {
+                    None => None,
+                    Some(o) => {
+                        let names: Vec<Vec<u8>> =
+                            o.as_array().filter(|a| a.len() == 2)?.iter().map(|e| e.as_name().map(<[u8]>::to_vec)).collect::<Option<_>>()?;
+                        if names.iter().any(|e| !known_ending(e)) {
+                            return None;
+                        }
+                        Some(names)
+                    }
+                }
+            } else {
+                None
+            };
             if let Some(f) = fill {
                 c.push_str(&rg(f));
             }
@@ -383,6 +497,17 @@ pub fn build(d: &Dict) -> Option<Stream> {
                 (false, true) => "S\n",
                 (false, false) => "n\n",
             });
+            if let Some(ends) = ends {
+                let col = col?;
+                let (Some(start), Some(end)) = (ends.first(), ends.get(1)) else { return None };
+                let (Some(&tip0), Some(&from0)) = (pts.first(), pts.get(1)) else { return None };
+                let (Some(&tip1), Some(&from1)) = (pts.last(), pts.get(pts.len().saturating_sub(2))) else { return None };
+                let fill = interior_color(d, Some(col)).unwrap_or(col);
+                c.push_str(&format!("[] 0 d\n{}", rg(fill)));
+                if !line_end(&mut c, start, tip0, from0, w) || !line_end(&mut c, end, tip1, from1, w) {
+                    return None;
+                }
+            }
         }
         b"Caret" => {
             // A filled caret: two curved flanks meeting at the top centre.
@@ -440,15 +565,18 @@ pub fn build(d: &Dict) -> Option<Stream> {
                         c.push_str("h\n");
                     }
                 }
-                c.push_str("f*\n");
+                c.push_str("f\n");
                 return Some(form(rect, c.as_bytes(), res));
             }
             // A custom stamp: its picture (an image, or a form mapped to /PCPictureSize) fills
-            // the rectangle.
+            // the rectangle. An image signature added to a turned page (`/PCPictureRotate`) gets
+            // the standard counter-rotation as its form `/Matrix`: viewers fit the turned
+            // bounding box to `/Rect` (ISO 32000-2 §12.5.5), so it reads upright as displayed.
             if let Some(pic) = d.get(b"PCPicture").and_then(Object::as_ref) {
                 let [x0, y0, x1, y1] = rect;
                 let (w, h) = (x1 - x0, y1 - y0);
-                let place = if matches!(d.get(b"PCPictureImage"), Some(Object::Bool(true))) {
+                let image = matches!(d.get(b"PCPictureImage"), Some(Object::Bool(true)));
+                let place = if image {
                     format!("{} 0 0 {} {} {} cm", n(w), n(h), n(x0), n(y0))
                 } else {
                     let size = nums(d, b"PCPictureSize").filter(|s| s.len() == 2 && s[0] > 0.0 && s[1] > 0.0)?;
@@ -458,12 +586,41 @@ pub fn build(d: &Dict) -> Option<Stream> {
                 let mut xo = Dict::new();
                 xo.set(b"Pic".to_vec(), Object::Ref(pic));
                 res.set(b"XObject".to_vec(), Object::Dict(xo));
-                return Some(form(rect, c.as_bytes(), res));
+                let mut stream = form(rect, c.as_bytes(), res);
+                let turn = picture_turn(d);
+                if image && turn != 0 {
+                    // The page's view matrix without its offset: display axes in user space.
+                    let m = pdfcraft_model::view_matrix_for(turn, [0.0; 4]);
+                    let matrix = [m[0], m[1], m[2], m[3], 0.0, 0.0];
+                    stream.dict.set(b"Matrix".to_vec(), Object::Array(matrix.iter().map(|x| Object::Real(*x)).collect()));
+                }
+                return Some(stream);
             }
             // Only PdfCraft's own Fill & Sign marks are drawn here.
             let name = d.name(b"Name")?;
             let col = stroke.unwrap_or([0.0; 3]);
-            let [x0, y0, x1, y1] = rect;
+            // A mark or stamp placed on a turned page is drawn upright in its displayed box, then
+            // mapped into `/Rect` the way the page maps display space into user space. Viewers
+            // fit that box to `/Rect`; the page rotation then shows it the right way up.
+            let turn = stamp_turn(d);
+            let draw = if turn == 0 {
+                rect
+            } else {
+                let (rw, rh) = (rect[2] - rect[0], rect[3] - rect[1]);
+                let (dw, dh) = if matches!(turn, 90 | 270) { (rh, rw) } else { (rw, rh) };
+                if dw < 1.0 || dh < 1.0 {
+                    return None;
+                }
+                [0.0, 0.0, dw, dh]
+            };
+            let turned = |mut stream: Stream| {
+                if turn != 0 {
+                    let m = pdfcraft_model::view_matrix_for(turn, rect);
+                    stream.dict.set(b"Matrix".to_vec(), Object::Array(m.iter().copied().map(Object::Real).collect()));
+                }
+                stream
+            };
+            let [x0, y0, x1, y1] = draw;
             let (w, h) = (x1 - x0, y1 - y0);
             let lw = w.min(h) * 0.12;
             match name {
@@ -513,8 +670,11 @@ pub fn build(d: &Dict) -> Option<Stream> {
                     }
                     let kind = crate::StampKind::from_name(other)?;
                     let by = d.get(b"PCByLine").and_then(|o| o.as_string()).map(PdfString::to_text);
-                    return Some(stamp(kind, rect, stroke.unwrap_or(kind.color()), by.as_deref(), opacity, res));
+                    return Some(turned(stamp(kind, draw, stroke.unwrap_or(kind.color()), by.as_deref(), opacity, res)));
                 }
+            }
+            if turn != 0 {
+                return Some(turned(form(draw, c.as_bytes(), res)));
             }
         }
         b"FreeText" => {
@@ -523,6 +683,19 @@ pub fn build(d: &Dict) -> Option<Stream> {
             let bw = if d.contains(b"BS") || d.contains(b"Border") { border_width(d) } else { 0.0 };
             // A callout: the leader line (arrowhead at its first point), and the text box inside
             // `/Rect` by `/RD`.
+            // Text added to a turned page is drawn upright in its displayed box, which the form
+            // `/Matrix` then maps into `/Rect` (as for stamps). Callouts keep user-space axes.
+            let turn = if d.contains(b"CL") { 0 } else { text_turn(d) };
+            let (rect, matrix) = if turn == 0 {
+                (rect, None)
+            } else {
+                let (rw, rh) = (rect[2] - rect[0], rect[3] - rect[1]);
+                let (dw, dh) = if matches!(turn, 90 | 270) { (rh, rw) } else { (rw, rh) };
+                if dw < 1.0 || dh < 1.0 {
+                    return None;
+                }
+                ([0.0, 0.0, dw, dh], Some(pdfcraft_model::view_matrix_for(turn, rect)))
+            };
             let full = rect;
             let mut rect = rect;
             if d.contains(b"CL") {
@@ -536,17 +709,22 @@ pub fn build(d: &Dict) -> Option<Stream> {
                     None => b"None".to_vec(),
                     Some(o) => o.as_name()?.to_vec(),
                 };
-                if !matches!(end.as_slice(), b"None" | b"OpenArrow" | b"ClosedArrow") {
+                if !known_ending(&end) {
                     return None;
                 }
                 let lw = bw.max(0.5);
                 let pts: Vec<(f64, f64)> = cl.as_chunks::<2>().0.iter().map(|p| (p[0], p[1])).collect();
+                if pts.len() < 2 || pts.iter().any(|p| !p.0.is_finite() || !p.1.is_finite()) {
+                    return None;
+                }
                 c.push_str(&format!("{}{}{} w 1 J 1 j\n", rg_stroke(text_color), rg(bg.unwrap_or([1.0; 3])), n(lw)));
                 for (i, p) in pts.iter().enumerate() {
                     c.push_str(&format!("{} {} {}\n", n(p.0), n(p.1), if i == 0 { "m" } else { "l" }));
                 }
                 c.push_str("S\n");
-                line_end(&mut c, &end, pts[0], pts[1], lw);
+                if !line_end(&mut c, &end, pts[0], pts[1], lw) {
+                    return None;
+                }
             }
             if let Some(bg) = bg {
                 c.push_str(&format!("{}{} {} {} {} re f\n", rg(bg), n(rect[0]), n(rect[1]), n(rect[2] - rect[0]), n(rect[3] - rect[1])));
@@ -603,7 +781,11 @@ pub fn build(d: &Dict) -> Option<Stream> {
             let mut fonts = Dict::new();
             fonts.set(b"Helv".to_vec(), Object::Dict(font));
             res.set(b"Font".to_vec(), Object::Dict(fonts));
-            return Some(form(full, &out, res));
+            let mut stream = form(full, &out, res);
+            if let Some(m) = matrix {
+                stream.dict.set(b"Matrix".to_vec(), Object::Array(m.iter().copied().map(Object::Real).collect()));
+            }
+            return Some(stream);
         }
         _ => return None,
     }
@@ -793,14 +975,107 @@ fn attach_icon(name: &str, col: Rgb) -> String {
     s
 }
 
+/// A closed circle path (four Bézier quarters) centred on (`x`, `y`).
+fn circle_path(x: f64, y: f64, r: f64) -> String {
+    let k = r * 0.5523;
+    let p = |v: f64| n(v);
+    format!(
+        "{} {} m {} {} {} {} {} {} c {} {} {} {} {} {} c {} {} {} {} {} {} c {} {} {} {} {} {} c h\n",
+        p(x + r),
+        p(y),
+        p(x + r),
+        p(y + k),
+        p(x + k),
+        p(y + r),
+        p(x),
+        p(y + r),
+        p(x - k),
+        p(y + r),
+        p(x - r),
+        p(y + k),
+        p(x - r),
+        p(y),
+        p(x - r),
+        p(y - k),
+        p(x - k),
+        p(y - r),
+        p(x),
+        p(y - r),
+        p(x + k),
+        p(y - r),
+        p(x + r),
+        p(y - k),
+        p(x + r),
+        p(y)
+    )
+}
+
+/// A note's icon in a 20 × 20 box: filled in `col`, outlined in dark grey. Each name of
+/// [`crate::NoteIcon`] has its own shape, so the icon a note names is the one it shows (ISO
+/// 32000-2 §12.5.6.4, Table 175); a name PdfCraft doesn't know draws as `Note`.
 fn note_icon(name: &str, col: Rgb) -> String {
     let mut s = format!("{}0.25 0.25 0.25 RG 0.8 w 1 j 1 J\n", rg(col));
-    if name == "Comment" {
-        s.push_str("3 18.5 m 17 18.5 l 18.5 18.5 18.5 17 18.5 17 c 18.5 8 l 18.5 6.5 17 6.5 17 6.5 c 9.5 6.5 l 5 2 l 5.5 6.5 l 3 6.5 l 1.5 6.5 1.5 8 1.5 8 c 1.5 17 l 1.5 18.5 3 18.5 3 18.5 c h B\n");
-        s.push_str("4.5 15 m 15.5 15 l 4.5 12.5 m 15.5 12.5 l 4.5 10 m 11.5 10 l S\n");
-    } else {
-        s.push_str("3 19 m 13 19 l 17 15 l 17 1 l 3 1 l h B\n13 19 m 13 15 l 17 15 l S\n");
-        s.push_str("5.5 12 m 14.5 12 l 5.5 9 m 14.5 9 l 5.5 6 m 11.5 6 l S\n");
+    match name {
+        "Comment" => {
+            s.push_str("3 18.5 m 17 18.5 l 18.5 18.5 18.5 17 18.5 17 c 18.5 8 l 18.5 6.5 17 6.5 17 6.5 c 9.5 6.5 l 5 2 l 5.5 6.5 l 3 6.5 l 1.5 6.5 1.5 8 1.5 8 c 1.5 17 l 1.5 18.5 3 18.5 3 18.5 c h B\n");
+            s.push_str("4.5 15 m 15.5 15 l 4.5 12.5 m 15.5 12.5 l 4.5 10 m 11.5 10 l S\n");
+        }
+        // A key lying flat: a round bow with a hole, a shaft and two bits.
+        "Key" => {
+            s.push_str(&circle_path(5.5, 10.0, 4.5));
+            s.push_str(&circle_path(5.0, 10.0, 1.5));
+            s.push_str(
+                "9.5 11.2 m 18.5 11.2 l 18.5 8.8 l 17 8.8 l 17 6 l 15 6 l 15 8.8 l 13.5 8.8 l 13.5 6.8 l 11.5 6.8 l 11.5 8.8 l 9.5 8.8 l h B*\n",
+            );
+        }
+        // A disc with a question mark.
+        "Help" => {
+            s.push_str(&circle_path(10.0, 10.0, 8.5));
+            s.push_str("B\n1.6 w 7 12.8 m 7 15.6 13 15.6 13 12.8 c 13 10.6 10 10.8 10 8.2 c S\n10 5 m 10 5.1 l S\n");
+        }
+        // An insertion caret.
+        "Insert" => s.push_str("1.5 3 m 10 18 l 18.5 3 l 14.5 3 l 10 11 l 5.5 3 l h B\n"),
+        // A caret over a bar: a new paragraph goes here.
+        "NewParagraph" => s.push_str("3.5 9 m 10 18.5 l 16.5 9 l h B\n3 2 14 4 re B\n"),
+        // A pilcrow: a filled bowl and two stems.
+        "Paragraph" => {
+            s.push_str("11 18.5 m 7 18.5 4 16.3 4 13.2 c 4 10.1 7 8 11 8 c h B\n");
+            s.push_str("11 18.5 m 16 18.5 l 16 1.5 l 14 1.5 l 14 16.5 l 13 16.5 l 13 1.5 l 11 1.5 l h B\n");
+        }
+        // A tick.
+        "Check" => s.push_str("1.5 10.5 m 4.5 13.5 l 8 9.5 l 16 18.5 l 18.5 15.5 l 8 3.5 l h B\n"),
+        // A ring.
+        "Circle" => {
+            s.push_str(&circle_path(10.0, 10.0, 8.5));
+            s.push_str(&circle_path(10.0, 10.0, 5.0));
+            s.push_str("B*\n");
+        }
+        // A thick X.
+        "Cross" => s.push_str("4 1.5 m 10 7.5 l 16 1.5 l 18.5 4 l 12.5 10 l 18.5 16 l 16 18.5 l 10 12.5 l 4 18.5 l 1.5 16 l 7.5 10 l 1.5 4 l h B\n"),
+        // A ring with sighting lines through it.
+        "CrossHairs" => {
+            s.push_str(&circle_path(10.0, 10.0, 7.0));
+            s.push_str(&circle_path(10.0, 10.0, 4.5));
+            s.push_str("B*\n1.2 w 10 0.5 m 10 19.5 l 0.5 10 m 19.5 10 l S\n");
+        }
+        // A five-pointed star.
+        "Star" => {
+            let points: Vec<String> = (0..10)
+                .map(|i| {
+                    let r = if i % 2 == 0 { 9.5 } else { 3.9 };
+                    let a = std::f64::consts::FRAC_PI_2 + f64::from(i) * std::f64::consts::PI / 5.0;
+                    format!("{} {}", n(10.0 + r * a.cos()), n(9.5 + r * a.sin()))
+                })
+                .collect();
+            s.push_str(&format!("{} m {} l h B\n", points[0], points[1..].join(" l ")));
+        }
+        // Block arrows.
+        "RightArrow" => s.push_str("1.5 7 m 11 7 l 11 2.5 l 18.5 10 l 11 17.5 l 11 13 l 1.5 13 l h B\n"),
+        "UpArrow" => s.push_str("7 1.5 m 7 11 l 2.5 11 l 10 18.5 l 17.5 11 l 13 11 l 13 1.5 l h B\n"),
+        _ => {
+            s.push_str("3 19 m 13 19 l 17 15 l 17 1 l 3 1 l h B\n13 19 m 13 15 l 17 15 l S\n");
+            s.push_str("5.5 12 m 14.5 12 l 5.5 9 m 14.5 9 l 5.5 6 m 11.5 6 l S\n");
+        }
     }
     s
 }

@@ -1,14 +1,17 @@
 //! Prepare a form: create, change and delete fields (execution plan M6.6).
 //!
 //! New fields follow Acrobat's conventions: names "Text1", "Check Box1", "Group1" (radio groups),
-//! "Dropdown1", "List Box1", "Button1", "Signature1", "Date1"; 12 pt Helvetica (auto-size for
-//! check boxes), a thin grey border and a white background, and appearance streams generated
+//! "Dropdown1", "List Box1", "Button1", "Signature1", "Date1"; Helvetica at Acrobat's Auto size
+//! for text and date fields (12 pt in a box that has room, smaller in a short one), 12 pt in
+//! choice fields, a thin grey border and a white background, and appearance streams generated
 //! immediately so every viewer shows the empty field.
 
 use pdfcraft_cos::{Dict, Document, ObjRef, Object, PdfString, Stream};
-use pdfcraft_fonts::{helvetica_width, literal, win_ansi};
 
 use crate::{Field, FieldKind, FormError, Widget, appearance, fields, flags, page_refs};
+
+/// The smallest width and height of a field's widget, in points: a smaller one is refused.
+pub const MIN_FIELD_SIDE: f64 = 4.0;
 
 /// The kind of field to add.
 #[derive(Clone, Debug, PartialEq)]
@@ -62,6 +65,9 @@ impl NewField {
 pub struct FieldProps {
     pub name: Option<String>,
     pub tooltip: Option<String>,
+    /// Normal push-button label (`/MK /CA`) of one widget (0-based index).
+    /// An empty string clears the label; other widgets and icon layouts are preserved.
+    pub caption: Option<(usize, String)>,
     pub read_only: Option<bool>,
     pub required: Option<bool>,
     pub multiline: Option<bool>,
@@ -75,6 +81,9 @@ pub struct FieldProps {
     pub rect: Option<(usize, [f64; 4])>,
     /// Appearance tab (border, fill, line, text colour, font).
     pub look: Option<Look>,
+    /// Change only these appearance properties. Unlike `look`, this preserves each widget's
+    /// other colours, border settings and default appearance, including custom font resources.
+    pub appearance: Option<LookPatch>,
     /// Format, Validate and Calculate tabs (written as Acrobat's AF scripts).
     pub format: Option<crate::af::Format>,
     pub validate: Option<crate::af::Validate>,
@@ -91,6 +100,10 @@ pub struct FieldProps {
     pub actions: Option<Vec<(crate::Trigger, crate::FieldAction)>>,
     /// Options tab: the mark of a check box or radio button (every widget).
     pub check_style: Option<CheckStyle>,
+    /// Position tab: rotate one widget (`/MK /R`) to 0, 90, 180 or 270 degrees counterclockwise.
+    /// Changing between horizontal and vertical swaps that widget's width and height around its
+    /// center, unless [`Self::rect`] is also set.
+    pub rotation: Option<(usize, i64)>,
 }
 
 fn invalid<T>(m: impl Into<String>) -> Result<T, FormError> {
@@ -155,6 +168,129 @@ pub struct Look {
     pub style: BorderStyle,
     pub text: [f64; 3],
     pub font: FieldFont,
+}
+
+/// A partial Appearance-tab edit. Outer `None` keeps a property; `Some(None)` removes a
+/// border or fill colour. The patch is applied to each widget's own dictionaries.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LookPatch {
+    pub border: Option<Option<[f64; 3]>>,
+    pub fill: Option<Option<[f64; 3]>>,
+    pub width: Option<f64>,
+    pub style: Option<BorderStyle>,
+    pub text: Option<[f64; 3]>,
+    pub font: Option<FieldFont>,
+}
+
+impl LookPatch {
+    fn validate(&self) -> Result<(), FormError> {
+        for c in self.border.flatten().into_iter().chain(self.fill.flatten()).chain(self.text) {
+            if !c.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)) {
+                return invalid("appearance colours must be finite RGB values between 0 and 1");
+            }
+        }
+        if self.width.is_some_and(|v| !v.is_finite() || !(0.0..=12.0).contains(&v)) {
+            return invalid("border width must be between 0 and 12 points");
+        }
+        Ok(())
+    }
+}
+
+/// Rewrite only the selected operators in place: the last `Tf` (font and size) and the last
+/// fill colour (`g`, `rg` or `k`), appending one when the string has none. Everything else (a
+/// custom font resource, colour space or other graphics state) is kept, and repeated edits don't
+/// grow the string.
+fn patch_da(da: &str, size: Option<f64>, patch: &LookPatch) -> String {
+    if patch.font.is_none() && size.is_none() && patch.text.is_none() {
+        return da.to_string();
+    }
+    let mut toks: Vec<String> = da.split_whitespace().map(str::to_string).collect();
+    let numeric = |s: &str| s.parse::<f64>().is_ok();
+    if patch.font.is_some() || size.is_some() {
+        let old = appearance::parse_da(da);
+        let font = patch.font.map_or_else(|| old.font.clone(), |f| f.resource().to_string());
+        // `parse_da` reads sizes up to 300 points; keep the same bound when writing.
+        let size = appearance::fmt(size.unwrap_or(old.size).clamp(0.0, 300.0));
+        let at = toks.iter().enumerate().rev().find(|(i, t)| t.as_str() == "Tf" && *i >= 2).map(|(i, _)| i);
+        match at {
+            Some(i) => {
+                if let Some(slot) = toks.get_mut(i - 2) {
+                    *slot = format!("/{font}");
+                }
+                if let Some(slot) = toks.get_mut(i - 1) {
+                    *slot = size;
+                }
+            }
+            None => toks.extend([format!("/{font}"), size, "Tf".into()]),
+        }
+    }
+    if let Some(c) = patch.text {
+        let rgb = [appearance::fmt(c[0]), appearance::fmt(c[1]), appearance::fmt(c[2]), "rg".into()];
+        let at = toks.iter().enumerate().rev().find_map(|(i, t)| {
+            let n = match t.as_str() {
+                "g" => 1,
+                "rg" => 3,
+                "k" => 4,
+                _ => return None,
+            };
+            let start = i.checked_sub(n)?;
+            toks.get(start..i).is_some_and(|ops| ops.iter().all(|o| numeric(o))).then_some((start, i))
+        });
+        match at {
+            Some((start, end)) => {
+                toks.splice(start..=end, rgb);
+            }
+            None => toks.extend(rgb),
+        }
+    }
+    toks.join(" ")
+}
+
+fn patch_widget_look(doc: &mut Document, w: &Widget, patch: &LookPatch) -> Result<(), FormError> {
+    let touches_mk = patch.border.is_some() || patch.fill.is_some();
+    let touches_bs = patch.width.is_some() || patch.style.is_some();
+    // A size- or font-only edit changes /DA, not the widget: leave it out of the save.
+    if !touches_mk && !touches_bs {
+        return Ok(());
+    }
+    let wd = doc.get(w.obj).as_dict().cloned().ok_or_else(|| FormError::Invalid("the widget is not a dictionary".into()))?;
+    if touches_mk {
+        let indirect = wd.get(b"MK").and_then(Object::as_ref);
+        let mut mk = wd.get(b"MK").map(|m| doc.resolve(m)).and_then(|m| m.as_dict().cloned()).unwrap_or_default();
+        for (key, change) in [(b"BC".as_slice(), patch.border), (b"BG".as_slice(), patch.fill)] {
+            if let Some(change) = change {
+                match change {
+                    Some(c) => mk.set(key.to_vec(), rgb(c)),
+                    None => {
+                        mk.remove(key);
+                    }
+                }
+            }
+        }
+        // A shared indirect /MK is updated where it lives, not copied into each widget.
+        match indirect {
+            Some(r) => doc.set(r, Object::Dict(mk)),
+            None => doc.update_dict(w.obj, |d| d.set(b"MK".to_vec(), Object::Dict(mk)))?,
+        }
+    }
+    if touches_bs {
+        let indirect = wd.get(b"BS").and_then(Object::as_ref);
+        let mut bs = wd.get(b"BS").map(|b| doc.resolve(b)).and_then(|b| b.as_dict().cloned()).unwrap_or_default();
+        if let Some(width) = patch.width {
+            bs.set(b"W".to_vec(), Object::Real(width));
+        }
+        if let Some(style) = patch.style {
+            bs.set(b"S".to_vec(), Object::name(style.code()));
+            if style == BorderStyle::Dashed && !bs.contains(b"D") {
+                bs.set(b"D".to_vec(), Object::Array(vec![Object::Int(3)]));
+            }
+        }
+        match indirect {
+            Some(r) => doc.set(r, Object::Dict(bs)),
+            None => doc.update_dict(w.obj, |d| d.set(b"BS".to_vec(), Object::Dict(bs)))?,
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -381,7 +517,7 @@ pub fn add_field(doc: &mut Document, page: usize, rect: [f64; 4], kind: &NewFiel
     let pages = page_refs(doc);
     let page_ref = *pages.get(page).ok_or_else(|| FormError::Invalid(format!("page {} does not exist", page + 1)))?;
     let rect = [rect[0].min(rect[2]), rect[1].min(rect[3]), rect[0].max(rect[2]), rect[1].max(rect[3])];
-    if !rect.iter().all(|v| v.is_finite()) || rect[2] - rect[0] < 4.0 || rect[3] - rect[1] < 4.0 {
+    if !rect.iter().all(|v| v.is_finite()) || rect[2] - rect[0] < MIN_FIELD_SIDE || rect[3] - rect[1] < MIN_FIELD_SIDE {
         return invalid("the field is too small");
     }
     let existing = fields(doc);
@@ -415,14 +551,15 @@ pub fn add_field(doc: &mut Document, page: usize, rect: [f64; 4], kind: &NewFiel
     match kind {
         NewField::Text { multiline } => {
             w.set(b"FT".to_vec(), Object::name("Tx"));
-            w.set(b"DA".to_vec(), PdfString::literal(b"/Helv 12 Tf 0 g".to_vec()));
+            // Auto size (0): a fixed 12 pt is clipped in a box shorter than that (#1888).
+            w.set(b"DA".to_vec(), PdfString::literal(b"/Helv 0 Tf 0 g".to_vec()));
             if *multiline {
                 w.set(b"Ff".to_vec(), Object::Int(flags::MULTILINE as i64));
             }
         }
         NewField::Date => {
             w.set(b"FT".to_vec(), Object::name("Tx"));
-            w.set(b"DA".to_vec(), PdfString::literal(b"/Helv 12 Tf 0 g".to_vec()));
+            w.set(b"DA".to_vec(), PdfString::literal(b"/Helv 0 Tf 0 g".to_vec()));
             // Acrobat's format and keystroke actions for mm/dd/yyyy (run by its JavaScript engine).
             let js = |s: &str| {
                 let mut a = Dict::new();
@@ -524,6 +661,10 @@ pub fn add_field(doc: &mut Document, page: usize, rect: [f64; 4], kind: &NewFiel
                 tab: usize::MAX,
                 locked: false,
                 hidden: false,
+                read_only: false,
+                rotation: 0,
+                caption: None,
+                list: None,
             };
             let ap = appearance::check_box_states(doc, &w, FieldKind::Radio, export);
             doc.update_dict(widget, |d| d.set(b"AP".to_vec(), Object::Dict(ap)))?;
@@ -538,13 +679,29 @@ pub fn add_field(doc: &mut Document, page: usize, rect: [f64; 4], kind: &NewFiel
     Ok(field_name)
 }
 
-/// Regenerate every widget appearance of a field from its current value and settings.
+/// Regenerate every widget appearance of a field from its current value and settings. A value or
+/// button caption its font can't hold is drawn with `?` for those characters, the widget is marked
+/// (`pdfcraft_fonts::UNDRAWN_MARK`) and other viewers are asked to redraw the form (see
+/// `ask_viewers_to_redraw`), as when a value is set.
 pub fn redraw_field(doc: &mut Document, name: &str) -> Result<(), FormError> {
+    redraw_widgets(doc, name, None)
+}
+
+/// `redraw_field` for the widget at index `only` alone (so a caption-only edit leaves the field's
+/// other widgets' appearances as they are), or for every widget when `only` is `None`. Fails with
+/// `FormError::NoSuchField` when no field is named `name`.
+fn redraw_widgets(doc: &mut Document, name: &str, only: Option<usize>) -> Result<(), FormError> {
     let f = fields(doc).into_iter().find(|f| f.name == name).ok_or_else(|| FormError::NoSuchField(name.into()))?;
-    for w in &f.widgets {
+    let mut undrawn = false;
+    for (index, w) in f.widgets.iter().enumerate() {
+        if only.is_some_and(|only| only != index) {
+            continue;
+        }
+        let mut missing = None;
         let ap = match f.kind {
             FieldKind::Text | FieldKind::Combo | FieldKind::List => {
-                let s = appearance::field_appearance(doc, &f, w, &f.value);
+                let (s, m) = appearance::field_appearance_drawn(doc, &f, w, &f.value, true);
+                missing = m;
                 let r = doc.add(Object::Stream(s));
                 let mut d = Dict::new();
                 d.set(b"N".to_vec(), Object::Ref(r));
@@ -555,7 +712,8 @@ pub fn redraw_field(doc: &mut Document, name: &str) -> Result<(), FormError> {
                 appearance::check_box_states(doc, w, f.kind, &on)
             }
             FieldKind::PushButton => {
-                let s = button_appearance(doc, w);
+                let (s, m) = button_appearance(doc, w, &f.da);
+                missing = m;
                 let r = doc.add(Object::Stream(s));
                 let mut d = Dict::new();
                 d.set(b"N".to_vec(), Object::Ref(r));
@@ -569,15 +727,25 @@ pub fn redraw_field(doc: &mut Document, name: &str) -> Result<(), FormError> {
                 d
             }
         };
-        doc.update_dict(w.obj, |d| d.set(b"AP".to_vec(), Object::Dict(ap)))?;
+        undrawn |= missing.is_some();
+        let existing = crate::merged_appearance(doc, w.obj, &ap);
+        doc.update_dict(w.obj, |d| {
+            d.set(b"AP".to_vec(), Object::Dict(existing));
+            pdfcraft_fonts::set_undrawn_mark(d, missing);
+        })?;
+    }
+    if undrawn {
+        crate::ask_viewers_to_redraw(doc)?;
     }
     Ok(())
 }
 
-fn frame_only(doc: &Document, w: &Widget) -> (String, f64, f64) {
-    let (width, height) = ((w.rect[2] - w.rect[0]).max(1.0), (w.rect[3] - w.rect[1]).max(1.0));
+fn frame_only(doc: &Document, w: &Widget) -> (String, crate::appearance::Placement) {
+    let (page_w, page_h) = ((w.rect[2] - w.rect[0]).max(1.0), (w.rect[3] - w.rect[1]).max(1.0));
     let wobj = doc.get(w.obj);
     let wd = wobj.as_dict().cloned().unwrap_or_default();
+    let place = crate::appearance::placement(crate::appearance::mk_rotation(doc, &wd), page_w, page_h);
+    let (width, height) = (place.layout_w, place.layout_h);
     let mk = wd.get(b"MK").and_then(|m| m.as_dict()).cloned().unwrap_or_default();
     let col = |k: &[u8]| -> Option<String> {
         let v: Vec<f64> = mk.get(k)?.as_array()?.iter().filter_map(|x| x.as_f64()).collect();
@@ -590,26 +758,30 @@ fn frame_only(doc: &Document, w: &Widget) -> (String, f64, f64) {
     if let Some(bc) = col(b"BC") {
         c.push_str(&format!("{bc} RG 1 w 0.5 0.5 {:.3} {:.3} re S\n", width - 1.0, height - 1.0));
     }
-    (c, width, height)
+    (c, place)
 }
 
-fn form_stream(width: f64, height: f64, content: Vec<u8>, resources: Dict) -> Stream {
+fn form_stream(place: crate::appearance::Placement, content: Vec<u8>, resources: Dict) -> Stream {
     let mut d = Dict::new();
     d.set(b"Type".to_vec(), Object::name("XObject"));
     d.set(b"Subtype".to_vec(), Object::name("Form"));
-    d.set(b"BBox".to_vec(), Object::Array([0.0, 0.0, width, height].iter().map(|v| Object::Real(*v)).collect()));
+    crate::appearance::set_form_box(&mut d, place);
     d.set(b"Resources".to_vec(), Object::Dict(resources));
     Stream::flate(d, &content)
 }
 
 /// A push button: background, border, its icon (`/MK /I`, scaled to fit and centred) and its
-/// centred caption (unless the layout is icon only, `/TP 1`).
-fn button_appearance(doc: &Document, w: &Widget) -> Stream {
-    let (mut c, width, height) = frame_only(doc, w);
+/// centred caption (unless the layout is icon only, `/TP 1`). The caption uses the font, size and
+/// color its `/DA` asks for (the widget's, else `field_da`, the field's own or inherited one).
+/// Also returns the first caption character the font can't draw (drawn as `?`), for the caller to
+/// mark and report.
+fn button_appearance(doc: &Document, w: &Widget, field_da: &str) -> (Stream, Option<char>) {
+    let (mut c, place) = frame_only(doc, w);
+    let (width, height) = (place.layout_w, place.layout_h);
     let wobj = doc.get(w.obj);
     let mk = wobj.as_dict().and_then(|d| d.get(b"MK")).map(|m| doc.resolve(m)).and_then(|m| m.as_dict().cloned()).unwrap_or_default();
-    let caption = mk.get(b"CA").and_then(|c| c.as_string()).map(|s| s.to_text()).unwrap_or_default();
-    let icon_only = mk.int(b"TP") == Some(1);
+    let caption = mk.get(b"CA").map(|c| doc.resolve(c)).and_then(|c| c.as_string().map(|s| s.to_text())).unwrap_or_default();
+    let icon_only = mk.get(b"TP").and_then(|t| doc.resolve(t).as_int()) == Some(1);
     let mut content = std::mem::take(&mut c).into_bytes();
     let mut xobjects = Dict::new();
     if let Some(icon) = mk.get(b"I").and_then(Object::as_ref)
@@ -627,26 +799,22 @@ fn button_appearance(doc: &Document, w: &Widget) -> Stream {
             xobjects.set(b"Icon".to_vec(), Object::Ref(icon));
         }
     }
-    if !icon_only && !caption.is_empty() {
-        let size = ((height - 4.0) * 0.6).clamp(4.0, 14.0);
-        let tw = helvetica_width(&caption, size);
-        content.extend(format!("BT /Helv {size:.2} Tf 0 g 1 0 0 1 {:.3} {:.3} Tm ", (width - tw) / 2.0, (height - size * 0.7) / 2.0).bytes());
-        content.extend(literal(&win_ansi(&caption)));
-        content.extend_from_slice(b" Tj ET\n");
-    }
-    let mut font = Dict::new();
-    font.set(b"Type".to_vec(), Object::name("Font"));
-    font.set(b"Subtype".to_vec(), Object::name("Type1"));
-    font.set(b"BaseFont".to_vec(), Object::name("Helvetica"));
-    font.set(b"Encoding".to_vec(), Object::name("WinAnsiEncoding"));
+    let mut missing = None;
     let mut fonts = Dict::new();
-    fonts.set(b"Helv".to_vec(), Object::Dict(font));
+    if !icon_only && !caption.is_empty() {
+        let da = wobj.as_dict().and_then(|d| d.get(b"DA")).and_then(|o| doc.resolve(o).as_string().map(|s| s.to_text()));
+        let auto = ((height - 4.0) * 0.6).clamp(4.0, 14.0);
+        let (ops, name, font, m) = appearance::button_caption(doc, da.as_deref().unwrap_or(field_da), &caption, width, height, auto);
+        content.extend(ops);
+        fonts.set(name.into_bytes(), font);
+        missing = m;
+    }
     let mut res = Dict::new();
     res.set(b"Font".to_vec(), Object::Dict(fonts));
     if !xobjects.is_empty() {
         res.set(b"XObject".to_vec(), Object::Dict(xobjects));
     }
-    form_stream(width, height, content, res)
+    (form_stream(place, content, res), missing)
 }
 
 /// Give a push button (an image field) the picture `image` (an image XObject of `px` pixels):
@@ -662,7 +830,8 @@ pub fn set_button_icon(doc: &mut Document, name: &str, image: ObjRef, px: (u32, 
     xo.set(b"Im0".to_vec(), Object::Ref(image));
     let mut res = Dict::new();
     res.set(b"XObject".to_vec(), Object::Dict(xo));
-    let icon = doc.add(Object::Stream(form_stream(w, h, format!("q {w} 0 0 {h} 0 0 cm /Im0 Do Q").into_bytes(), res)));
+    let icon =
+        doc.add(Object::Stream(form_stream(crate::appearance::placement(0, w, h), format!("q {w} 0 0 {h} 0 0 cm /Im0 Do Q").into_bytes(), res)));
     for wd in &f.widgets {
         let mut mk =
             doc.get(wd.obj).as_dict().and_then(|d| d.get(b"MK").map(|m| doc.resolve(m))).and_then(|m| m.as_dict().cloned()).unwrap_or_default();
@@ -676,14 +845,61 @@ pub fn set_button_icon(doc: &mut Document, name: &str, image: ObjRef, px: (u32, 
 }
 
 fn empty_box(doc: &Document, w: &Widget) -> Stream {
-    let (c, width, height) = frame_only(doc, w);
-    form_stream(width, height, c.into_bytes(), Dict::new())
+    let (c, place) = frame_only(doc, w);
+    form_stream(place, c.into_bytes(), Dict::new())
+}
+
+/// Swap width and height, keeping the center. `None` when that is not a usable widget.
+fn swapped_around_center(r: [f64; 4]) -> Option<[f64; 4]> {
+    if !r.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let (x0, y0, x1, y1) = (r[0].min(r[2]), r[1].min(r[3]), r[0].max(r[2]), r[1].max(r[3]));
+    let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+    let (nw, nh) = (y1 - y0, x1 - x0);
+    let out = [cx - nw / 2.0, cy - nh / 2.0, cx + nw / 2.0, cy + nh / 2.0];
+    (out.iter().all(|v| v.is_finite()) && out[2] - out[0] >= MIN_FIELD_SIDE && out[3] - out[1] >= MIN_FIELD_SIDE).then_some(out)
 }
 
 /// Change a field's properties (General and Options tabs) and redraw it.
 pub fn set_props(doc: &mut Document, name: &str, props: &FieldProps) -> Result<String, FormError> {
+    if props.font_size.is_some_and(|size| !size.is_finite() || size < 0.0) {
+        return invalid("font size must be a finite, non-negative number");
+    }
+    if let Some(patch) = &props.appearance {
+        if props.look.is_some() {
+            return invalid("give an appearance patch or a complete look, not both");
+        }
+        patch.validate()?;
+    }
     let all = fields(doc);
     let f = all.iter().find(|f| f.name == name).ok_or_else(|| FormError::NoSuchField(name.into()))?.clone();
+    // Refuse a wrong type/index before any other requested property is written.
+    if let Some((wi, _)) = &props.caption {
+        if f.kind != FieldKind::PushButton {
+            return invalid("only push buttons have a caption");
+        }
+        if f.widgets.get(*wi).is_none() {
+            return invalid(format!("{name} has no widget {}", wi.saturating_add(1)));
+        }
+    }
+    // Validated before anything is written, so a refused rotation leaves the document unchanged.
+    // `Some(Some(rect))`: the widget's axis changes and it gets the swapped rectangle.
+    let mut rotated_rect: Option<Option<[f64; 4]>> = None;
+    if let Some((wi, rot)) = props.rotation {
+        if !matches!(rot, 0 | 90 | 180 | 270) {
+            return invalid("rotation must be 0, 90, 180 or 270 degrees");
+        }
+        let Some(w) = f.widgets.get(wi) else {
+            return invalid(format!("{name} has no widget {}", wi.saturating_add(1)));
+        };
+        let axis_change = (w.rotation % 180 == 0) != (rot % 180 == 0);
+        rotated_rect = Some(None);
+        if axis_change && props.rect.is_none() {
+            let Some(rect) = swapped_around_center(w.rect) else { return invalid("the field is too small") };
+            rotated_rect = Some(Some(rect));
+        }
+    }
     // A locked field only takes unlocking (Acrobat greys its properties out).
     if f.locked() && props.locked != Some(false) && *props != (FieldProps { locked: props.locked, ..FieldProps::default() }) {
         return invalid(format!("{name} is locked: unlock it first"));
@@ -706,22 +922,27 @@ pub fn set_props(doc: &mut Document, name: &str, props: &FieldProps) -> Result<S
         if n.is_empty() || n.contains('.') {
             return invalid("field names can't be empty or contain a period");
         }
-        if all.iter().any(|x| x.name == n) {
-            return invalid(format!("a field named {n:?} already exists"));
-        }
-        // Rename the terminal part (the field's own /T).
+        // Rename the terminal part (the field's own /T). The parents' part stays, so the name that
+        // must be free is the full one: `MASTER.a` renamed to `b` takes `MASTER.b` (ISO 32000-2
+        // §12.7.4.2). The field itself is no clash when it keeps its own name.
         let prefix = f.name.rsplit_once('.').map(|(p, _)| format!("{p}.")).unwrap_or_default();
         new_name = format!("{prefix}{n}");
+        if all.iter().any(|x| x.obj != f.obj && x.name == new_name) {
+            return invalid(format!("a field named {new_name:?} already exists"));
+        }
         doc.update_dict(f.obj, |d| d.set(b"T".to_vec(), PdfString::text(n)))?;
+        // Calculations read the field by its new name, unless another field keeps the old one.
+        if all.iter().filter(|x| x.name == f.name).count() == 1 {
+            rename_in_calculations(doc, &all, &f.name, &new_name)?;
+        }
     }
     // The new default appearance when the size or the look changes.
-    let current = look(doc, &f);
     let size = props.font_size.unwrap_or_else(|| crate::appearance::parse_da(&f.da).size);
     let new_da = match &props.look {
         Some(l) => da_string(l.font, size, l.text),
-        None => da_string(current.font, size, current.text),
+        None => patch_da(&f.da, props.font_size, &props.appearance.unwrap_or_default()),
     };
-    if props.look.is_some() {
+    if props.look.is_some() || props.appearance.is_some_and(|p| p.font.is_some()) {
         ensure_form(doc)?;
     }
     let mut ff = f.flags;
@@ -759,7 +980,7 @@ pub fn set_props(doc: &mut Document, name: &str, props: &FieldProps) -> Result<S
     {
         return invalid("alignment is 0 (left), 1 (centre) or 2 (right)");
     }
-    if props.options.as_ref().is_some_and(|o| o.is_empty()) && matches!(f.kind, FieldKind::Combo | FieldKind::List) {
+    if props.options.as_ref().is_some_and(Vec::is_empty) && matches!(f.kind, FieldKind::Combo | FieldKind::List) {
         return invalid("a list needs at least one option");
     }
     if props.check_style.is_some() && !matches!(f.kind, FieldKind::CheckBox | FieldKind::Radio) {
@@ -809,22 +1030,43 @@ pub fn set_props(doc: &mut Document, name: &str, props: &FieldProps) -> Result<S
         }
         match &props.default_value {
             // Buttons name their default state; text and choices hold a string.
-            Some(Some(v)) if matches!(f.kind, FieldKind::CheckBox | FieldKind::Radio) => d.set(b"DV".to_vec(), Object::name(v)),
+            Some(Some(v)) if matches!(f.kind, FieldKind::CheckBox | FieldKind::Radio) => d.set(b"DV".to_vec(), Object::Name(crate::name_bytes(v))),
             Some(Some(v)) => d.set(b"DV".to_vec(), PdfString::text(v)),
             Some(None) => {
                 d.remove(b"DV");
             }
             None => {}
         }
-        if props.font_size.is_some() || props.look.is_some() {
+        if props.font_size.is_some() || props.look.is_some() || props.appearance.is_some_and(|p| p.font.is_some() || p.text.is_some()) {
             d.set(b"DA".to_vec(), PdfString::literal(new_da.clone().into_bytes()));
         }
     })?;
+    if props.appearance.is_some() || (props.font_size.is_some() && props.look.is_none()) {
+        let patch = &props.appearance.unwrap_or_default();
+        for w in &f.widgets {
+            patch_widget_look(doc, w, patch)?;
+            // A widget's own /DA overrides its field's /DA. Patch that override separately
+            // rather than replacing its font or colour with the first widget's defaults.
+            if w.obj != f.obj && (props.font_size.is_some() || patch.font.is_some() || patch.text.is_some()) {
+                let da = doc
+                    .get(w.obj)
+                    .as_dict()
+                    .and_then(|d| d.get(b"DA").cloned())
+                    .map(|v| doc.resolve(&v))
+                    .and_then(|v| v.as_string().map(|s| s.to_text()));
+                if let Some(da) = da {
+                    let da = patch_da(&da, props.font_size, patch);
+                    doc.update_dict(w.obj, |d| d.set(b"DA".to_vec(), PdfString::literal(da.into_bytes())))?;
+                }
+            }
+        }
+    }
     if let Some(l) = &props.look {
         let arr = |c: [f64; 3]| Object::Array(c.iter().map(|v| Object::Real(v.clamp(0.0, 1.0))).collect());
         for w in &f.widgets {
+            // Resolved first: an indirect /MK keeps its mark, rotation and other entries.
+            let mut mk = doc.get(w.obj).as_dict().and_then(|d| d.get(b"MK").map(|m| doc.resolve(m).as_dict().cloned())).flatten().unwrap_or_default();
             doc.update_dict(w.obj, |d| {
-                let mut mk = d.get(b"MK").and_then(|m| m.as_dict().cloned()).unwrap_or_default();
                 match l.border {
                     Some(c) => mk.set(b"BC".to_vec(), arr(c)),
                     None => {
@@ -859,7 +1101,7 @@ pub fn set_props(doc: &mut Document, name: &str, props: &FieldProps) -> Result<S
     if let Some((wi, r)) = props.rect {
         let w = f.widgets.get(wi).ok_or_else(|| FormError::Invalid(format!("{name} has no widget {}", wi + 1)))?;
         let r = [r[0].min(r[2]), r[1].min(r[3]), r[0].max(r[2]), r[1].max(r[3])];
-        if !r.iter().all(|v| v.is_finite()) || r[2] - r[0] < 4.0 || r[3] - r[1] < 4.0 {
+        if !r.iter().all(|v| v.is_finite()) || r[2] - r[0] < MIN_FIELD_SIDE || r[3] - r[1] < MIN_FIELD_SIDE {
             return invalid("the field is too small");
         }
         doc.update_dict(w.obj, |d| d.set(b"Rect".to_vec(), Object::Array(r.iter().map(|v| Object::Real(*v)).collect())))?;
@@ -902,26 +1144,7 @@ pub fn set_props(doc: &mut Document, name: &str, props: &FieldProps) -> Result<S
             if let Some(js) = crate::af::calculate_js(c) {
                 aa.set(b"C".to_vec(), action(&js));
             }
-            // The calculation order lists calculated fields.
-            let af_ref = ensure_form(doc)?;
-            let mut co: Vec<Object> = doc
-                .get(af_ref)
-                .as_dict()
-                .and_then(|d| d.get(b"CO").cloned())
-                .map(|c| doc.resolve(&c))
-                .and_then(|c| c.as_array().cloned())
-                .unwrap_or_default();
-            co.retain(|o| o.as_ref() != Some(f.obj));
-            if *c != crate::af::Calculate::None {
-                co.push(Object::Ref(f.obj));
-            }
-            doc.update_dict(af_ref, |d| {
-                if co.is_empty() {
-                    d.remove(b"CO");
-                } else {
-                    d.set(b"CO".to_vec(), Object::Array(co));
-                }
-            })?;
+            crate::calc_order::keep_listed(doc, f.obj, *c != crate::af::Calculate::None)?;
         }
         doc.update_dict(f.obj, |d| {
             if aa.is_empty() {
@@ -931,8 +1154,9 @@ pub fn set_props(doc: &mut Document, name: &str, props: &FieldProps) -> Result<S
             }
         })?;
     }
-    // Widgets may carry their own /DA; keep them in step with the field.
-    if props.font_size.is_some() || props.look.is_some() {
+    // A complete look replaces widget /DA overrides. Partial changes were patched above
+    // against each override, including size-only changes that keep its font and colour.
+    if props.look.is_some() {
         for w in &f.widgets {
             if w.obj != f.obj {
                 doc.update_dict(w.obj, |d| {
@@ -943,17 +1167,89 @@ pub fn set_props(doc: &mut Document, name: &str, props: &FieldProps) -> Result<S
             }
         }
     }
-    redraw_field(doc, &new_name)?;
+    if let (Some((wi, rot)), Some(swapped)) = (props.rotation, rotated_rect)
+        && let Some(w) = f.widgets.get(wi)
+    {
+        if let Some(rect) = swapped {
+            doc.update_dict(w.obj, |d| d.set(b"Rect".to_vec(), Object::Array(rect.iter().map(|v| Object::Real(*v)).collect())))?;
+        }
+        let mut mk = doc.get(w.obj).as_dict().and_then(|d| d.get(b"MK").map(|m| doc.resolve(m).as_dict().cloned())).flatten().unwrap_or_default();
+        if rot == 0 {
+            mk.remove(b"R");
+        } else {
+            mk.set(b"R".to_vec(), Object::Int(rot));
+        }
+        doc.update_dict(w.obj, |d| {
+            if mk.is_empty() {
+                d.remove(b"MK");
+            } else {
+                d.set(b"MK".to_vec(), Object::Dict(mk));
+            }
+        })?;
+    }
+    if let Some((wi, caption)) = &props.caption
+        && let Some(w) = f.widgets.get(*wi)
+    {
+        // Copy an indirect/shared MK before patching it; colours, icons, rotation and
+        // unknown entries belong to this widget, and other owners keep their old label.
+        let mut mk = doc.get(w.obj).as_dict().and_then(|d| d.get(b"MK").map(|m| doc.resolve(m).as_dict().cloned())).flatten().unwrap_or_default();
+        mk.set(b"CA".to_vec(), PdfString::text(caption));
+        doc.update_dict(w.obj, |d| d.set(b"MK".to_vec(), Object::Dict(mk)))?;
+    }
+    // A label-only edit must not replace another widget's custom appearances.
+    let only = props.caption.as_ref().filter(|_| *props == (FieldProps { caption: props.caption.clone(), ..Default::default() })).map(|(wi, _)| *wi);
+    redraw_widgets(doc, &new_name, only)?;
     if props.calculate.is_some() {
         crate::recalculate(doc)?;
     }
     Ok(new_name)
 }
 
+/// Name field `old` `new` in each field's Calculate script that reads it
+/// ([`crate::af::rename_in_calculation`]).
+fn rename_in_calculations(doc: &mut Document, all: &[Field], old: &str, new: &str) -> Result<(), FormError> {
+    let aa_of =
+        |doc: &Document, r: ObjRef| doc.get(r).as_dict().and_then(|d| d.get(b"AA").map(|a| doc.resolve(a))).and_then(|a| a.as_dict().cloned());
+    for f in all {
+        // The script is the field's, or its only widget's when the field has none, as
+        // `actions_of` reads it.
+        let only_widget = || match f.widgets.as_slice() {
+            [w] => aa_of(doc, w.obj).map(|aa| (w.obj, aa)),
+            _ => None,
+        };
+        let Some((owner, mut aa)) = aa_of(doc, f.obj).map(|aa| (f.obj, aa)).or_else(only_widget) else { continue };
+        let Some(mut action) = aa.get(b"C").and_then(|a| doc.resolve(a).as_dict().cloned()) else { continue };
+        let js = match action.get(b"JS").map(|js| doc.resolve(js)).as_deref() {
+            Some(Object::String(s)) => s.to_text(),
+            // A stream that isn't UTF-8 reads with replacement characters, which must not be
+            // written back in place of what it holds.
+            Some(Object::Stream(s)) => match s.decoded().ok().and_then(|b| String::from_utf8(b).ok()) {
+                Some(js) => js,
+                None => continue,
+            },
+            _ => continue,
+        };
+        let Some(js) = crate::af::rename_in_calculation(&js, old, new) else { continue };
+        action.set(b"JS".to_vec(), PdfString::text(&js));
+        aa.set(b"C".to_vec(), Object::Dict(action));
+        doc.update_dict(owner, |d| d.set(b"AA".to_vec(), Object::Dict(aa)))?;
+    }
+    Ok(())
+}
+
 /// Delete a field: its widgets leave their pages and the field leaves the form.
 pub fn delete_field(doc: &mut Document, name: &str) -> Result<(), FormError> {
-    let all = fields(doc);
-    let f = all.iter().find(|f| f.name == name).ok_or_else(|| FormError::NoSuchField(name.into()))?.clone();
+    let f = fields(doc).into_iter().find(|f| f.name == name).ok_or_else(|| FormError::NoSuchField(name.into()))?;
+    delete_found_field(doc, f)
+}
+
+/// [`delete_field`] for the field object `obj`, when separate fields share one name.
+pub fn delete_field_object(doc: &mut Document, obj: ObjRef) -> Result<(), FormError> {
+    let f = fields(doc).into_iter().find(|f| f.obj == obj).ok_or_else(|| FormError::NoSuchField(format!("{obj:?}")))?;
+    delete_found_field(doc, f)
+}
+
+fn delete_found_field(doc: &mut Document, f: Field) -> Result<(), FormError> {
     let widgets: std::collections::HashSet<ObjRef> = f.widgets.iter().map(|w| w.obj).collect();
     for p in page_refs(doc) {
         let Some(a) = doc.get(p).as_dict().and_then(|d| d.get(b"Annots").cloned()) else { continue };
@@ -991,6 +1287,31 @@ pub fn delete_field(doc: &mut Document, name: &str) -> Result<(), FormError> {
                 }
                 _ => {}
             }
+        }
+    }
+    // Out of the calculation order too: a `/CO` entry would keep the field, its value and its
+    // widgets reachable for a full save.
+    drop_from_calculation_order(doc, |r| r == f.obj || widgets.contains(&r))
+}
+
+/// Remove the `/CO` entries `gone` matches, whether the form and the array are held directly or
+/// by reference.
+fn drop_from_calculation_order(doc: &mut Document, gone: impl Fn(ObjRef) -> bool) -> Result<(), FormError> {
+    let Some(root) = doc.root() else { return Ok(()) };
+    let Some(af_obj) = doc.get(root).as_dict().and_then(|d| d.get(b"AcroForm").cloned()) else { return Ok(()) };
+    let Some(mut af) = doc.resolve(&af_obj).as_dict().cloned() else { return Ok(()) };
+    let Some(co_obj) = af.get(b"CO").cloned() else { return Ok(()) };
+    let co = doc.resolve(&co_obj).as_array().cloned().unwrap_or_default();
+    let kept: Vec<Object> = co.iter().filter(|o| !o.as_ref().is_some_and(&gone)).cloned().collect();
+    if kept.len() == co.len() {
+        return Ok(());
+    }
+    match (co_obj.as_ref(), af_obj.as_ref()) {
+        (Some(r), _) if doc.get(r).as_array().is_some() => doc.set(r, Object::Array(kept)),
+        (_, Some(af_ref)) => doc.update_dict(af_ref, |d| d.set(b"CO".to_vec(), Object::Array(kept)))?,
+        (_, None) => {
+            af.set(b"CO".to_vec(), Object::Array(kept));
+            doc.update_dict(root, |d| d.set(b"AcroForm".to_vec(), Object::Dict(af)))?;
         }
     }
     Ok(())

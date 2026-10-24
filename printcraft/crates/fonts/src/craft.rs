@@ -49,6 +49,12 @@ pub fn ui_arabic_fonts() -> Vec<&'static CraftFont> {
     arabic(CRAFT_FONTS.iter())
 }
 
+/// The face for Arabic text written into PDFs: the first `Arab` face. `None` when built without
+/// craft-fonts or when its revision has no Arabic face.
+pub fn document_arabic_font() -> Option<&'static CraftFont> {
+    ui_arabic_fonts().into_iter().next()
+}
+
 fn arabic<'a>(faces: impl IntoIterator<Item = &'a CraftFont>) -> Vec<&'a CraftFont> {
     faces.into_iter().filter(|f| f.covers("Arab")).collect()
 }
@@ -58,6 +64,48 @@ fn arabic<'a>(faces: impl IntoIterator<Item = &'a CraftFont>) -> Vec<&'a CraftFo
 /// Telugu face.
 pub fn ui_telugu_fonts() -> Vec<&'static CraftFont> {
     CRAFT_FONTS.iter().filter(|f| f.covers("Telu")).collect()
+}
+
+/// Thai faces shared by the interface and PDF text writer.
+pub fn ui_thai_fonts() -> Vec<&'static CraftFont> {
+    CRAFT_FONTS.iter().filter(|f| f.covers("Thai")).collect()
+}
+
+pub fn document_thai_font() -> Option<&'static CraftFont> {
+    ui_thai_fonts().into_iter().next()
+}
+
+/// The `Deva` craft-fonts faces for Devanagari interface text (the Hindi catalog, file names,
+/// document titles), in manifest order. Empty when built without craft-fonts or when its revision
+/// has no Devanagari face; a desktop build then falls back to one font already installed on the
+/// machine (`SYSTEM_DEVANAGARI_FALLBACK`), and the web build shows replacement boxes.
+pub fn ui_devanagari_fonts() -> Vec<&'static CraftFont> {
+    CRAFT_FONTS.iter().filter(|f| f.covers("Deva")).collect()
+}
+
+/// The face for Devanagari text written into PDFs: the first `Deva` face. `None` when built
+/// without craft-fonts or when its revision has no Devanagari face.
+pub fn document_devanagari_font() -> Option<&'static CraftFont> {
+    ui_devanagari_fonts().into_iter().next()
+}
+
+/// The `Hebr` craft-fonts faces for Hebrew interface text (file names, document titles, text
+/// being edited), in manifest order. Empty when built without craft-fonts or when it has no
+/// Hebrew face.
+pub fn ui_hebrew_fonts() -> Vec<&'static CraftFont> {
+    CRAFT_FONTS.iter().filter(|f| f.covers("Hebr")).collect()
+}
+
+/// The face for Hebrew text written into PDFs: the `Hebr` face of the asked weight, else its
+/// Regular, else any `Hebr` face. `None` without craft-fonts or without a Hebrew face.
+pub fn document_hebrew_font(bold: bool) -> Option<&'static CraftFont> {
+    hebrew_face(CRAFT_FONTS, bold)
+}
+
+fn hebrew_face(faces: &[CraftFont], bold: bool) -> Option<&CraftFont> {
+    let hebr = || faces.iter().filter(|f| f.covers("Hebr"));
+    let style = if bold { "Bold" } else { "Regular" };
+    hebr().find(|f| f.style == style).or_else(|| hebr().find(|f| f.style == "Regular")).or_else(|| hebr().next())
 }
 
 /// Interface CJK faces in fallback order for the UI language: Simplified Chinese first when
@@ -96,22 +144,54 @@ pub fn document_japanese_font_for_style(serif: bool, bold: bool) -> Option<&'sta
     document_face(CRAFT_FONTS, serif, bold)
 }
 
+/// Every `Jpan` face that can stand in for the document text, the best match for the style first
+/// (the face [`document_japanese_font_for_style`] returns), then the others. Not every face has
+/// every glyph (their coverage of e.g. Cyrillic differs), so a caller can move on to the next one.
+/// Empty without craft-fonts.
+pub fn document_japanese_fonts_for_style(serif: bool, bold: bool) -> Vec<&'static CraftFont> {
+    document_faces(CRAFT_FONTS, serif, bold)
+}
+
+/// The scripts the bundled Inter faces are for.
+static LATIN_SCRIPTS: &[&str] = &["Latn", "Cyrl", "Grek"];
+
+/// The bundled Latin document faces (`assets/fonts`, OFL): every build has them, unlike
+/// craft-fonts. The Japanese faces carry only part of the Cyrillic (`привет` yes, Uzbek `қизил`
+/// and Kazakh `әже` no), so letters like қ, ғ, ҳ, ә, ө, ү, ұ and һ have no face at all without
+/// these.
+static INTER_REGULAR_FACE: CraftFont =
+    CraftFont { family: "Inter", style: "Regular", scripts: LATIN_SCRIPTS, bytes: include_bytes!("../../../assets/fonts/Inter-Regular.ttf") };
+static INTER_SEMIBOLD_FACE: CraftFont =
+    CraftFont { family: "Inter", style: "SemiBold", scripts: LATIN_SCRIPTS, bytes: include_bytes!("../../../assets/fonts/Inter-SemiBold.ttf") };
+
+/// The face for Latin, Greek and Cyrillic text written into PDFs: the bundled Inter Regular, or
+/// SemiBold for bold text. Present in every build, crafted ones included.
+pub fn document_latin_fonts(bold: bool) -> Vec<&'static CraftFont> {
+    vec![if bold { &INTER_SEMIBOLD_FACE } else { &INTER_REGULAR_FACE }]
+}
+
 fn document_face(faces: &[CraftFont], serif: bool, bold: bool) -> Option<&CraftFont> {
+    document_faces(faces, serif, bold).into_iter().next()
+}
+
+fn document_faces(faces: &[CraftFont], serif: bool, bold: bool) -> Vec<&CraftFont> {
     let jpan = || faces.iter().filter(|f| f.covers("Jpan"));
+    let mut preferred = Vec::new();
     if !serif {
         let style = if bold { "Bold" } else { "Regular" };
-        if let Some(face) = jpan()
-            .find(|f| f.family == "BIZ UDPGothic" && f.style == style)
-            .or_else(|| jpan().find(|f| f.family == "BIZ UDPGothic" && f.style == "Regular"))
-        {
-            return Some(face);
+        preferred.extend(jpan().find(|f| f.family == "BIZ UDPGothic" && f.style == style));
+        preferred.extend(jpan().find(|f| f.family == "BIZ UDPGothic" && f.style == "Regular"));
+    }
+    for family in ["Shippori Mincho", "BIZ UDMincho"] {
+        preferred.extend(jpan().find(|f| f.family == family && f.style == "Regular"));
+    }
+    let mut out: Vec<&CraftFont> = Vec::new();
+    for face in preferred.into_iter().chain(jpan().filter(|f| f.style == "Regular")).chain(jpan()) {
+        if !out.iter().any(|f| std::ptr::eq(*f, face)) {
+            out.push(face);
         }
     }
-    ["Shippori Mincho", "BIZ UDMincho"]
-        .iter()
-        .find_map(|family| jpan().find(|f| f.family == *family && f.style == "Regular"))
-        .or_else(|| jpan().find(|f| f.style == "Regular"))
-        .or_else(|| jpan().next())
+    out
 }
 
 const fn str_eq(a: &str, b: &str) -> bool {
@@ -191,6 +271,11 @@ mod tests {
         assert_eq!(document_face(&faces, true, true).unwrap().bytes, b"serif");
         assert_eq!(document_face(&faces[..2], false, true).unwrap().bytes, b"sans");
         assert_eq!(document_face(&faces[..1], false, true).unwrap().bytes, b"serif");
+        // Every Japanese face is a candidate, the style's match first and none twice.
+        let order: Vec<&[u8]> = document_faces(&faces, false, true).iter().map(|f| f.bytes).collect();
+        assert_eq!(order, [b"bold".as_slice(), b"sans", b"serif"]);
+        let order: Vec<&[u8]> = document_faces(&faces, true, false).iter().map(|f| f.bytes).collect();
+        assert_eq!(order, [b"serif".as_slice(), b"sans", b"bold"]);
         assert!(document_face(&faces[3..], false, true).is_none());
         assert!(document_face(&[], false, true).is_none());
     }
@@ -210,6 +295,57 @@ mod tests {
         // An Arabic face is never a CJK fallback, and the other way round.
         assert!(order_cjk(&faces, false).iter().all(|f| f.family == "BIZ UDPGothic"));
         assert_eq!(ui_arabic_fonts().len(), CRAFT_FONTS.iter().filter(|f| f.covers("Arab")).count());
+    }
+
+    #[test]
+    fn hebrew_document_faces_follow_the_weight() {
+        static HEBR_LATN: &[&str] = &["Hebr", "Latn"];
+        let faces = [
+            CraftFont { family: "BIZ UDPGothic", style: "Bold", scripts: &["Jpan"], bytes: b"not-hebrew" },
+            CraftFont { family: "FakeHebrew", style: "Regular", scripts: HEBR_LATN, bytes: b"regular" },
+            CraftFont { family: "FakeHebrew", style: "Bold", scripts: HEBR_LATN, bytes: b"bold" },
+        ];
+        assert_eq!(hebrew_face(&faces, false).map(|f| f.bytes), Some(&b"regular"[..]));
+        assert_eq!(hebrew_face(&faces, true).map(|f| f.bytes), Some(&b"bold"[..]));
+        // No bold face: Regular, never a face of another script.
+        assert_eq!(hebrew_face(&faces[..2], true).map(|f| f.bytes), Some(&b"regular"[..]));
+        assert!(hebrew_face(&faces[..1], false).is_none());
+        assert_eq!(ui_hebrew_fonts().len(), CRAFT_FONTS.iter().filter(|f| f.covers("Hebr")).count());
+        assert_eq!(document_hebrew_font(false).is_some(), CRAFT_FONTS.iter().any(|f| f.covers("Hebr")));
+    }
+
+    /// `build.rs` embeds the Japanese CJK faces whole and any other CJK face only up to
+    /// `MAX_OTHER_CJK_BYTES`, so a checkout with a large Chinese or Korean face (craft-fonts has the
+    /// 16.4 MB Noto Sans CJK SC) leaves it out. The four Japanese faces of the pinned craft-fonts
+    /// are 24.1 MB.
+    #[test]
+    fn cjk_faces_follow_the_size_rule() {
+        use crate::cjk_scripts::{MAX_OTHER_CJK_BYTES, WHOLE_CJK_FAMILIES, is_cjk_script};
+        // A tag can carry a region after the code: craft-fonts tags Noto Sans HK UI `Hant-HK`.
+        assert!(["Hant-HK", "Hans", "Jpan", "Hang"].iter().all(|s| is_cjk_script(s)));
+        assert!(!["Latn", "Arab", "Hebr"].iter().any(|s| is_cjk_script(s)));
+        let cjk = CRAFT_FONTS.iter().filter(|f| f.scripts.iter().any(|s| is_cjk_script(s)));
+        let (whole, other): (Vec<_>, Vec<_>) = cjk.partition(|f| WHOLE_CJK_FAMILIES.contains(&f.family));
+        for face in &other {
+            let len = face.bytes.len();
+            assert!(u64::try_from(len).is_ok_and(|n| n <= MAX_OTHER_CJK_BYTES), "{} is embedded at {len} bytes", face.name());
+        }
+        let bytes: usize = whole.iter().map(|f| f.bytes.len()).sum();
+        assert!(bytes < 25_000_000, "{bytes} bytes of Japanese faces");
+    }
+
+    /// The bundled Inter faces carry the Latin, Greek and Cyrillic letters the craft-fonts faces
+    /// lack: Uzbek қ ғ ҳ, Kazakh ә ө ү ұ һ, Ukrainian ї є ґ, Greek. This one runs with or without
+    /// CRAFT_FONTS_DIR (#2593).
+    #[test]
+    fn latin_faces_carry_the_letters_the_japanese_faces_lack() {
+        for face in document_latin_fonts(false).into_iter().chain(document_latin_fonts(true)) {
+            for ch in ['қ', 'ғ', 'ҳ', 'ә', 'ө', 'ү', 'ұ', 'һ', 'ї', 'є', 'ґ', 'ё', 'α', 'β', 'γ', '≥', '≈'] {
+                assert!(crate::japanese_glyph_from(face, ch).is_ok(), "{} has no {ch}", face.name());
+            }
+        }
+        assert_eq!(document_latin_fonts(false)[0].style, "Regular");
+        assert_eq!(document_latin_fonts(true)[0].style, "SemiBold");
     }
 
     #[test]

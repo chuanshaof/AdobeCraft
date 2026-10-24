@@ -3,7 +3,9 @@
 //! Geometry follows the automation convention: points from the top-left of the displayed page,
 //! y down. It is converted to PDF user space (crop box, `/Rotate`) here.
 
-use pdfcraft_engine::{Edit, Markup, NOTE_SIZE, NewAnnotation, NoteIcon, ReviewState, Rgb, Shape, StampGroup, StampKind, Style, SummarySort};
+use pdfcraft_engine::{
+    Edit, LineEnding, Markup, NOTE_SIZE, NewAnnotation, NoteIcon, ReviewState, Rgb, Shape, StampGroup, StampKind, Style, SummarySort,
+};
 use pdfcraft_render::{Annotation, PageInfo};
 use serde_json::{Value, json};
 
@@ -11,6 +13,8 @@ use crate::{Args, Automation, Content, DEFAULT_DPI, MAX_DPI, Result, ToolError, 
 
 /// Author used when a tool call names none.
 pub(crate) const DEFAULT_AUTHOR: &str = "PdfCraft";
+/// The largest side of a stamp's box, in points: the largest page PDF allows (ISO 32000-2 Annex C).
+const MAX_STAMP_SIDE: f64 = 14_400.0;
 
 pub(crate) fn parse_color(s: &str) -> Result<Rgb> {
     let named = match s.to_ascii_lowercase().as_str() {
@@ -32,6 +36,33 @@ pub(crate) fn parse_color(s: &str) -> Result<Rgb> {
     }
     let c = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).map(|v| v as f64 / 255.0).unwrap_or(0.0);
     Ok([c(0), c(2), c(4)])
+}
+
+const ENDING_NAMES: &str = "None, Square, Circle, Diamond, OpenArrow, ClosedArrow, Butt, ROpenArrow, RClosedArrow, Slash";
+
+fn line_endings(a: &Args) -> Result<Option<Vec<LineEnding>>> {
+    let Some(v) = a.get("endings") else { return Ok(None) };
+    let arr = v.as_array().ok_or_else(|| ToolError::InvalidArgs("endings must be an array of line-ending names".into()))?;
+    if arr.is_empty() || arr.len() > 2 {
+        return Err(ToolError::InvalidArgs("endings takes one name for a callout, or two for a line or polyline".into()));
+    }
+    arr.iter()
+        .map(|item| {
+            let name = item.as_str().ok_or_else(|| ToolError::InvalidArgs("endings must be line-ending names".into()))?;
+            LineEnding::parse(name).ok_or_else(|| ToolError::InvalidArgs(format!("unknown line ending {name:?} ({ENDING_NAMES})")))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+/// `[start, end]` for a line, arrow or polyline. An arrow with no `endings` stays `[None, OpenArrow]`.
+fn ending_pair(kind: &str, endings: Option<&[LineEnding]>) -> Result<[LineEnding; 2]> {
+    match endings {
+        None if kind == "arrow" => Ok([LineEnding::None, LineEnding::OpenArrow]),
+        None => Ok([LineEnding::None, LineEnding::None]),
+        Some(v) if v.len() == 2 => Ok([v.first().copied().unwrap_or(LineEnding::None), v.get(1).copied().unwrap_or(LineEnding::None)]),
+        Some(_) => Err(ToolError::InvalidArgs("a line or polyline needs two endings, the start and the end".into())),
+    }
 }
 
 fn hex(c: [f32; 3]) -> String {
@@ -109,6 +140,7 @@ impl Automation {
         };
         Ok(vec![
             Content::Json(json!({ "page": page + 1, "index": index + 1, "rect": rect_to_view(info, annotation.rect), "rotation": info.rotation,
+                "image_rotation": (i64::from(info.rotation) - preview.turn).rem_euclid(360),
                 "layer": layer, "opacity": preview.opacity, "dpi": dpi })),
             image,
         ])
@@ -143,8 +175,7 @@ impl Automation {
         let only = a.opt_int("page")?.map(|p| (p.max(1) - 1) as usize);
         let all = self.comments(a)?;
         let view = |c: &Annotation| -> Value {
-            let p = &doc.info.pages[c.page.min(doc.info.pages.len().saturating_sub(1))];
-            json!({
+            let mut v = json!({
                 "id": c.name,
                 "page": c.page + 1,
                 "index": c.index + 1,
@@ -152,17 +183,41 @@ impl Automation {
                 "author": c.author,
                 "contents": c.contents,
                 "modified": c.modified,
-                "rect": rect_to_view(p, c.rect),
+                // Unchanged on a page the viewer could not read (#2660), as `doc_info` reports it.
+                "rect": crate::view_rect(&doc.info, c.page, c.rect),
                 "color": c.color.map(hex),
-            })
+            });
+            // A line's ends, or the corners of connected lines, a polygon or a cloud, as
+            // comment_edit's `points` takes them.
+            // Unchanged on a page the viewer could not read, as `rect` is.
+            if !c.points.is_empty() {
+                let round = |v: f32| (v * 100.0).round() / 100.0;
+                let page = doc.info.pages.get(c.page);
+                v["points"] =
+                    json!(c.points.iter().map(|q| page.map_or([q[0], q[1]], |p| p.user_to_view(q[0], q[1])).map(round)).collect::<Vec<_>>());
+            }
+            v
         };
         let roots: Vec<Value> = all
             .iter()
             .filter(|c| c.in_reply_to.is_none() && only.is_none_or(|p| c.page == p))
             .map(|c| {
                 let mut v = view(c);
-                let thread: Vec<&Annotation> = match &c.name {
-                    Some(nm) => all.iter().filter(|r| r.in_reply_to.as_deref() == Some(nm.as_str())).collect(),
+                // Every reply under this comment, at any depth, in document order. A reply to a
+                // reply keeps its `/IRT` on the direct parent, so following one level would drop it.
+                let descends_from = |r: &Annotation, root: &str| -> bool {
+                    let mut parent = r.in_reply_to.as_deref();
+                    for _ in 0..64 {
+                        let Some(nm) = parent else { return false };
+                        if nm == root {
+                            return true;
+                        }
+                        parent = all.iter().find(|x| x.name.as_deref() == Some(nm)).and_then(|x| x.in_reply_to.as_deref());
+                    }
+                    false
+                };
+                let thread: Vec<&Annotation> = match c.name.as_deref() {
+                    Some(nm) => all.iter().filter(|r| r.in_reply_to.is_some() && descends_from(r, nm)).collect(),
                     None => Vec::new(),
                 };
                 let status = thread.iter().rev().filter(|r| !r.is_mark()).find_map(|r| r.state.clone());
@@ -180,6 +235,10 @@ impl Automation {
         let page = self.page(a)?;
         let info = self.doc(a)?.info.pages[page].clone();
         let kind = a.str("type")?;
+        let endings = line_endings(a)?;
+        if endings.is_some() && !matches!(kind, "line" | "arrow" | "polyline" | "callout") {
+            return Err(ToolError::InvalidArgs("endings apply to a line, arrow, polyline or callout".into()));
+        }
         let markup = match kind {
             "highlight" => Some(Markup::Highlight),
             "underline" => Some(Markup::Underline),
@@ -253,7 +312,8 @@ impl Automation {
                 }
                 "line" | "arrow" => {
                     let (f, t) = (a.need::<2>("from", "a line")?, a.need::<2>("to", "a line")?);
-                    Shape::Line { from: to_user(&info, f[0], f[1]), to: to_user(&info, t[0], t[1]), arrow: kind == "arrow" }
+                    let [start, end] = ending_pair(kind, endings.as_deref())?;
+                    Shape::Line { from: to_user(&info, f[0], f[1]), to: to_user(&info, t[0], t[1]), start, end }
                 }
                 "ink" => {
                     let wrong = || ToolError::InvalidArgs("strokes must be an array of arrays of [x, y] points".into());
@@ -286,7 +346,10 @@ impl Automation {
                         })
                         .collect::<Result<Vec<_>>>()?;
                     match kind {
-                        "polyline" => Shape::PolyLine { vertices },
+                        "polyline" => {
+                            let [start, end] = ending_pair(kind, endings.as_deref())?;
+                            Shape::PolyLine { vertices, start, end }
+                        }
                         _ => Shape::Polygon { vertices, cloud: kind == "cloud" },
                     }
                 }
@@ -309,7 +372,17 @@ impl Automation {
                             [(point[0] + side) / 2.0, mid]
                         }
                     };
-                    Shape::Callout { rect, knee, point, font_size: a.opt_num("font_size")?.unwrap_or(10.0) }
+                    Shape::Callout {
+                        rect,
+                        knee,
+                        point,
+                        font_size: a.opt_num("font_size")?.unwrap_or(10.0),
+                        ending: match endings.as_deref() {
+                            None => LineEnding::OpenArrow,
+                            Some([ending]) => *ending,
+                            Some(_) => return Err(ToolError::InvalidArgs("a callout needs one ending".into())),
+                        },
+                    }
                 }
                 "attachment" => {
                     let [x, y] = a.need::<2>("at", "an attachment (its icon's top-left)")?;
@@ -371,6 +444,35 @@ impl Automation {
         Ok(out)
     }
 
+    /// Preferences ▸ Date format: set it with `format` and its names' `language` (`auto`
+    /// follows the app's interface language, so English here), or read them.
+    pub(crate) fn fill_sign_date_format(&mut self, a: &Args) -> Result<Value> {
+        use pdfcraft_engine::dates;
+        let format = a.opt_str("format")?;
+        let language = a.opt_str("language")?.map(|l| Some(l).filter(|l| !l.trim().eq_ignore_ascii_case("auto")));
+        // Check the format before changing anything, so a bad one leaves both settings alone.
+        if let Some(f) = format {
+            dates::check_date_format(f).map_err(ToolError::InvalidArgs)?;
+        }
+        if let Some(l) = language {
+            self.session.set_date_language(l).map_err(ToolError::InvalidArgs)?;
+        }
+        if let Some(f) = format {
+            self.session.set_date_format(f).map_err(ToolError::InvalidArgs)?;
+        }
+        let today = self.session.today_text(None, None).map_err(ToolError::Failed)?;
+        let languages: Vec<Value> = dates::DATE_LANGUAGES.iter().map(|l| json!({ "code": l.code, "name": l.name })).collect();
+        Ok(json!({
+            "format": self.session.date_format(),
+            "language": self.session.date_language().unwrap_or("auto"),
+            // Characters Fill & Sign can't write into a PDF yet; dates with them are refused.
+            "unwritable": dates::unwritable(&today),
+            "today": today,
+            "presets": dates::DATE_FORMATS,
+            "languages": languages,
+        }))
+    }
+
     pub(crate) fn fill_sign_add(&mut self, a: &Args) -> Result<Value> {
         use pdfcraft_engine::FillMark;
         let page = self.page(a)?;
@@ -379,21 +481,50 @@ impl Automation {
         let at = to_user(&info, x, y);
         let author = a.opt_str("author")?.unwrap_or(DEFAULT_AUTHOR).to_string();
         let kind = a.str("type")?;
+        let scan = a.opt_bool("scan")?.unwrap_or(false);
+        let sensitivity = a.opt_int("sensitivity")?;
+        if (scan || sensitivity.is_some()) && a.opt_str("path")?.is_none() {
+            return Err(ToolError::InvalidArgs("scan and sensitivity need path, a photo of a signature on paper".into()));
+        }
+        if sensitivity.is_some() && !scan {
+            return Err(ToolError::InvalidArgs("sensitivity is only for scan: true".into()));
+        }
+        let requested_size = a.opt_num("font_size")?;
+        if requested_size.is_some() && !matches!(kind, "text" | "date") {
+            return Err(ToolError::InvalidArgs("font_size is only for type text or date".into()));
+        }
+        let size = requested_size.unwrap_or(10.0);
+        if !(4.0..=300.0).contains(&size) {
+            return Err(ToolError::InvalidArgs("font_size must be 4–300 pt".into()));
+        }
         if let Some(path) = a.opt_str("path")? {
             if !matches!(kind, "signature" | "initials") || a.opt_str("text")?.is_some() {
                 return Err(ToolError::InvalidArgs("path is only for an image signature or initials; pass either path or text".into()));
             }
             let path = self.resolve(path, false)?;
             let file = std::fs::File::open(&path).map_err(|e| failed(format!("{}: {e}", path.display())))?;
-            let image = pdfcraft_engine::SignatureImage::read(file).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
-            let edit = image.edit(page, at, kind == "initials", &author).ok_or_else(|| ToolError::InvalidArgs("at must be finite".into()))?;
+            let image = if scan {
+                let sensitivity = match sensitivity {
+                    None => pdfcraft_engine::signature_scan::DEFAULT_SENSITIVITY,
+                    Some(s) => u8::try_from(s)
+                        .ok()
+                        .filter(|s| *s <= 100)
+                        .ok_or_else(|| ToolError::InvalidArgs(format!("sensitivity must be 0–100, got {s}")))?,
+                };
+                let mut photo = pdfcraft_engine::SignaturePhoto::read(file).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+                let frame = photo.auto_frame();
+                photo.scan(frame, sensitivity, pdfcraft_engine::signature_scan::SCAN_MAX_SIDE).map_err(|e| ToolError::InvalidArgs(e.to_string()))?
+            } else {
+                pdfcraft_engine::SignatureImage::read(file).map_err(|e| ToolError::InvalidArgs(e.to_string()))?
+            };
+            let edit = image.edit(page, &info, at, kind == "initials", &author).ok_or_else(|| ToolError::InvalidArgs("at must be finite".into()))?;
             return self.apply(a, edit);
         }
-        let size = 10.0;
         let text_at = |t: &str| {
             let w = (pdfcraft_engine::annot_text::text_width(t, size) + 8.0).clamp(20.0, 600.0);
             let h = size * 1.2 + 6.0;
-            Shape::Typewriter { rect: [at[0], at[1] - h, at[0] + w, at[1]], font_size: size }
+            let rect = pdfcraft_engine::text_box_at(i64::from(info.rotation), at, w, h).unwrap_or([at[0], at[1] - h, at[0] + w, at[1]]);
+            Shape::Typewriter { rect, font_size: size }
         };
         let (shape, contents) = match kind {
             "text" => {
@@ -401,16 +532,27 @@ impl Automation {
                 (text_at(&t), t)
             }
             "date" => {
-                let (yy, m, d) = self.session.today();
-                let t = format!("{m}/{d}/{yy}");
+                let lang = a.opt_str("language")?;
+                if let Some(l) = lang.filter(|l| pdfcraft_engine::dates::date_language(l).is_none()) {
+                    return Err(ToolError::InvalidArgs(format!("unknown date language {l:?} (see fill_sign_date_format)")));
+                }
+                let t = self.session.today_text_for_pdf(a.opt_str("format")?, lang).map_err(ToolError::InvalidArgs)?;
                 (text_at(&t), t)
             }
-            // A typed signature or initials in the script font, left edge at `at`.
+            // A typed signature or initials in the script font, left edge at `at`, upright as displayed.
             kind @ ("signature" | "initials") => {
                 let t = a.str("text")?;
+                // Nobody sees a preview here: refuse what the script font would leave out.
+                if let Some(c) = pdfcraft_engine::script_missing(t) {
+                    return Err(ToolError::InvalidArgs(format!(
+                        "the signature script font can't draw \"{}\" (U+{:04X}); type the {kind} in Latin, Cyrillic or Greek letters, or pass `path` to a PNG or JPEG image of it instead of `text`",
+                        c.escape_debug(),
+                        u32::from(c)
+                    )));
+                }
                 let h = if kind == "initials" { 24.0 } else { 32.0 };
-                let shape =
-                    pdfcraft_engine::typed_signature_shape(at, t, h).ok_or_else(|| ToolError::InvalidArgs("text has nothing to draw".into()))?;
+                let shape = pdfcraft_engine::typed_signature_shape(at, t, h, i64::from(info.rotation))
+                    .ok_or_else(|| ToolError::InvalidArgs("text has nothing to draw".into()))?;
                 (shape, String::new())
             }
             kind => {
@@ -421,8 +563,7 @@ impl Automation {
                     "line" => FillMark::Line,
                     other => return Err(ToolError::InvalidArgs(format!("unknown type {other:?}"))),
                 };
-                let (w, h) = if mark == FillMark::Line { (36.0, 4.0) } else { (12.0, 12.0) };
-                (Shape::Mark { rect: [at[0] - w / 2.0, at[1] - h / 2.0, at[0] + w / 2.0, at[1] + h / 2.0], mark }, String::new())
+                (Shape::Mark { rect: mark.rect_at(at, i64::from(info.rotation)), mark }, String::new())
             }
         };
         let style = Style::default_for(&shape);
@@ -459,7 +600,10 @@ impl Automation {
     pub(crate) fn comments_hide(&mut self, a: &Args) -> Result<Value> {
         let id = self.doc(a)?.id;
         let hidden = a.opt_bool("hidden")?.unwrap_or(true);
-        self.session.set_hide_comments(id, hidden);
+        if self.session.set_hide_comments(id, hidden) {
+            // The cached renderer drew with the old setting; page_render must read it again.
+            self.renderers.remove(&id);
+        }
         Ok(json!({ "hidden": hidden }))
     }
 
@@ -483,7 +627,17 @@ impl Automation {
         }
         let (color, opacity, width) = (a.color("color")?, a.opt_num("opacity")?, a.opt_num("width")?);
         if color.is_some() || opacity.is_some() || width.is_some() {
-            edits.push(Edit::StyleAnnotation { page, index, color, opacity, width });
+            edits.push(Edit::StyleAnnotation { page, index, color, opacity, width, endings: None });
+        }
+        if let Some(f) = a.opt_str("fill")? {
+            let fill = if f.eq_ignore_ascii_case("none") { None } else { Some(parse_color(f)?) };
+            edits.push(Edit::FillAnnotation { page, index, fill });
+        }
+        if let Some(size) = a.opt_num("font_size")? {
+            if !(1.0..=400.0).contains(&size) {
+                return Err(ToolError::InvalidArgs("font_size must be 1–400 pt".into()));
+            }
+            edits.push(Edit::FontSizeAnnotation { page, index, size });
         }
         if let Some(r) = a.nums::<4>("rect")? {
             edits.push(Edit::ResizeAnnotation { page, index, rect: rect_to_user(&info, r) });
@@ -492,8 +646,23 @@ impl Automation {
             let (o, d) = (to_user(&info, 0.0, 0.0), to_user(&info, dx, dy));
             edits.push(Edit::MoveAnnotation { page, index, dx: d[0] - o[0], dy: d[1] - o[1] });
         }
+        if let Some(pts) = a.get("points") {
+            let wrong = || ToolError::InvalidArgs("points must be an array of [x, y] points (a line's two ends, or every corner)".into());
+            let points = pts
+                .as_array()
+                .ok_or_else(wrong)?
+                .iter()
+                .map(|p| match p.as_array().map(|p| p.iter().map(|v| v.as_f64()).collect::<Vec<_>>()).as_deref() {
+                    Some([Some(x), Some(y)]) => Ok(to_user(&info, *x, *y)),
+                    _ => Err(wrong()),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            edits.push(Edit::ReshapeAnnotation { page, index, points });
+        }
         if edits.is_empty() {
-            return Err(ToolError::InvalidArgs("nothing to change: pass contents, color, opacity, width, rect or move".into()));
+            return Err(ToolError::InvalidArgs(
+                "nothing to change: pass contents, color, opacity, width, fill, font_size, rect, move or points".into(),
+            ));
         }
         let edit = if edits.len() == 1 { edits.remove(0) } else { Edit::Batch { label: "Edit comment".into(), edits } };
         self.apply(a, edit)
@@ -507,19 +676,34 @@ impl Automation {
 
 impl Automation {
     /// A custom stamp: a picture file (PDF page or image) centred at `at`, at its natural size
-    /// (at most 200 pt) or `width` points wide.
+    /// (at most 200 pt), or fitted inside `rect`, keeping its shape and centred (#4077).
     pub(crate) fn stamp_custom(&mut self, a: &Args) -> Result<Value> {
         let page = self.page(a)?;
         let info = self.doc(a)?.info.pages[page].clone();
+        let rect = match (a.nums::<4>("rect")?, a.get("at")) {
+            (Some(_), Some(_)) => return Err(ToolError::InvalidArgs("pass at (a point) or rect (a box), not both".into())),
+            (Some(r), None) => {
+                let (w, h) = ((r[2] - r[0]).abs(), (r[3] - r[1]).abs());
+                if !((1.0..=MAX_STAMP_SIDE).contains(&w) && (1.0..=MAX_STAMP_SIDE).contains(&h)) {
+                    return Err(ToolError::InvalidArgs(format!(
+                        "rect must be [x0, y0, x1, y1] with each side at least 1 pt and at most {MAX_STAMP_SIDE} pt"
+                    )));
+                }
+                rect_to_user(&info, r)
+            }
+            (None, _) => {
+                let [x, y] = a.need::<2>("at", "a stamp (its centre, or pass rect)")?;
+                let [ux, uy] = to_user(&info, x, y);
+                [ux, uy, ux, uy]
+            }
+        };
         let path = self.resolve(a.str("path")?, false)?;
         let bytes = std::fs::read(&path).map_err(|e| failed(format!("{}: {e}", path.display())))?;
         let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let name = a.opt_str("name")?.map(str::to_owned).unwrap_or_else(|| file.rsplit_once('.').map_or(file.clone(), |(s, _)| s.to_owned()));
-        let [x, y] = a.need::<2>("at", "a stamp (its centre)")?;
-        let [ux, uy] = to_user(&info, x, y);
         let edit = Edit::AddCustomStamp {
             page,
-            rect: [ux, uy, ux, uy],
+            rect,
             name,
             file: pdfcraft_engine::MarkFile {
                 name: file,

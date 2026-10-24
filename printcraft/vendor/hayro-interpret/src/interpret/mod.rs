@@ -1,5 +1,5 @@
 use crate::{BlendMode, FillRule};
-use crate::color::ColorSpace;
+use crate::color::{ColorSpace, DefaultColorSpaces, DeviceFamily};
 use crate::context::Context;
 use crate::convert::{convert_line_cap, convert_line_join};
 use crate::device::Device;
@@ -18,13 +18,15 @@ use crate::x_object::{
 use hayro_syntax::content::TypedIter;
 use hayro_syntax::content::ops::TypedInstruction;
 use hayro_syntax::object::dict::keys::{
-    ANNOTS, AP, AS, C, CA, F, MCID, N, OC, QUADPOINTS, RECT, SUBTYPE,
+    ACTUAL_TEXT, ANNOTS, AP, AS, C, CA, F, MCID, N, OC, QUADPOINTS, RECT, SUBTYPE,
 };
 use hayro_syntax::object::{Array, Dict, Object, Rect, Stream, dict_or_stream};
-use hayro_syntax::page::{Page, Resources};
+use hayro_syntax::page::{ContentReader, Page, Resources};
+use hayro_syntax::MAX_DECODED_STREAM;
 use kurbo::{Affine, BezPath, Point, Shape};
 use smallvec::smallvec;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) mod path;
 pub(crate) mod state;
@@ -109,6 +111,15 @@ pub struct InterpreterSettings {
     /// PdfCraft patch: viewer overrides for optional content groups (object number, generation,
     /// visible), applied on top of the document's default configuration (Layers panel toggles).
     pub ocg_overrides: Arc<Vec<(i32, i32, bool)>>,
+    /// PdfCraft patch: once this is `true`, interpretation stops before the next content
+    /// operator. What was drawn is then incomplete, so only set it when the output will be
+    /// thrown away (a viewer's render whose result nobody can receive any more).
+    pub cancelled: Option<Arc<AtomicBool>>,
+    /// PdfCraft patch: a low-detail render for previews (page backdrops, thumbnails). Images
+    /// that would cover only a few device pixels are skipped: redrawing them at full detail
+    /// costs a decode and a resample each for pixels nobody can see. Never set it for a final
+    /// render (tiles, whole pages, print, export).
+    pub preview: bool,
 }
 
 impl Default for InterpreterSettings {
@@ -129,6 +140,8 @@ impl Default for InterpreterSettings {
             render_annotations: true,
             hide_comments: false,
             ocg_overrides: Arc::new(Vec::new()),
+            cancelled: None,
+            preview: false,
         }
     }
 }
@@ -142,6 +155,8 @@ pub enum InterpreterWarning {
     UnsupportedFont,
     /// An image failed to decode.
     ImageDecodeFailure,
+    /// PdfCraft patch (18): a page content stream was skipped after exhausting its safety budget.
+    ContentTruncated,
 }
 
 /// interpret the contents of the page and render them into the device.
@@ -151,11 +166,18 @@ pub fn interpret_page<'a>(
     device: &mut impl Device<'a>,
 ) {
     let resources = page.resources();
-    interpret(page.typed_operations(), resources, context, device);
+    let mut content = page.content_reader();
+    // PdfCraft patch: the page's own contents count against its content budget too, where they
+    // are decoded whole. Streamed content is only ever held a window at a time.
+    crate::context::charge_content(content.materialized_len());
+    interpret_content(&mut content, resources, context, device);
 
     if context.settings.render_annotations
         && let Some(annot_arr) = page.raw().get::<Array<'_>>(ANNOTS)
     {
+        // PdfCraft patch (29): bracket the annotations so devices can tell their paints from
+        // the document's own (the reading-colours setting recolours the document, not comments).
+        device.begin_annotations();
         for annot in annot_arr.iter::<Dict<'_>>() {
             let flags = annot.get::<u32>(F).unwrap_or(0);
 
@@ -256,6 +278,7 @@ pub fn interpret_page<'a>(
                 draw_highlight_without_appearance(&annot, context, device);
             }
         }
+        device.end_annotations();
     }
 }
 
@@ -313,33 +336,65 @@ fn draw_highlight_without_appearance<'a>(
     context.restore_state(device);
 }
 
-/// Interpret the instructions from `ops` and render them into the device.
-pub fn interpret<'a>(
-    mut ops: TypedIter<'_>,
+/// PdfCraft patch (38): the colour space `cs` or `CS` selects by `name`: a device space, else
+/// the `/ColorSpace` resource `name`. A device space, named directly or by a resource, is
+/// replaced by its default from `defaults` (ISO 32000-2 §8.6.5.6).
+fn named_color_space<'a>(
+    name: &hayro_syntax::object::Name<'_>,
+    resources: &Resources<'a>,
+    defaults: &DefaultColorSpaces<'_, '_>,
+    context: &mut Context<'a>,
+) -> Option<ColorSpace> {
+    if let Some(named) = ColorSpace::new_from_name(name) {
+        let default = DeviceFamily::of_name(name).and_then(|family| defaults.get(family));
+        return Some(default.map_or(named, |(space, _)| space));
+    }
+    let resource = resources.get_color_space(name);
+    if let Some((space, _)) = resource
+        .as_ref()
+        .and_then(DeviceFamily::of_object)
+        .and_then(|family| defaults.get(family))
+    {
+        return Some(space);
+    }
+    context.get_color_space(resources, name)
+}
+
+/// Interprets the instructions that `ops` yields, until they run out or the caller cancels. It runs
+/// once per window of a content stream, between one `save_state` and its restore (see
+/// `interpret_content`).
+fn interpret_window<'a>(
+    ops: &mut TypedIter<'_>,
     resources: &Resources<'a>,
     context: &mut Context<'a>,
     device: &mut impl Device<'a>,
 ) {
-    let num_states = context.num_states();
-
-    context.save_state();
-
+    // PdfCraft patch (38): the resources' DefaultGray, DefaultRGB and DefaultCMYK replace the
+    // device spaces that colour operators and images select (ISO 32000-2 §8.6.5.6).
+    let defaults = DefaultColorSpaces::new(resources, &context.interpreter_cache.object_cache);
     while let Some(op) = ops.next() {
+        // PdfCraft patch: stop when the caller cancelled (see `InterpreterSettings::cancelled`).
+        if context.settings.cancelled.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+            break;
+        }
         match op {
             TypedInstruction::SaveState(_) => context.save_state(),
             TypedInstruction::StrokeColorDeviceRgb(s) => {
-                context.get_mut().graphics_state.stroke_cs = ColorSpace::device_rgb();
+                // PdfCraft patch (38): DeviceRGB, or the DefaultRGB that replaces it.
+                context.get_mut().graphics_state.stroke_cs = defaults.device(DeviceFamily::Rgb);
                 context.get_mut().graphics_state.stroke_color =
                     smallvec![s.0.as_f32(), s.1.as_f32(), s.2.as_f32()];
                 context.get_mut().graphics_state.stroke_pattern = None;
             }
             TypedInstruction::StrokeColorDeviceGray(s) => {
-                context.get_mut().graphics_state.stroke_cs = ColorSpace::device_gray();
+                // PdfCraft patch (38): DeviceGray, or the DefaultGray that replaces it.
+                context.get_mut().graphics_state.stroke_cs = defaults.device(DeviceFamily::Gray);
                 context.get_mut().graphics_state.stroke_color = smallvec![s.0.as_f32()];
                 context.get_mut().graphics_state.stroke_pattern = None;
             }
             TypedInstruction::StrokeColorCmyk(s) => {
-                context.get_mut().graphics_state.stroke_cs = ColorSpace::device_cmyk();
+                // PdfCraft patch (38): DeviceCMYK, or the DefaultCMYK that replaces it.
+                context.get_mut().graphics_state.stroke_cs = defaults.device(DeviceFamily::Cmyk);
                 context.get_mut().graphics_state.stroke_color =
                     smallvec![s.0.as_f32(), s.1.as_f32(), s.2.as_f32(), s.3.as_f32()];
                 context.get_mut().graphics_state.stroke_pattern = None;
@@ -403,18 +458,21 @@ pub fn interpret<'a>(
                 fill_stroke_path(context, device, FillRule::NonZero);
             }
             TypedInstruction::NonStrokeColorDeviceGray(s) => {
-                context.get_mut().graphics_state.none_stroke_cs = ColorSpace::device_gray();
+                // PdfCraft patch (38): DeviceGray, or the DefaultGray that replaces it.
+                context.get_mut().graphics_state.none_stroke_cs = defaults.device(DeviceFamily::Gray);
                 context.get_mut().graphics_state.non_stroke_color = smallvec![s.0.as_f32()];
                 context.get_mut().graphics_state.non_stroke_pattern = None;
             }
             TypedInstruction::NonStrokeColorDeviceRgb(s) => {
-                context.get_mut().graphics_state.none_stroke_cs = ColorSpace::device_rgb();
+                // PdfCraft patch (38): DeviceRGB, or the DefaultRGB that replaces it.
+                context.get_mut().graphics_state.none_stroke_cs = defaults.device(DeviceFamily::Rgb);
                 context.get_mut().graphics_state.non_stroke_color =
                     smallvec![s.0.as_f32(), s.1.as_f32(), s.2.as_f32()];
                 context.get_mut().graphics_state.non_stroke_pattern = None;
             }
             TypedInstruction::NonStrokeColorCmyk(s) => {
-                context.get_mut().graphics_state.none_stroke_cs = ColorSpace::device_cmyk();
+                // PdfCraft patch (38): DeviceCMYK, or the DefaultCMYK that replaces it.
+                context.get_mut().graphics_state.none_stroke_cs = defaults.device(DeviceFamily::Cmyk);
                 context.get_mut().graphics_state.non_stroke_color =
                     smallvec![s.0.as_f32(), s.1.as_f32(), s.2.as_f32(), s.3.as_f32()];
                 context.get_mut().graphics_state.non_stroke_pattern = None;
@@ -503,13 +561,9 @@ pub fn interpret<'a>(
                 // Ignore for now.
             }
             TypedInstruction::ColorSpaceStroke(c) => {
-                let cs = if let Some(named) = ColorSpace::new_from_name(c.0) {
-                    named
-                } else {
-                    context
-                        .get_color_space(resources, c.0)
-                        .unwrap_or(ColorSpace::device_gray())
-                };
+                // PdfCraft patch (38): see `named_color_space`.
+                let cs = named_color_space(c.0, resources, &defaults, context)
+                    .unwrap_or(ColorSpace::device_gray());
 
                 if !cs.is_pattern() {
                     context.get_mut().graphics_state.stroke_pattern = None;
@@ -518,13 +572,9 @@ pub fn interpret<'a>(
                 context.get_mut().graphics_state.stroke_cs = cs;
             }
             TypedInstruction::ColorSpaceNonStroke(c) => {
-                let cs = if let Some(named) = ColorSpace::new_from_name(c.0) {
-                    named
-                } else {
-                    context
-                        .get_color_space(resources, c.0)
-                        .unwrap_or(ColorSpace::device_gray())
-                };
+                // PdfCraft patch (38): see `named_color_space`.
+                let cs = named_color_space(c.0, resources, &defaults, context)
+                    .unwrap_or(ColorSpace::device_gray());
 
                 if !cs.is_pattern() {
                     context.get_mut().graphics_state.non_stroke_pattern = None;
@@ -549,7 +599,7 @@ pub fn interpret<'a>(
                 context.get_mut().graphics_state.non_stroke_pattern = n.1.and_then(|name| {
                     resources
                         .get_pattern(name)
-                        .and_then(|d| Pattern::new(d, context, resources))
+                        .and_then(|d| Pattern::new(d, context, resources, &defaults))
                 });
             }
             TypedInstruction::StrokeColorNamed(n) => {
@@ -558,7 +608,7 @@ pub fn interpret<'a>(
                 context.get_mut().graphics_state.stroke_pattern = n.1.and_then(|name| {
                     resources
                         .get_pattern(name)
-                        .and_then(|d| Pattern::new(d, context, resources))
+                        .and_then(|d| Pattern::new(d, context, resources, &defaults))
                 });
             }
             TypedInstruction::BeginMarkedContentWithProperties(bdc) => {
@@ -594,6 +644,19 @@ pub fn interpret<'a>(
                 }
 
                 device.begin_marked_content(bdc.0, mcid);
+
+                // PdfCraft patch (25): hand the device the sequence's `/ActualText`, from an inline
+                // property list or one named in the resources' `/Properties`.
+                let actual = dict_or_stream(bdc.1)
+                    .map(|(props, _)| props.clone())
+                    .or_else(|| {
+                        let name = bdc.1.clone().into_name()?;
+                        resources.properties.get::<Dict<'_>>(name)
+                    })
+                    .and_then(|props| props.get::<hayro_syntax::object::String<'_>>(ACTUAL_TEXT));
+                if let Some(text) = actual {
+                    device.actual_text(text.as_bytes());
+                }
             }
             TypedInstruction::MarkedContentPointWithProperties(_) => {}
             TypedInstruction::EndMarkedContent(_) => {
@@ -743,13 +806,21 @@ pub fn interpret<'a>(
             TypedInstruction::ShapeGlyph(_) => {}
             TypedInstruction::XObject(x) => {
                 let cache = context.interpreter_cache.object_cache.clone();
+                // PdfCraft patch: decoded images are cached per quality (preview or final).
+                let decoded_cache = context
+                    .interpreter_cache
+                    .decoded_cache
+                    .for_render(context.settings.preview);
                 let transfer_function = context.get().graphics_state.transfer_function.clone();
                 if let Some(x_object) = resources.get_x_object(x.0).and_then(|s| {
                     XObject::new(
                         &s,
                         &context.settings.warning_sink,
                         &cache,
+                        Some(&decoded_cache),
                         transfer_function.clone(),
+                        // PdfCraft patch (38): an image in a device space draws in its default.
+                        &defaults,
                     )
                 }) {
                     draw_xobject(&x_object, resources, context, device);
@@ -759,13 +830,18 @@ pub fn interpret<'a>(
                 let warning_sink = context.settings.warning_sink.clone();
                 let transfer_function = context.get().graphics_state.transfer_function.clone();
                 let cache = context.interpreter_cache.object_cache.clone();
+                // PdfCraft patch: inline images are not cached (see `DecodedImageKey`).
+                // PdfCraft patch (38): an inline image in a device space, named directly or by a
+                // resource, draws in its default.
                 if let Some(x_object) = ImageXObject::new(
                     i.0,
-                    |name| context.get_color_space(resources, name),
+                    |name| named_color_space(name, resources, &defaults, context),
                     &warning_sink,
                     &cache,
+                    None,
                     false,
                     transfer_function,
+                    Some(&defaults),
                 ) {
                     draw_image_xobject(&x_object, context, device);
                 }
@@ -784,7 +860,13 @@ pub fn interpret<'a>(
                     .get_shading(s.0)
                     .and_then(|o| {
                         let (dict, stream) = dict_or_stream(&o)?;
-                        Shading::new(dict, stream, &context.interpreter_cache.object_cache)
+                        // PdfCraft patch (38): a shading in a device space draws in its default.
+                        Shading::new(
+                            dict,
+                            stream,
+                            &context.interpreter_cache.object_cache,
+                            &defaults,
+                        )
                     })
                     .map(|s| {
                         Pattern::Shading(ShadingPattern {
@@ -828,8 +910,84 @@ pub fn interpret<'a>(
             }
         }
     }
+}
+
+/// Interpret the instructions from `ops` and render them into the device.
+pub fn interpret<'a>(
+    mut ops: TypedIter<'_>,
+    resources: &Resources<'a>,
+    context: &mut Context<'a>,
+    device: &mut impl Device<'a>,
+) {
+    let num_states = context.num_states();
+
+    context.save_state();
+
+    interpret_window(&mut ops, resources, context, device);
 
     while context.num_states() > num_states {
         context.restore_state(device);
+    }
+    // PdfCraft patch (18): say that content was skipped, so a truncated page isn't a clean render.
+    if crate::context::content_was_truncated() {
+        (context.settings.warning_sink)(InterpreterWarning::ContentTruncated);
+    }
+}
+
+/// PdfCraft patch: the bytes of a window of page content. A window grows only while an instruction
+/// at its end is incomplete.
+const CONTENT_WINDOW: usize = 64 << 10;
+
+/// PdfCraft patch: interprets the content of a page a window at a time, so the decoded content is
+/// never all in memory (see `ContentReader`). A window ends at an instruction that is not complete
+/// yet: its bytes are kept, and the next window starts with them.
+fn interpret_content<'a>(
+    content: &mut ContentReader<'_>,
+    resources: &Resources<'a>,
+    context: &mut Context<'a>,
+    device: &mut impl Device<'a>,
+) {
+    let num_states = context.num_states();
+
+    context.save_state();
+
+    let mut window = Vec::with_capacity(CONTENT_WINDOW);
+    let mut exhausted = false;
+    let mut cut = false;
+    loop {
+        let (committed, needs_more) = {
+            let mut ops = TypedIter::new_window(&window, exhausted);
+            interpret_window(&mut ops, resources, context, device);
+            (ops.committed(), ops.needs_more())
+        };
+        window.drain(..committed);
+
+        let cancelled = context
+            .settings
+            .cancelled
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Relaxed));
+        if !needs_more || cancelled || exhausted {
+            break;
+        }
+        // A window that is still incomplete at its end waits for more of the stream. It doubles
+        // while it waits, so one long instruction costs time in proportion to its length, and it
+        // stops growing at `MAX_DECODED_STREAM`, the most any one stream may decode to.
+        if window.len() >= MAX_DECODED_STREAM {
+            cut = true;
+            break;
+        }
+        let want = window.len().max(CONTENT_WINDOW);
+        if content.read_into(&mut window, want) == 0 {
+            exhausted = true;
+        }
+    }
+
+    while context.num_states() > num_states {
+        context.restore_state(device);
+    }
+    // PdfCraft patch (18): say that content was skipped, so a truncated page isn't a clean render.
+    if cut || content.truncated() || crate::context::content_was_truncated() {
+        (context.settings.warning_sink)(InterpreterWarning::ContentTruncated);
     }
 }

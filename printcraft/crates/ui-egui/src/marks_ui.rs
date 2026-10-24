@@ -3,10 +3,13 @@
 //! preview of the current page. "Update" opens the same dialog in replace mode.
 
 use egui::{Align, Color32, CornerRadius, Layout, Rect, Stroke, pos2, vec2};
-use pdfcraft_engine::{Background, Edit, HeaderFooter, MarkKind, Watermark};
+use pdfcraft_engine::{Background, Edit, FontFamily, HeaderFooter, MarkKind, Watermark};
 
 use crate::theme::{self, Tokens};
 use crate::{PdfCraftApp, widgets};
+
+/// How far a watermark may be moved from the page centre, in points.
+const MAX_OFFSET: f64 = 20_000.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Subset {
@@ -25,8 +28,10 @@ pub struct PageRange {
 }
 
 impl Default for PageRange {
+    /// From the first page to the last: `to` starts past any page count, and the range field
+    /// shows (and clamps it to) the document's last page.
     fn default() -> Self {
-        Self { all: true, from: 1, to: 1, subset: Subset::All }
+        Self { all: true, from: 1, to: usize::MAX, subset: Subset::All }
     }
 }
 
@@ -46,13 +51,10 @@ impl PageRange {
 
     pub(crate) fn ui(&mut self, ui: &mut egui::Ui, count: usize) {
         ui.horizontal(|ui| {
-            ui.radio_value(&mut self.all, true, tl!("All pages"));
-            ui.radio_value(&mut self.all, false, tl!("Pages from"));
+            widgets::radio_value(ui, &mut self.all, true, tl!("All pages"));
+            widgets::radio_value(ui, &mut self.all, false, tl!("Pages from"));
             ui.add_enabled(!self.all, egui::DragValue::new(&mut self.from).range(1..=count.max(1)));
             ui.label(tl!("to"));
-            if self.to == 1 && self.from == 1 {
-                self.to = count.max(1);
-            }
             ui.add_enabled(!self.all, egui::DragValue::new(&mut self.to).range(1..=count.max(1)));
             ui.label(tl!("Subset"));
             let label = match self.subset {
@@ -109,7 +111,9 @@ impl Default for MarksDraft {
 }
 
 const PAGE_FORMATS: [&str; 5] = ["<<1>>", "<<1 of n>>", "<<1/n>>", "<<Page 1>>", "<<Page 1 of n>>"];
-const DATE_FORMATS: [&str; 6] = ["<<m/d/yyyy>>", "<<mm/dd/yyyy>>", "<<d/m/yyyy>>", "<<yyyy-mm-dd>>", "<<m/d/yy>>", "<<mmmm d, yyyy>>"];
+// New formats go last: `date_format` is an index into this list.
+const DATE_FORMATS: [&str; 8] =
+    ["<<m/d/yyyy>>", "<<mm/dd/yyyy>>", "<<d/m/yyyy>>", "<<yyyy-mm-dd>>", "<<m/d/yy>>", "<<mmmm d, yyyy>>", "<<yyyy/mm/dd>>", "<<yyyy/m/d>>"];
 const BOX_NAMES: [&str; 6] =
     ["Left Header Text", "Center Header Text", "Right Header Text", "Left Footer Text", "Center Footer Text", "Right Footer Text"];
 
@@ -144,6 +148,7 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens, kind: M
     let Some(doc) = app.session.get(id) else { return (false, true) };
     let count = doc.info.pages.len();
     let page = doc.info.pages.get(current).map(|p| (p.width as f64, p.height as f64)).unwrap_or((612.0, 792.0));
+    let units = app.units;
     let d = &mut app.marks_draft;
     let mut browse = false;
     let verb = if d.replace { tl!("Update") } else { tl!("Add") };
@@ -157,18 +162,27 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens, kind: M
     match kind {
         MarkKind::HeaderFooter => {
             ui.horizontal(|ui| {
-                ui.label(tl!("Font: Helvetica"));
+                // The standard faces a header can be drawn in (#3754).
+                ui.label(tl!("Font:"));
+                egui::ComboBox::from_id_salt("hf-font").selected_text(d.hf.font.label()).width(100.0).show_ui(ui, |ui| {
+                    for f in [FontFamily::Helvetica, FontFamily::Times, FontFamily::Courier] {
+                        ui.selectable_value(&mut d.hf.font, f, f.label());
+                    }
+                });
                 ui.label(tl!("Size"));
                 ui.add(egui::DragValue::new(&mut d.hf.font_size).range(4.0..=72.0).speed(0.5));
-                ui.checkbox(&mut d.hf.underline, tl!("Underline"));
+                ui.add(widgets::checkbox(&mut d.hf.underline, tl!("Underline")));
                 color_button(ui, &mut d.hf.color);
                 ui.add_space(16.0);
-                ui.label(tl!("Margins (in)"));
+                ui.label(format!("{} ({})", tl!("Margins"), units.label()));
+                let per = units.per_point();
                 for (label, k) in [(tl!("Top"), 0), (tl!("Bottom"), 1), (tl!("Left"), 2), (tl!("Right"), 3)] {
                     ui.label(label);
-                    let mut v = d.hf.margins[k] / 72.0;
-                    if ui.add(egui::DragValue::new(&mut v).range(0.0..=10.0).speed(0.05).max_decimals(2)).changed() {
-                        d.hf.margins[k] = v * 72.0;
+                    let mut v = d.hf.margins[k] * per;
+                    // Up to 10 inches, whatever the unit.
+                    let max = 720.0 * per;
+                    if ui.add(egui::DragValue::new(&mut v).range(0.0..=max).speed(units.speed()).max_decimals(units.decimals())).changed() {
+                        d.hf.margins[k] = v / per;
                     }
                 }
             });
@@ -181,7 +195,7 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens, kind: M
                     ui.end_row();
                     for col in 0..3 {
                         let k = row * 3 + col;
-                        let r = ui.add_sized([220.0, 40.0], egui::TextEdit::multiline(&mut d.hf.text[k]).desired_rows(2).id_salt(("hf-box", k)));
+                        let r = ui.add_sized([220.0, 40.0], crate::widgets::block(&mut d.hf.text[k]).desired_rows(2).id_salt(("hf-box", k)));
                         if r.gained_focus() || r.has_focus() {
                             d.focused_box = k;
                         }
@@ -217,12 +231,13 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens, kind: M
                 ui.label(tl!("Start page number"));
                 ui.add(egui::DragValue::new(&mut d.hf.start_number).range(1..=999_999));
             });
+            ui.add(widgets::checkbox(&mut d.hf.shrink, tl!("Shrink the page content to make room for the header and footer")));
         }
         MarkKind::Watermark => {
             ui.horizontal(|ui| {
                 ui.label(tl!("Source"));
-                ui.radio_value(&mut d.use_file, false, tl!("Text"));
-                ui.radio_value(&mut d.use_file, true, tl!("File"));
+                widgets::radio_value(ui, &mut d.use_file, false, tl!("Text"));
+                widgets::radio_value(ui, &mut d.use_file, true, tl!("File"));
             });
             if d.use_file {
                 browse |= file_source(ui, d, MarkKind::Watermark);
@@ -232,15 +247,11 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens, kind: M
                     ui.add_enabled_ui(!d.use_file, |ui| {
                         ui.label(tl!("Text"));
                         ui.add(
-                            egui::TextEdit::multiline(&mut d.wm.text)
-                                .desired_rows(2)
-                                .desired_width(320.0)
-                                .hint_text("CONFIDENTIAL")
-                                .id_salt("wm-text"),
+                            crate::widgets::block(&mut d.wm.text).desired_rows(2).desired_width(320.0).hint_text("CONFIDENTIAL").id_salt("wm-text"),
                         );
                     });
                     ui.horizontal(|ui| {
-                        ui.add_enabled_ui(!d.use_file, |ui| ui.checkbox(&mut d.fit, tl!("Fit to page")));
+                        ui.add_enabled_ui(!d.use_file, |ui| ui.add(widgets::checkbox(&mut d.fit, tl!("Fit to page"))));
                         ui.add_enabled_ui(!d.fit, |ui| {
                             ui.label(tl!("Size"));
                             if d.wm.font_size == 0.0 {
@@ -253,7 +264,7 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens, kind: M
                     ui.horizontal(|ui| {
                         ui.label(tl!("Rotation"));
                         for r in [-45.0, 0.0, 45.0] {
-                            ui.radio_value(&mut d.wm.rotation, r, if r == 0.0 { tl!("None").to_string() } else { format!("{r}°") });
+                            widgets::radio_value(ui, &mut d.wm.rotation, r, if r == 0.0 { tl!("None").to_string() } else { format!("{r}°") });
                         }
                         ui.add(egui::DragValue::new(&mut d.wm.rotation).range(-180.0..=180.0).suffix("°"));
                     });
@@ -266,18 +277,25 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens, kind: M
                     });
                     ui.horizontal(|ui| {
                         ui.label(tl!("Location"));
-                        ui.radio_value(&mut d.wm.behind, true, tl!("Appear behind page"));
-                        ui.radio_value(&mut d.wm.behind, false, tl!("Appear on top of page"));
+                        widgets::radio_value(ui, &mut d.wm.behind, true, tl!("Appear behind page"));
+                        widgets::radio_value(ui, &mut d.wm.behind, false, tl!("Appear on top of page"));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(tl!("Offset from centre"));
+                        ui.label(tl!("Horizontal"));
+                        ui.add(egui::DragValue::new(&mut d.wm.offset[0]).range(-MAX_OFFSET..=MAX_OFFSET).suffix(" pt"));
+                        ui.label(tl!("Vertical"));
+                        ui.add(egui::DragValue::new(&mut d.wm.offset[1]).range(-MAX_OFFSET..=MAX_OFFSET).suffix(" pt"));
                     });
                 });
             });
         }
         MarkKind::Background => {
             ui.horizontal(|ui| {
-                ui.radio_value(&mut d.use_file, false, tl!("From colour"));
+                widgets::radio_value(ui, &mut d.use_file, false, tl!("From colour"));
                 ui.add_enabled_ui(!d.use_file, |ui| color_button(ui, &mut d.bg.color));
                 ui.add_space(12.0);
-                ui.radio_value(&mut d.use_file, true, tl!("File"));
+                widgets::radio_value(ui, &mut d.use_file, true, tl!("File"));
             });
             if d.use_file {
                 browse |= file_source(ui, d, MarkKind::Background);
@@ -297,11 +315,20 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens, kind: M
     ui.add_space(8.0);
     // Preview of the current page.
     let hf = d.hf.clone();
+    let size_h = page.1.max(1.0);
     let (wm, bg, fit) = (d.wm.clone(), d.bg.clone(), d.fit);
     let file_name = d.use_file.then(|| d.file.as_ref().map(|f| f.0.clone())).flatten();
     ui.horizontal(|ui| {
         preview(ui, t, page, |p, r, s| match kind {
             MarkKind::HeaderFooter => {
+                if hf.shrink {
+                    // The band the page content shrinks into, centred across.
+                    let (top, bottom) = hf.bands();
+                    let k = ((size_h - top - bottom) / size_h).clamp(0.0, 1.0) as f32;
+                    let band = Rect::from_min_max(pos2(r.left(), r.top() + top as f32 * s), pos2(r.right(), r.bottom() - bottom as f32 * s));
+                    let content = Rect::from_center_size(band.center(), vec2(r.width() * k, band.height().max(0.0)));
+                    p.rect_filled(content, CornerRadius::ZERO, Color32::from_gray(232));
+                }
                 for (k, text) in hf.text.iter().enumerate() {
                     if text.trim().is_empty() {
                         continue;
@@ -313,24 +340,22 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens, kind: M
                         1 => (r.center().x, egui::Align2::CENTER_CENTER),
                         _ => (r.right() - hf.margins[3] as f32 * s, egui::Align2::RIGHT_CENTER),
                     };
-                    p.text(pos2(x, y), align, shown, egui::FontId::proportional((hf.font_size as f32 * s).max(5.0)), rgb32(hf.color));
+                    // Courier previews in the monospaced UI face, the others proportional.
+                    let size = (hf.font_size as f32 * s).max(5.0);
+                    let font = if hf.font == FontFamily::Courier { egui::FontId::monospace(size) } else { egui::FontId::proportional(size) };
+                    p.text(pos2(x, y), align, shown, font, rgb32(hf.color));
                 }
             }
             MarkKind::Watermark if file_name.is_some() => {
                 let side = r.width().min(r.height()) * wm.scale as f32;
+                let centre = r.center() + vec2(wm.offset[0] as f32 * s, -wm.offset[1] as f32 * s);
                 p.rect_stroke(
-                    Rect::from_center_size(r.center(), vec2(side, side)),
+                    Rect::from_center_size(centre, vec2(side, side)),
                     CornerRadius::ZERO,
                     egui::Stroke::new(1.0, Color32::GRAY),
                     egui::StrokeKind::Inside,
                 );
-                p.text(
-                    r.center(),
-                    egui::Align2::CENTER_CENTER,
-                    file_name.clone().unwrap_or_default(),
-                    egui::FontId::proportional(10.0),
-                    Color32::GRAY,
-                );
+                p.text(centre, egui::Align2::CENTER_CENTER, file_name.clone().unwrap_or_default(), egui::FontId::proportional(10.0), Color32::GRAY);
             }
             MarkKind::Watermark => {
                 let text = if wm.text.trim().is_empty() { "CONFIDENTIAL" } else { wm.text.trim() };
@@ -344,7 +369,8 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens, kind: M
                 let half = galley.size() / 2.0;
                 let (sn, cs) = angle.sin_cos();
                 let offset = vec2(half.x * cs - half.y * sn, half.x * sn + half.y * cs);
-                p.add(egui::epaint::TextShape::new(r.center() - offset, galley, Color32::BLACK).with_angle(angle));
+                let centre = r.center() + vec2(wm.offset[0] as f32 * s, -wm.offset[1] as f32 * s);
+                p.add(egui::epaint::TextShape::new(centre - offset, galley, Color32::BLACK).with_angle(angle));
             }
             MarkKind::Background if file_name.is_some() => {
                 p.rect_stroke(r.shrink(6.0), CornerRadius::ZERO, egui::Stroke::new(1.0, Color32::GRAY), egui::StrokeKind::Inside);
@@ -378,20 +404,29 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens, kind: M
             }
         });
     });
+    // Text the standard fonts can't draw is refused on apply (#125), so it's refused here, with the
+    // preview (drawn in the interface font, which can draw it) no longer the only answer (#2013).
+    let undrawable = undrawable(kind, d);
+    if let Some(c) = undrawable {
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new(crate::content_ui::undrawable_message(c)).small().color(crate::content_ui::UNDRAWABLE));
+    }
     ui.add_space(10.0);
     let (mut apply, mut cancel) = (false, false);
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        let ready = match kind {
-            MarkKind::HeaderFooter => d.hf.text.iter().any(|x| !x.trim().is_empty()),
-            MarkKind::Watermark => {
-                if d.use_file {
-                    d.file.is_some()
-                } else {
-                    !d.wm.text.trim().is_empty()
+        let ready = undrawable.is_none()
+            && match kind {
+                MarkKind::HeaderFooter => d.hf.text.iter().any(|x| !x.trim().is_empty()),
+                MarkKind::Watermark => {
+                    if d.use_file {
+                        d.file.is_some()
+                    } else {
+                        !d.wm.text.trim().is_empty()
+                    }
                 }
+                MarkKind::Background => !d.use_file || d.file.is_some(),
             }
-            MarkKind::Background => !d.use_file || d.file.is_some(),
-        } && !d.range.pages(count).is_empty();
+            && !d.range.pages(count).is_empty();
         if ui.add_enabled_ui(ready, |ui| widgets::pill_button(ui, tl!("OK"), true)).inner.clicked() {
             apply = true;
         }
@@ -417,6 +452,16 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens, kind: M
     #[cfg(target_arch = "wasm32")]
     let _ = browse;
     (apply, cancel)
+}
+
+/// The first character of the dialog's text that applying would refuse (the standard fonts can't
+/// draw it), as the engine decides it. Pictures draw no text.
+fn undrawable(kind: MarkKind, d: &MarksDraft) -> Option<char> {
+    match kind {
+        MarkKind::HeaderFooter => d.hf.first_undrawable(),
+        MarkKind::Watermark if !d.use_file => d.wm.first_undrawable(),
+        MarkKind::Watermark | MarkKind::Background => None,
+    }
 }
 
 fn mark_file(d: &MarksDraft) -> Option<pdfcraft_engine::MarkFile> {
@@ -473,6 +518,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn text_applying_would_refuse_is_caught_in_the_dialog() {
+        let mut d = MarksDraft::default();
+        d.hf.text[5] = "Страница <<1>> из <<n>> / Page <<1>> of <<n>>".into();
+        assert_eq!(undrawable(MarkKind::HeaderFooter, &d), Some('С'), "#2013: refused before OK, not after");
+        d.hf.text[5] = "Page <<1>> of <<n>> — café".into();
+        assert_eq!(undrawable(MarkKind::HeaderFooter, &d), None);
+        d.wm.text = "ΑΠΟΡΡΗΤΟ".into();
+        assert_eq!(undrawable(MarkKind::Watermark, &d), Some('Α'));
+        d.use_file = true;
+        assert_eq!(undrawable(MarkKind::Watermark, &d), None, "a picture watermark draws no text");
+        assert_eq!(undrawable(MarkKind::Background, &d), None);
+    }
+
+    #[test]
     fn page_ranges_with_subsets() {
         let r = PageRange::default();
         assert_eq!(r.pages(4), [0, 1, 2, 3]);
@@ -480,5 +539,21 @@ mod tests {
         assert_eq!(r.pages(6), [1, 3, 5]);
         let r = PageRange { all: true, subset: Subset::Odd, ..PageRange::default() };
         assert_eq!(r.pages(5), [0, 2, 4]);
+        // Not all pages: by default up to the last one; a single page is a range too.
+        let r = PageRange { all: false, ..PageRange::default() };
+        assert_eq!(r.pages(4), [0, 1, 2, 3]);
+        let r = PageRange { all: false, from: 1, to: 1, subset: Subset::All };
+        assert_eq!(r.pages(38), [0]);
+    }
+
+    #[test]
+    fn the_watermark_edit_carries_the_offset() {
+        let mut d = MarksDraft::default();
+        d.wm.text = "DRAFT".into();
+        d.wm.offset = [-72.0, 36.0];
+        match edit(&d, MarkKind::Watermark, 3) {
+            Edit::AddWatermark { settings, .. } => assert_eq!(settings.offset, [-72.0, 36.0]),
+            other => panic!("expected AddWatermark, got {other:?}"),
+        }
     }
 }

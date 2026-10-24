@@ -14,6 +14,7 @@ use hayro_syntax::object::dict::keys::*;
 use hayro_syntax::object::{Array, Object};
 use kurbo::{BezPath, Vec2};
 use skrifa::attribute::Style;
+use skrifa::charmap::MapVariant;
 use skrifa::raw::collections::int_set::Domain;
 use skrifa::{FontRef, GlyphId, MetadataProvider};
 use std::collections::HashMap;
@@ -41,9 +42,19 @@ pub(crate) struct Type0Font {
     /// Whether the `to_unicode` map is a UCS2 `CMap` (CID-indexed) rather than
     /// a `ToUnicode` `CMap` (code-indexed).
     to_unicode_is_cid_indexed: bool,
+    /// PdfCraft patch: whether the CIDs belong to an Adobe character collection (Japan1, GB1,
+    /// CNS1, Korea1), whose glyph numbering no substitute other than a CID-keyed CFF font shares.
+    adobe_collection: bool,
+    /// PdfCraft patch: `/ToUnicode /Identity-H` (a name, not a CMap stream), which CAD exporters
+    /// such as WSCAD write for fonts whose two-byte codes are UTF-16 code units. Acrobat shows
+    /// such text as the code's Unicode value; the identity CMap the name resolves to maps codes
+    /// to CIDs only and gave no text at all.
+    identity_to_unicode: bool,
 }
 
 impl Type0Font {
+    /// Reads a Type 0 font from its dictionary: the descendant CID font, the encoding CMap and
+    /// the code-to-Unicode map (`/ToUnicode`, the `/Identity-H` name, or the UCS2 CMap).
     pub(crate) fn new(
         dict: &Dict<'_>,
         font_resolver: &FontResolverFn,
@@ -113,6 +124,9 @@ impl Type0Font {
         let cache_key = dict.cache_key();
 
         let mut to_unicode = read_to_unicode(dict, cmap_resolver);
+        let identity_to_unicode = dict
+            .get::<Name<'_>>(TO_UNICODE)
+            .is_some_and(|n| matches!(n.as_ref(), b"Identity-H" | b"Identity-V"));
         let mut to_unicode_is_cid_indexed = false;
 
         // If there is no ToUnicode map, try to get the UCS2 CMap.
@@ -128,6 +142,10 @@ impl Type0Font {
                 to_unicode_is_cid_indexed = true;
             }
         }
+
+        let adobe_collection = character_collection
+            .as_ref()
+            .is_some_and(|cc| cc.family.ucs2_cmap().is_some());
 
         let postscript_name = dict
             .get::<Name<'_>>(BASE_FONT)
@@ -153,6 +171,8 @@ impl Type0Font {
             font_flags,
             fallback,
             to_unicode_is_cid_indexed,
+            adobe_collection,
+            identity_to_unicode,
         })
     }
 
@@ -174,6 +194,16 @@ impl Type0Font {
         {
             // Yay, Unicode worked!
             return glyph;
+        }
+
+        // PdfCraft patch: a substitute that isn't CID-keyed numbers its glyphs its own way, so
+        // the CID of an Adobe character collection taken as its glyph index draws an unrelated
+        // glyph. Draw .notdef, as for a CID the font has no glyph for.
+        if self.fallback
+            && self.adobe_collection
+            && !matches!(&self.font_type, FontType::Cff(c) if c.is_cid())
+        {
+            return GlyphId::NOTDEF;
         }
 
         // At this point, not much we can do anymore. Just hope that the
@@ -207,7 +237,7 @@ impl Type0Font {
     fn map_via_unicode(&self, key: u32) -> Option<GlyphId> {
         let to_unicode = self.to_unicode.as_ref()?;
 
-        let character = to_unicode
+        let (character, selector) = to_unicode
             .lookup_bf_string(key)
             .or_else(|| {
                 for len in 0..4 {
@@ -221,12 +251,38 @@ impl Type0Font {
                 None
             })
             .and_then(|bf| match bf {
-                BfString::Char(c) => Some(c),
-                BfString::String(_) => None,
+                BfString::Char(c) => Some((c, None)),
+                // PdfCraft patch: a character and a variation selector is that character in a
+                // given form, as Adobe-Japan1 maps the JIS X 0208 forms of the kanji that
+                // JIS X 0213:2004 redrew (噂 is U+5642 U+E0100). Other strings (ligatures) still
+                // have no glyph.
+                BfString::String(s) => {
+                    let mut chars = s.chars();
+                    let character = chars.next()?;
+                    let selector = chars.next().filter(|c| is_variation_selector(*c))?;
+                    chars.next().is_none().then_some((character, Some(selector)))
+                }
             })?;
 
         match &self.font_type {
-            FontType::OpenType(t) => t.font_ref().charmap().map(character),
+            FontType::OpenType(t) => {
+                let charmap = t.font_ref().charmap();
+                // PdfCraft patch: the face's glyph for that form when its `cmap` has one, else its
+                // glyph for the character, as when a form isn't supported (Unicode FAQ on
+                // variation sequences).
+                if let Some(selector) = selector
+                    && let Some(MapVariant::Variant(glyph)) = charmap.map_variant(character, selector)
+                {
+                    return Some(glyph);
+                }
+                // PdfCraft patch: a substitute may lack a spacing character (#3601; e.g.
+                // Adobe-Japan1's U+2002). Draw its ordinary space instead of .notdef;
+                // the PDF's widths and Unicode mapping still determine advance and text.
+                charmap.map(character).or_else(|| match character {
+                    '\u{00a0}' | '\u{2000}'..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}' => charmap.map(' '),
+                    _ => None,
+                })
+            }
             FontType::Cff(c) => {
                 // Map codepoint to glyph name via AFL, and then look it up.
                 if let Some(name) = glyph_names::get_reverse(character)
@@ -391,7 +447,16 @@ impl Type0Font {
         }
     }
 
+    /// The text a character code stands for, or `None` when the font gives none (or, for an
+    /// identity `/ToUnicode` name, when the code is a control or a lone surrogate).
     pub(crate) fn char_code_to_unicode(&self, code: u32) -> Option<BfString> {
+        if self.identity_to_unicode {
+            // Controls and lone surrogates are not text. The same rule builds the editing
+            // map, `identity_to_unicode` in crates/fonts/src/pdf.rs: keep both alike.
+            return char::from_u32(code)
+                .filter(|c| !c.is_control())
+                .map(BfString::Char);
+        }
         if let Some(to_unicode) = &self.to_unicode {
             let key = if self.to_unicode_is_cid_indexed {
                 self.code_to_cid(code).unwrap_or(0)
@@ -509,6 +574,11 @@ impl CidToGIdMap {
     }
 }
 
+/// PdfCraft patch: Variation Selectors (U+FE00–U+FE0F) and their supplement (U+E0100–U+E01EF).
+fn is_variation_selector(c: char) -> bool {
+    matches!(c, '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}')
+}
+
 /// PdfCraft patch: the largest CID (ISO 32000-2 §9.7.2; CIDs are at most two bytes).
 const MAX_CID: u32 = 65_535;
 
@@ -548,6 +618,12 @@ fn read_widths2(arr: &Array<'_>) -> Option<HashMap<u32, [f32; 3]>> {
             let mut iter = range.iter::<f32>();
 
             while let Some(w) = iter.next() {
+                // PdfCraft patch: as in `read_widths`, checked before the run's metrics are
+                // read. Without it, a run starting at 4294967295 overflowed `first` and
+                // discarded the whole /W2 table.
+                if first > MAX_CID {
+                    break;
+                }
                 let v1 = iter.next()?;
                 let v2 = iter.next()?;
                 map.insert(first, [w, v1, v2]);
@@ -597,5 +673,26 @@ fn read_encoding(object: &Object<'_>, cmap_resolver: &CMapResolverFn) -> Option<
             CMap::parse(&decoded, move |n| (resolver)(n))
         }
         _ => None,
+    }
+}
+
+/// PdfCraft patch test (ported from craft-libs): a /W2 run whose first CID is past `MAX_CID`
+/// is skipped and the rest of the table kept.
+#[cfg(test)]
+mod tests {
+    use super::read_widths2;
+    use hayro_syntax::object::{Array, FromBytes};
+
+    #[test]
+    fn w2_run_past_the_largest_cid_keeps_the_rest_of_the_table() {
+        let arr =
+            Array::from_bytes(b"[4294967295 [1000 500] 10 [900 450 860] 20 30 800 400 870]")
+                .unwrap();
+        let map = read_widths2(&arr).unwrap();
+
+        assert_eq!(map.get(&4_294_967_295), None);
+        assert_eq!(map.get(&10), Some(&[900.0, 450.0, 860.0]));
+        assert_eq!(map.get(&25), Some(&[800.0, 400.0, 870.0]));
+        assert_eq!(map.len(), 12);
     }
 }

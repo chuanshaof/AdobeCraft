@@ -90,7 +90,9 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens, kind: E
     } else if kind == ExportKind::AllImages {
         ui.horizontal(|ui| {
             ui.label(tl!("Exclude images smaller than"));
-            let label = move |n: u32| if n == 0 { tl!("No limit").to_string() } else { format!("{n} pixels") };
+            let label = move |n: u32| {
+                if n == 0 { tl!("No limit").to_string() } else { crate::i18n::trn(crate::i18n::current(), u64::from(n), "{n} pixel", "{n} pixels") }
+            };
             egui::ComboBox::from_id_salt("export-min").selected_text(label(d.min_side)).show_ui(ui, |ui| {
                 for n in [0, 16, 32, 64, 128, 256] {
                     ui.selectable_value(&mut d.min_side, n, label(n));
@@ -151,7 +153,7 @@ fn run(
             Err(e) => return crate::i18n::fmt(tl!("Export stopped: {e}"), &[("e", &e.to_string())]),
         };
         for (k, img) in out.images.iter().enumerate() {
-            if let Err(e) = sink(&pdfcraft_engine::export::image_file_name(&stem, img, k + 1), img.data.clone()) {
+            if let Err(e) = sink(&pdfcraft_engine::export::image_file_name(&stem, img, k + 1, src.pages), img.data.clone()) {
                 return crate::i18n::fmt(tl!("Export stopped: {e}"), &[("e", &e.to_string())]);
             }
         }
@@ -181,11 +183,21 @@ fn run(
                     return crate::i18n::fmt(tl!("Export stopped: {e}"), &[("e", &e.to_string())]);
                 }
             }
-            if total == 1 {
+            let mut msg = if total == 1 {
                 crate::i18n::fmt(tl!("Exported 1 image"), &[])
             } else {
                 crate::i18n::fmt(tl!("Exported {n} images"), &[("n", &total.to_string())])
+            };
+            // Pages too large for the renderer at the chosen resolution are drawn at the most it
+            // allows: say so, rather than leave a smaller image unexplained.
+            let lowered: Vec<f64> = pages.iter().map(|p| ex.dpi_used(*p, dpi)).filter(|used| *used < dpi.clamp(18.0, 1200.0) - 0.5).collect();
+            if let Some(lowest) = lowered.iter().copied().reduce(f64::min) {
+                msg.push_str(&crate::i18n::fmt(
+                    tl!(" ({n} at {dpi} dpi, the largest size they can be drawn at)"),
+                    &[("n", &lowered.len().to_string()), ("dpi", &format!("{}", lowest.floor()))],
+                ));
             }
+            msg
         }
         ExportKind::Text => {
             set(0, None);
@@ -211,6 +223,9 @@ impl PdfCraftApp {
             return;
         }
         let Some((_, id)) = self.active_ids() else { return };
+        if !self.may_copy(id) {
+            return;
+        }
         let Some(doc) = self.session.get(id) else { return };
         let src = doc.export_source();
         let stem = doc.name.trim_end_matches(".pdf").trim_end_matches(".PDF").to_string();

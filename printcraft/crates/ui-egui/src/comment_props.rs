@@ -1,9 +1,9 @@
 //! Comment Properties (Acrobat: right-click a comment ▸ Properties…; audit "Comment
-//! properties"): Appearance (colour, opacity, line thickness, note icon), General (author,
+//! properties"): Appearance (colour, fill, opacity, line thickness, note icon), General (author,
 //! subject, modified) and Review History (status changes), with Acrobat's Locked box.
 
 use egui::{Align, Layout};
-use pdfcraft_engine::{CommentProps, Edit, NoteIcon};
+use pdfcraft_engine::{CommentProps, Edit, LineEnding, NoteIcon};
 
 use crate::comments::swatch_grid;
 use crate::theme::{self, Tokens};
@@ -23,10 +23,28 @@ pub struct PropsDraft {
     pub tab: PropsTab,
     pub original: CommentProps,
     pub edited: CommentProps,
+    /// Acrobat's Make Properties Default box: on OK, new comments of this kind take the edited
+    /// colour, opacity and line width too.
+    pub make_default: bool,
 }
 
-const ICONS: [NoteIcon; 7] =
-    [NoteIcon::Comment, NoteIcon::Note, NoteIcon::Help, NoteIcon::Insert, NoteIcon::Key, NoteIcon::NewParagraph, NoteIcon::Paragraph];
+const ICONS: [NoteIcon; 14] = NoteIcon::ALL;
+
+/// The name shown in the line-ending combo. [`LineEnding::name`] stays the PDF `/LE` token.
+fn ending_label(ending: LineEnding) -> &'static str {
+    match ending {
+        LineEnding::None => tl!("None"),
+        LineEnding::Square => tl!("Square"),
+        LineEnding::Circle => tl!("Circle"),
+        LineEnding::Diamond => tl!("Diamond"),
+        LineEnding::OpenArrow => tl!("Open arrow"),
+        LineEnding::ClosedArrow => tl!("Closed arrow"),
+        LineEnding::Butt => tl!("Butt"),
+        LineEnding::ROpenArrow => tl!("Reverse open arrow"),
+        LineEnding::RClosedArrow => tl!("Reverse closed arrow"),
+        LineEnding::Slash => tl!("Slash"),
+    }
+}
 
 impl PdfCraftApp {
     /// Attach file: ask for a file (or take `attach_override`) and attach it at `at`.
@@ -71,28 +89,38 @@ impl PdfCraftApp {
     /// Make Current Properties Default: new comments of this kind take this one's colour,
     /// opacity and line width.
     pub fn make_comment_default(&mut self, page: usize, index: usize) {
+        let Some(p) = self.active_ids().and_then(|(_, id)| self.session.get(id)).and_then(|doc| doc.comment_props(page, index)) else { return };
+        self.make_props_default(page, index, &p);
+    }
+
+    /// New comments of the kind at `(page, index)` take the look in `p`: its colour, opacity,
+    /// line width and (for shapes) fill. `p` may be a Comment Properties draft not applied yet.
+    pub fn make_props_default(&mut self, page: usize, index: usize, p: &CommentProps) {
         let Some((_, id)) = self.active_ids() else { return };
         let Some(doc) = self.session.get(id) else { return };
         let Some(a) = doc.info.annotations.iter().find(|a| a.page == page && a.index == index && a.in_reply_to.is_none()) else { return };
-        let Some(tool) = crate::comments::tool_for(a) else { return };
-        let Some(p) = doc.comment_props(page, index) else { return };
+        let Some(tool) = crate::comments::tool_for_default(a, p.endings.as_deref()) else { return };
         let mut style = self.comment_prefs.style(tool);
         if let Some(c) = p.color {
             style.color = c;
         }
-        style.opacity = p.opacity;
-        if let Some(w) = p.width {
-            style.width = w;
+        if p.fillable && tool.has_fill() {
+            style.fill = p.fill;
         }
         self.comment_prefs.set_style(tool, style);
-        self.notify_fmt("New {tool} comments will look like this one", &[("tool", &tl!(tool.label()).to_lowercase())]);
+        // Keep invisible defaults out of tools where a zero stroke would make them disappear.
+        self.comment_prefs.set_opacity(tool, p.opacity);
+        if let Some(w) = p.width {
+            self.comment_prefs.set_width(tool, w);
+        }
+        self.notify_fmt("New {tool} comments will look like this one", &[("tool", &crate::i18n::in_sentence(tl!(tool.label())))]);
     }
 
     /// Open Comment Properties for the comment at `(page, index)` of the active document.
     pub fn open_comment_props(&mut self, page: usize, index: usize) {
         let Some((_, id)) = self.active_ids() else { return };
         let Some(p) = self.session.get(id).and_then(|d| d.comment_props(page, index)) else { return };
-        self.comment_props = Some(PropsDraft { page, index, tab: PropsTab::Appearance, original: p.clone(), edited: p });
+        self.comment_props = Some(PropsDraft { page, index, tab: PropsTab::Appearance, original: p.clone(), edited: p, make_default: false });
         self.dialog = Some(crate::Dialog::CommentProps);
     }
 }
@@ -108,8 +136,17 @@ pub fn edits(d: &PropsDraft) -> Vec<Edit> {
     let color = (e.color != o.color).then_some(e.color).flatten();
     let opacity = ((e.opacity - o.opacity).abs() > 1e-6).then_some(e.opacity);
     let width = (e.width != o.width).then_some(e.width).flatten();
-    if e.restylable && (color.is_some() || opacity.is_some() || width.is_some()) {
-        out.push(Edit::StyleAnnotation { page: d.page, index: d.index, color, opacity, width });
+    let endings = (e.endings != o.endings).then(|| e.endings.clone()).flatten();
+    if e.restylable && (color.is_some() || opacity.is_some() || width.is_some() || endings.is_some()) {
+        out.push(Edit::StyleAnnotation { page: d.page, index: d.index, color, opacity, width, endings });
+    }
+    if e.restylable && e.fillable && e.fill != o.fill {
+        out.push(Edit::FillAnnotation { page: d.page, index: d.index, fill: e.fill });
+    }
+    if e.restylable
+        && let Some(size) = e.font_size.filter(|s| Some(*s) != o.font_size)
+    {
+        out.push(Edit::FontSizeAnnotation { page: d.page, index: d.index, size });
     }
     let author = (e.author != o.author).then(|| e.author.clone());
     let subject = (e.subject != o.subject).then(|| e.subject.clone());
@@ -140,11 +177,17 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) -> (boo
                 .collect()
         })
         .unwrap_or_default();
+    let default_tool = app.comment_props.as_ref().and_then(|d| {
+        let (_, id) = app.active_ids()?;
+        let doc = app.session.get(id)?;
+        let a = doc.info.annotations.iter().find(|a| a.page == d.page && a.index == d.index && a.in_reply_to.is_none())?;
+        crate::comments::tool_for_default(a, d.edited.endings.as_deref())
+    });
     let Some(d) = app.comment_props.as_mut() else { return (false, true) };
     let kind = tl!(crate::comments_panel::subtype_label(&d.edited.subtype)).to_string();
     ui.label(egui::RichText::new(crate::i18n::fmt(tl!("{kind} Properties"), &[("kind", &kind)])).font(theme::semibold(18.0)));
     ui.add_space(6.0);
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         for (tab, label) in
             [(PropsTab::Appearance, tl!("Appearance")), (PropsTab::General, tl!("General")), (PropsTab::ReviewHistory, tl!("Review History"))]
         {
@@ -177,15 +220,44 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) -> (boo
                         e.color = Some(c);
                     }
                     ui.end_row();
+                    if e.fillable {
+                        ui.label(tl!("Fill colour"));
+                        if let Some(f) = crate::comments::fill_picker(ui, e.fill) {
+                            e.fill = f;
+                        }
+                        ui.end_row();
+                    }
+                    if let Some(size) = e.font_size.as_mut() {
+                        ui.label(tl!("Font size"));
+                        ui.add(egui::DragValue::new(size).range(1.0..=400.0).speed(0.5).suffix(" pt"));
+                        ui.end_row();
+                    }
                     ui.label(tl!("Opacity"));
                     let mut pct = e.opacity * 100.0;
                     if ui.add(egui::Slider::new(&mut pct, 0.0..=100.0).suffix("%")).changed() {
                         e.opacity = pct / 100.0;
                     }
                     ui.end_row();
+                    let min_width = if e.font_size.is_some() { 0.0 } else { 0.5 };
                     if let Some(w) = e.width.as_mut() {
                         ui.label(tl!("Thickness"));
-                        ui.add(egui::Slider::new(w, 0.5..=12.0).step_by(0.5).suffix(" pt"));
+                        ui.add(egui::Slider::new(w, min_width..=12.0).step_by(0.5).suffix(" pt"));
+                        ui.end_row();
+                    }
+                    if let Some(ends) = e.endings.as_mut() {
+                        ui.label(tl!("Line ending"));
+                        ui.horizontal(|ui| {
+                            for (i, ending) in ends.iter_mut().enumerate() {
+                                egui::ComboBox::from_id_salt(("line-ending", i)).selected_text(ending_label(*ending)).width(188.0).show_ui(
+                                    ui,
+                                    |ui| {
+                                        for style in LineEnding::ALL {
+                                            ui.selectable_value(ending, style, ending_label(style));
+                                        }
+                                    },
+                                );
+                            }
+                        });
                         ui.end_row();
                     }
                 });
@@ -194,10 +266,10 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) -> (boo
         PropsTab::General => {
             egui::Grid::new("comment-general").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
                 let l = ui.label(tl!("Author"));
-                ui.add(egui::TextEdit::singleline(&mut e.author).desired_width(280.0)).labelled_by(l.id);
+                ui.add(crate::widgets::line(&mut e.author).desired_width(280.0)).labelled_by(l.id);
                 ui.end_row();
                 let l = ui.label(tl!("Subject"));
-                ui.add(egui::TextEdit::singleline(&mut e.subject).desired_width(280.0)).labelled_by(l.id);
+                ui.add(crate::widgets::line(&mut e.subject).desired_width(280.0)).labelled_by(l.id);
                 ui.end_row();
                 ui.label(tl!("Modified"));
                 ui.label(e.modified.as_deref().map(pdfcraft_render::pretty_date).unwrap_or_else(|| "—".into()));
@@ -214,7 +286,13 @@ pub(crate) fn body(ui: &mut egui::Ui, app: &mut PdfCraftApp, t: &Tokens) -> (boo
         }
     }
     ui.add_space(12.0);
-    ui.checkbox(&mut d.edited.locked, tl!("Locked"));
+    ui.horizontal(|ui| {
+        ui.add(widgets::checkbox(&mut d.edited.locked, tl!("Locked")));
+        ui.add_space(16.0);
+        // Acrobat's box beside Locked. Only a comment whose look can change, made by a tool.
+        let defaultable = d.edited.restylable && default_tool.is_some();
+        ui.add_enabled(defaultable, widgets::checkbox(&mut d.make_default, tl!("Make Properties Default")));
+    });
     let (mut apply, mut cancel) = (false, false);
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         if widgets::pill_button(ui, tl!("OK"), true).clicked() {

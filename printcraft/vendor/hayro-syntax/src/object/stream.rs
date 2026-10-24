@@ -22,6 +22,16 @@ struct FiltersAndParams<'a> {
     params: SmallVec<[Dict<'a>; 2]>,
 }
 
+/// PdfCraft patch: how the decoded data of a stream can be produced (see `Stream::incremental`).
+pub(crate) enum Incremental {
+    /// The stream has no filter, so its data is its own bytes.
+    Plain,
+    /// The stream is Flate-compressed without a predictor, so it decodes a piece at a time.
+    Flate,
+    /// Anything else decodes whole.
+    Whole,
+}
+
 /// A stream of arbitrary data.
 #[derive(Clone)]
 pub struct Stream<'a> {
@@ -152,6 +162,22 @@ impl<'a> Stream<'a> {
         self.filters_and_params().filters
     }
 
+    /// PdfCraft patch: how the decoded data of the stream can be produced a piece at a time.
+    pub(crate) fn incremental(&self) -> Incremental {
+        let filters_and_params = self.filters_and_params();
+
+        match (
+            filters_and_params.filters.as_slice(),
+            filters_and_params.params.first(),
+        ) {
+            ([], _) => Incremental::Plain,
+            ([Filter::FlateDecode], Some(params)) if crate::filter::flate_is_plain(params) => {
+                Incremental::Flate
+            }
+            _ => Incremental::Whole,
+        }
+    }
+
     /// Return the decoded data of the stream.
     ///
     /// Note that the result of this method will not be cached, so calling it multiple
@@ -167,20 +193,61 @@ impl<'a> Stream<'a> {
         &self,
         image_params: &ImageDecodeParams,
     ) -> Result<FilterResult<'a>, DecodeFailure> {
-        let data = self.raw_data();
+        self.decode_within(image_params, usize::MAX)
+    }
+
+    /// PdfCraft patch: the decoded data of the stream, for callers that budget what a page
+    /// holds. Flate, LZW and RunLength stop at `max` bytes (and at
+    /// [`crate::filter::MAX_DECODED_STREAM`] in any case). A stream without filters is returned
+    /// as it is; ASCIIHex and ASCII85 barely expand, and the image codecs stop at their own pixel
+    /// limits.
+    pub fn decoded_within(&self, max: usize) -> Result<Cow<'a, [u8]>, DecodeFailure> {
+        self.decode_within(&ImageDecodeParams::default(), max)
+            .map(|r| r.data)
+    }
+
+    fn decode_within(
+        &self,
+        image_params: &ImageDecodeParams,
+        max: usize,
+    ) -> Result<FilterResult<'a>, DecodeFailure> {
+        self.decode_raw_within(self.raw_data(), image_params, max)
+    }
+
+    /// PdfCraft patch: decode caller-supplied raw/decrypted bytes with the same filters and limits.
+    pub(crate) fn decoded_raw_within(
+        &self,
+        data: Cow<'a, [u8]>,
+        max: usize,
+    ) -> Result<Cow<'a, [u8]>, DecodeFailure> {
+        self.decode_raw_within(data, &ImageDecodeParams::default(), max)
+            .map(|r| r.data)
+    }
+
+    fn decode_raw_within(
+        &self,
+        data: Cow<'a, [u8]>,
+        image_params: &ImageDecodeParams,
+        max: usize,
+    ) -> Result<FilterResult<'a>, DecodeFailure> {
         let filters_and_params = self.filters_and_params();
+        let count = filters_and_params.filters.len();
 
         let mut current: Option<FilterResult<'a>> = None;
 
-        for (filter, params) in filters_and_params
+        for (i, (filter, params)) in filters_and_params
             .filters
             .iter()
             .zip(filters_and_params.params.iter())
+            .enumerate()
         {
+            // PdfCraft patch: see `filter::decode_limit`.
+            let limit = crate::filter::decode_limit(image_params, i + 1 == count).min(max);
             let new = filter.apply(
                 current.as_ref().map(|c| c.data.as_ref()).unwrap_or(&data),
                 params,
                 image_params,
+                limit,
             )?;
             current = Some(new);
         }
@@ -286,14 +353,25 @@ impl FilterResult<'_> {
     }
 }
 
+/// PdfCraft patch (20): the end-of-line after the `stream` keyword. Microsoft Reporting Services
+/// writes `stream \r\n`, a space before the line break, which the specification does not allow.
+/// Without this the content stream was taken to start at the space, failed to inflate, and the
+/// page rendered blank (bank statements, invoices) while other viewers showed it. Only spaces and
+/// tabs are skipped, and only when a line break follows, so stream data is never swallowed.
+fn forward_stream_eol(r: &mut Reader<'_>) -> Option<()> {
+    r.forward_while(|b| b == b' ' || b == b'\t');
+    r.forward_tag(b"\n")
+        .or_else(|| r.forward_tag(b"\r\n"))
+        // Technically not allowed, but no reason to not try it.
+        .or_else(|| r.forward_tag(b"\r"))
+}
+
 fn parse_proper<'a>(r: &mut Reader<'a>, dict: &Dict<'a>) -> Option<Stream<'a>> {
     let length = dict.get::<u32>(LENGTH)?;
 
     r.skip_white_spaces_and_comments();
     r.forward_tag(b"stream")?;
-    r.forward_tag(b"\n")
-        .or_else(|| r.forward_tag(b"\r\n"))
-        .or_else(|| r.forward_tag(b"\r"))?;
+    forward_stream_eol(r)?;
     let data = r.read_bytes(length as usize)?;
     r.skip_white_spaces();
     r.forward_tag(b"endstream")?;
@@ -309,11 +387,7 @@ fn parse_fallback<'a>(r: &mut Reader<'a>, dict: &Dict<'a>) -> Option<Stream<'a>>
     // A wrong `/Length` still recovers, because that keyword sits directly after the dict.
     r.skip_white_spaces_and_comments();
     r.forward_tag(b"stream")?;
-
-    r.forward_tag(b"\n")
-        .or_else(|| r.forward_tag(b"\r\n"))
-        // Technically not allowed, but no reason to not try it.
-        .or_else(|| r.forward_tag(b"\r"))?;
+    forward_stream_eol(r)?;
 
     let tail = r.tail()?;
     let endstream_offset = find_needle(tail, b"endstream")?;

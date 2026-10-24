@@ -108,6 +108,9 @@ impl<'a> Type3<'a> {
                     .encodings
                     .get(&code)
                     .map(|s| s.as_str())
+                    // PdfCraft patch: an Annex D.2 alias code reads as the ordinary character;
+                    // see `Encoding::text_alias`.
+                    .or_else(|| self.encoding.text_alias(code))
                     .or_else(|| self.encoding.map_code(code));
                 name.and_then(crate::font::glyph_name_to_unicode)
                     .or_else(|| (0x20..0x7f).contains(&code).then_some(code as char))
@@ -141,7 +144,8 @@ impl<'a> Type3<'a> {
 
         let name = self.glyph_simulator.glyph_to_string(glyph.glyph_id)?;
         let program = self.char_procs.get(&name)?;
-        let decoded = program.decoded().ok()?;
+        // PdfCraft patch: see `context::MAX_PAGE_CONTENT`.
+        let decoded = crate::context::decode_content(program)?;
         let iter = TypedIter::new(decoded.as_ref());
 
         let is_shape_glyph = {
@@ -164,9 +168,10 @@ impl<'a> Type3<'a> {
             is_shape_glyph
         };
 
+        // PdfCraft patch: context clips and shading bounds are in device space; FontBBox is in glyph space.
         let mut context = Context::new_with(
             state.ctm,
-            self.font_bbox,
+            root_transform.transform_rect_bbox(self.font_bbox),
             &glyph.cache,
             glyph.xref,
             glyph.settings.clone(),

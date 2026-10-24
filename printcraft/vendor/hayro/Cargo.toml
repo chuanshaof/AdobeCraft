@@ -60,6 +60,10 @@ default-features = false
 [dependencies.kurbo]
 version = "0.13.0"
 
+# PdfCraft patch: report image resampling fallbacks through the application's logger.
+[dependencies.log]
+version = "0.4"
+
 [dependencies.pic-scale]
 version = "0.7.9"
 features = [
@@ -79,9 +83,9 @@ features = [
 ]
 default-features = false
 
-[dev-dependencies.log]
-version = "0.4"
-
+# PdfCraft patch: the upstream-only `[dev-dependencies.log]` entry is removed (log is a normal
+# dependency since the logging patch), so `cargo test -p hayro` can run this crate's unit tests
+# even though a patched non-workspace crate may not require dev-dependencies.
 [lints.clippy]
 collection_is_never_read = "warn"
 dbg_macro = "warn"

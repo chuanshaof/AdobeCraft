@@ -8,7 +8,7 @@
 //! children, then its siblings, then each ancestor's children.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use boa_engine::object::ObjectInitializer;
 use boa_engine::object::builtins::{JsArray, JsProxy};
@@ -64,6 +64,9 @@ pub struct XfaNode {
     /// This instance's index among its same-named siblings.
     pub index: usize,
     pub children: Vec<XfaNode>,
+    /// Fields: the value shown in the field's display picture, what `formattedValue` reads;
+    /// `None` when the picture doesn't change it (the raw value is read then).
+    pub formatted: Option<String>,
 }
 
 /// The event a script runs for.
@@ -155,7 +158,10 @@ pub const MAX_ALERTS: usize = 100;
 /// Most console lines one run may print.
 pub const MAX_CONSOLE: usize = 1_000;
 /// Longest message or console line kept, in characters.
-const MAX_LINE: usize = 4_096;
+pub(crate) const MAX_LINE: usize = 4_096;
+/// Most bytes of text one run may hand back or write: messages, console lines, URLs, names
+/// and the values it sets. Past it, more are left out and noted.
+pub(crate) const MAX_PAYLOAD: usize = 32 << 20;
 
 /// Longest value a script may put in a field (characters); longer ones are cut and noted.
 const MAX_VALUE: usize = 65_536;
@@ -173,6 +179,47 @@ pub(crate) fn clip_value(v: String) -> (String, bool) {
     match v.char_indices().nth(MAX_VALUE) {
         Some((at, _)) => (v.get(..at).unwrap_or_default().to_string(), true),
         None => (v, false),
+    }
+}
+
+/// The field names of a `resetData` list (comma-separated), each cut to [`MAX_LINE`] and
+/// named once, at most as many as a snapshot holds nodes.
+pub(crate) fn reset_names(list: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for name in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if out.len() >= MAX_NODES {
+            break;
+        }
+        let name = clip(name.to_string());
+        if seen.insert(name.clone()) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// The (property, SOM) an effect setting a property of an object is merged by, see
+/// [`XHost::set_at`].
+fn effect_key(e: &XfaEffect) -> Option<(u8, String)> {
+    match e {
+        XfaEffect::SetValue { som, .. } => Some((0, som.clone())),
+        XfaEffect::SetPresence { som, .. } => Some((1, som.clone())),
+        XfaEffect::SetAccess { som, .. } => Some((2, som.clone())),
+        _ => None,
+    }
+}
+
+/// Bytes of text `e` holds.
+fn payload(e: &XfaEffect) -> usize {
+    match e {
+        XfaEffect::SetValue { som, value: s } | XfaEffect::SetPresence { som, presence: s } | XfaEffect::SetAccess { som, access: s } => {
+            som.len().saturating_add(s.len())
+        }
+        XfaEffect::AddInstance { som } | XfaEffect::RemoveInstance { som } => som.len(),
+        XfaEffect::MessageBox(s) | XfaEffect::LaunchUrl(s) | XfaEffect::SetFocus(s) => s.len(),
+        XfaEffect::ResetData(names) => names.iter().fold(0usize, |n, s| n.saturating_add(s.len()).saturating_add(std::mem::size_of::<String>())),
+        XfaEffect::Print | XfaEffect::SaveAs | XfaEffect::Beep | XfaEffect::Recalculate | XfaEffect::Relayout => 0,
     }
 }
 
@@ -205,6 +252,8 @@ pub(crate) struct HNode {
     pub(crate) children: Vec<usize>,
     /// Removed by `removeInstance`: skipped everywhere.
     pub(crate) gone: bool,
+    /// See [`XfaNode::formatted`]; dropped when a script sets the value, which it no longer shows.
+    pub(crate) formatted: Option<String>,
 }
 
 /// The form as a script sees and changes it, with the effects it records.
@@ -227,6 +276,9 @@ pub(crate) struct XHost {
     clipped_values: usize,
     dropped_alerts: usize,
     dropped_console: usize,
+    /// Bytes of text kept in effects, console lines and values written, against [`MAX_PAYLOAD`].
+    kept: usize,
+    dropped_bytes: usize,
 }
 
 impl XHost {
@@ -251,15 +303,71 @@ impl XHost {
             clipped_values: 0,
             dropped_alerts: 0,
             dropped_console: 0,
+            kept: 0,
+            dropped_bytes: 0,
+        }
+    }
+
+    /// Room for `bytes` more bytes of kept text: charged when there is, a drop counted when not.
+    fn room(&mut self, bytes: usize) -> bool {
+        match self.kept.checked_add(bytes).filter(|k| *k <= MAX_PAYLOAD) {
+            Some(k) => {
+                self.kept = k;
+                true
+            }
+            None => {
+                self.dropped_bytes = self.dropped_bytes.saturating_add(1);
+                false
+            }
         }
     }
 
     /// Record an effect: values, presence and access set again on the same object replace the
-    /// earlier one; past [`MAX_EFFECTS`] (or [`MAX_ALERTS`] message boxes) effects are counted
-    /// and dropped.
+    /// earlier one; past [`MAX_EFFECTS`] (or [`MAX_ALERTS`] message boxes, or [`MAX_PAYLOAD`]
+    /// bytes of text) effects are counted and dropped.
     pub(crate) fn push(&mut self, e: XfaEffect) {
-        let e = match e {
+        let e = self.clip_effect(e);
+        if self.room(payload(&e)) {
+            self.record(e);
+        }
+    }
+
+    /// Room for `e`, which holds `bytes` of text, charged now: a change to the snapshot is made
+    /// only when the effect that applies it will be kept, so a script never sees a change its
+    /// effects leave out. An effect that replaces an earlier one needs no new slot. A drop is
+    /// counted when there is no room.
+    fn reserve(&mut self, e: &XfaEffect, bytes: usize) -> bool {
+        let replaces = effect_key(e).and_then(|k| self.set_at.get(&k)).is_some_and(|&at| at >= self.barrier && at < self.effects.len());
+        if !replaces && self.effects.len() >= MAX_EFFECTS {
+            self.dropped_effects += 1;
+            return false;
+        }
+        self.room(bytes)
+    }
+
+    /// Set the presence or access of node `i` to what `e` (a [`XfaEffect::SetPresence`] or
+    /// [`XfaEffect::SetAccess`]) says, in the snapshot only when the effect is kept.
+    pub(crate) fn set_state(&mut self, i: usize, e: XfaEffect) {
+        if !self.reserve(&e, payload(&e)) {
+            return;
+        }
+        if let Some(n) = self.nodes.get_mut(i) {
+            match &e {
+                XfaEffect::SetPresence { presence, .. } => n.presence = presence.clone(),
+                XfaEffect::SetAccess { access, .. } => n.access = access.clone(),
+                _ => {}
+            }
+        }
+        self.record(e);
+    }
+
+    /// `e` with its text cut to the lengths an effect keeps.
+    fn clip_effect(&mut self, e: XfaEffect) -> XfaEffect {
+        match e {
             XfaEffect::MessageBox(m) => XfaEffect::MessageBox(clip(m)),
+            XfaEffect::LaunchUrl(u) => XfaEffect::LaunchUrl(clip(u)),
+            XfaEffect::SetFocus(s) => XfaEffect::SetFocus(clip(s)),
+            XfaEffect::ResetData(names) => XfaEffect::ResetData(names.into_iter().map(clip).collect()),
             XfaEffect::SetValue { som, value } => {
                 let (value, cut) = clip_value(value);
                 if cut {
@@ -268,14 +376,12 @@ impl XHost {
                 XfaEffect::SetValue { som, value }
             }
             other => other,
-        };
-        let key = match &e {
-            XfaEffect::SetValue { som, .. } => Some((0u8, som.clone())),
-            XfaEffect::SetPresence { som, .. } => Some((1, som.clone())),
-            XfaEffect::SetAccess { som, .. } => Some((2, som.clone())),
-            _ => None,
-        };
-        if let Some(key) = key {
+        }
+    }
+
+    /// Keep `e`, whose bytes are already charged, against the count limits.
+    fn record(&mut self, e: XfaEffect) {
+        if let Some(key) = effect_key(&e) {
             if let Some(&at) = self.set_at.get(&key)
                 && at >= self.barrier
                 && let Some(slot) = self.effects.get_mut(at)
@@ -311,7 +417,7 @@ impl XHost {
     pub(crate) fn print(&mut self, line: String) {
         if self.console.len() >= MAX_CONSOLE {
             self.dropped_console += 1;
-        } else {
+        } else if self.room(line.len()) {
             self.console.push(line);
         }
     }
@@ -328,6 +434,9 @@ impl XHost {
         if self.dropped_console > 0 {
             out.push(format!("the script printed more than {MAX_CONSOLE} console lines; {} more were left out", self.dropped_console));
         }
+        if self.dropped_bytes > 0 {
+            out.push(format!("the script's changes and output passed {} MiB of text; {} more were left out", MAX_PAYLOAD >> 20, self.dropped_bytes));
+        }
         if self.clipped_values > 0 {
             out.push(format!("the script set {} value(s) longer than {MAX_VALUE} characters; they were cut", self.clipped_values));
         }
@@ -338,29 +447,41 @@ impl XHost {
     /// holds a value; writing one into a subform would put text where another viewer expects
     /// a data group). Returns whether it was.
     pub(crate) fn set_value(&mut self, i: usize, text: String) -> bool {
-        let Some(n) = self.nodes.get_mut(i) else { return false };
+        let Some(n) = self.nodes.get(i) else { return false };
         if n.gone || !matches!(n.kind, XfaKind::Field | XfaKind::ExclGroup) {
             return false;
         }
+        let som = n.som.clone();
         // Cut here, not only in the effect: later reads in the script see what is saved, and
         // the snapshot stays bounded however often a long value is written.
         let (text, cut) = clip_value(text);
-        n.value = text.clone();
-        let som = n.som.clone();
         if cut {
             self.clipped_values += 1;
         }
-        self.push(XfaEffect::SetValue { som, value: text });
+        // The snapshot's copy and the effect's are charged together, before either is kept:
+        // past the byte budget or the effect cap the write is left out of both.
+        let effect = XfaEffect::SetValue { som, value: text.clone() };
+        if !self.reserve(&effect, text.len().saturating_add(payload(&effect))) {
+            return true;
+        }
+        if let Some(n) = self.nodes.get_mut(i) {
+            n.value = text;
+            n.formatted = None;
+        }
+        self.record(effect);
         true
     }
 }
 
 type Shared = RefCell<XHost>;
 
+/// The form host of the script running in `ctx`.
 fn host(ctx: &Context) -> JsResult<&Shared> {
     ctx.get_data::<Shared>().ok_or_else(|| error("the XFA script host is not set up"))
 }
 
+/// The snapshot `n` and its descendants flattened into `out` under `parent` (to [`MAX_DEPTH`]
+/// and [`MAX_NODES`]): the index of `n`'s node, `None` past the limits.
 fn flatten(n: &XfaNode, parent: Option<usize>, out: &mut Vec<HNode>, depth: usize) -> Option<usize> {
     if depth > MAX_DEPTH || out.len() >= MAX_NODES {
         return None;
@@ -381,6 +502,7 @@ fn flatten(n: &XfaNode, parent: Option<usize>, out: &mut Vec<HNode>, depth: usiz
         parent,
         children: Vec::new(),
         gone: false,
+        formatted: n.formatted.clone(),
     });
     let mut kids = Vec::new();
     for c in &n.children {
@@ -580,18 +702,23 @@ fn renumber(h: &mut XHost, idx: usize, depth: usize) {
         let parent_som = n.parent.and_then(|p| h.nodes.get(p)).map(|p| p.som.clone()).unwrap_or_default();
         (parent_som, n.name.clone(), n.index, n.children.clone())
     };
-    let som = if name.starts_with('#') || name.is_empty() {
-        parent_som
-    } else if parent_som.is_empty() {
-        format!("{name}[{index}]")
-    } else {
-        format!("{parent_som}.{name}[{index}]")
-    };
+    let som = child_som(parent_som, &name, index);
     if let Some(n) = h.nodes.get_mut(idx) {
         n.som = som;
     }
     for k in kids {
         renumber(h, k, depth + 1);
+    }
+}
+
+/// The SOM of instance `index` of the node `name` under a parent at `parent_som`.
+fn child_som(parent_som: String, name: &str, index: usize) -> String {
+    if name.starts_with('#') || name.is_empty() {
+        parent_som
+    } else if parent_som.is_empty() {
+        format!("{name}[{index}]")
+    } else {
+        format!("{parent_som}.{name}[{index}]")
     }
 }
 
@@ -618,6 +745,8 @@ fn clone_subtree(h: &mut XHost, src: usize, parent: Option<usize>, depth: usize)
                 parent,
                 children: Vec::new(),
                 gone: false,
+                // The copy holds no value, so nothing is shown in its picture either.
+                formatted: None,
             },
             n.children.clone(),
         )
@@ -660,7 +789,14 @@ impl XHost {
         let live = instances(h, parent, name);
         let &first = live.first()?;
         let (repeatable, max) = h.nodes.get(first).map(|n| (n.repeatable, n.occur_max)).unwrap_or((false, Some(1)));
-        if !repeatable || max.is_some_and(|m| live.len() >= m) || h.added >= MAX_ADDED {
+        if !repeatable || max.is_some_and(|m| live.len() >= m) || h.added >= MAX_ADDED || h.nodes.len() >= MAX_NODES {
+            return None;
+        }
+        // The copy's SOM, as `renumber` will give it, so its effect is reserved before the copy.
+        let name = h.nodes.get(first).map(|n| n.name.clone()).unwrap_or_default();
+        let parent_som = h.nodes.get(parent).map(|p| p.som.clone()).unwrap_or_default();
+        let som = child_som(parent_som, &name, live.len());
+        if !h.reserve(&XfaEffect::AddInstance { som: String::new() }, som.len()) {
             return None;
         }
         let new = clone_subtree(h, first, Some(parent), 0)?;
@@ -675,8 +811,7 @@ impl XHost {
         }
         renumber(h, new, 0);
         h.added += 1;
-        let som = h.nodes.get(new).map(|n| n.som.clone()).unwrap_or_default();
-        h.push(XfaEffect::AddInstance { som });
+        h.record(XfaEffect::AddInstance { som });
         Some(new)
     }
 
@@ -713,6 +848,9 @@ impl XHost {
             return;
         }
         let som = h.nodes.get(gone).map(|n| n.som.clone()).unwrap_or_default();
+        if !h.reserve(&XfaEffect::RemoveInstance { som: String::new() }, som.len()) {
+            return;
+        }
         if let Some(n) = h.nodes.get_mut(gone) {
             n.gone = true;
         }
@@ -723,7 +861,7 @@ impl XHost {
             }
             renumber(h, inst, 0);
         }
-        h.push(XfaEffect::RemoveInstance { som });
+        h.record(XfaEffect::RemoveInstance { som });
     }
 }
 
@@ -817,6 +955,8 @@ pub(crate) fn resolve_som(h: &XHost, from: usize, expr: &str) -> Vec<usize> {
     cur
 }
 
+/// The live descendants of node `from` named `name` (`from..name` in a SOM path), in document
+/// order, to [`MAX_DEPTH`].
 pub(crate) fn descendants_named(h: &XHost, from: usize, name: &str, depth: usize) -> Vec<usize> {
     let mut out = Vec::new();
     if depth > MAX_DEPTH {
@@ -837,6 +977,8 @@ pub(crate) fn descendants_named(h: &XHost, from: usize, name: &str, depth: usize
     out
 }
 
+/// A property read on a form node's Proxy: its value (and `formattedValue` as its picture shows
+/// it), attributes, relatives, methods, instance managers and children by name.
 fn node_get(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let idx = node_index(&arg(args, 0), ctx)?;
     let key = arg(args, 1);
@@ -853,7 +995,7 @@ fn node_get(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
     Ok(match key.as_str() {
         IDX => JsValue::from(idx as f64),
         "rawValue" | "value" => host(ctx)?.borrow().nodes.get(idx).map_or(JsValue::null(), value_js),
-        "formattedValue" => s(&value),
+        "formattedValue" => s(&host(ctx)?.borrow().nodes.get(idx).and_then(|n| n.formatted.clone()).unwrap_or(value)),
         "name" => s(&name),
         "somExpression" => s(&som),
         "className" => s(kind.class_name()),
@@ -942,20 +1084,14 @@ fn node_set(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValu
                 "hidden" | "invisible" | "inactive" | "visible" => value.clone(),
                 _ => return Ok(JsValue::from(true)),
             };
-            if let Some(n) = h.nodes.get_mut(idx) {
-                n.presence = p.clone();
-            }
-            h.push(XfaEffect::SetPresence { som, presence: p });
+            h.set_state(idx, XfaEffect::SetPresence { som, presence: p });
         }
         "access" => {
             let a = match value.as_str() {
                 "open" | "readOnly" | "protected" | "nonInteractive" => value.clone(),
                 _ => return Ok(JsValue::from(true)),
             };
-            if let Some(n) = h.nodes.get_mut(idx) {
-                n.access = a.clone();
-            }
-            h.push(XfaEffect::SetAccess { som, access: a });
+            h.set_state(idx, XfaEffect::SetAccess { som, access: a });
         }
         _ => {}
     }
@@ -1008,8 +1144,7 @@ fn message_box(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsV
 
 fn reset_data(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     let list = text(&arg(args, 0), ctx)?;
-    let names: Vec<String> = list.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect();
-    effect(ctx, XfaEffect::ResetData(names))?;
+    effect(ctx, XfaEffect::ResetData(reset_names(&list)))?;
     Ok(JsValue::undefined())
 }
 
@@ -1281,7 +1416,7 @@ fn install(ctx: &mut Context, event: &XfaEvent, doc: &XfaDoc, current: usize) ->
         "DataView",
         "Intl",
     ];
-    let mut defined: Vec<String> = RESERVED.iter().map(|s| s.to_string()).collect();
+    let mut defined: Vec<String> = RESERVED.iter().map(ToString::to_string).collect();
     for scope in scopes {
         let kids: Vec<(usize, String, bool)> = {
             let h = host(ctx)?.borrow();
@@ -1345,7 +1480,7 @@ pub fn run_xfa(script: &str, event: &XfaEvent, doc: &XfaDoc, root: &XfaNode, lim
             let spawned = std::thread::Builder::new()
                 .name("pdfcraft-xfa-js".into())
                 .stack_size(crate::SCRIPT_STACK)
-                .spawn_scoped(scope, || run_here(script, event, doc, root.clone(), limits));
+                .spawn_scoped(scope, || run_here(script, event, doc, root.clone(), limits, &|| {}));
             match spawned {
                 Ok(thread) => thread.join().unwrap_or_else(|_| failed("the script stopped with an internal error".into())),
                 Err(e) => failed(format!("the script engine could not start: {e}")),
@@ -1353,56 +1488,114 @@ pub fn run_xfa(script: &str, event: &XfaEvent, doc: &XfaDoc, root: &XfaNode, lim
         })
     }
     #[cfg(target_arch = "wasm32")]
-    run_here(script, event, doc, root.clone(), limits)
+    run_here(script, event, doc, root.clone(), limits, &|| {})
 }
 
-/// [`run_xfa`] with a time limit: a script still running after `timeout` (loops inside
-/// nested function calls can run for hours within the engine's per-frame loop limit) is left
-/// on its thread, which ends when the engine's own limits stop it, and an outcome with
-/// `abandoned` set comes back at once. In the browser build there are no threads: the script
-/// runs to its limits.
+/// [`run_xfa`] with a time limit: a script still running `timeout` after the engine is ready
+/// (loops inside nested function calls can run for hours within the engine's per-frame loop
+/// limit) is left on its thread, which ends when the engine's own limits stop it, and an
+/// outcome with `abandoned` set comes back at once. In the browser build there are no
+/// threads: the script runs to its limits.
 pub fn run_xfa_within(script: &str, event: &XfaEvent, doc: &XfaDoc, root: XfaNode, limits: Limits, timeout: std::time::Duration) -> XfaOutcome {
     if let Some(why) = refuse(script) {
         return XfaOutcome { error: Some(why), ..Default::default() };
     }
     let (script, event, doc) = (script.to_string(), event.clone(), doc.clone());
-    run_within("pdfcraft-xfa-js", timeout, move || run_here(&script, &event, &doc, root, limits))
+    run_within("pdfcraft-xfa-js", timeout, move |started| run_here(&script, &event, &doc, root, limits, started))
 }
 
+/// Longest the script engine may take to be ready for a script (its thread and context, and
+/// for the first script in a process the engine's own set-up) before the script is abandoned.
+/// It doesn't count against the script's time: on a busy machine the start alone can take
+/// longer than the tightest limit, and abandoning a script turns the form's scripts off.
+pub(crate) const ENGINE_START_LIMIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Run `script` on its own thread (with the script stack) and wait at most `timeout` for its
-/// outcome; past that the thread is abandoned and the outcome says so. On wasm there are no
-/// threads: the script runs here.
-pub(crate) fn run_within(name: &str, timeout: std::time::Duration, script: impl FnOnce() -> XfaOutcome + Send + 'static) -> XfaOutcome {
+/// outcome, counted from when it calls `started` (once the engine is ready); past that the
+/// thread is abandoned and the outcome says so. On wasm there are no threads: the script runs
+/// here.
+pub(crate) fn run_within(name: &str, timeout: std::time::Duration, script: impl FnOnce(&dyn Fn()) -> XfaOutcome + Send + 'static) -> XfaOutcome {
+    run_within_limits(name, ENGINE_START_LIMIT, timeout, script)
+}
+
+/// [`run_within`] with the engine's start-up limit given.
+pub(crate) fn run_within_limits(
+    name: &str,
+    start_limit: std::time::Duration,
+    timeout: std::time::Duration,
+    script: impl FnOnce(&dyn Fn()) -> XfaOutcome + Send + 'static,
+) -> XfaOutcome {
     #[cfg(not(target_arch = "wasm32"))]
     {
+        use std::sync::mpsc::RecvTimeoutError;
+        use std::time::Instant;
+        enum Step {
+            Started,
+            Done(XfaOutcome),
+        }
         let failed = |why: String| XfaOutcome { error: Some(why), ..Default::default() };
+        let abandoned = |why: String| XfaOutcome { error: Some(why), abandoned: true, ..Default::default() };
         let (tx, rx) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new().name(name.into()).stack_size(crate::SCRIPT_STACK).spawn(move || {
             // The receiver is gone when the caller stopped waiting: nothing to report then.
-            let _ = tx.send(script());
+            let started = tx.clone();
+            let outcome = script(&move || {
+                let _ = started.send(Step::Started);
+            });
+            let _ = tx.send(Step::Done(outcome));
         });
         if let Err(e) = spawned {
             return failed(format!("the script engine could not start: {e}"));
         }
-        match rx.recv_timeout(timeout) {
-            Ok(o) => o,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => XfaOutcome {
-                error: Some(format!("the script ran longer than {:.1} s and was abandoned", timeout.as_secs_f64())),
-                abandoned: true,
-                ..Default::default()
-            },
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => failed("the script stopped with an internal error".into()),
+        // Wait for the engine within its start-up limit, then for the script within its own.
+        let (mut running, mut limit) = (false, start_limit);
+        let mut deadline = Instant::now().checked_add(limit);
+        loop {
+            let left = deadline.map_or(limit, |d| d.saturating_duration_since(Instant::now()));
+            match rx.recv_timeout(left) {
+                Ok(Step::Done(o)) => return o,
+                Ok(Step::Started) => {
+                    // A second call changes nothing: the script's time has already begun.
+                    if !running {
+                        (running, limit) = (true, timeout);
+                        deadline = Instant::now().checked_add(limit);
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) if running => {
+                    return abandoned(format!("the script ran longer than {:.1} s and was abandoned", timeout.as_secs_f64()));
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    return abandoned(format!("the script engine took longer than {:.0} s to start", start_limit.as_secs_f64()));
+                }
+                Err(RecvTimeoutError::Disconnected) => return failed("the script stopped with an internal error".into()),
+            }
         }
     }
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = (name, timeout);
-        script()
+        let _ = (name, start_limit, timeout);
+        script(&|| {})
     }
 }
 
-fn run_here(script: &str, event: &XfaEvent, doc: &XfaDoc, root: XfaNode, limits: Limits) -> XfaOutcome {
-    let mut ctx = Context::default();
+/// The first script in a process sets the engine up (its built-ins, parser and compiler come
+/// into use): a trivial script takes that on, so a form's script is never timed with it.
+pub(crate) fn warm_up() {
+    static WARM: std::sync::Once = std::sync::Once::new();
+    // `call_once_force`: a poisoned `Once` (a panic while warming up) only means warming up again.
+    WARM.call_once_force(|_| {
+        let mut ctx = Context::default();
+        let _ = ctx.eval(Source::from_bytes(b"(function () { return eval('0'); }).call({})"));
+    });
+}
+
+/// `started` is called once the engine is ready: a time limit on the script runs from then.
+pub(crate) fn run_here(script: &str, event: &XfaEvent, doc: &XfaDoc, root: XfaNode, limits: Limits, started: &dyn Fn()) -> XfaOutcome {
+    warm_up();
+    let mut ctx = match Context::builder().host_hooks(std::rc::Rc::new(crate::CheckedCodeFromStrings)).build() {
+        Ok(ctx) => ctx,
+        Err(e) => return XfaOutcome { error: Some(format!("the script engine could not start: {e}")), ..Default::default() },
+    };
     ctx.runtime_limits_mut().set_loop_iteration_limit(limits.loop_iterations);
     ctx.runtime_limits_mut().set_recursion_limit(limits.recursion);
     let host_state = XHost::new(root, &event.target, doc);
@@ -1411,6 +1604,8 @@ fn run_here(script: &str, event: &XfaEvent, doc: &XfaDoc, root: XfaNode, limits:
     let mut out = XfaOutcome::default();
     let result = (|| -> JsResult<()> {
         install(&mut ctx, event, doc, current)?;
+        // Ready for the script: its time starts now, the set-up above not charged to it.
+        started();
         ctx.register_global_property(js_string!("__xfa_src"), s(script), Attribute::CONFIGURABLE)?;
         // Direct eval inside a function called on the node: `this` is the node and the
         // completion value is the script's last expression (what a calculate script yields).
