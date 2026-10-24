@@ -39,30 +39,98 @@ pub fn start(port: u16, ctx: egui::Context) -> Receiver<ControlRequest> {
 
 fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Context) {
     let open = Arc::new(AtomicUsize::new(0));
-    for mut stream in listener.incoming().flatten() {
-        if open.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
-            open.fetch_sub(1, Ordering::SeqCst);
-            let _ = writeln!(stream, "{}", json!({"ok": false, "error": "too many control connections"}));
-            continue;
-        }
-        let tx = tx.clone();
-        let ctx = ctx.clone();
-        let open = Arc::clone(&open);
-        std::thread::spawn(move || {
-            serve(stream, &tx, &ctx);
-            open.fetch_sub(1, Ordering::SeqCst);
-        });
+    for stream in listener.incoming().flatten() {
+        let _ = spawn_connection(stream, tx.clone(), ctx.clone(), Arc::clone(&open), IDLE_TIMEOUT);
     }
 }
 
-fn serve(stream: TcpStream, tx: &Sender<ControlRequest>, ctx: &egui::Context) {
-    let Ok(read) = stream.try_clone() else { return };
-    serve_lines(read, stream, |method, params| {
+/// Admit and serve one connection, releasing its slot when serving ends.
+fn spawn_connection(
+    mut stream: TcpStream,
+    tx: Sender<ControlRequest>,
+    ctx: egui::Context,
+    open: Arc<AtomicUsize>,
+    idle_timeout: Duration,
+) -> Option<std::thread::JoinHandle<()>> {
+    if open.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+        open.fetch_sub(1, Ordering::SeqCst);
+        let _ = writeln!(stream, "{}", json!({"ok": false, "error": "too many control connections"}));
+        return None;
+    }
+    Some(std::thread::spawn(move || {
+        serve(stream, &tx, &ctx, idle_timeout);
+        open.fetch_sub(1, Ordering::SeqCst);
+    }))
+}
+
+/// Five minutes allows pauses between automation commands without retaining abandoned slots forever.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// How long a request waits for its reply.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(60);
+/// A request the app has not picked up while it drew no frame for this long is given up: the
+/// window is not being redrawn (on Wayland, a window on a hidden workspace or minimized gets no
+/// frame callbacks, so the app's loop is paused: issue #718).
+const NO_FRAMES_AFTER: Duration = Duration::from_secs(5);
+
+/// The reply for a request given up because the app drew no frames.
+pub const HIDDEN_WINDOW_ERROR: &str = "the app drew no frame for 5 s, so the request was not run: its window is probably not visible \
+(on Wayland a window on a hidden workspace or minimized is not redrawn, which pauses the app). Bring the window on screen and send it again";
+
+/// Reads and writes go through the one `stream` (`&TcpStream` is `Read` and `Write`): no
+/// `try_clone`. On Windows a cloned socket handle is inheritable, so every program the app starts
+/// while a client is connected (a link in the browser, Show in Explorer, an external editor) kept a
+/// copy of the connection: closing it then reached the client only when that program exited, as a
+/// reset instead of a clean close.
+fn serve(stream: TcpStream, tx: &Sender<ControlRequest>, ctx: &egui::Context, idle_timeout: Duration) {
+    if let Err(e) = stream.set_read_timeout(Some(idle_timeout)) {
+        log::warn!("control connection closed: could not set idle read timeout: {e}");
+        return;
+    }
+    serve_lines(&stream, &stream, |method, params| {
         let (req, rrx) = ControlRequest::new(method, params);
+        let state = Arc::clone(&req.state);
         tx.send(req).ok()?;
         ctx.request_repaint();
-        Some(rrx.recv_timeout(Duration::from_secs(60)).unwrap_or_else(|_| json!({"ok": false, "error": "timeout"})))
+        Some(await_reply(&rrx, &state, || ctx.cumulative_pass_nr(), || ctx.request_repaint(), NO_FRAMES_AFTER, REPLY_TIMEOUT))
     });
+}
+
+/// Wait for a request's reply. While the app has not picked the request up and `frames` (its
+/// frame counter) stands still for `no_frames`, the request is abandoned (it will not run late)
+/// and the reply says why; a request the app is running gets the whole `timeout`.
+fn await_reply(
+    rrx: &Receiver<Value>,
+    state: &std::sync::atomic::AtomicU8,
+    frames: impl Fn() -> u64,
+    wake: impl Fn(),
+    no_frames: Duration,
+    timeout: Duration,
+) -> Value {
+    let start = std::time::Instant::now();
+    let slice = (no_frames / 10).max(Duration::from_millis(1));
+    let (mut last, mut since) = (frames(), std::time::Instant::now());
+    loop {
+        match rrx.recv_timeout(slice) {
+            Ok(v) => return v,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return json!({"ok": false, "error": "the app dropped the request"}),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        let now = frames();
+        if now != last {
+            (last, since) = (now, std::time::Instant::now());
+        }
+        let taken = state.load(Ordering::SeqCst) == lightcraft_ui_egui::control::TAKEN;
+        if !taken && since.elapsed() >= no_frames && ControlRequest::abandon(state) {
+            return json!({"ok": false, "error": HIDDEN_WINDOW_ERROR});
+        }
+        if start.elapsed() >= timeout {
+            // not run yet: make sure it never is; already running: it may still finish
+            ControlRequest::abandon(state);
+            return json!({"ok": false, "error": "timeout"});
+        }
+        wake();
+    }
 }
 
 /// One parsed line.
@@ -108,7 +176,10 @@ fn read_bounded_line(reader: &mut impl BufRead, buf: &mut Vec<u8>, max: usize) -
     buf.clear();
     // `take` bounds the bytes buffered for one line: a peer can't make us allocate more than `max`.
     let limit = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
-    let n = reader.take(limit).read_until(b'\n', buf).map_err(|e| e.to_string())?;
+    let n = reader.take(limit).read_until(b'\n', buf).map_err(|e| match e.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => "control connection idle read timed out; closing the connection".to_string(),
+        _ => e.to_string(),
+    })?;
     if n == 0 {
         return Ok(false);
     }
@@ -159,6 +230,149 @@ fn serve_lines<R: Read, W: Write>(read: R, mut out: W, mut handle: impl FnMut(St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Own the client and worker together: even a failing timeout assertion closes the socket
+    /// before joining, so the regression cannot leave a worker stuck in a read.
+    struct Connection {
+        client: BufReader<TcpStream>,
+        requests: Receiver<ControlRequest>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Connection {
+        /// `before` acts on the client before the worker starts reading, so what it sends is
+        /// already there however late this thread gets scheduled.
+        fn new(open: &Arc<AtomicUsize>, idle: Duration, before: impl FnOnce(&mut TcpStream)) -> Self {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            before(&mut client);
+            let (tx, requests) = channel();
+            let worker = spawn_connection(stream, tx, egui::Context::default(), Arc::clone(open), idle).unwrap();
+            Self { client: BufReader::new(client), requests, worker: Some(worker) }
+        }
+
+        fn join(&mut self) {
+            if let Some(worker) = self.worker.take() {
+                worker.join().unwrap();
+            }
+        }
+    }
+
+    impl Drop for Connection {
+        fn drop(&mut self) {
+            let _ = self.client.get_ref().shutdown(std::net::Shutdown::Both);
+            while let Ok(req) = self.requests.try_recv() {
+                let _ = req.reply.send(json!({"ok": false, "error": "test closing"}));
+            }
+            self.join();
+        }
+    }
+
+    #[test]
+    fn idle_connections_release_their_slots_without_dispatching() {
+        for input in ["", "{\"method\":\"engine.execute\""] {
+            let open = Arc::new(AtomicUsize::new(0));
+            let mut connection = Connection::new(&open, Duration::from_millis(100), |c| c.write_all(input.as_bytes()).unwrap());
+            assert_eq!(open.load(Ordering::SeqCst), 1);
+            let mut reply = String::new();
+            let closed = connection.client.read_to_string(&mut reply);
+            assert!(closed.is_ok(), "idle connection stayed open: {closed:?}");
+            connection.join();
+            assert_eq!(open.load(Ordering::SeqCst), 0, "the production worker releases its slot");
+            assert!(connection.requests.try_recv().is_err(), "incomplete input never runs");
+            let reply: Value = serde_json::from_str(&reply).unwrap();
+            assert_eq!(reply["ok"], false);
+            assert!(reply["error"].as_str().unwrap().contains("idle read timed out"));
+
+            // A subsequent connection is admitted through the same accounting path.
+            let mut next = Connection::new(&open, Duration::from_secs(1), |c| c.shutdown(std::net::Shutdown::Write).unwrap());
+            let mut eof = String::new();
+            next.client.read_to_string(&mut eof).unwrap();
+            next.join();
+            assert!(eof.is_empty());
+            assert_eq!(open.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn persistent_requests_and_slow_replies_outlive_the_idle_read_timeout() {
+        let open = Arc::new(AtomicUsize::new(0));
+        let request = |id: u64| format!("{}\n", json!({"id": id, "method": "engine.commands"}));
+        // Each request reaches the socket before the worker reads it (the next one while the worker
+        // waits for the reply), so only the reply waits outlast the idle timeout, however slowly
+        // this thread runs.
+        let mut connection = Connection::new(&open, Duration::from_millis(100), |c| c.write_all(request(1).as_bytes()).unwrap());
+        for id in [1, 2] {
+            let req = connection.requests.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(req.method, "engine.commands");
+            assert!(req.take());
+            if id == 1 {
+                connection.client.get_mut().write_all(request(2).as_bytes()).unwrap();
+            } else {
+                connection.client.get_mut().shutdown(std::net::Shutdown::Write).unwrap();
+            }
+            // A dispatched command waits for its reply, not for socket input.
+            std::thread::sleep(Duration::from_millis(250));
+            req.reply.send(json!({"ok": true, "result": id})).unwrap();
+            let mut reply = String::new();
+            connection.client.read_line(&mut reply).unwrap();
+            let reply: Value = serde_json::from_str(&reply).unwrap();
+            assert_eq!(reply, json!({"id": id, "ok": true, "result": id}));
+        }
+        let mut eof = String::new();
+        connection.client.read_to_string(&mut eof).unwrap();
+        connection.join();
+        assert!(eof.is_empty());
+        assert_eq!(open.load(Ordering::SeqCst), 0);
+    }
+
+    /// Issue #718: an app that draws no frames (a hidden Wayland window) gets the request given
+    /// up with a reason, quickly, and the app then skips it instead of running it late.
+    #[test]
+    fn a_request_to_an_app_drawing_no_frames_is_given_up_with_a_reason() {
+        let (req, rrx) = ControlRequest::new("ui.inspect", json!({}));
+        let t0 = std::time::Instant::now();
+        let r = await_reply(&rrx, &req.state, || 7, || {}, Duration::from_millis(50), Duration::from_secs(10));
+        // the frame window (50 ms), not the 10 s timeout; the margin is for a slow machine
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        assert_eq!(r["ok"], false);
+        assert!(r["error"].as_str().unwrap().contains("not visible"), "{r}");
+        assert!(!req.take(), "the app does not run it once it shows up");
+    }
+
+    /// A request the app is running is not given up because frames stopped (a long command
+    /// blocks the frame loop), and its reply arrives.
+    #[test]
+    fn a_request_being_run_waits_for_its_reply() {
+        let (req, rrx) = ControlRequest::new("export.run", json!({}));
+        assert!(req.take());
+        let reply = req.reply.clone();
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            let _ = reply.send(json!({"ok": true, "result": 1}));
+        });
+        let r = await_reply(&rrx, &req.state, || 7, || {}, Duration::from_millis(20), Duration::from_secs(10));
+        assert_eq!(r["ok"], true, "{r}");
+        worker.join().unwrap();
+    }
+
+    /// Frames still coming: the request just waits, then is answered.
+    #[test]
+    fn a_drawing_app_is_waited_for() {
+        let (req, rrx) = ControlRequest::new("ui.inspect", json!({}));
+        let n = std::sync::atomic::AtomicU64::new(0);
+        let reply = req.reply.clone();
+        let state = Arc::clone(&req.state);
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            let _ = reply.send(json!({"ok": true, "result": 2}));
+        });
+        let r = await_reply(&rrx, &state, || n.fetch_add(1, Ordering::SeqCst), || {}, Duration::from_millis(30), Duration::from_secs(10));
+        assert_eq!(r["ok"], true, "{r}");
+        worker.join().unwrap();
+    }
 
     fn run(input: &[u8]) -> (Vec<Value>, Vec<String>) {
         let mut out = Vec::new();
@@ -241,6 +455,37 @@ mod tests {
         assert_eq!(read_bounded_line(&mut &input[..], &mut buf, 10), Ok(true));
         assert_eq!(buf, line);
         assert!(read_bounded_line(&mut &[b'a'; 11][..], &mut buf, 10).is_err());
+    }
+
+    /// A program the app starts while a client is connected doesn't keep the connection open:
+    /// when the server closes it, the client sees that at once, not when the program exits.
+    #[cfg(windows)]
+    #[test]
+    fn a_program_started_meanwhile_does_not_hold_the_connection_open() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, _rx) = channel::<ControlRequest>();
+        let server = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            serve(s, &tx, &egui::Context::default(), IDLE_TIMEOUT);
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        // the connection is being served: start a program that lives about 4 s
+        std::thread::sleep(Duration::from_millis(200));
+        let mut child = std::process::Command::new("cmd").args(["/c", "ping -n 5 127.0.0.1 >nul"]).spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        // junk makes the server answer once and close
+        c.write_all(b"hello\n").unwrap();
+        let t0 = std::time::Instant::now();
+        let mut text = String::new();
+        let read = c.read_to_string(&mut text);
+        let waited = t0.elapsed();
+        server.join().unwrap();
+        let _ = child.wait();
+        assert!(read.is_ok(), "the close must be clean, not a reset: {read:?}");
+        assert!(text.contains("closing the connection"), "{text}");
+        assert!(waited < Duration::from_secs(2), "the client saw the close only after {waited:?}, when the program exited");
     }
 
     #[test]

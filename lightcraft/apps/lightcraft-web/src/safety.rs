@@ -14,7 +14,7 @@ use wasm_bindgen_futures::JsFuture;
 use crate::backend::Backend;
 use crate::backup::{
     ACTIVE_LIBRARY, README, ZipWriter, data_offset, find_central, original_entry, parse_central, restore_key, restored_dir_name, tail_len,
-    valid_hash, verify,
+    valid_hash, verify, verify_original,
 };
 use crate::files::{Files, LIBRARY_FILES};
 use crate::store::storage_key;
@@ -93,25 +93,41 @@ pub fn install_panic_hook() {
 const TAB_LOCK: &str = "lightcraft-library";
 
 /// Hold the library lock for as long as this page lives (Web Locks API). `Some(true)`: ours;
-/// `Some(false)`: another tab of this site has it; `None`: the browser can't tell (no Web Locks).
+/// `Some(false)`: another tab of this site has it; `None`: the browser can't tell (no Web Locks, or
+/// it refused the request).
 pub async fn acquire_tab_lock() -> Option<bool> {
     let nav = Reflect::get(&js_sys::global(), &"navigator".into()).ok()?;
     let locks = Reflect::get(&nav, &"locks".into()).ok().filter(|l| !l.is_undefined() && !l.is_null())?;
     let request: js_sys::Function = Reflect::get(&locks, &"request".into()).ok()?.dyn_into().ok()?;
     let opts = js_sys::Object::new();
     Reflect::set(&opts, &"ifAvailable".into(), &true.into()).ok()?;
-    let granted = js_sys::Promise::new(&mut |resolve, _reject| {
+    let granted = js_sys::Promise::new(&mut |resolve, reject| {
         let cb = Closure::once_into_js(move |lock: JsValue| -> JsValue {
             let ours = !lock.is_null() && !lock.is_undefined();
             let _ = resolve.call1(&JsValue::NULL, &ours.into());
             // keep the lock until the page goes away: a promise that never settles
             if ours { js_sys::Promise::new(&mut |_, _| {}).into() } else { JsValue::NULL }
         });
-        if let Err(e) = request.call3(&locks, &TAB_LOCK.into(), &opts, &cb) {
-            log::warn!("Web Locks request failed: {e:?}");
+        // a refused request never calls `cb`: settle with its error instead of waiting forever
+        match request.call3(&locks, &TAB_LOCK.into(), &opts, &cb) {
+            Ok(pending) => {
+                let catch = Reflect::get(&pending, &"catch".into()).ok().and_then(|c| c.dyn_into::<js_sys::Function>().ok());
+                if let Some(catch) = catch {
+                    let _ = catch.call1(&pending, &reject);
+                }
+            }
+            Err(e) => {
+                let _ = reject.call1(&JsValue::NULL, &e);
+            }
         }
     });
-    JsFuture::from(granted).await.ok().map(|v| v.is_truthy())
+    match JsFuture::from(granted).await {
+        Ok(v) => Some(v.is_truthy()),
+        Err(e) => {
+            log::warn!("Web Locks request failed, starting without the one-tab guard: {e:?}");
+            None
+        }
+    }
 }
 
 /// Offer a blob as a download named `name`.
@@ -208,6 +224,9 @@ pub async fn restore(file: web_sys::File, backend: Backend) -> Result<String, St
         let start = data_offset(e, &local)?;
         let data = read_range(&file, start, start + e.size).await?;
         verify(e, &data)?;
+        if let Some(hash) = key.strip_prefix("originals/") {
+            verify_original(e, hash, &data)?;
+        }
         backend.write(&key, &data).await.map_err(|err| format!("storing {}: {err}", e.name))?;
         written += 1;
     }

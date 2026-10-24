@@ -85,6 +85,71 @@ fn grid_keeps_the_users_scroll_position() {
 }
 
 #[test]
+fn deleting_photos_does_not_jump_the_grid_to_the_top() {
+    for view in ["photoGrid", "squareGrid"] {
+        for count in [1, 3] {
+            let mut h = demo(view);
+            let ids = h.app.session.visible_cloned();
+            let at = ids.len() / 2;
+            let r = h.request("engine.execute", json!({"command": "library.select", "params": {"ids": &ids[at..at + count]}}), T);
+            assert_eq!(r["ok"], true, "{r}");
+            idle(&mut h, 30);
+            let y = grid_y(&h);
+            assert!(y > 600.0, "selection is well below the top: {view}, {y}");
+            let r = h.request("engine.execute", json!({"command": "photo.delete"}), T);
+            assert_eq!(r["ok"], true, "{r}");
+            idle(&mut h, 60);
+            let next = ids[at + count];
+            assert!(grid_y(&h) > 600.0, "deleting scrolled to the top: {view}, {} → {}", y, grid_y(&h));
+            assert_eq!(h.app.session.active(), Some(next), "{view}, count {count}");
+            let canvas = h.app.canvas_rect.unwrap();
+            assert!(widget(&h, &format!("thumb:{}", next.0)).intersects(canvas), "the next survivor is in view");
+            let after = grid_y(&h);
+            idle(&mut h, 60);
+            assert_eq!(grid_y(&h), after, "idle frames preserve the new position");
+        }
+    }
+}
+
+#[test]
+fn permanently_deleting_photos_keeps_the_current_view_neighbour_in_sight() {
+    for view in ["photoGrid", "squareGrid", "detail"] {
+        for count in [1, 3] {
+            let mut h = demo(view);
+            for (command, params) in
+                [("library.selectAll", json!({})), ("photo.delete", json!({})), ("library.source", json!({"kind": "recentlyDeleted"}))]
+            {
+                let r = h.request("engine.execute", json!({"command": command, "params": params}), T);
+                assert_eq!(r["ok"], true, "{r}");
+            }
+            let ids = h.app.session.visible_cloned();
+            let at = ids.len() / 2;
+            let r = h.request("engine.execute", json!({"command": "library.select", "params": {"ids": &ids[at..at + count]}}), T);
+            assert_eq!(r["ok"], true, "{r}");
+            idle(&mut h, 30);
+            let scroll = |h: &Headless| if view == "detail" { film_x(h) } else { grid_y(h) };
+            let before = scroll(&h);
+            assert!(before > 600.0, "selection is far from the beginning: {view}, {before}");
+            let r = h.request("ui.menu.invoke", json!({"id": "photo.deletePermanently"}), T);
+            assert_eq!(r["ok"], true, "{r}");
+            idle(&mut h, 60);
+            let next = ids[at + count];
+            assert_eq!(h.app.session.active(), Some(next), "{view}, count {count}");
+            assert!(scroll(&h) > 600.0, "deleting scrolled to the beginning: {view}, {before} → {}", scroll(&h));
+            let cell = widget(&h, &format!("{}:{}", if view == "detail" { "film" } else { "thumb" }, next.0));
+            if view == "detail" {
+                assert!(cell.left() >= 0.0 && cell.right() <= 1200.0, "the next survivor is in view: {cell:?}");
+            } else {
+                assert!(cell.intersects(h.app.canvas_rect.unwrap()), "the next survivor is in view");
+            }
+            let after = scroll(&h);
+            idle(&mut h, 60);
+            assert_eq!(scroll(&h), after, "idle frames preserve the new position");
+        }
+    }
+}
+
+#[test]
 fn filmstrip_wheel_scrolls_and_keeps_its_position() {
     let mut h = demo("detail");
     let first = h.app.session.visible_cloned()[0].0;
@@ -142,4 +207,65 @@ fn filmstrip_shows_every_selected_photo() {
     let r = h.request("engine.execute", json!({"command": "library.select", "params": {"ids": [second], "mode": "toggle"}}), T);
     assert_eq!(r["ok"], true, "{r}");
     assert_eq!(fill(&mut h, second), active);
+}
+
+/// One notch of a mouse wheel (a line).
+fn notch(h: &mut Headless, dy: f32) {
+    h.events.push(egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Line,
+        delta: egui::vec2(0.0, dy),
+        phase: egui::TouchPhase::Move,
+        modifiers: egui::Modifiers::NONE,
+    });
+    h.step();
+}
+
+/// A mouse wheel notch scrolls the grid a third of its height, as in Lightroom (two rows of six), not the
+/// `theme::WHEEL_LINE_POINTS` a side panel scrolls: at big thumbnails that was a quarter of a row. Exactly
+/// a third, not whole rows, so the photos don't land where the last ones were, and at once, without a
+/// glide that blurs them. A trackpad still scrolls the points it reports.
+#[test]
+fn a_wheel_notch_scrolls_a_third_of_the_grid() {
+    let mut h = demo("photoGrid");
+    let view = widget(&h, "grid:scroll");
+    h.request("ui.move", json!({"x": view.center().x, "y": view.center().y}), T);
+    let y0 = grid_y(&h);
+    notch(&mut h, -1.0);
+    // at once, no glide: the frame after the notch draws it there
+    h.step();
+    h.step();
+    let moved = grid_y(&h) - y0;
+    assert!((moved - view.height() * crate::theme::WHEEL_STRIP_SHARE).abs() < 1.0, "a notch scrolled {moved} of {} points", view.height());
+    idle(&mut h, 120);
+    assert!((grid_y(&h) - y0 - moved).abs() < 0.5, "and no further: {} after the glide", grid_y(&h) - y0);
+    let y1 = grid_y(&h);
+    for _ in 0..2 {
+        notch(&mut h, -1.0);
+    }
+    idle(&mut h, 120);
+    let moved = grid_y(&h) - y1;
+    assert!((moved - 2.0 * view.height() * crate::theme::WHEEL_STRIP_SHARE).abs() < 1.0, "two notches scrolled {moved} of {} points", view.height());
+    // back up
+    let y2 = grid_y(&h);
+    notch(&mut h, 1.0);
+    idle(&mut h, 120);
+    assert!((y2 - grid_y(&h) - view.height() * crate::theme::WHEEL_STRIP_SHARE).abs() < 1.0, "a notch up scrolled back a third");
+    // a trackpad (points) scrolls what it reports
+    let y3 = grid_y(&h);
+    h.request("ui.scroll", json!({"dy": -60.0}), T);
+    idle(&mut h, 120);
+    assert!((grid_y(&h) - y3 - 60.0).abs() < 1.0, "a 60-point trackpad scroll moved {}", grid_y(&h) - y3);
+}
+
+/// The same in the filmstrip: a notch scrolls it sideways by a third of its width (about five photos).
+#[test]
+fn a_wheel_notch_scrolls_a_third_of_the_filmstrip() {
+    let mut h = demo("detail");
+    let strip = widget(&h, "filmstrip");
+    h.request("ui.move", json!({"x": strip.center().x, "y": strip.center().y}), T);
+    let x0 = film_x(&h);
+    notch(&mut h, -1.0);
+    idle(&mut h, 120);
+    let moved = film_x(&h) - x0;
+    assert!((moved - strip.width() * crate::theme::WHEEL_STRIP_SHARE).abs() < 1.0, "a notch scrolled {moved} of {} points", strip.width());
 }

@@ -1,5 +1,5 @@
 //! `cargo xtask web`: build `apps/lightcraft-web` for wasm32 and bundle it with `wasm-bindgen`
-//! into `<target>/web/` (index.html + worker.js + lightcraft_web.js + lightcraft_web_bg.wasm),
+//! into `<target>/web-site/` (index.html + worker.js + lightcraft_web.js + lightcraft_web_bg.wasm),
 //! with gzip and brotli precompressed copies (`*.gz`, `*.br`) next to each file.
 //! `--serve [port]` then serves that folder with a tiny static HTTP server (std only) that sends
 //! the cross-origin isolation headers (COOP/COEP) and the precompressed files when the browser
@@ -13,12 +13,66 @@ use std::process::Command;
 use crate::{cargo, metadata, root, run as step};
 
 const TARGET: &str = "wasm32-unknown-unknown";
+/// Cargo profile for the optimized (`--dev` off) browser build; see `[profile.web]` in `Cargo.toml`.
+const WEB_PROFILE: &str = "web";
+/// Directory under `<target>` that receives the bundle. It must **not** be a Cargo profile name:
+/// cross-compiling with `--target wasm32-unknown-unknown` makes Cargo write the selected profile's
+/// *host* artifacts (build scripts, proc-macros, `deps/`, `build/`, `.fingerprint/`) to
+/// `<target>/<profile>/`, and `packaging/web/package.sh` zips the whole bundle directory (issue #793).
+const SITE_DIR: &str = "web-site";
+const CHINESE_FONT_FILE: &str = "lightcraft_zh_hans.otf";
+const CHINESE_FONT_LICENSE_FILE: &str = "OFL-noto-sans-cjk-sc.txt";
 
 /// Files copied from `apps/lightcraft-web/` into the bundle as they are.
 const STATIC_FILES: [&str; 2] = ["index.html", "worker.js"];
 
 /// Bundle files that get precompressed copies.
 const COMPRESSED: [&str; 4] = ["index.html", "worker.js", "lightcraft_web.js", "lightcraft_web_bg.wasm"];
+
+/// The Noto face is shipped beside the WASM rather than embedded in it: hosts such as Cloudflare
+/// Pages cap individual files at 25 MiB, while the complete site can contain larger assets.
+fn chinese_font_in_manifest(manifest: &str) -> Option<(&str, &str)> {
+    manifest.lines().find_map(|line| {
+        let fields: Vec<_> = line.split('|').map(str::trim).collect();
+        if fields.len() >= 6 && fields[0] == "Noto Sans CJK SC" && fields[1] == "Regular" && !fields[2].is_empty() && !fields[5].is_empty() {
+            Some((fields[2], fields[5]))
+        } else {
+            None
+        }
+    })
+}
+
+fn copy_chinese_font(out: &Path) -> Result<bool, String> {
+    // A previous font-enabled build must not leave an unlicensed/stale asset in a font-free one.
+    for name in [CHINESE_FONT_FILE, CHINESE_FONT_LICENSE_FILE, "lightcraft_zh_hans.otf.gz", "lightcraft_zh_hans.otf.br"] {
+        let path = out.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+    }
+    let Some(dir) = std::env::var_os("CRAFT_FONTS_DIR") else {
+        if std::env::var_os("CRAFT_FONTS_REQUIRED").is_some() {
+            return Err("CRAFT_FONTS_REQUIRED is set but CRAFT_FONTS_DIR is missing".into());
+        }
+        return Ok(false);
+    };
+    let dir = PathBuf::from(dir);
+    let dir = if dir.is_absolute() { dir } else { root().join(dir) };
+    let manifest_path = dir.join("fonts/manifest.txt");
+    let manifest = std::fs::read_to_string(&manifest_path).map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+    let (font, licence) =
+        chinese_font_in_manifest(&manifest).ok_or_else(|| format!("{}: Noto Sans CJK SC Regular is missing", manifest_path.display()))?;
+    let licence = dir.join(licence);
+    let licence_target = out.join(CHINESE_FONT_LICENSE_FILE);
+    std::fs::copy(&licence, &licence_target).map_err(|e| format!("{} → {}: {e}", licence.display(), licence_target.display()))?;
+    let source = dir.join(font);
+    let target = out.join(CHINESE_FONT_FILE);
+    std::fs::copy(&source, &target).map_err(|e| format!("{} → {}: {e}", source.display(), target.display()))?;
+    println!("web Chinese font: {} → {}", source.display(), target.display());
+    Ok(true)
+}
 
 /// The `wasm-bindgen` version pinned in Cargo.lock (the CLI must match it exactly).
 fn locked_bindgen_version() -> Result<String, String> {
@@ -53,14 +107,14 @@ pub fn run(args: &[&str]) -> Result<(), String> {
     check_bindgen(&want)?;
     let meta = metadata()?;
     let target_dir = PathBuf::from(meta["target_directory"].as_str().ok_or("cargo metadata: no target_directory")?);
-    let profile = if dev { "dev" } else { "web" };
+    let profile = if dev { "dev" } else { WEB_PROFILE };
 
     let mut c = cargo();
     c.args(["build", "-p", "lightcraft-web", "--lib", "--target", TARGET, "--profile", profile]);
     step(c, &format!("cargo build -p lightcraft-web --target {TARGET} --profile {profile}"))?;
 
     let wasm = target_dir.join(TARGET).join(if dev { "debug" } else { profile }).join("lightcraft_web.wasm");
-    let out = target_dir.join("web");
+    let out = target_dir.join(SITE_DIR);
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
     let mut b = Command::new("wasm-bindgen");
     b.arg(&wasm).args(["--target", "web", "--no-typescript", "--out-name", "lightcraft_web", "--out-dir"]).arg(&out);
@@ -84,10 +138,11 @@ pub fn run(args: &[&str]) -> Result<(), String> {
     for f in STATIC_FILES {
         std::fs::copy(root().join("apps/lightcraft-web").join(f), out.join(f)).map_err(|e| format!("copy {f}: {e}"))?;
     }
+    let chinese_font = copy_chinese_font(&out)?;
 
     // precompressed copies (skipped for --dev: they'd only slow the edit loop down)
     println!("\n{:<26} {:>12} {:>12} {:>12}", "file", "bytes", "gzip -9", "brotli -11");
-    for f in COMPRESSED {
+    for f in COMPRESSED.into_iter().chain(chinese_font.then_some(CHINESE_FONT_FILE)) {
         let p = out.join(f);
         let raw = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
         let (gz, br) = if dev {
@@ -138,6 +193,8 @@ fn mime(path: &Path) -> &'static str {
         "json" => "application/json",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
+        "otf" => "font/otf",
+        "txt" => "text/plain; charset=utf-8",
         "svg" => "image/svg+xml",
         _ => "application/octet-stream",
     }
@@ -238,10 +295,35 @@ mod tests {
     }
 
     #[test]
+    fn site_dir_is_not_a_cargo_profile() {
+        // Cross-compiling writes the selected profile's *host* artifacts (build scripts,
+        // proc-macros, `deps/`, `build/`, `.fingerprint/`) to `<target>/<profile>/`, so the bundle
+        // must not live in a profile directory or `packaging/web/package.sh` would zip them
+        // (issue #793).
+        let manifest = std::fs::read_to_string(root().join("Cargo.toml")).unwrap();
+        let is_profile = |name: &str| {
+            let header = format!("[profile.{name}]");
+            manifest.lines().any(|l| l.trim() == header)
+        };
+        assert!(is_profile(WEB_PROFILE), "`{WEB_PROFILE}` is no longer a profile in Cargo.toml");
+        assert!(!is_profile(SITE_DIR), "`{SITE_DIR}` is a Cargo profile name; pick a different bundle directory");
+    }
+
+    #[test]
     fn wasm_mime() {
         assert_eq!(mime(Path::new("a/lightcraft_web_bg.wasm")), "application/wasm");
         assert_eq!(mime(Path::new("index.html")), "text/html; charset=utf-8");
         assert_eq!(mime(Path::new("worker.js")), "text/javascript; charset=utf-8");
+        assert_eq!(mime(Path::new(CHINESE_FONT_FILE)), "font/otf");
+    }
+
+    #[test]
+    fn web_bundle_selects_the_chinese_face_from_the_font_manifest() {
+        let manifest = "# family | style | path | scripts | licence | licence file\n\
+            BIZ UDPGothic | Regular | fonts/biz.ttf | Jpan,Latn | OFL-1.1 | fonts/biz/OFL.txt\n\
+            Noto Sans CJK SC | Regular | fonts/noto/NotoSansCJKsc-Regular.otf | Hans,Latn | OFL-1.1 | fonts/noto/OFL.txt\n";
+        assert_eq!(chinese_font_in_manifest(manifest), Some(("fonts/noto/NotoSansCJKsc-Regular.otf", "fonts/noto/OFL.txt")));
+        assert_eq!(chinese_font_in_manifest("BIZ UDPGothic | Regular | fonts/biz.ttf | Jpan,Latn | OFL-1.1 | fonts/biz/OFL.txt"), None);
     }
 
     #[test]

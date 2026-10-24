@@ -5,10 +5,13 @@
 //! chosen folder, filed by day, by month, into one folder or by a custom folder template,
 //! optionally renamed), an album (existing or new), a preset and keywords to apply. Importing
 //! runs on a worker thread (files are probed, copied or moved there) and its batches join the
-//! catalog between frames, with a progress window and Cancel; the whole import is one undo step.
+//! catalog between frames, with a row and ✕ in the activity stack (issue #345); the whole import is
+//! one undo step.
 
-use egui::{Align2, Color32, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
-use lightcraft_engine::import::{ImportCandidate, ScanInput, ScanOutput, ScanProgress, scan_with};
+use egui::{Align2, Color32, Rect, Sense, Stroke, StrokeKind, Vec2, pos2, vec2};
+use lightcraft_engine::import::{
+    ImportCandidate, ImportUprightMode, ImportWarning, ImportWarningCode, ScanInput, ScanOutput, ScanProgress, scan_with,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::atomic::Ordering;
@@ -80,9 +83,10 @@ pub struct ImportDialog {
     pub metadata_preset: String,
     /// Copy: raws are copied as DNG.
     pub dng: bool,
-    /// Per candidate: the library already has it in Recently Deleted.
+    /// Per candidate: the library already has it in Recently Deleted ([`ImportDialog::set_trashed`]).
     pub trashed: Vec<bool>,
-    /// What to do with those: "" (leave them), `restore` or `fresh` (the `onDeleted` param).
+    /// What to do with those: `restore` (the default: the photo comes back with its edits), `fresh`
+    /// (imported as a new photo, the old record deleted) or "" (leave them) — the `onDeleted` param.
     pub on_deleted: String,
     /// The candidate clicked last: where a Shift-click range starts ([`ImportDialog::click`]).
     #[serde(skip)]
@@ -108,10 +112,32 @@ fn file_type(c: &ImportCandidate) -> String {
 impl ImportDialog {
     pub fn new(candidates: Vec<ImportCandidate>) -> Self {
         let checked = candidates.iter().map(|c| c.duplicate.is_none() && c.error.is_none()).collect();
-        ImportDialog { candidates, checked, ..Default::default() }
+        ImportDialog { candidates, checked, on_deleted: "restore".into(), ..Default::default() }
     }
+    /// Mark the candidates whose photo is in Recently Deleted. They are checked when the choice
+    /// for them (`on_deleted`) imports them — by default it restores them, so a photo deleted by
+    /// mistake comes back by importing its file again (issue #706).
+    pub fn set_trashed(&mut self, trashed: Vec<bool>) {
+        self.trashed = trashed;
+        for i in 0..self.candidates.len() {
+            if !self.is_trashed(i) {
+                continue;
+            }
+            let on = self.checked_by_default(i);
+            if let Some(c) = self.checked.get_mut(i) {
+                *c = on;
+            }
+        }
+    }
+    /// Candidate `i` can be checked: a readable file the library doesn't have, or one whose photo
+    /// is in Recently Deleted — even with "Leave them", a click picks it (issue #1285).
     pub fn importable(&self, i: usize) -> bool {
-        self.candidates.get(i).is_some_and(|c| c.error.is_none() && (c.duplicate.is_none() || self.is_trashed(i) && !self.on_deleted.is_empty()))
+        self.candidates.get(i).is_some_and(|c| c.error.is_none() && (c.duplicate.is_none() || self.is_trashed(i)))
+    }
+    /// Candidate `i` is checked by Check All and the file type toggles: with "Leave them", a file in
+    /// Recently Deleted is only checked by hand.
+    pub fn checked_by_default(&self, i: usize) -> bool {
+        self.importable(i) && !(self.is_trashed(i) && self.on_deleted.is_empty())
     }
     /// The file types among the candidates (`ARW`, `JPG`…, upper case, sorted) and how many of each.
     pub fn file_types(&self) -> Vec<(String, usize)> {
@@ -130,7 +156,7 @@ impl ImportDialog {
     pub fn check_type(&mut self, ty: &str, on: bool) {
         for i in 0..self.candidates.len() {
             let same = self.candidates.get(i).is_some_and(|c| file_type(c) == ty);
-            let importable = self.importable(i);
+            let importable = self.checked_by_default(i);
             if same && let Some(c) = self.checked.get_mut(i) {
                 *c = on && importable;
             }
@@ -223,6 +249,8 @@ pub struct ImportTask {
     /// Move: originals moved, and sources left in place (reported by the engine with a reason).
     pub moved: usize,
     pub kept: usize,
+    /// Structured diagnostics from foreign XMP develop settings.
+    pub warnings: Vec<ImportWarning>,
     undo0: usize,
     first: Option<u64>,
     /// Reading a folder for the Local view: the photos stay out of the library, and nothing is
@@ -234,7 +262,14 @@ pub struct ImportTask {
     auto: bool,
     /// Auto Import: the selection to keep.
     keep_selection: Option<lightcraft_engine::Selection>,
+    /// The selection and source as the import last left them: a change between frames is the
+    /// user choosing another photo or view, which the end of the import doesn't take away.
+    left: Option<(lightcraft_engine::Selection, lightcraft_engine::LibrarySource)>,
+    /// The user chose another photo or view while the import ran.
+    moved_on: bool,
     run: Option<ImportRun>,
+    /// The import's row in the activity stack (its ✕ and `activity.cancel` set the run's cancel flag).
+    guard: Option<lightcraft_engine::activity::TaskGuard>,
 }
 
 impl ImportTask {
@@ -387,10 +422,48 @@ pub struct ScanTask {
     rx: std::sync::mpsc::Receiver<ScanOutput>,
     /// Open the review with "copy into the library" checked (a camera / card).
     pub copy: bool,
+    /// Open the review with this album chosen (an album's context menu ▸ Import…).
+    pub album: Option<u64>,
     /// Browsing a folder (Local): the photos are read in place instead of opening the review.
     browse: bool,
     /// What is being scanned (the review's source).
     sources: Vec<String>,
+    /// The scan's row in the activity stack (its ✕ and `activity.cancel` set `progress.cancel`).
+    guard: lightcraft_engine::activity::TaskGuard,
+}
+
+/// The activity row of a scan: the review's ("Scanning folder") or the Local view's ("Reading folder").
+fn scan_guard(app: &LightcraftApp, progress: &ScanProgress, browse: bool) -> lightcraft_engine::activity::TaskGuard {
+    let label = if browse { "Reading folder" } else { "Scanning folder" };
+    app.session.activity.start("scan", label, lightcraft_engine::activity::Cancel::Flag(progress.cancel.clone()))
+}
+
+/// An import and a Synchronize Folder never run at once: each readies its files against the
+/// library as it was when it started, so both could add the same file.
+pub(crate) fn busy_synchronizing(app: &LightcraftApp) -> Result<(), String> {
+    if app.sync_run.is_some() { Err(crate::i18n::tr("A folder is being synchronized").to_string()) } else { Ok(()) }
+}
+
+/// Settings → Import → "Show the import review when a camera or card is connected", called with
+/// each device scan while it's on. The first look only notes the cards already in. A card that
+/// shows up after that opens Import from Device once nothing else is open, and a card that is
+/// taken out and put back in asks again.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn cards_seen(app: &mut LightcraftApp, now: Vec<lightcraft_engine::devices::Device>) {
+    let Some(known) = app.ui.known_cards.as_mut() else {
+        app.ui.known_cards = Some(now.into_iter().map(|d| d.root).collect());
+        return;
+    };
+    known.retain(|root| now.iter().any(|d| d.root == *root));
+    let Some(card) = now.into_iter().find(|d| !known.contains(&d.root)) else { return };
+    // busy: ask when the window is free (the card isn't noted until then)
+    if app.import.is_some() || app.scan.is_some() || app.sync_run.is_some() || app.lightroom.is_some() || app.ui.dialog.is_some() {
+        return;
+    }
+    known.push(card.root);
+    if let Err(e) = app.run("file.addFromDevice", json!({"path": card.path})) {
+        log::warn!("import from {}: {e}", card.name);
+    }
 }
 
 /// Scan `paths` in the background, then open the review dialog (see [`poll_scan`]).
@@ -410,7 +483,8 @@ pub fn open(app: &mut LightcraftApp, paths: Vec<String>) -> Result<Value, String
     std::thread::spawn(job);
     #[cfg(target_arch = "wasm32")]
     job();
-    app.scan = Some(ScanTask { progress, rx, copy: false, browse: false, sources });
+    let guard = scan_guard(app, &progress, false);
+    app.scan = Some(ScanTask { progress, rx, copy: false, album: None, browse: false, sources, guard });
     Ok(json!({"scanning": true}))
 }
 
@@ -432,6 +506,7 @@ pub fn browse(app: &mut LightcraftApp, path: &str, subfolders: Option<bool>) -> 
     if running && app.session.browse.as_ref().is_some_and(|b| b.path == dir_s && b.subfolders == subfolders) {
         // already reading this folder: clicking it again must not restart the progress
         app.session.source = lightcraft_engine::LibrarySource::Folder;
+        app.session.keep_active_in_view();
         return Ok(json!({"path": dir_s, "subfolders": subfolders, "scanning": true}));
     }
     if let Some(t) = app.scan.take() {
@@ -440,6 +515,8 @@ pub fn browse(app: &mut LightcraftApp, path: &str, subfolders: Option<bool>) -> 
     app.import = None;
     app.session.browse = Some(lightcraft_engine::Browse { path: dir_s.clone(), subfolders });
     app.session.source = lightcraft_engine::LibrarySource::Folder;
+    // the photos the library already knows from this folder show at once: keep or pick the active one
+    app.session.keep_active_in_view();
     let (input, _) = ScanInput::new(&mut app.session, std::slice::from_ref(&dir_s));
     let progress = std::sync::Arc::new(ScanProgress::default());
     let (tx, rx) = std::sync::mpsc::channel();
@@ -471,7 +548,8 @@ pub fn browse(app: &mut LightcraftApp, path: &str, subfolders: Option<bool>) -> 
     std::thread::spawn(job);
     #[cfg(target_arch = "wasm32")]
     job();
-    app.scan = Some(ScanTask { progress, rx, copy: false, browse: true, sources: Vec::new() });
+    let guard = scan_guard(app, &progress, true);
+    app.scan = Some(ScanTask { progress, rx, copy: false, album: None, browse: true, sources: Vec::new(), guard });
     app.renderer.forget_imports();
     Ok(json!({"path": dir_s, "subfolders": subfolders, "scanning": true}))
 }
@@ -482,7 +560,18 @@ pub fn poll_scan(app: &mut LightcraftApp, ctx: &egui::Context) {
     ctx.request_repaint_after(std::time::Duration::from_millis(100));
     let out = match task.rx.try_recv() {
         Ok(o) => o,
-        Err(std::sync::mpsc::TryRecvError::Empty) => return,
+        Err(std::sync::mpsc::TryRecvError::Empty) => {
+            if task.guard.is_cancelled() {
+                // ✕: the worker stops at its next file; don't wait for it (a NAS read can take a while)
+                app.scan = None;
+                return;
+            }
+            let (total, done) = (task.progress.total.load(Ordering::Relaxed), task.progress.done.load(Ordering::Relaxed));
+            task.guard.progress(done as u64, total as u64);
+            // while the folders are listed the total isn't known: say what is happening instead
+            task.guard.detail(if total == 0 { crate::i18n::tr("Looking for photos…") } else { "" });
+            return;
+        }
         Err(_) => {
             app.scan = None;
             app.toast(ctx, crate::i18n::tr("Scan failed"));
@@ -495,6 +584,18 @@ pub fn poll_scan(app: &mut LightcraftApp, ctx: &egui::Context) {
     }
     app.session.import_probes = out.probes;
     if task.browse {
+        // the folder and the ones its photos are in count as browsed now, as `library.browse` records them, so
+        // their untouched Local photos aren't forgotten while the folder is in use
+        if let Some(root) = app.session.browse.as_ref().map(|b| b.path.clone()) {
+            let shown: Vec<String> = out.candidates.iter().map(|c| c.path.clone()).collect();
+            app.session.note_browsed(&root, &shown);
+        }
+        // records of files gone from the folder (deleted or moved by another app) that nothing was changed on go,
+        // as `library.browse` forgets them (issue #1392)
+        if let Some(b) = app.session.browse.clone() {
+            let listed: Vec<String> = out.candidates.iter().map(|c| c.path.clone()).collect();
+            app.session.forget_gone_from(&b.path, b.subfolders, &listed);
+        }
         // what the library doesn't know yet joins the Local view
         let queue: Vec<String> =
             out.candidates.iter().filter(|c| c.duplicate != Some("path".into()) && c.error.is_none()).map(|c| c.path.clone()).collect();
@@ -512,7 +613,7 @@ pub fn poll_scan(app: &mut LightcraftApp, ctx: &egui::Context) {
     }
     app.renderer.forget_imports();
     let mut d = ImportDialog::new(out.candidates);
-    d.trashed = d
+    let trashed = d
         .candidates
         .iter()
         .map(|c| {
@@ -520,40 +621,12 @@ pub fn poll_scan(app: &mut LightcraftApp, ctx: &egui::Context) {
                 && c.existing.is_some_and(|id| app.session.catalog.photo(lightcraft_catalog::PhotoId(id)).is_some_and(|p| p.deleted))
         })
         .collect();
+    d.set_trashed(trashed);
     d.copy = task.copy;
+    // only an album the review offers (it may have been deleted while the scan ran)
+    d.album = task.album.filter(|id| app.session.catalog.album(lightcraft_catalog::AlbumId(*id)).is_some_and(|a| !a.folder && !a.is_smart()));
     d.sources = task.sources;
     app.ui.dialog = Some(crate::state::Dialog::Import { opts: Box::new(d) });
-}
-
-/// The progress window while a folder is being scanned.
-pub fn scan_progress(app: &mut LightcraftApp, ctx: &egui::Context) {
-    let Some(task) = &app.scan else { return };
-    let t = Tokens::get(ctx);
-    let total = task.progress.total.load(Ordering::Relaxed);
-    let done = task.progress.done.load(Ordering::Relaxed);
-    let text = if total == 0 {
-        if task.browse { "Reading folder…" } else { "Looking for photos…" }.to_string()
-    } else {
-        crate::i18n::tr_format!("Reading photos… {done} of {total}", done = done, total = total)
-    };
-    let mut cancel = false;
-    egui::Window::new(crate::i18n::tr("Scanning"))
-        .title_bar(false)
-        .resizable(false)
-        .anchor(Align2::CENTER_BOTTOM, [0.0, -80.0])
-        .fixed_size([340.0, 80.0])
-        .show(ctx, |ui| {
-            ui.label(egui::RichText::new(text).color(t.text));
-            ui.add(egui::ProgressBar::new(done as f32 / total.max(1) as f32).desired_width(320.0));
-            let r = ui.button(crate::i18n::tr("Cancel"));
-            register(ui.ctx(), "button:scanCancel", r.rect);
-            cancel = r.clicked();
-        });
-    if cancel {
-        // the worker stops at its next file; don't wait for it (a NAS read can take a while)
-        task.progress.cancel.store(true, Ordering::Relaxed);
-        app.scan = None;
-    }
 }
 
 impl ScanTask {
@@ -565,6 +638,7 @@ impl ScanTask {
 
 /// Start importing the dialog's checked files (the dialog's OK / `ui.dialog.confirm`).
 pub fn start(app: &mut LightcraftApp, d: &ImportDialog) -> Result<Value, String> {
+    busy_synchronizing(app)?;
     let queue = d.selected_paths();
     if queue.is_empty() {
         return Err("no photos selected".into());
@@ -616,6 +690,7 @@ pub fn start(app: &mut LightcraftApp, d: &ImportDialog) -> Result<Value, String>
 
 /// Start importing `paths` (files or folders) in the background, e.g. dropped on the window.
 pub fn start_paths(app: &mut LightcraftApp, paths: Vec<String>) -> Result<Value, String> {
+    busy_synchronizing(app)?;
     if app.import.is_some() || app.scan.as_ref().is_some_and(|t| !t.browse) {
         return Err("an import is running".into());
     }
@@ -640,7 +715,11 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
             task.keep_selection = Some(app.session.selection.clone());
         }
         match started {
-            Ok(run) => task.run = Some(run),
+            Ok(run) => {
+                let label = if task.browse { "Reading folder" } else { "Importing" };
+                task.guard = Some(app.session.activity.start("import", label, lightcraft_engine::activity::Cancel::Flag(run.cancel.clone())));
+                task.run = Some(run);
+            }
             Err(e) => {
                 log::warn!("import: {e}");
                 app.toast(ctx, crate::i18n::tr_format!("Import failed: {e}", e = e));
@@ -652,16 +731,31 @@ pub fn tick(app: &mut LightcraftApp, ctx: &egui::Context) {
     let Some(run) = task.run.as_mut() else { return };
     let batches = run.next_batches();
     let finished = batches.is_none();
+    if task.left.as_ref().is_some_and(|(sel, source)| *sel != app.session.selection || *source != app.session.source) {
+        task.moved_on = true;
+    }
     for prepared in batches.into_iter().flatten() {
         commit_batch(app, &mut task, prepared);
         // arriving photos don't take over the selection
         if let Some(sel) = &task.keep_selection {
             app.session.selection = sel.clone();
         }
+        // a Local folder still on screen: its first photo becomes active once there is one (#1447)
+        if task.browse && app.session.source == lightcraft_engine::LibrarySource::Folder {
+            app.session.keep_active_in_view();
+        }
     }
+    task.left = Some((app.session.selection.clone(), app.session.source));
     if let Some(run) = &task.run {
         task.total = run.total.load(Ordering::Relaxed).max(task.total);
         task.done = run.done.load(Ordering::Relaxed);
+    }
+    if let Some(guard) = &task.guard {
+        guard.progress(task.done as u64, task.total as u64);
+        // ✕ in the stack (or `activity.cancel`): no further files are started
+        if guard.is_cancelled() {
+            task.cancelled = true;
+        }
     }
     if !finished {
         app.import = Some(task);
@@ -693,6 +787,7 @@ fn commit_batch(app: &mut LightcraftApp, task: &mut ImportTask, prepared: lightc
             task.failed += len("failed");
             task.moved += len("moved");
             task.kept += len("kept");
+            task.warnings.extend(v["warnings"].as_array().into_iter().flatten().filter_map(|warning| serde_json::from_value(warning.clone()).ok()));
             for k in v["kept"].as_array().into_iter().flatten() {
                 log::warn!("import: kept {}: {}", k["path"].as_str().unwrap_or(""), k["reason"].as_str().unwrap_or(""));
             }
@@ -707,7 +802,63 @@ fn commit_batch(app: &mut LightcraftApp, task: &mut ImportTask, prepared: lightc
     }
 }
 
-/// The import is done (or cancelled): one undo step, select the first photo, say what happened.
+fn xmp_warning_text(warning: &ImportWarning) -> String {
+    let path = &warning.path;
+    match warning.code {
+        ImportWarningCode::CameraProfile => crate::i18n::tr_format!(
+            "XMP profile \"{profile}\" was not applied for {path}; colors may differ from Lightroom.",
+            profile = warning.profile.as_deref().unwrap_or_default(),
+            path = path,
+        ),
+        ImportWarningCode::UprightGeometry => match warning.mode.unwrap_or(ImportUprightMode::Unknown) {
+            ImportUprightMode::Off => crate::i18n::tr_format!(
+                "Lightroom geometry for {path} was not preserved; saved transform is ignored because Upright is Off.",
+                path = path,
+            ),
+            ImportUprightMode::Guided => crate::i18n::tr_format!(
+                "Lightroom geometry for {path} was not preserved; Guided Upright saved transform is unsupported.",
+                path = path,
+            ),
+            ImportUprightMode::Auto => crate::i18n::tr_format!(
+                "Lightroom geometry was not preserved for {path}; {mode} will be recalculated.",
+                path = path,
+                mode = crate::i18n::tr("Auto")
+            ),
+            ImportUprightMode::Level => crate::i18n::tr_format!(
+                "Lightroom geometry was not preserved for {path}; {mode} will be recalculated.",
+                path = path,
+                mode = crate::i18n::tr("Level")
+            ),
+            ImportUprightMode::Vertical => crate::i18n::tr_format!(
+                "Lightroom geometry was not preserved for {path}; {mode} will be recalculated.",
+                path = path,
+                mode = crate::i18n::tr("Vertical")
+            ),
+            ImportUprightMode::Full => crate::i18n::tr_format!(
+                "Lightroom geometry was not preserved for {path}; {mode} will be recalculated.",
+                path = path,
+                mode = crate::i18n::tr("Full")
+            ),
+            ImportUprightMode::Unknown => {
+                crate::i18n::tr_format!("Lightroom geometry for {path} was not preserved; saved Upright transform is unsupported.", path = path,)
+            }
+        },
+        ImportWarningCode::UnmappedXmp => {
+            crate::i18n::tr_format!("XMP adjustments were not imported for {path}: {fields}.", path = path, fields = warning.fields.join(", "),)
+        }
+    }
+}
+
+fn xmp_warnings_text(warnings: &[ImportWarning]) -> String {
+    crate::i18n::tr_format!(
+        "Import warnings ({n}):\n{warnings}",
+        n = warnings.len(),
+        warnings = warnings.iter().map(xmp_warning_text).collect::<Vec<_>>().join("\n"),
+    )
+}
+
+/// The import is done (or cancelled): one undo step, show and select the first photo (unless the
+/// user chose another meanwhile), say what happened.
 fn finish(app: &mut LightcraftApp, ctx: &egui::Context, task: ImportTask) {
     let steps = app.session.undo.len().saturating_sub(task.undo0);
     let plural = |n: usize| if n == 1 { "" } else { "s" };
@@ -720,32 +871,49 @@ fn finish(app: &mut LightcraftApp, ctx: &egui::Context, task: ImportTask) {
     };
     app.session.merge_undo(steps, &label);
     if task.auto {
-        if task.imported > 0 {
+        if !task.warnings.is_empty() {
+            app.toast_for(ctx, xmp_warnings_text(&task.warnings), 8.0);
+        } else if task.imported > 0 {
             app.toast(ctx, crate::i18n::tr_format!("Auto Import: added {} photo{}", task.imported, if task.imported == 1 { "" } else { "s" }));
         }
         return;
     }
     if task.browse {
-        if task.failed > 0 {
+        if !task.warnings.is_empty() {
+            app.toast_for(ctx, xmp_warnings_text(&task.warnings), 8.0);
+        } else if task.failed > 0 {
             app.toast(ctx, crate::i18n::tr_format!("{} photo{} not readable", task.failed, if task.failed == 1 { "" } else { "s" }));
         }
         return;
     }
-    if let Some(f) = task.first {
+    if let Some(f) = task.first.filter(|_| !task.moved_on) {
+        // a view the new photos aren't in (an album, Picks, a Local folder) would leave the active
+        // photo off screen: show All Photos, as Lightroom shows the import's own collection (#1446)
+        if !app.session.visible().contains(&lightcraft_catalog::PhotoId(f)) {
+            let _ = app.run("library.source", json!({"kind": "all"}));
+        }
         let _ = app.run("library.select", json!({"ids": [f]}));
     }
     let plural = |n: usize| if n == 1 { "" } else { "s" };
     // nothing new, only files the library already has: show where they are (Recently Deleted is
     // easy to miss, and the side panel that lists it starts collapsed)
-    if task.imported == 0 && task.restored == 0 && task.failed == 0 && !task.cancelled && show_existing(app, ctx, &task.existing) {
+    if task.imported == 0
+        && task.restored == 0
+        && task.failed == 0
+        && task.warnings.is_empty()
+        && !task.cancelled
+        && show_existing(app, ctx, &task.existing)
+    {
         return;
     }
     let mut msg = if task.cancelled {
         crate::i18n::tr_format!("Import cancelled · {} photo{} added", task.imported, plural(task.imported))
+    } else if task.imported == 0 && task.restored > 0 {
+        crate::i18n::tr_format!("Restored {} photo{} from Recently Deleted", task.restored, plural(task.restored))
     } else {
         crate::i18n::tr_format!("Imported {} photo{}", task.imported, plural(task.imported))
     };
-    if task.restored > 0 {
+    if task.restored > 0 && (task.imported > 0 || task.cancelled) {
         msg.push_str(&crate::i18n::tr_format!(" · {} restored from Recently Deleted", task.restored));
     }
     if task.params["mode"] == "move" {
@@ -764,7 +932,13 @@ fn finish(app: &mut LightcraftApp, ctx: &egui::Context, task: ImportTask) {
     if task.failed > 0 {
         msg.push_str(&crate::i18n::tr_format!(" · {} not readable", task.failed));
     }
-    app.toast(ctx, msg);
+    if task.warnings.is_empty() {
+        app.toast(ctx, msg);
+    } else {
+        msg.push_str("\n\n");
+        msg.push_str(&xmp_warnings_text(&task.warnings));
+        app.toast_for(ctx, msg, 8.0);
+    }
 }
 
 /// The photos among `ids` that are in Recently Deleted (each once).
@@ -804,50 +978,33 @@ fn show_existing(app: &mut LightcraftApp, ctx: &egui::Context, existing: &[u64])
     true
 }
 
-/// The progress window while an import runs, with Cancel (files already copied or added stay;
-/// nothing new is started).
-pub fn progress(app: &mut LightcraftApp, ctx: &egui::Context) {
-    let Some(task) = &app.import else { return };
-    let t = Tokens::get(ctx);
-    let frac = task.done as f32 / task.total.max(1) as f32;
-    let text = if task.cancelled {
-        crate::i18n::tr("Stopping…").to_string()
-    } else if task.browse {
-        crate::i18n::tr_format!("Reading photos… {} of {}", task.done, task.total)
-    } else {
-        crate::i18n::tr_format!("Adding photos… {} of {}", task.done, task.total)
-    };
-    let mut cancel = false;
-    egui::Window::new(crate::i18n::tr("Importing"))
-        .title_bar(false)
-        .resizable(false)
-        .anchor(Align2::CENTER_BOTTOM, [0.0, -80.0])
-        .fixed_size([340.0, 80.0])
-        .show(ctx, |ui| {
-            ui.label(egui::RichText::new(text).color(t.text));
-            ui.add(egui::ProgressBar::new(frac).desired_width(320.0));
-            let r = ui.add_enabled(!task.cancelled, egui::Button::new(crate::i18n::tr("Cancel")));
-            register(ui.ctx(), "button:importCancel", r.rect);
-            cancel = r.clicked();
-        });
-    if cancel && let Some(task) = app.import.as_mut() {
-        task.cancelled = true;
-        if let Some(run) = &task.run {
-            run.cancel.store(true, Ordering::Relaxed);
-        }
-    }
+/// Skipped candidates: (already in the library, identical copies within the source, in Recently
+/// Deleted). Files of photos in Recently Deleted are not "already in the library", and a file with
+/// the same bytes as one earlier in the list (no library photo) is a copy in the source.
+fn dup_counts(d: &ImportDialog) -> (usize, usize, usize) {
+    let trashed = d.trashed.iter().filter(|t| **t).count();
+    let in_source = d.candidates.iter().filter(|c| c.duplicate.as_deref() == Some("content") && c.existing.is_none()).count();
+    let dups = d.candidates.iter().filter(|c| c.duplicate.is_some()).count().saturating_sub(trashed).saturating_sub(in_source);
+    (dups, in_source, trashed)
 }
 
 /// The dialog body: options, then the candidate grid.
 pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImportDialog) {
     let t = Tokens::get(ui.ctx());
     let n = d.candidates.len();
-    let dups = d.candidates.iter().filter(|c| c.duplicate.is_some()).count();
+    let (dups, in_source, trashed) = dup_counts(d);
     let sel = d.selected_paths().len();
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(crate::i18n::tr_format!("{n} found · {sel} selected", n = n, sel = sel)).color(t.text));
         if dups > 0 {
             ui.label(egui::RichText::new(crate::i18n::tr_format!("· {dups} already in the library", dups = dups)).color(t.text_dim));
+        }
+        if in_source > 0 {
+            ui.label(egui::RichText::new(crate::i18n::tr_format!("· {in_source} identical copies", in_source = in_source)).color(t.text_dim))
+                .on_hover_text(crate::i18n::tr("Files with the same content as another file in this import: only the first is imported."));
+        }
+        if trashed > 0 {
+            ui.label(egui::RichText::new(crate::i18n::tr_format!("· {trashed} in Recently Deleted", trashed = trashed)).color(t.text_dim));
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if crate::widgets::text_button(ui, "importNone", crate::i18n::tr("Uncheck All"), false).clicked() {
@@ -855,7 +1012,7 @@ pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImportDialog) {
             }
             if crate::widgets::text_button(ui, "importAll", crate::i18n::tr("Check All"), false).clicked() {
                 for i in 0..n {
-                    d.checked[i] = d.importable(i);
+                    d.checked[i] = d.checked_by_default(i);
                 }
             }
         });
@@ -986,7 +1143,7 @@ pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImportDialog) {
             ];
             let key = if d.organize.is_empty() { "date".to_string() } else { d.organize.clone() };
             let cur = opts.iter().find(|o| o.0 == key).map_or(opts[0].1, |o| o.1);
-            let combo = egui::ComboBox::from_id_salt("import-organize").selected_text(crate::i18n::tr(cur)).show_ui(ui, |ui| {
+            let combo = crate::widgets::combo_box("import-organize").selected_text(crate::i18n::tr(cur)).show_ui(ui, |ui| {
                 for (k, label) in opts {
                     let r = ui.selectable_label(key == k, crate::i18n::tr(label));
                     register(ui.ctx(), format!("button:importOrganize-{k}"), r.rect);
@@ -1069,8 +1226,8 @@ pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImportDialog) {
                 _ => "Leave them",
             };
             let mut pick = None;
-            egui::ComboBox::from_id_salt("import-on-deleted").selected_text(crate::i18n::tr(cur)).show_ui(ui, |ui| {
-                for (v, label) in [("", "Leave them"), ("restore", "Restore them"), ("fresh", "Import as new")] {
+            crate::widgets::combo_box("import-on-deleted").selected_text(crate::i18n::tr(cur)).show_ui(ui, |ui| {
+                for (v, label) in [("restore", "Restore them"), ("fresh", "Import as new"), ("", "Leave them")] {
                     if ui.selectable_label(d.on_deleted == v, crate::i18n::tr(label)).clicked() {
                         pick = Some(v);
                     }
@@ -1087,40 +1244,49 @@ pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImportDialog) {
             );
         });
     }
-    let albums: Vec<(u64, String)> = {
-        let mut v: Vec<(u64, String)> =
-            app.session.catalog.albums().filter(|a| !a.folder && !a.is_smart()).map(|a| (a.id.0, a.name.clone())).collect();
-        v.sort_by_key(|(_, n)| n.to_lowercase());
-        v
-    };
+    let mut albums = crate::album_picker::entries_from(&app.session.catalog, |_| None);
+    albums.retain(|a| a.folder || !a.smart);
+    // Catalog changes while the review is open must not leave a hidden, unselectable destination.
+    d.album = d.album.filter(|id| albums.iter().any(|a| a.id == *id && !a.folder));
     field(ui, "Album", |ui| {
-        let cur = match d.album {
-            Some(a) => albums.iter().find(|x| x.0 == a).map(|x| x.1.clone()).unwrap_or_default(),
-            None if !d.new_album.is_empty() => crate::i18n::tr("New album").into(),
-            None => crate::i18n::tr("None").into(),
-        };
-        egui::ComboBox::from_id_salt("import-album").selected_text(cur).show_ui(ui, |ui| {
-            if ui.selectable_label(d.album.is_none() && d.new_album.is_empty(), crate::i18n::tr("None")).clicked() {
-                d.album = None;
+        ui.vertical(|ui| {
+            let mut chosen = d.album;
+            let mut extra = None;
+            let empty = crate::i18n::tr(if d.new_album.is_empty() { "None" } else { "New album" });
+            let response = crate::album_picker::AlbumPicker::new("import-album", &mut chosen, &albums)
+                .width(ui.available_width())
+                .empty_text(empty)
+                .show_with_choices(ui, |ui| {
+                    let none = ui.selectable_label(d.album.is_none() && d.new_album.is_empty(), crate::i18n::tr("None"));
+                    register(ui.ctx(), "importAlbum:none", none.rect);
+                    if none.clicked() {
+                        extra = Some(false);
+                    }
+                    let new = ui.selectable_label(d.album.is_none() && !d.new_album.is_empty(), crate::i18n::tr("New album…"));
+                    register(ui.ctx(), "importAlbum:new", new.rect);
+                    if new.clicked() {
+                        extra = Some(true);
+                    }
+                    ui.separator();
+                    extra.is_some()
+                });
+            if response.changed() {
+                d.album = chosen;
                 d.new_album.clear();
             }
-            if ui.selectable_label(d.album.is_none() && !d.new_album.is_empty(), crate::i18n::tr("New album…")).clicked() {
+            if let Some(new) = extra {
                 d.album = None;
-                if d.new_album.is_empty() {
+                if !new {
+                    d.new_album.clear();
+                } else if d.new_album.is_empty() {
                     d.new_album = crate::i18n::tr("Imported Photos").into();
                 }
             }
-            for (id, name) in &albums {
-                if ui.selectable_label(d.album == Some(*id), name).clicked() {
-                    d.album = Some(*id);
-                    d.new_album.clear();
-                }
+            if d.album.is_none() && !d.new_album.is_empty() {
+                let r = ui.add(egui::TextEdit::singleline(&mut d.new_album).desired_width(f32::INFINITY));
+                register(ui.ctx(), "field:importAlbumName", r.rect);
             }
         });
-        if d.album.is_none() && !d.new_album.is_empty() {
-            let r = ui.add(egui::TextEdit::singleline(&mut d.new_album).desired_width(f32::INFINITY));
-            register(ui.ctx(), "field:importAlbumName", r.rect);
-        }
     });
     field(ui, "Preset", |ui| {
         let cur = app
@@ -1130,27 +1296,20 @@ pub fn body(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImportDialog) {
             .find(|p| p.id == d.preset)
             .map(|p| crate::i18n::builtin_label(&p.name, p.builtin).to_string())
             .unwrap_or_else(|| crate::i18n::tr("None").into());
-        egui::ComboBox::from_id_salt("import-preset").selected_text(cur).height(300.0).show_ui(ui, |ui| {
+        crate::widgets::combo_box("import-preset").selected_text(cur).height(300.0).show_ui(ui, |ui| {
             if ui.selectable_label(d.preset.is_empty(), crate::i18n::tr("None")).clicked() {
                 d.preset.clear();
             }
-            for p in &app.session.presets {
-                if ui
-                    .selectable_label(
-                        d.preset == p.id,
-                        format!("{} — {}", crate::i18n::builtin_label(&p.group, p.builtin), crate::i18n::builtin_label(&p.name, p.builtin)),
-                    )
-                    .clicked()
-                {
-                    d.preset = p.id.clone();
-                }
+            let selected = (!d.preset.is_empty()).then_some(d.preset.as_str());
+            if let Some(pid) = crate::panels::presets::picker_rows(ui, "import-preset", &app.session.presets, selected) {
+                d.preset = pid;
             }
         });
     });
     if !app.session.metadata_presets.is_empty() {
         field(ui, "Metadata", |ui| {
             let cur = if d.metadata_preset.is_empty() { crate::i18n::tr("None").to_string() } else { d.metadata_preset.clone() };
-            egui::ComboBox::from_id_salt("import-metadata").selected_text(cur).show_ui(ui, |ui| {
+            crate::widgets::combo_box("import-metadata").selected_text(cur).show_ui(ui, |ui| {
                 if ui.selectable_label(d.metadata_preset.is_empty(), crate::i18n::tr("None")).clicked() {
                     d.metadata_preset.clear();
                 }
@@ -1174,6 +1333,7 @@ fn candidate_cell(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImportDial
     let ok = d.importable(i);
     let img = Rect::from_min_size(rect.min, vec2(rect.width(), rect.width()));
     let resp = ui.interact(img, egui::Id::new(("import-cell", i)), Sense::click());
+    crate::widgets::announce(&resp, c.name.clone());
     register(ui.ctx(), format!("import:{i}"), img);
     let p = ui.painter();
     p.rect_filled(img, 3.0, Color32::from_gray(30));
@@ -1204,7 +1364,8 @@ fn candidate_cell(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImportDial
     }
     let in_trash = c.existing.is_some_and(|id| app.session.catalog.photo(lightcraft_catalog::PhotoId(id)).is_some_and(|p| p.deleted));
     let badge = match (&c.duplicate, &c.error) {
-        (Some(_), _) if in_trash && ok => Some(if d.on_deleted == "restore" { "Will be restored" } else { "Will be replaced" }),
+        // checked with "Leave them", the file goes without `onDeleted`: the engine restores it
+        (Some(_), _) if in_trash && on => Some(if d.on_deleted == "fresh" { "Will be replaced" } else { "Will be restored" }),
         (Some(_), _) if in_trash => Some("In Recently Deleted"),
         (Some(r), _) if r == "path" => Some("In library"),
         (Some(_), _) => Some("Duplicate"),
@@ -1213,7 +1374,7 @@ fn candidate_cell(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImportDial
     };
     if let Some(b) = badge {
         let g = p.layout_no_wrap(crate::i18n::tr(b).to_string(), t.semibold(10.0), Color32::WHITE);
-        let br = Rect::from_min_size(pos2(img.right() - g.size().x - 12.0, img.top() + 6.0), g.size() + vec2(8.0, 4.0));
+        let br = badge_rect(img, cb, g.size());
         p.rect_filled(br, 3.0, Color32::from_rgba_unmultiplied(170, 60, 50, 220));
         p.galley(br.min + vec2(4.0, 2.0), g, Color32::WHITE);
     }
@@ -1233,6 +1394,15 @@ fn candidate_cell(app: &mut LightcraftApp, ui: &mut egui::Ui, d: &mut ImportDial
         let shift = ui.input(|input| input.modifiers.shift);
         d.click(i, shift);
     }
+}
+
+/// Where a cell's badge goes: top right, or under the checkbox when the text is too wide to sit
+/// beside it — drawn over the checkbox it hid it (issue #1285).
+fn badge_rect(img: Rect, cb: Rect, text: Vec2) -> Rect {
+    let size = text + vec2(8.0, 4.0);
+    let left = img.right() - size.x - 4.0;
+    let top = if left < cb.right() + 4.0 { cb.bottom() + 4.0 } else { img.top() + 6.0 };
+    Rect::from_min_size(pos2(left, top), size)
 }
 
 /// Reserve the actual translated tag button width beside a template field.
@@ -1306,7 +1476,7 @@ pub(crate) fn tag_help(ui: &mut egui::Ui, key: &str, text: &mut String, edit_id:
                 for (i, tok) in TOKENS.iter().enumerate() {
                     let r = ui.add(egui::Button::new(egui::RichText::new(tok.tag).monospace().color(t.text)).small()).on_hover_text(
                         if tok.aliases.is_empty() {
-                            "Insert at the cursor".to_string()
+                            crate::i18n::tr("Insert at the cursor").to_string()
                         } else {
                             crate::i18n::tr_format!("Insert at the cursor (also written {})", tok.aliases.join(", "))
                         },
@@ -1446,6 +1616,19 @@ mod tests {
         ImportDialog::new(candidates)
     }
 
+    /// Identical copies inside the source folder are not "already in the library" (a fresh library
+    /// said "8 already in the library").
+    #[test]
+    fn copies_within_the_source_are_not_counted_as_in_the_library() {
+        let mut d = dialog();
+        assert_eq!(dup_counts(&d), (0, 1, 0), "same bytes as an earlier file, no library photo");
+        d.candidates[4].duplicate = Some("content".into());
+        d.candidates[4].existing = Some(7);
+        d.candidates[5].duplicate = Some("path".into());
+        d.candidates[5].existing = Some(8);
+        assert_eq!(dup_counts(&d), (2, 1, 0));
+    }
+
     /// A toggle per file type: the raws only, without the JPEGs beside them (issue #344).
     #[test]
     fn file_types_check_and_uncheck_together() {
@@ -1500,6 +1683,44 @@ mod tests {
         let mut d = dialog();
         d.click(2, true);
         assert_eq!(d.checked, [true, true, false, false, true, true]);
+    }
+
+    /// With "Leave them", a file in Recently Deleted stays out of Check All and the type toggles,
+    /// but a click still checks it: it is imported (restored) on its own (issue #1285).
+    #[test]
+    fn leave_them_keeps_a_trashed_file_out_until_it_is_clicked() {
+        let mut d = dialog();
+        d.set_trashed(vec![false, false, false, true, false, false]);
+        assert!(d.checked[3], "restored by default");
+        d.set_on_deleted("");
+        assert!(!d.checked[3]);
+        d.check_type("JPG", true);
+        assert!(!d.checked[3], "the type toggle leaves it out");
+        d.click(3, false);
+        assert!(d.checked[3], "a click checks it");
+        assert!(d.selected_paths().contains(&"img3.jpg".to_string()));
+        d.click(3, false);
+        assert!(!d.checked[3]);
+        // a plain duplicate (not in Recently Deleted) still can't be checked
+        d.set_trashed(vec![false; 6]);
+        d.click(3, false);
+        assert!(!d.checked[3]);
+    }
+
+    /// A badge too wide to fit beside the checkbox goes under it instead of covering it (issue #1285).
+    #[test]
+    fn a_badge_never_covers_the_checkbox() {
+        let img = Rect::from_min_size(pos2(100.0, 50.0), vec2(116.0, 116.0));
+        let cb = Rect::from_min_size(img.min + vec2(6.0, 6.0), vec2(16.0, 16.0));
+        // "Will be restored" fits beside it, top right
+        let short = badge_rect(img, cb, vec2(76.0, 12.0));
+        assert_eq!(short.right(), img.right() - 4.0);
+        assert_eq!(short.top(), img.top() + 6.0);
+        // "In Recently Deleted" doesn't
+        let long = badge_rect(img, cb, vec2(96.0, 12.0));
+        assert!(!long.intersects(cb), "{long:?} covers {cb:?}");
+        assert_eq!(long.right(), img.right() - 4.0);
+        assert!(img.contains_rect(long));
     }
 
     #[test]

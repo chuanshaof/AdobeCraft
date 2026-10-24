@@ -22,7 +22,7 @@ release that has already been published, so bump the version before producing an
 
 ## Builds and artifacts
 
-Release jobs build macOS universal, Windows x86/x64/ARM64, Linux x86_64/aarch64, FreeBSD x86_64,
+Release jobs build macOS universal, Windows x86/x64/ARM64, Linux x86_64/aarch64/riscv64, FreeBSD x86_64,
 and the WASM web app. The platform scripts in [`packaging/`](../packaging/) write their outputs to
 `dist/release/` (the full list of files is the README's Downloads section):
 
@@ -32,6 +32,9 @@ and the WASM web app. The platform scripts in [`packaging/`](../packaging/) writ
   architecture (`packaging/linux/package.sh`). Each AppImage embeds
   `gh-releases-zsync|storytold|lightcraft|latest|lightcraft-*-linux-<arch>.AppImage.zsync`, so
   AppImageUpdate fetches only the changed blocks from the latest published (non-pre-) release.
+- Linux riscv64: `.tar.gz` only, cross-compiled on Ubuntu 24.04 against its riscv64 ports
+  libraries (so glibc 2.39 or newer), with the CLI smoke-tested under QEMU (`CROSS_*` variables
+  of `packaging/linux/package.sh`).
 - Flatpak: a single-file `.flatpak` bundle for each architecture, repackaged from that
   architecture's Linux tarball (`packaging/linux/flatpak-bundle.sh` with
   `packaging/linux/flatpak/ai.storyteller.lightcraft.bundle.yml`; no Rust build). The from-source
@@ -57,7 +60,19 @@ workflow, and bump it (in `release.yml`, five jobs, and `freebsd.yml`) whenever 
 shipped language needs: a stale pin still builds, it just ships tofu (issue #319: v0.4.0 pinned a revision
 from before Noto Sans CJK SC, so Simplified Chinese had no glyphs). Before a release, check the pin against
 craft-fonts' `fonts/manifest.txt` and run `CRAFT_FONTS_DIR=../craft-fonts cargo test -p lightcraft-ui-egui i18n`,
-whose glyph-coverage test fails when a language's characters have no face.
+whose glyph-coverage test checks the characters in available faces. `CRAFT_FONTS_REQUIRED=1` now also makes
+the native build fail if the pinned manifest lacks Noto Sans CJK SC Regular (`Hans`) or BIZ UDPGothic Regular;
+the web build requires BIZ UDPGothic Regular and packages Noto Sans CJK SC as a separate asset.
+
+Local macOS, Linux and Windows packaging scripts automatically use the sibling `../craft-fonts`
+checkout. If it is absent, they clone it at revision
+`3d9ab3a132ed0eff457e424226a435a901da30d3` (keep the pins in `packaging/fonts.sh` and
+`packaging/windows/fonts.ps1` in sync with the release workflow). Existing checkouts are left untouched.
+Set `CRAFT_FONTS_DIR` to use another
+checkout; relative paths resolve from the workspace root. The script requires the Chinese and Japanese
+UI faces and includes their OFL licences in the package. Download failures or incomplete checkouts
+stop packaging with an error. `--skip-build` (`-SkipBuild` on Windows) packages existing binaries without downloading fonts or
+changing what they embed; pass the same `CRAFT_FONTS_DIR` used to compile them so their licences ship.
 
 ## Signing credentials
 

@@ -69,7 +69,9 @@ fn accepting_a_local_model_installs_in_background_and_resumes_the_pending_action
     assert_eq!(result["started"], "local-install");
     assert_eq!(app.ui.dialog, Some(Dialog::Settings { tab: "denoise".into() }));
     let ctx = egui::Context::default();
-    for _ in 0..600 {
+    // a deadline, not a count of tries: the install copies on a background thread, slow on a busy machine
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
         crate::panels::denoise::pump(&mut app, &ctx);
         if app.session.denoise_photo_state(raw) != lightcraft_engine::denoise::PhotoState::NoModel {
             break;
@@ -197,6 +199,27 @@ fn model_installation_waits_for_an_active_slider_gesture_to_finish() {
     app.session.end_interaction().unwrap();
     resume(&mut app);
     assert_eq!(amount(&app, raw), 50.0);
+    drop(app);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Issue #922: closing the setup without installing a model turns the AI Denoise switch back off
+/// and drops the "Cancel pending action" offer; while the setup stays open the request waits.
+#[test]
+fn dismissing_the_setup_without_a_model_leaves_ai_denoise_off() {
+    let (mut app, dir, raw) = setup("dismissed");
+    let r = app.run("denoise.toggle", json!({"id": raw.0, "enabled": true})).unwrap();
+    assert_eq!(r["setupRequired"], true);
+    resume(&mut app);
+    assert!(model_setup::denoise_requested(&app, raw), "the open setup keeps the request");
+    app.ui.dialog = None;
+    resume(&mut app);
+    assert!(!model_setup::denoise_requested(&app, raw), "a dismissed setup leaves nothing pending");
+    assert!(app.ui.status.contains("cancelled"), "{}", app.ui.status);
+    // installing later changes nothing; asking again offers the setup again
+    install_denoise(&mut app, &dir);
+    resume(&mut app);
+    assert_eq!(amount(&app, raw), 0.0);
     drop(app);
     let _ = std::fs::remove_dir_all(dir);
 }

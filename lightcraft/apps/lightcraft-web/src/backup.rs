@@ -11,8 +11,9 @@
 //!
 //! Restoring never deletes anything: the library files go to a new library folder in browser
 //! storage, originals that aren't stored yet are added (they're named by content, so existing
-//! ones are identical), and only then does a small pointer file ([`ACTIVE_LIBRARY`]) switch to
-//! the restored library. The library that was there before stays in storage.
+//! ones are identical; a restored one must match its content hash, see [`verify_original`]),
+//! and only then does a small pointer file ([`ACTIVE_LIBRARY`]) switch to the restored library.
+//! The library that was there before stays in storage.
 //!
 //! No zip64: a backup holds at most [`MAX_BYTES`] and 65 535 entries.
 
@@ -49,6 +50,18 @@ pub fn valid_library_dir(name: &str) -> bool {
 /// Is `h` a plausible content hash (used as a storage key segment)?
 pub fn valid_hash(h: &str) -> bool {
     !h.is_empty() && h.len() <= 128 && h.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Why a backup can't start yet, given [`lightcraft_engine::Session::unsaved`]: changes applied in
+/// the app but not yet written to browser storage (a save failed). The zip copies the stored
+/// library files, so it would report success while missing them; `None` when everything is saved.
+pub fn unsaved_refusal(unsaved: Option<(usize, &str)>) -> Option<String> {
+    let (ops, why) = unsaved?;
+    let changes = if ops == 1 { "1 change".to_string() } else { format!("{ops} changes") };
+    Some(format!(
+        "Backup not started: {changes} could not be saved to browser storage yet ({why}), so the backup would miss them. \
+         Free up storage space; LightCraft retries the save with every change. Back up once nothing is left unsaved."
+    ))
 }
 
 /// Zip entry name for an original.
@@ -241,6 +254,16 @@ pub fn verify(entry: &ZipEntry, data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Check that an original's bytes are the photo its storage key names: originals are stored
+/// under their content hash, and a restore that kept bytes under another photo's hash would
+/// give that photo's catalog record a different image (the zip checksum can't tell).
+pub fn verify_original(entry: &ZipEntry, hash: &str, data: &[u8]) -> Result<(), String> {
+    if crate::store::content_hash(data) != hash {
+        return Err(format!("{}: the file doesn't match its content hash (damaged or altered backup)", entry.name));
+    }
+    Ok(())
+}
+
 /// A name for the restored library's folder.
 pub fn restored_dir_name(now_ms: f64) -> String {
     format!("library-restored-{}", now_ms.max(0.0) as u64)
@@ -281,6 +304,27 @@ mod tests {
         let e = &entries[2];
         assert!(verify(e, &[0, 1, 2, 3, 254]).is_err());
         assert!(find_central(b"not a zip at all, just some text").is_err());
+    }
+
+    #[test]
+    fn originals_must_match_their_content_hash() {
+        let red: &[u8] = b"red corner photo";
+        let blue: &[u8] = b"blue corner photo";
+        let hash = crate::store::content_hash(red);
+        let name = original_entry(&hash, "IMG 1.png");
+        let key = restore_key(&name, "d").unwrap();
+        let key_hash = key.strip_prefix("originals/").unwrap();
+        assert_eq!(key_hash, hash);
+        // the entry's own bytes pass; other bytes under the same name (valid zip CRC) don't
+        let zip = build(&[(name.as_str(), blue)]);
+        let tail = &zip[zip.len() - tail_len(zip.len() as u64) as usize..];
+        let (off, size) = find_central(tail).unwrap();
+        let entries = parse_central(&zip[off as usize..(off + size) as usize]).unwrap();
+        let entry = &entries[0];
+        verify(entry, blue).unwrap();
+        let err = verify_original(entry, key_hash, blue).unwrap_err();
+        assert!(err.contains(&name), "{err}");
+        verify_original(entry, key_hash, red).unwrap();
     }
 
     #[test]

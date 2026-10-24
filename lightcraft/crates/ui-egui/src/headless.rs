@@ -79,6 +79,10 @@ pub struct HeadlessView {
     pixels_per_point: f32,
     size: [usize; 2],
     frames: u64,
+    /// The pretend host's clipboard: what the UI last copied, and what a paste request pastes.
+    pub clipboard: String,
+    /// Events the host owes the next frame (a paste request's paste, as a desktop host sends it).
+    owed: Vec<egui::Event>,
 }
 
 impl Default for HeadlessView {
@@ -92,7 +96,16 @@ impl HeadlessView {
         let ctx = egui::Context::default();
         crate::theme::install_fonts(&ctx);
         crate::theme::apply(&ctx);
-        HeadlessView { ctx, textures: TextureStore::default(), shapes: vec![], pixels_per_point: 1.0, size: [1600, 1000], frames: 0 }
+        HeadlessView {
+            ctx,
+            textures: TextureStore::default(),
+            shapes: vec![],
+            pixels_per_point: 1.0,
+            size: [1600, 1000],
+            frames: 0,
+            clipboard: String::new(),
+            owed: vec![],
+        }
     }
 
     /// Input for one frame of a `size` (points) viewport at `pixels_per_point`.
@@ -132,17 +145,62 @@ impl HeadlessView {
                 }
             }
         }
+        raw.events.splice(0..0, std::mem::take(&mut self.owed));
         let mut out = self.ctx.run_ui(raw, run_ui);
         self.frames += 1;
         self.textures.apply(std::mem::take(&mut out.textures_delta));
         self.shapes = std::mem::take(&mut out.shapes);
         self.pixels_per_point = out.pixels_per_point;
-        out.viewport_output.remove(&ViewportId::ROOT).map(|v| v.commands).unwrap_or_default()
+        for c in &out.platform_output.commands {
+            if let egui::OutputCommand::CopyText(text) = c {
+                self.clipboard.clone_from(text);
+            }
+        }
+        let commands = out.viewport_output.remove(&ViewportId::ROOT).map(|v| v.commands).unwrap_or_default();
+        // what a desktop host does with a cut, copy or paste request (egui-winit): the event, next frame
+        for c in &commands {
+            match c {
+                ViewportCommand::RequestCut => self.owed.push(egui::Event::Cut),
+                ViewportCommand::RequestCopy => self.owed.push(egui::Event::Copy),
+                ViewportCommand::RequestPaste if !self.clipboard.is_empty() => self.owed.push(egui::Event::Paste(self.clipboard.clone())),
+                _ => {}
+            }
+        }
+        commands
     }
 
     /// Frames run so far.
     pub fn frames(&self) -> u64 {
         self.frames
+    }
+
+    /// Every piece of text the last frame painted (labels, tooltips, values), in paint order.
+    /// Every shape of the last frame, with `Shape::Vec` flattened.
+    pub fn painted_shapes(&self) -> Vec<egui::epaint::Shape> {
+        fn flat(shape: &egui::epaint::Shape, out: &mut Vec<egui::epaint::Shape>) {
+            match shape {
+                egui::epaint::Shape::Vec(shapes) => shapes.iter().for_each(|shape| flat(shape, out)),
+                other => out.push(other.clone()),
+            }
+        }
+        let mut out = Vec::new();
+        self.shapes.iter().for_each(|s| flat(&s.shape, &mut out));
+        out
+    }
+
+    pub fn painted_text(&self) -> Vec<String> {
+        fn texts(shape: &egui::epaint::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(shape) => out.push(shape.galley.job.text.clone()),
+                egui::epaint::Shape::Vec(shapes) => shapes.iter().for_each(|shape| texts(shape, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for shape in &self.shapes {
+            texts(&shape.shape, &mut out);
+        }
+        out
     }
 
     /// Size in pixels of the last frame.
@@ -170,6 +228,9 @@ pub struct Headless {
     pub view: HeadlessView,
     /// The largest texture the pretend GPU takes (what a WebGL device may report: 2048).
     pub max_texture_side: usize,
+    /// The limit egui was last told. Like a native host (egui-winit) it is reported once, not in
+    /// every frame's input: code that reads the raw input sees `None` from then on (issue #652).
+    reported_texture_side: Option<usize>,
     /// Logical size (points) and scale.
     pub size: egui::Vec2,
     pub pixels_per_point: f32,
@@ -182,6 +243,18 @@ pub struct Headless {
     pub window_maximized: bool,
     /// Window-management commands the app sent (`StartDrag`, `Maximized`, …), oldest first.
     pub window_commands: Vec<ViewportCommand>,
+    /// The pointer cursor the last frame asked for (what a real host would show).
+    pub last_cursor: egui::CursorIcon,
+}
+
+/// A headless run (`lightcraft-cli snapshot`, tests) is a one-shot process: however it ends, it
+/// first waits for an Apple Photos import its script left running (`export.addToPhotos {wait:
+/// false}`), bounded, so it never abandons osascript or the import's result.
+impl Drop for Headless {
+    fn drop(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.app.session.wait_for_photos_imports();
+    }
 }
 
 impl Headless {
@@ -201,6 +274,7 @@ impl Headless {
             app,
             view: HeadlessView::new(),
             max_texture_side: 16384,
+            reported_texture_side: None,
             size,
             pixels_per_point,
             time: 0.0,
@@ -210,11 +284,22 @@ impl Headless {
             quit: false,
             window_maximized: false,
             window_commands: vec![],
+            last_cursor: egui::CursorIcon::Default,
         }
     }
 
     pub fn frames(&self) -> u64 {
         self.frames
+    }
+
+    /// The simulated clock (seconds) the next frame runs at.
+    pub fn time(&self) -> f64 {
+        self.time
+    }
+
+    /// Every piece of text the last frame painted ([`HeadlessView::painted_text`]).
+    pub fn painted_text(&self) -> Vec<String> {
+        self.view.painted_text()
     }
 
     /// `app.quit` was requested.
@@ -227,13 +312,17 @@ impl Headless {
         (self.size, self.pixels_per_point) = bounded_viewport(self.size, self.pixels_per_point);
         let mut raw = HeadlessView::raw_input(self.size, self.pixels_per_point, self.time, std::mem::take(&mut self.events));
         raw.viewports.entry(ViewportId::ROOT).or_default().maximized = Some(self.window_maximized);
-        raw.max_texture_side = Some(self.max_texture_side);
+        raw.max_texture_side = (self.reported_texture_side != Some(self.max_texture_side)).then_some(self.max_texture_side);
+        self.reported_texture_side = Some(self.max_texture_side);
         self.app.raw_input_hook(&mut raw);
         let app = &mut self.app;
+        let mut cursor = egui::CursorIcon::Default;
         let commands = self.view.run(raw, |ui| {
             app.logic(ui.ctx());
             app.ui(ui);
+            cursor = ui.ctx().output(|output| output.cursor_icon);
         });
+        self.last_cursor = cursor;
         self.time += FRAME_DT;
         self.frames += 1;
         for c in commands {
@@ -266,6 +355,8 @@ impl Headless {
             || crate::panels::left::fs_cached_running(&self.view.ctx) > 0
             || self.app.merge.busy()
             || self.app.scan.is_some()
+            || self.app.sync.is_some()
+            || self.app.sync_run.is_some()
             || self.app.import.is_some()
             || self.app.export.is_some()
             || self.app.session.denoise_busy()
@@ -364,6 +455,50 @@ impl Headless {
     }
 }
 
+/// For tests, a render offload: renders wait (stay queued) until `open` is set, then run; those
+/// whose slot `fails` picks come back failed, as an undecodable raw's would. Install it with
+/// `h.app.renderer.set_offload(Box::new(RenderGate::new(open.clone())))`.
+#[cfg(test)]
+pub(crate) struct RenderGate {
+    open: std::rc::Rc<std::cell::Cell<bool>>,
+    fails: fn(crate::render::Slot) -> bool,
+    jobs: Vec<(crate::render::Slot, lightcraft_engine::media::RenderJob)>,
+}
+
+#[cfg(test)]
+impl RenderGate {
+    pub(crate) fn new(open: std::rc::Rc<std::cell::Cell<bool>>) -> Self {
+        Self::failing(open, |_| false)
+    }
+    pub(crate) fn failing(open: std::rc::Rc<std::cell::Cell<bool>>, fails: fn(crate::render::Slot) -> bool) -> Self {
+        Self { open, fails, jobs: Vec::new() }
+    }
+}
+
+#[cfg(test)]
+impl crate::render::RenderOffload for RenderGate {
+    fn try_start(&mut self, slot: crate::render::Slot, job: lightcraft_engine::media::RenderJob) -> Option<lightcraft_engine::media::RenderJob> {
+        if !self.open.get() {
+            return Some(job);
+        }
+        self.jobs.push((slot, job));
+        None
+    }
+    fn finished(&mut self) -> Vec<(crate::render::Slot, lightcraft_engine::media::RenderResult, f64)> {
+        let fails = self.fails;
+        self.jobs
+            .drain(..)
+            .map(|(slot, job)| {
+                let mut r = job.run();
+                if fails(slot) {
+                    r.rendered = Err("no decoder for this raw".into());
+                }
+                (slot, r, 0.0)
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -422,7 +557,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Install from file… with a model the engine rejects says why in the AI Denoise section (#1381), instead of
+    /// leaving the button looking dead.
+    #[test]
+    fn a_rejected_model_file_says_why_in_settings() {
+        use crate::state::Dialog;
+        let mut h = demo([1400.0, 900.0]);
+        let t = Duration::from_secs(10);
+        let dir = std::env::temp_dir().join(format!("lc-ui-denoise-rejected-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        h.app.session.set_denoise_models_dir(Some(dir.join("denoise-models")));
+        // without the runtime the button is disabled (the workspace build turns it on through the desktop app)
+        if h.app.session.execute("denoise.models.list", &json!({})).unwrap()["runtime"] != true {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        // another app's model folder: the .onnx with that app's model.json, and no denoise-model.json
+        let onnx = dir.join("rawdenoise.onnx");
+        std::fs::write(&onnx, b"not a model").unwrap();
+        std::fs::write(dir.join("model.json"), br#"{"name": "rawdenoise", "scale": 2}"#).unwrap();
+        let picked = onnx.to_string_lossy().into_owned();
+        h.app.services.pick_denoise_model = Some(Box::new(move || vec![picked.clone()]));
+        h.app.ui.dialog = Some(Dialog::Settings { tab: "denoise".into() });
+        h.settle(SETTLE);
+        let r = h.request("ui.clickWidget", json!({"id": "denoise:installFile"}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        h.step();
+        h.step();
+        assert_eq!(h.app.ui.dialog, Some(Dialog::Settings { tab: "denoise".into() }));
+        let painted = h.painted_text();
+        assert!(
+            painted
+                .iter()
+                .any(|s| s.starts_with("No denoise-model.json beside this .onnx file. The model.json there") && s.ends_with("(see docs/denoise.md)")),
+            "{painted:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
+
+    /// The pretend host has a clipboard, as a desktop does: text the UI copies lands in it, and a
+    /// cut, copy or paste request (from a context menu) comes back as that event on the next frame.
+    #[test]
+    fn the_headless_host_has_a_clipboard() {
+        let mut view = HeadlessView::new();
+        let raw = || HeadlessView::raw_input(egui::vec2(200.0, 100.0), 1.0, 0.0, vec![]);
+        view.run(raw(), |ui| ui.ctx().copy_text("Lisbon".into()));
+        assert_eq!(view.clipboard, "Lisbon");
+        for (command, event) in [
+            (ViewportCommand::RequestPaste, egui::Event::Paste("Lisbon".into())),
+            (ViewportCommand::RequestCopy, egui::Event::Copy),
+            (ViewportCommand::RequestCut, egui::Event::Cut),
+        ] {
+            view.run(raw(), |ui| ui.ctx().send_viewport_cmd(command.clone()));
+            let mut seen = vec![];
+            view.run(raw(), |ui| seen = ui.input(|i| i.events.clone()));
+            assert!(seen.contains(&event), "{command:?}: {seen:?}");
+        }
+        // an empty clipboard pastes nothing, as a desktop host does
+        view.clipboard.clear();
+        view.run(raw(), |ui| ui.ctx().send_viewport_cmd(ViewportCommand::RequestPaste));
+        let mut seen = vec![];
+        view.run(raw(), |ui| seen = ui.input(|i| i.events.clone()));
+        assert!(!seen.iter().any(|e| matches!(e, egui::Event::Paste(_))), "{seen:?}");
+    }
 
     #[test]
     fn screenshot_dimensions_are_checked_before_layout() {
@@ -453,20 +653,14 @@ mod tests {
         {
             let mut view = HeadlessView::new();
             for frame in 0..9 {
-                let key = match frame {
-                    1 => Some(egui::Key::Plus),
-                    5 => Some(egui::Key::Minus),
-                    _ => None,
-                };
-                let mut raw = HeadlessView::raw_input(size, scale, frame as f64 / 60.0, vec![]);
-                if let Some(key) = key {
-                    let modifiers = egui::Modifiers { command: true, ..Default::default() };
-                    raw.events.push(egui::Event::ModifiersChanged(modifiers));
-                    raw.events.extend(vec![
-                        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers },
-                        egui::Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers },
-                    ]);
+                // the interface scale changes between frames (Cmd+Plus / Cmd+Minus are the
+                // photo's zoom, issue #566: egui's own keyboard zoom is off)
+                match frame {
+                    1 => view.ctx.set_zoom_factor(1.1),
+                    5 => view.ctx.set_zoom_factor(1.0),
+                    _ => {}
                 }
+                let raw = HeadlessView::raw_input(size, scale, frame as f64 / 60.0, vec![]);
                 view.run(raw, |ui| {
                     ui.label("UI zoom changes layout, keeping the host viewport size");
                 });
@@ -489,7 +683,8 @@ mod tests {
         app.ui.settings.gpu = false;
         let mut h = Headless::new(app, [480.0, 320.0], 2.0);
         let t = Duration::from_secs(5);
-        assert_eq!(h.request("ui.key", json!({"key": "Plus", "cmd": true}), t)["ok"], true);
+        h.view.ctx.set_zoom_factor(1.1);
+        assert_eq!(h.request("ui.inspect", json!({}), t)["ok"], true);
         assert!(h.view.ctx.zoom_factor() > 1.0);
         let main = h.view.ctx.clone();
         let screenshot = h.app.headless_screenshot(&main, true).unwrap();
@@ -506,7 +701,9 @@ mod tests {
             app.ui.settings.gpu = false;
             let mut h = Headless::new(app, [480.0, 320.0], scale);
             let t = Duration::from_secs(5);
-            assert_eq!(h.request("ui.key", json!({"key": "Plus", "cmd": true}), t)["ok"], true);
+            assert_eq!(h.request("ui.zoomFactor", json!({"factor": 1.1}), t)["ok"], true);
+            h.step();
+            assert!(h.view.ctx.zoom_factor() > 1.0);
             let native_size = resized_viewport([320.0, 240.0], scale, h.view.ctx.zoom_factor()).unwrap();
             let expected = native_viewport_pixels([native_size.x, native_size.y], scale).unwrap();
             assert_eq!(h.request("ui.resize", json!({"width": 320, "height": 240}), t)["ok"], true);
@@ -538,7 +735,8 @@ mod tests {
         app.ui.settings.gpu = false;
         let mut h = Headless::new(app, [480.0, 320.0], 0.9);
         let t = Duration::from_secs(5);
-        assert_eq!(h.request("ui.key", json!({"key": "Minus", "cmd": true}), t)["ok"], true);
+        h.view.ctx.set_zoom_factor(0.9);
+        h.step();
         assert!((h.view.ctx.zoom_factor() - 0.9).abs() < 0.001);
         assert_eq!(h.request("ui.resize", json!({"width": 150, "height": 150}), t)["ok"], true);
         assert_eq!(h.size, egui::vec2(135.0, 135.0));
@@ -578,6 +776,232 @@ mod tests {
         let mut app = LightcraftApp::new(lightcraft_engine::Session::with_demo(), services);
         app.ui.view = crate::state::ViewMode::PhotoGrid;
         Headless::new(app, size, 1.0)
+    }
+
+    /// Agents cut, copy and paste in a text field as the system does for ⌘X / ⌘C / ⌘V
+    /// (`ui.clipboard`), and `ui.inspect` → `copied` says what the UI last copied.
+    #[test]
+    fn agents_cut_copy_and_paste_in_text_fields() {
+        let mut h = demo([1200.0, 760.0]);
+        let t = Duration::from_secs(10);
+        let ask = |h: &mut Headless, method: &str, params: serde_json::Value| {
+            let r = h.request(method, params.clone(), t);
+            assert_eq!(r["ok"], true, "{method} {params}: {r}");
+            h.step();
+            h.step();
+            r
+        };
+        h.settle(SETTLE);
+        ask(&mut h, "ui.clickWidget", json!({"id": "field:search"}));
+        ask(&mut h, "ui.text", json!({"text": "wedding"}));
+        ask(&mut h, "ui.key", json!({"key": "a", "cmd": true}));
+        ask(&mut h, "ui.clipboard", json!({"action": "copy"}));
+        assert_eq!(ask(&mut h, "ui.inspect", json!({}))["result"]["copied"], "wedding");
+        ask(&mut h, "ui.clipboard", json!({"action": "cut"}));
+        assert_eq!(h.app.ui.search, "");
+        ask(&mut h, "ui.clipboard", json!({"action": "paste", "text": "travel"}));
+        assert_eq!(h.app.ui.search, "travel");
+        let r = h.request("ui.clipboard", json!({"action": "shred"}), t);
+        assert_eq!(r["ok"], false, "an unknown action is refused: {r}");
+    }
+
+    /// `ui.clipboard` acts in a text field: with none focused it is refused, rather than doing
+    /// what ⌘V does there on one platform (paste edit settings) and nothing on another.
+    #[test]
+    fn the_clipboard_method_needs_a_text_field() {
+        let mut h = demo([1200.0, 760.0]);
+        let t = Duration::from_secs(10);
+        h.settle(SETTLE);
+        let undo = h.app.session.undo.len();
+        for action in ["copy", "paste"] {
+            let r = h.request("ui.clipboard", json!({"action": action, "text": "travel"}), t);
+            assert_eq!(r["ok"], false, "{action}: {r}");
+            assert!(r["error"].as_str().is_some_and(|e| e.contains("text field")), "{r}");
+        }
+        h.settle(SETTLE);
+        assert_eq!(h.app.session.undo.len(), undo, "nothing was pasted");
+    }
+
+    /// `ui.clickWidget` right-clicks with `button: "right"`, as `ui.click` does (MCP `click`
+    /// passes it on with a widget): a filmstrip photo's context menu opens.
+    #[test]
+    fn click_widget_right_clicks() {
+        let mut h = demo([1200.0, 760.0]);
+        let t = Duration::from_secs(10);
+        h.request("ui.set", json!({"view": "detail"}), t);
+        h.settle(SETTLE);
+        let cell = h.app.widgets.iter().find(|(w, _)| w.starts_with("film:")).map(|(w, _)| w.clone()).expect("a filmstrip photo");
+        assert!(!egui::Popup::is_any_open(&h.view.ctx));
+        let r = h.request("ui.clickWidget", json!({"id": cell, "button": "right"}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        h.settle(SETTLE);
+        assert!(egui::Popup::is_any_open(&h.view.ctx), "its context menu");
+    }
+
+    /// #1877: a right-click while another photo's context menu is open closes that menu and
+    /// opens this photo's, which stays open (it flashed and closed again).
+    #[test]
+    fn right_clicking_elsewhere_moves_the_context_menu() {
+        let mut h = demo([1200.0, 760.0]);
+        let t = Duration::from_secs(10);
+        h.settle(SETTLE);
+        let thumbs: Vec<String> = h.app.widgets.iter().filter(|(w, _)| w.starts_with("thumb:")).map(|(w, _)| w.clone()).collect();
+        let (Some(a), Some(b)) = (thumbs.first().cloned(), thumbs.get(1).cloned()) else { panic!("two grid photos: {thumbs:?}") };
+        let popup = |w: &str| {
+            let id: u64 = w.trim_start_matches("thumb:").parse().expect("a photo id");
+            egui::Id::new(("cell", id)).with("popup")
+        };
+        assert!(!egui::Popup::is_any_open(&h.view.ctx));
+        let r = h.request("ui.clickWidget", json!({"id": a, "button": "right"}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        h.settle(SETTLE);
+        assert!(egui::Popup::is_id_open(&h.view.ctx, popup(&a)), "the first photo's menu is open");
+        // A real click: the press and the release reach the UI on different frames, with the
+        // pointer resting on the photo in between (`ui.clickWidget` sends both on one frame).
+        let rect = h.app.widgets.iter().find(|(w, _)| *w == b).map(|(_, r)| *r).expect("the second photo on screen");
+        let at = egui::pos2(rect.left() + rect.width() * 0.9, rect.center().y);
+        let button = egui::PointerButton::Secondary;
+        let modifiers = egui::Modifiers::NONE;
+        h.app.synthetic.push(egui::Event::PointerMoved(at));
+        h.step();
+        h.step();
+        h.app.synthetic.push(egui::Event::PointerButton { pos: at, button, pressed: true, modifiers });
+        h.step();
+        h.step();
+        h.app.synthetic.push(egui::Event::PointerButton { pos: at, button, pressed: false, modifiers });
+        // one frame at a time: the menu flashed for a frame or two before it closed
+        for frame in 0..6 {
+            h.step();
+            assert!(!egui::Popup::is_id_open(&h.view.ctx, popup(&a)), "frame {frame}: the first photo's menu closed");
+            if frame > 0 {
+                assert!(egui::Popup::is_id_open(&h.view.ctx, popup(&b)), "frame {frame}: the second photo's menu is open");
+            }
+        }
+        h.settle(SETTLE);
+        assert!(egui::Popup::is_id_open(&h.view.ctx, popup(&b)), "the second photo's menu stays open");
+        // The same photo again, elsewhere on it (the menu that is open belongs to this very
+        // widget): the menu moves to the pointer and stays.
+        let before = h.view.ctx.read_response(popup(&b)).map(|r| r.rect).expect("the menu's area");
+        let at = egui::pos2(rect.left() + rect.width() * 0.2, rect.center().y);
+        h.app.synthetic.push(egui::Event::PointerMoved(at));
+        h.step();
+        h.step();
+        h.app.synthetic.push(egui::Event::PointerButton { pos: at, button, pressed: true, modifiers });
+        h.step();
+        h.step();
+        h.app.synthetic.push(egui::Event::PointerButton { pos: at, button, pressed: false, modifiers });
+        for frame in 0..6 {
+            h.step();
+            if frame > 0 {
+                assert!(egui::Popup::is_id_open(&h.view.ctx, popup(&b)), "frame {frame}: the menu is open after a right-click on the same photo");
+            }
+        }
+        h.settle(SETTLE);
+        assert!(egui::Popup::is_id_open(&h.view.ctx, popup(&b)), "the menu stays open");
+        let after = h.view.ctx.read_response(popup(&b)).map(|r| r.rect).expect("the menu's area");
+        assert!((after.left() - at.x).abs() < 4.0, "the menu moved to the pointer: {after:?} vs {at:?} (was {before:?})");
+    }
+
+    /// #1171: Up / Down in the grid go to the cell above / below; in the filmstrip, one photo.
+    #[test]
+    fn up_and_down_move_through_the_grid_rows() {
+        let mut h = demo([1200.0, 760.0]);
+        let t = Duration::from_secs(10);
+        h.request("ui.set", json!({"view": "grid"}), t);
+        h.settle(SETTLE);
+        let first = h.app.session.visible_cloned()[0];
+        h.request("engine.execute", json!({"command": "library.select", "params": {"ids": [first.0]}}), t);
+        h.settle(SETTLE);
+        let rect = |h: &Headless| {
+            let a = h.app.session.selection.active.unwrap();
+            h.app.widgets.iter().find(|(w, _)| *w == format!("thumb:{}", a.0)).map(|(_, r)| *r).expect("grid cell")
+        };
+        let top = rect(&h);
+        h.request("ui.key", json!({"key": "down"}), t);
+        h.settle(SETTLE);
+        let below = rect(&h);
+        let pos = {
+            let a = h.app.session.selection.active;
+            h.app.session.visible_cloned().iter().position(|x| Some(*x) == a)
+        }
+        .unwrap();
+        assert!(below.top() > top.bottom(), "the next row, at {pos}: {top:?} -> {below:?}");
+        assert!(below.left() < top.right() && below.right() > top.left(), "overlapping horizontally");
+        h.request("ui.key", json!({"key": "up"}), t);
+        h.settle(SETTLE);
+        assert_eq!(h.app.session.selection.active, Some(first), "back up");
+        h.request("ui.key", json!({"key": "up"}), t);
+        h.settle(SETTLE);
+        assert_eq!(h.app.session.selection.active, Some(first), "the top row stays put");
+        // the filmstrip (one row): Down is the next photo
+        h.request("ui.set", json!({"view": "detail"}), t);
+        h.settle(SETTLE);
+        h.request("ui.key", json!({"key": "down"}), t);
+        h.settle(SETTLE);
+        assert_eq!(
+            {
+                let a = h.app.session.selection.active;
+                h.app.session.visible_cloned().iter().position(|x| Some(*x) == a)
+            },
+            Some(1)
+        );
+    }
+
+    /// The search field is a shared text field: right-click ▸ Paste puts the clipboard's text in
+    /// and filters by it.
+    #[test]
+    fn the_search_field_pastes_from_its_menu() {
+        let mut h = demo([1200.0, 760.0]);
+        let t = Duration::from_secs(10);
+        h.settle(SETTLE);
+        h.view.clipboard = "wedding".into();
+        for (id, button) in [("field:search", "right"), ("field:search:paste", "left")] {
+            let r = h.request("ui.clickWidget", json!({"id": id, "button": button}), t);
+            assert_eq!(r["ok"], true, "{id}: {r}");
+            h.settle(SETTLE);
+        }
+        assert_eq!(h.app.ui.search, "wedding");
+        assert_eq!(h.app.session.filter.text, "wedding", "and the library is filtered by it");
+    }
+
+    /// Issue #1648: clearing the filters from the loupe's pill empties the search field too, so
+    /// the field never shows a search that is no longer applied.
+    #[test]
+    fn clearing_the_loupe_filters_empties_the_search_field() {
+        let mut h = demo([1200.0, 760.0]);
+        let t = Duration::from_secs(10);
+        h.settle(SETTLE);
+        for (method, params) in [("ui.clickWidget", json!({"id": "field:search"})), ("ui.text", json!({"text": "a"}))] {
+            let r = h.request(method, params, t);
+            assert_eq!(r["ok"], true, "{r}");
+            h.settle(SETTLE);
+        }
+        assert_eq!(h.app.session.filter.text, "a", "filtered while typing");
+        assert!(!h.app.session.visible_cloned().is_empty(), "the search finds photos, so the loupe has one to show");
+        h.request("engine.execute", json!({"command": "view.detail"}), t);
+        h.settle(SETTLE);
+        let r = h.request("ui.clickWidget", json!({"id": "loupe:filters"}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        h.settle(SETTLE);
+        assert_eq!((h.app.ui.search.as_str(), h.app.session.filter.text.as_str()), ("", ""));
+    }
+
+    /// Esc in the search field gives back the search from before the edit, and the filter with it.
+    #[test]
+    fn escape_in_the_search_field_gives_back_the_search() {
+        let mut h = demo([1200.0, 760.0]);
+        let t = Duration::from_secs(10);
+        h.settle(SETTLE);
+        for (method, params) in [("ui.clickWidget", json!({"id": "field:search"})), ("ui.text", json!({"text": "travel"}))] {
+            let r = h.request(method, params, t);
+            assert_eq!(r["ok"], true, "{r}");
+            h.settle(SETTLE);
+        }
+        assert_eq!(h.app.session.filter.text, "travel", "filtered while typing");
+        let r = h.request("ui.key", json!({"key": "Escape"}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        h.settle(SETTLE);
+        assert_eq!((h.app.ui.search.as_str(), h.app.session.filter.text.as_str()), ("", ""));
     }
 
     #[test]
@@ -1032,6 +1456,122 @@ mod tests {
         assert_eq!(h.request("engine.execute", json!({"command": "view.person", "params": {"name": "  "}}), t)["ok"], false);
     }
 
+    /// A person's More grid confirms a score-bounded batch through either ↑ or the focused tile's A key. Both
+    /// routes use one undo step and leave hidden, lower-score and already named faces alone.
+    #[test]
+    fn person_more_confirms_all_above_with_one_undo_step() {
+        use lightcraft_catalog::Op;
+        let mut h = demo([1400.0, 900.0]);
+        let t = Duration::from_secs(10);
+        let ids: Vec<_> = h.app.session.catalog.photos().map(|p| p.id).take(7).collect();
+        assert_eq!(ids.len(), 7);
+        let region = |name: Option<&str>| lightcraft_meta::Region {
+            rect: lightcraft_geom::Rect { x0: 0.25, y0: 0.2, x1: 0.55, y1: 0.6 },
+            kind: lightcraft_meta::RegionKind::Face,
+            name: name.map(str::to_string),
+            description: None,
+        };
+        for (id, name) in ids.iter().zip([Some("Jane Doe"), None, None, None, None, None, Some("John Roe")]) {
+            let mut meta = h.app.session.catalog.photo(*id).unwrap().meta.clone();
+            meta.regions = vec![region(name)];
+            h.app.session.commit("setup", Op::SetMeta { id: *id, meta: Box::new(meta) }).unwrap();
+        }
+        h.request("engine.execute", json!({"command": "view.person", "params": {"name": "Jane Doe"}}), t);
+        h.settle(SETTLE);
+        let page = crate::panels::person::PersonPage {
+            name: "Jane Doe".into(),
+            total: 1,
+            confirmed: vec![crate::panels::person::Face { photo: ids[0].0, index: 0, rect: region(None).rect, score: 0.0 }],
+            more: ids[1..6]
+                .iter()
+                .zip([0.95, 0.80, 0.80, 0.80, 0.60])
+                .map(|(id, score)| crate::panels::person::Face { photo: id.0, index: 0, rect: region(None).rect, score })
+                .collect(),
+            ready: true,
+            pending: 0,
+        };
+        let set_page = |h: &mut Headless| {
+            h.app.caches.person_page =
+                Some(("Jane Doe".into(), h.app.session.catalog.revision, h.app.caches.faces_indexed, 0.0, Arc::new(page.clone())));
+            h.step();
+        };
+        h.app.ui.dismissed_faces.insert((ids[4].0, 0));
+        set_page(&mut h);
+        let bulk_id = format!("more-face-above:{}:0", ids[2].0);
+        assert!(h.request("ui.widgets", json!({"filter": "more-face-above:"}), t).to_string().contains(&bulk_id));
+        let undo = h.app.session.undo.len();
+        let r = h.request("ui.clickWidget", json!({"id": bulk_id}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        h.step();
+        let names = |h: &Headless| ids.iter().map(|id| h.app.session.catalog.photo(*id).unwrap().meta.regions[0].name.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            names(&h),
+            vec![
+                Some("Jane Doe".into()),
+                Some("Jane Doe".into()),
+                Some("Jane Doe".into()),
+                Some("Jane Doe".into()),
+                None,
+                None,
+                Some("John Roe".into())
+            ]
+        );
+        assert_eq!(h.app.session.undo.len(), undo + 1);
+        h.request("engine.execute", json!({"command": "edit.undo"}), t);
+        h.step();
+        assert_eq!(names(&h), vec![Some("Jane Doe".into()), None, None, None, None, None, Some("John Roe".into())]);
+        // With no target A cannot name a face, even on this page.
+        h.request("ui.move", json!({"x": 1, "y": 1}), t);
+        h.view.ctx.memory_mut(|m| m.surrender_focus(egui::Id::new(("more-face-above", ids[2].0, 0_usize))));
+        set_page(&mut h);
+        h.request("ui.key", json!({"key": "a"}), t);
+        h.step();
+        assert_eq!(names(&h)[1], None);
+        // Text editing owns A even if a face was the last pointer target.
+        let search = h.request("ui.clickWidget", json!({"id": "field:search"}), t);
+        assert_eq!(search["ok"], true, "{search}");
+        h.step();
+        h.request("ui.key", json!({"key": "a"}), t);
+        h.step();
+        assert_eq!(names(&h)[1], None);
+        h.request("ui.key", json!({"key": "escape"}), t);
+        h.step();
+        // Hovering a tile is enough for the A key, without clicking or moving keyboard focus there.
+        let tile_id = format!("more-face:{}:0", ids[2].0);
+        let rect = h.app.widgets.iter().find(|(id, _)| id == &tile_id).unwrap().1;
+        h.request("ui.move", json!({"x": rect.center().x, "y": rect.center().y}), t);
+        h.step();
+        h.request("ui.key", json!({"key": "a"}), t);
+        h.step();
+        assert_eq!(names(&h)[1..4], [Some("Jane Doe".into()), Some("Jane Doe".into()), Some("Jane Doe".into())]);
+        assert_eq!(h.app.session.undo.len(), undo + 1);
+        h.request("engine.execute", json!({"command": "edit.undo"}), t);
+        h.step();
+        h.request("ui.move", json!({"x": 1, "y": 1}), t);
+        set_page(&mut h);
+        // Keyboard focus on the candidate makes the same batch action available without hovering it.
+        h.view.ctx.memory_mut(|m| m.request_focus(egui::Id::new(("more-face", ids[2].0, 0_usize))));
+        h.request("ui.key", json!({"key": "a"}), t);
+        h.step();
+        assert_eq!(
+            names(&h),
+            vec![
+                Some("Jane Doe".into()),
+                Some("Jane Doe".into()),
+                Some("Jane Doe".into()),
+                Some("Jane Doe".into()),
+                None,
+                None,
+                Some("John Roe".into())
+            ]
+        );
+        assert_eq!(h.app.session.undo.len(), undo + 1);
+        h.request("engine.execute", json!({"command": "view.photoGrid"}), t);
+        h.request("ui.key", json!({"key": "a"}), t);
+        h.step();
+        assert_eq!(h.app.session.undo.len(), undo + 1, "A outside the person page cannot name more faces");
+    }
+
     /// The People view lists the unnamed faces below the named people: select some (a click each, or all), type a name,
     /// press Enter, and they are all named at once, in one undo step; the new person appears among the named.
     #[test]
@@ -1108,6 +1648,95 @@ mod tests {
         assert_eq!(named(&h, ids[1], 0), None);
     }
 
+    /// A double click on an unnamed face opens its photo in the loupe, as in the grid (#1664); a single click still only
+    /// selects it, and Escape from that photo goes back to the People view.
+    #[test]
+    fn double_clicking_an_unnamed_face_opens_its_photo() {
+        use crate::state::ViewMode;
+        use lightcraft_catalog::Op;
+        let mut h = demo([1400.0, 900.0]);
+        let t = Duration::from_secs(10);
+        let ids: Vec<_> = h.app.session.catalog.photos().map(|p| p.id).take(2).collect();
+        for id in &ids {
+            let mut meta = h.app.session.catalog.photo(*id).unwrap().meta.clone();
+            meta.regions = vec![lightcraft_meta::Region {
+                rect: lightcraft_geom::Rect { x0: 0.3, y0: 0.2, x1: 0.5, y1: 0.55 },
+                kind: lightcraft_meta::RegionKind::Face,
+                name: None,
+                description: None,
+            }];
+            h.app.session.commit("setup", Op::SetMeta { id: *id, meta: Box::new(meta) }).unwrap();
+        }
+        h.request("engine.execute", json!({"command": "library.select", "params": {"ids": [ids[0].0]}}), t);
+        h.request("engine.execute", json!({"command": "view.people"}), t);
+        h.settle(SETTLE);
+        h.step();
+        h.step();
+        let tile = format!("unnamed-face:{}:0", ids[1].0);
+        // one click selects the face and stays in People
+        let r = h.request("ui.clickWidget", json!({"id": tile}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        h.step();
+        h.step();
+        assert_eq!((h.app.ui.view, h.app.session.active()), (ViewMode::People, Some(ids[0])));
+        assert_eq!(h.app.ui.unnamed_selected.len(), 1);
+        h.request("ui.clickWidget", json!({"id": "unnamed:clear"}), t);
+        // half a second of frames, so egui does not count the next two clicks as the third and fourth of one burst
+        for _ in 0..30 {
+            h.step();
+        }
+        // two open the photo the face is in
+        let r = h.request("ui.clickWidget", json!({"id": tile, "count": 2}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        h.step();
+        h.step();
+        assert_eq!((h.app.ui.view, h.app.session.active()), (ViewMode::Detail, Some(ids[1])));
+        assert_eq!(h.app.session.catalog.photo(ids[1]).unwrap().meta.regions[0].name, None, "nothing is named");
+        // Escape goes back to the faces, not to the grid
+        h.request("ui.key", json!({"key": "escape"}), t);
+        h.step();
+        assert_eq!((h.app.ui.view, h.app.ui.person_page.clone()), (ViewMode::People, None));
+    }
+
+    /// The name field under the unnamed faces is a shared text field: right-click ▸ Paste puts the
+    /// clipboard's name in, and Esc leaves the field and clears the selection, as Clear does.
+    #[test]
+    fn the_unnamed_faces_name_field_pastes_and_escape_clears() {
+        use lightcraft_catalog::Op;
+        let mut h = demo([1400.0, 900.0]);
+        let t = Duration::from_secs(10);
+        let id = h.app.session.catalog.photos().map(|p| p.id).next().unwrap();
+        let mut meta = h.app.session.catalog.photo(id).unwrap().meta.clone();
+        meta.regions = vec![lightcraft_meta::Region {
+            rect: lightcraft_geom::Rect { x0: 0.3, y0: 0.2, x1: 0.5, y1: 0.55 },
+            kind: lightcraft_meta::RegionKind::Face,
+            name: None,
+            description: None,
+        }];
+        h.app.session.commit("setup", Op::SetMeta { id, meta: Box::new(meta) }).unwrap();
+        h.request("engine.execute", json!({"command": "view.people"}), t);
+        h.settle(SETTLE);
+        h.view.clipboard = "Wedding Guest".into();
+        for (widget, button) in [
+            (format!("unnamed-face:{}:0", id.0), "left"),
+            ("field:unnamedName".to_string(), "left"),
+            ("field:unnamedName".to_string(), "right"),
+            ("field:unnamedName:paste".to_string(), "left"),
+        ] {
+            let r = h.request("ui.clickWidget", json!({"id": widget, "button": button}), t);
+            assert_eq!(r["ok"], true, "{widget}: {r}");
+            h.step();
+            h.step();
+            h.step();
+        }
+        assert_eq!(h.app.ui.unnamed_name, "Wedding Guest");
+        assert_eq!(h.app.ui.unnamed_selected.len(), 1, "still naming");
+        h.request("ui.key", json!({"key": "Escape"}), t);
+        h.step();
+        h.step();
+        assert!(h.app.ui.unnamed_selected.is_empty() && h.app.ui.unnamed_name.is_empty(), "Esc cleared the selection and the name");
+    }
+
     /// A screenful of faces larger than the picture cache's usual budget (96) is all kept: with a fixed budget the same few
     /// tiles were evicted and re-requested every frame and stayed blank.
     #[test]
@@ -1138,7 +1767,7 @@ mod tests {
         // the pictures are made and kept, well beyond the old budget (a few demo photos share a scene, so two faces can share a
         // picture: the count is a little under the number of tiles)
         let started = Instant::now();
-        while h.app.renderer.variant_textures() < drawn - 20 && started.elapsed() < Duration::from_secs(20) {
+        while h.app.renderer.variant_textures() < drawn - 20 && started.elapsed() < Duration::from_secs(60) {
             h.step();
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -1207,6 +1836,84 @@ mod tests {
         h.settle(SETTLE);
     }
 
+    /// Hovering the applied profile shows the applied look (no preview), not the last other profile hovered.
+    #[test]
+    fn hovering_the_applied_profile_drops_the_last_hover() {
+        let mut h = demo([1400.0, 900.0]);
+        let t = Duration::from_secs(10);
+        h.request("ui.set", json!({"view": "detail"}), t);
+        h.request("engine.execute", json!({"command": "panel.profiles"}), t);
+        h.settle(SETTLE);
+        h.request("ui.clickWidget", json!({"id": "profileCell:lc.vivid"}), t);
+        h.request("ui.hoverWidget", json!({"id": "profileCell:lc.portrait"}), t);
+        h.step();
+        assert!(h.app.hover_preview.is_some(), "another profile previews");
+        h.request("ui.hoverWidget", json!({"id": "profileCell:lc.vivid"}), t);
+        h.step();
+        assert!(h.app.hover_preview.is_none(), "the applied profile is shown, not the last hovered one");
+    }
+
+    /// The preset applied to a photo is still marked (and its Amount slider back) after visiting
+    /// another photo, which shows none (issue #2392); an edit to the photo drops the mark.
+    #[test]
+    fn applied_preset_is_marked_again_on_returning_to_the_photo() {
+        let mut h = demo([1400.0, 900.0]);
+        let t = Duration::from_secs(10);
+        h.request("ui.set", json!({"view": "detail"}), t);
+        h.request("engine.execute", json!({"command": "panel.presets"}), t);
+        h.settle(SETTLE);
+        let a = h.app.session.active().unwrap();
+        let b = h.app.session.visible_cloned().into_iter().find(|id| *id != a).unwrap();
+        let has = |h: &Headless, w: &str| h.app.widgets.iter().any(|(id, _)| id == w);
+        let marked = |h: &Headless| {
+            let r = h.app.widgets.iter().find(|(id, _)| id == "presetApplied").map(|(_, r)| *r)?;
+            h.app.widgets.iter().find(|(id, wr)| id.starts_with("preset:") && *wr == r).map(|(id, _)| id.clone())
+        };
+        let r = h.request("ui.clickWidget", json!({"id": "preset:lc.warm-glow"}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        h.settle(SETTLE);
+        assert_eq!(marked(&h).as_deref(), Some("preset:lc.warm-glow"));
+        assert!(has(&h, "slider:presetAmount"));
+        for (photo, want) in [(b, None), (a, Some("preset:lc.warm-glow"))] {
+            h.request("engine.execute", json!({"command": "library.select", "params": {"ids": [photo.0]}}), t);
+            h.settle(SETTLE);
+            h.step();
+            assert_eq!(marked(&h).as_deref(), want, "on photo {photo:?}");
+            assert_eq!(has(&h, "slider:presetAmount"), want.is_some(), "the Amount slider follows the mark");
+        }
+        h.request("engine.execute", json!({"command": "develop.set", "params": {"control": "light.exposure", "value": 0.5}}), t);
+        h.settle(SETTLE);
+        h.step();
+        assert_eq!(marked(&h), None, "an edit after the preset drops the mark");
+    }
+
+    /// A preset applied while the active photo lies outside the selection changes only the
+    /// selection, so the active photo isn't marked as having it.
+    #[test]
+    fn applied_preset_is_not_marked_on_an_active_photo_outside_the_selection() {
+        let mut h = demo([1400.0, 900.0]);
+        let t = Duration::from_secs(10);
+        h.request("ui.set", json!({"view": "detail"}), t);
+        h.request("engine.execute", json!({"command": "panel.presets"}), t);
+        h.settle(SETTLE);
+        let a = h.app.session.active().unwrap();
+        let b = h.app.session.visible_cloned().into_iter().find(|id| *id != a).unwrap();
+        h.app.session.selection.ids = vec![b];
+        h.app.session.selection.active = Some(a);
+        let before = h.app.session.develop_of(a).unwrap();
+        let r = h.request("ui.clickWidget", json!({"id": "preset:lc.warm-glow"}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        h.settle(SETTLE);
+        h.step();
+        assert_eq!(h.app.session.active(), Some(a));
+        assert!(*h.app.session.develop_of(a).unwrap() == *before, "the active photo wasn't changed");
+        assert!(!h.app.widgets.iter().any(|(id, _)| id == "presetApplied"), "nor marked");
+        h.request("engine.execute", json!({"command": "library.select", "params": {"ids": [b.0]}}), t);
+        h.settle(SETTLE);
+        h.step();
+        assert!(h.app.widgets.iter().any(|(id, _)| id == "presetApplied"), "the selected photo is");
+    }
+
     /// Presets column: resting on a preset previews it in the loupe without a history entry;
     /// thumbnails are variant renders; Create Preset includes only the checked groups.
     #[test]
@@ -1264,6 +1971,51 @@ mod tests {
         let p = h.app.session.presets.iter().find(|p| !p.builtin).expect("created").clone();
         assert!(p.settings.get("light").is_none() && p.settings["effects"]["clarity"] == 25.0, "{}", p.settings);
         h.settle(SETTLE);
+    }
+
+    /// A collection of thousands of presets (a Lightroom library imported whole) lists only the
+    /// rows in view: a few dozen widgets and thumbnails a frame, not one per preset (every frame
+    /// built all of them and froze the app for seconds); scrolling brings later rows in.
+    #[test]
+    fn presets_panel_with_thousands_of_presets_builds_only_visible_rows() {
+        let mut h = demo([1400.0, 900.0]);
+        let t = Duration::from_secs(10);
+        let many = (0..5000)
+            .map(|i| lightcraft_develop::Preset {
+                id: format!("user.big.{i}"),
+                name: format!("Look {i}"),
+                group: format!("Big {:02}", i / 500),
+                settings: json!({"light": {"exposure": (i % 20) as f64 / 10.0}}),
+                favorite: false,
+                builtin: false,
+            })
+            .collect();
+        assert_eq!(h.app.session.add_presets(many).len(), 5000);
+        h.request("ui.set", json!({"view": "detail"}), t);
+        h.request("engine.execute", json!({"command": "panel.presets"}), t);
+        h.app.ui.preset_thumbs = true;
+        h.settle(SETTLE);
+        h.step();
+        let rows = |h: &Headless| h.app.widgets.iter().filter(|(w, _)| w.starts_with("preset:")).map(|(w, _)| w.clone()).collect::<Vec<_>>();
+        let first = rows(&h);
+        assert!((5..60).contains(&first.len()), "{} rows built", first.len());
+        assert!(h.app.renderer.variant_textures() < 60, "{} thumbnails", h.app.renderer.variant_textures());
+        assert!(h.app.widgets.iter().any(|(w, _)| w == "presetGroup:Big 09"), "every group header is listed");
+        let started = std::time::Instant::now();
+        h.step();
+        eprintln!("presets panel frame with 5000 presets: {:?}", started.elapsed());
+        // scroll far down over the list: later presets come into view
+        let r = h.request("ui.hoverWidget", json!({"id": first[first.len() / 2]}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        for _ in 0..20 {
+            h.request("ui.scroll", json!({"dy": -2000}), t);
+            h.step();
+        }
+        h.step();
+        let later = rows(&h);
+        assert!((5..60).contains(&later.len()), "{} rows built", later.len());
+        let deep = later.iter().filter_map(|w| w.strip_prefix("preset:user.big.")).filter_map(|n| n.parse::<usize>().ok()).max();
+        assert!(deep.is_some_and(|n| n > 500), "scrolled rows: {later:?}");
     }
 
     /// The filter bar drives `library.filter` and saves the view as a smart album.
@@ -1371,6 +2123,90 @@ mod tests {
         h.settle(SETTLE);
     }
 
+    /// Rename Keyword's name field is a shared text field. It opens with the name selected, so
+    /// typing replaces it, and Return renames; right-click ▸ Paste works too; Esc cancels the
+    /// dialog and renames nothing.
+    #[test]
+    fn the_rename_keyword_field_selects_pastes_and_cancels() {
+        let mut h = demo([1200.0, 800.0]);
+        let t = Duration::from_secs(10);
+        let first = h.app.session.visible_cloned()[0].0;
+        h.request("engine.execute", json!({"command": "photo.setMeta", "params": {"ids": [first], "addKeywords": ["travel"]}}), t);
+        let keywords = |h: &Headless| h.app.session.catalog.photo(lightcraft_catalog::PhotoId(first)).unwrap().meta.keywords.clone();
+        let open = |h: &mut Headless, name: &str| {
+            h.app.ui.dialog = Some(crate::state::Dialog::RenameKeyword { from: name.into(), to: name.into() });
+            h.settle(SETTLE);
+        };
+        let ask = |h: &mut Headless, method: &str, params: serde_json::Value| {
+            let r = h.request(method, params.clone(), t);
+            assert_eq!(r["ok"], true, "{method} {params}: {r}");
+            h.settle(SETTLE);
+        };
+        // typing replaces the selected name
+        open(&mut h, "travel");
+        ask(&mut h, "ui.text", json!({"text": "trips"}));
+        ask(&mut h, "ui.key", json!({"key": "Enter"}));
+        assert!(keywords(&h).contains(&"trips".to_string()) && !keywords(&h).contains(&"travel".to_string()), "{:?}", keywords(&h));
+        assert_eq!(h.app.ui.dialog, None);
+        // the menu's Paste
+        open(&mut h, "trips");
+        h.view.clipboard = "weddings".into();
+        ask(&mut h, "ui.clickWidget", json!({"id": "field:keywordName", "button": "right"}));
+        ask(&mut h, "ui.clickWidget", json!({"id": "field:keywordName:paste"}));
+        ask(&mut h, "ui.key", json!({"key": "Enter"}));
+        assert!(keywords(&h).contains(&"weddings".to_string()), "{:?}", keywords(&h));
+        // Esc cancels
+        open(&mut h, "weddings");
+        ask(&mut h, "ui.text", json!({"text": "parties"}));
+        ask(&mut h, "ui.key", json!({"key": "Escape"}));
+        assert_eq!(h.app.ui.dialog, None, "Esc closed the dialog");
+        assert!(keywords(&h).contains(&"weddings".to_string()), "renamed nothing: {:?}", keywords(&h));
+    }
+
+    /// Return confirms the one-field dialogs: New Album, Rename Album, New Smart Album, Merge
+    /// Keywords and a text prompt (here: renaming an album). Their name opens selected, so typing
+    /// replaces it. Return did nothing: the field took the focus back on every frame, so egui never
+    /// reported the focus Return gives up.
+    #[test]
+    fn return_confirms_the_one_field_dialogs() {
+        use crate::state::Dialog;
+        let mut h = demo([1200.0, 800.0]);
+        let t = Duration::from_secs(10);
+        let first = h.app.session.visible_cloned()[0].0;
+        h.request("engine.execute", json!({"command": "photo.setMeta", "params": {"ids": [first], "addKeywords": ["holiday"]}}), t);
+        let album = |h: &Headless, name: &str| h.app.session.catalog.albums().find(|a| a.name == name).map(|a| a.id.0);
+        let garden = album(&h, "Garden").expect("the demo's Garden album");
+        let confirm = |h: &mut Headless, dialog: Dialog, typed: &str| {
+            h.app.ui.dialog = Some(dialog);
+            h.settle(SETTLE);
+            for (method, params) in [("ui.text", json!({"text": typed})), ("ui.key", json!({"key": "Enter"}))] {
+                let r = h.request(method, params, t);
+                assert_eq!(r["ok"], true, "{r}");
+                h.settle(SETTLE);
+            }
+            assert_eq!(h.app.ui.dialog, None, "Return confirmed the dialog ({typed})");
+        };
+        confirm(&mut h, Dialog::NewAlbum { name: String::new(), folder: false, parent: None, include_selected: true }, "Weddings");
+        assert!(album(&h, "Weddings").is_some(), "New Album");
+        confirm(&mut h, Dialog::RenameAlbum { id: garden, name: "Garden".into() }, "Flowers");
+        assert_eq!(album(&h, "Flowers"), Some(garden), "Rename Album");
+        confirm(&mut h, Dialog::NewSmartAlbum { name: "Smart Album".into(), parent: None }, "Everything");
+        assert!(album(&h, "Everything").is_some(), "New Smart Album");
+        confirm(&mut h, Dialog::MergeKeywords { from: vec!["holiday".into()], into: String::new() }, "travel");
+        let keywords = h.app.session.catalog.photo(lightcraft_catalog::PhotoId(first)).unwrap().meta.keywords.clone();
+        assert!(keywords.contains(&"travel".to_string()) && !keywords.contains(&"holiday".to_string()), "Merge Keywords: {keywords:?}");
+        let prompt = Dialog::TextPrompt {
+            title: "Rename Album".into(),
+            hint: "Name".into(),
+            value: "Flowers".into(),
+            command: "album.rename".into(),
+            params: json!({"id": garden}),
+            key: "name".into(),
+        };
+        confirm(&mut h, prompt, "Botanical");
+        assert_eq!(album(&h, "Botanical"), Some(garden), "the text prompt");
+    }
+
     /// The sidebar's file-system checks run on worker threads and add rows when they land, which
     /// moves every row below them: `busy()` counts them, so `settle` waits for them before a test
     /// reads widget positions (a click aimed at a stale rect hits the neighbouring row).
@@ -1457,6 +2293,77 @@ mod tests {
         assert!(w1 < 700.0, "{w1}");
     }
 
+    /// With a watermark on, the Export dialog shows the first photo with the watermark on it.
+    #[test]
+    fn export_dialog_previews_the_watermark() {
+        let mut h = demo([1400.0, 900.0]);
+        let t = Duration::from_secs(10);
+        h.request("engine.execute", json!({"command": "dialog.export", "params": {}}), t);
+        let preview = |h: &mut Headless| {
+            let r = h.request("ui.widgets", json!({}), t);
+            r["result"].as_array().and_then(|a| a.iter().find(|w| w["id"] == "image:exportWatermarkPreview")).map(|w| w["rect"].clone())
+        };
+        h.settle(SETTLE);
+        assert!(preview(&mut h).is_none(), "no preview without a watermark");
+        if let Some(crate::state::Dialog::Export { opts, .. }) = &mut h.app.ui.dialog {
+            opts.watermark = Some(lightcraft_engine::export::Watermark { text: "© LightCraft".into(), ..Default::default() });
+        }
+        let t0 = Instant::now();
+        while preview(&mut h).is_none() && t0.elapsed() < Duration::from_secs(30) {
+            h.step();
+        }
+        let rect = preview(&mut h).expect("the watermark preview is shown");
+        assert!(rect[2].as_f64().unwrap() > 50.0 && rect[3].as_f64().unwrap() > 50.0, "{rect}");
+    }
+
+    /// Issue #1952: a previous export saved with a depth its format doesn't have (an API call made
+    /// before `app.export` refused it) opens at a depth the format offers, so the dialog's Export,
+    /// which has no depth to pick for JPEG, doesn't fail; a depth the format has is kept.
+    #[test]
+    fn export_dialog_drops_a_depth_the_format_lacks() {
+        let mut h = demo([1200.0, 900.0]);
+        let t = Duration::from_secs(10);
+        let opened = |h: &mut Headless, last: Value| {
+            h.app.ui.dialog = None;
+            h.app.session.last_export = Some(last);
+            h.request("engine.execute", json!({"command": "dialog.export", "params": {}}), t);
+            match &h.app.ui.dialog {
+                Some(crate::state::Dialog::Export { opts, .. }) => opts.clone(),
+                _ => panic!("the export dialog is open"),
+            }
+        };
+        let o = opened(&mut h, json!({"format": "jpeg", "bitDepth": 16}));
+        assert_eq!(o.bit_depth, None);
+        lightcraft_engine::export::ExportOptions::from_params(&o.to_json()).expect("the dialog's settings export");
+        assert_eq!(opened(&mut h, json!({"format": "tiff", "bitDepth": 32})).bit_depth, Some(32));
+    }
+
+    /// Review of #1966: a `path` whose extension names no format exports JPEG here, so its
+    /// `bitDepth` is checked against JPEG's, not let through to an 8-bit file.
+    #[test]
+    fn export_checks_the_depth_of_the_format_a_bare_path_gets() {
+        let mut h = demo([1200.0, 900.0]);
+        let t = Duration::from_secs(10);
+        let out = std::env::temp_dir().join(format!("lc-bare-path-depth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(&out).unwrap();
+        h.app.services.write = Some(Box::new(|p: &str, bytes: &[u8]| lightcraft_engine::export::write_file(p, bytes)));
+        for name in ["output", "output.xyz"] {
+            let p = json!({"path": out.join(name).to_string_lossy(), "longEdge": 32, "bitDepth": 10});
+            let r = h.request("engine.execute", json!({"command": "app.export", "params": p}), t);
+            assert_eq!(r["ok"], false, "{name}: {r}");
+            assert!(r["error"].as_str().unwrap().contains("`bitDepth` must be 8 for jpeg"), "{name}: {r}");
+        }
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0, "nothing written");
+        // the format such a path gets is still JPEG
+        let p = json!({"path": out.join("output").to_string_lossy(), "longEdge": 32, "bitDepth": 8});
+        let r = h.request("engine.execute", json!({"command": "app.export", "params": p}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        let written = std::fs::read_dir(&out).unwrap().next().unwrap().unwrap().path();
+        assert!(std::fs::read(&written).unwrap().starts_with(&[0xFF, 0xD8]), "{written:?} is a JPEG");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
     #[test]
     fn export_dialog_runs_in_the_background() {
         let mut h = demo([1200.0, 900.0]);
@@ -1482,6 +2389,8 @@ mod tests {
         assert!(h.app.export.is_some(), "running in the background");
         let running = h.request("ui.inspect", json!({}), t);
         assert_eq!(running["result"]["export"]["running"]["total"], 3, "{}", running["result"]["export"]);
+        // …and as a row in the activity stack (issue #345)
+        assert_eq!(running["result"]["activity"][0]["kind"], "export", "{}", running["result"]["activity"]);
         let t0 = Instant::now();
         while h.app.export.is_some() && t0.elapsed() < Duration::from_secs(60) {
             h.step();
@@ -1490,9 +2399,281 @@ mod tests {
         let w = written.lock().unwrap().clone();
         assert_eq!(w.len(), 3, "{w:?}");
         assert!(w.iter().all(|p| p.starts_with("/lc-test-out/")));
-        let last = h.request("ui.inspect", json!({}), t)["result"]["export"]["last"].clone();
+        let after = h.request("ui.inspect", json!({}), t)["result"].clone();
+        assert_eq!(after["activity"], json!([]), "the row is gone");
+        let last = after["export"]["last"].clone();
         assert_eq!(last["files"].as_array().map(Vec::len), Some(3), "{last}");
         assert!(last["files"][0]["width"].as_u64().is_some_and(|w| w <= 64));
+    }
+
+    /// Issue #236: the Export dialog's Add to Apple Photos is there on macOS only; there the
+    /// background export hands the files it wrote to Photos (a fake runner: tests never start
+    /// osascript or Photos) and the toast says how it went.
+    #[test]
+    fn export_dialog_adds_to_apple_photos_on_macos() {
+        let mut h = demo([1200.0, 1100.0]);
+        let t = Duration::from_secs(10);
+        let out = std::env::temp_dir().join(format!("lc-photos-dialog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        h.app.services.write_shared = Some(Arc::new(|p: &str, bytes: &[u8]| lightcraft_engine::export::write_file(p, bytes)));
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let c = calls.clone();
+        h.app.session.apple_photos = Some(Arc::new(move |args: &[String], _| {
+            c.lock().unwrap().push(args.to_vec());
+            Ok(lightcraft_engine::apple_photos::Output { status: Some(0), stdout: "A/L0/001\nB/L0/001\n".into(), stderr: String::new() })
+        }));
+        let ids: Vec<u64> = h.app.session.visible_cloned().iter().take(2).map(|p| p.0).collect();
+        h.request("engine.execute", json!({"command": "library.select", "params": {"ids": ids}}), t);
+        h.request("engine.execute", json!({"command": "dialog.export", "params": {}}), t);
+        h.settle(SETTLE);
+        let shown = h.request("ui.widgets", json!({"filter": "exportAddToPhotos"}), t)["result"].as_array().map_or(0, Vec::len);
+        assert_eq!(shown > 0, cfg!(target_os = "macos"), "the option is offered where Photos is");
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        h.request("ui.clickWidget", json!({"id": "exportAddToPhotos"}), t);
+        h.settle(SETTLE);
+        if let Some(crate::state::Dialog::Export { opts, full_size, resize, dir, .. }) = &mut h.app.ui.dialog {
+            assert!(opts.add_to_photos, "the checkbox turns it on");
+            opts.photos_album = "Trip “2026”".into();
+            *full_size = false;
+            *resize = lightcraft_engine::export::Resize::long_edge(48);
+            *dir = out.to_string_lossy().into_owned();
+        }
+        let r = h.request("ui.dialog.confirm", json!({}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        let t0 = Instant::now();
+        while h.app.export.is_some() && t0.elapsed() < Duration::from_secs(60) {
+            h.step();
+        }
+        let last = h.request("ui.inspect", json!({}), t)["result"]["export"]["last"].clone();
+        let written: Vec<String> = last["files"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap().to_string()).collect();
+        assert_eq!(written.len(), 2, "{last}");
+        assert_eq!(last["applePhotos"]["imported"], 2, "{last}");
+        assert_eq!(last["applePhotos"]["album"], "Trip “2026”");
+        let args = calls.lock().unwrap().clone();
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0][args[0].len() - 2..], written[..], "the files written go to Photos");
+        let toast = h.app.ui.toast.as_ref().map(|t| t.0.clone()).unwrap_or_default();
+        assert!(toast.contains("2 added to Apple Photos album “Trip “2026””"), "{toast}");
+        // Export with Previous repeats it
+        assert_eq!(h.app.session.last_export.as_ref().unwrap()["addToPhotos"], true);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// Codex review of #643: the progress line while Photos imports was translated on the export's
+    /// worker thread, whose language is always English.
+    #[test]
+    fn the_photos_progress_line_is_in_the_users_language() {
+        if !cfg!(target_os = "macos") {
+            return;
+        }
+        let mut h = demo([1200.0, 900.0]);
+        let t = Duration::from_secs(10);
+        let out = std::env::temp_dir().join(format!("lc-photos-language-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        h.app.ui.language = crate::i18n::Locale::De;
+        crate::i18n::set_language(crate::i18n::Locale::De);
+        h.app.services.write_shared = Some(Arc::new(|p: &str, bytes: &[u8]| lightcraft_engine::export::write_file(p, bytes)));
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = std::sync::Mutex::new(held);
+        let (entered, photos_asked) = std::sync::mpsc::channel::<()>();
+        let entered = std::sync::Mutex::new(entered);
+        h.app.session.apple_photos = Some(Arc::new(move |_: &[String], _| {
+            let _ = entered.lock().unwrap().send(());
+            let _ = held.lock().unwrap().recv_timeout(Duration::from_secs(30));
+            Ok(lightcraft_engine::apple_photos::Output { status: Some(0), stdout: "ID\n".into(), stderr: String::new() })
+        }));
+        let ids: Vec<u64> = h.app.session.visible_cloned().iter().take(1).map(|p| p.0).collect();
+        let params = json!({"ids": ids, "dir": out, "longEdge": 48, "addToPhotos": true, "background": true});
+        let r = h.request("engine.execute", json!({"command": "app.export", "params": params}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        // Photos has been asked, and the window hasn't drawn a frame since (Codex review of #643):
+        // the export's row already has no ✕, and a cancel is refused rather than half-honoured
+        photos_asked.recv_timeout(Duration::from_secs(60)).expect("the export asks Photos");
+        let row = h.app.session.activity.list().into_iter().find(|r| r.kind == "export").expect("the export's row");
+        assert!(!row.cancellable, "{row:?}");
+        assert!(h.app.session.activity.cancel(row.id).is_err(), "Photos can't be stopped once asked");
+        let current = h.app.export.as_ref().map(|e| e.progress.lock().unwrap().1.clone()).unwrap_or_default();
+        assert_eq!(current, crate::i18n::Locale::De.tr("Adding to Apple Photos…"));
+        // the row says so on the next frame (issue #345)
+        h.step();
+        let row = h.app.session.activity.list().into_iter().find(|r| r.kind == "export").expect("the export's row");
+        assert_eq!((row.detail.as_str(), row.cancellable), ("Wird zu Apple Fotos hinzugefügt…", false), "{row:?}");
+        release.send(()).unwrap();
+        let t0 = Instant::now();
+        while h.app.export.is_some() && t0.elapsed() < Duration::from_secs(90) {
+            h.step();
+        }
+        let last = h.app.last_export_result.clone().expect("the export reports");
+        assert_eq!((last["cancelled"].as_bool(), last["applePhotos"]["imported"].as_u64()), (Some(false), Some(1)), "{last}");
+        crate::i18n::set_language(crate::i18n::Locale::En);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// Issue #236 review: control requests run on the UI thread, which must not wait minutes for
+    /// Photos. `export.addToPhotos` and `app.export {addToPhotos}` without `background` answer at
+    /// once with the running job; the app announces the outcome when Photos is done.
+    #[test]
+    fn a_slow_photos_import_never_blocks_the_window() {
+        let mut h = demo([1000.0, 700.0]);
+        let t = Duration::from_secs(30);
+        let out = std::env::temp_dir().join(format!("lc-photos-slow-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(&out).unwrap();
+        let file = out.join("a.jpg");
+        std::fs::write(&file, b"jpeg").unwrap();
+        h.app.services.write = Some(Box::new(|p: &str, bytes: &[u8]| lightcraft_engine::export::write_file(p, bytes)));
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let wait = std::sync::Mutex::new(wait);
+        h.app.session.apple_photos_background = true; // as the desktop app sets it
+        h.app.session.apple_photos = Some(Arc::new(move |args: &[String], _| {
+            // a regression (Photos on the UI thread) fails the timing below instead of hanging
+            let _ = wait.lock().unwrap().recv_timeout(Duration::from_secs(20));
+            let n = args.len() - args.iter().position(|a| a == lightcraft_engine::apple_photos::MARKER).unwrap() - 2;
+            Ok(lightcraft_engine::apple_photos::Output { status: Some(0), stdout: "ID\n".repeat(n), stderr: String::new() })
+        }));
+        let t0 = Instant::now();
+        let r =
+            h.request("engine.execute", json!({"command": "export.addToPhotos", "params": {"paths": [file.to_string_lossy()], "album": "Slow"}}), t);
+        assert!(t0.elapsed() < Duration::from_secs(5), "answered at once: {r}");
+        assert_eq!(r["result"]["running"], true, "{r}");
+        go.send(()).unwrap();
+        while !h.app.ui.toast.as_ref().is_some_and(|t| t.0.contains("Apple Photos")) {
+            assert!(t0.elapsed() < Duration::from_secs(20), "the outcome is announced");
+            h.step();
+        }
+        assert_eq!(h.app.ui.toast.as_ref().unwrap().0, "1 added to Apple Photos album “Slow”");
+        if cfg!(target_os = "macos") {
+            let t1 = Instant::now();
+            let p = json!({"dir": out.to_string_lossy(), "longEdge": 32, "addToPhotos": true});
+            let r = h.request("engine.execute", json!({"command": "app.export", "params": p}), t);
+            assert!(t1.elapsed() < Duration::from_secs(10), "the export answers without waiting for Photos: {r}");
+            assert_eq!(r["result"]["applePhotos"]["running"], true, "{r}");
+            assert_eq!(r["result"]["applePhotos"]["job"], 2, "{r}");
+            go.send(()).unwrap();
+            while !h.app.ui.toast.as_ref().is_some_and(|t| t.0.starts_with("1 added to Apple Photos") && !t.0.contains("Slow")) {
+                assert!(t1.elapsed() < Duration::from_secs(20), "the outcome is announced");
+                h.step();
+            }
+        }
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// Review of #236: a headless run (snapshot scripts) ending while an import it started with
+    /// `wait: false` is still running waits for it, on every exit path (dropping the `Headless`).
+    #[test]
+    fn a_headless_run_waits_for_its_photos_import_before_ending() {
+        let mut h = demo([800.0, 600.0]);
+        let t = Duration::from_secs(10);
+        let dir = std::env::temp_dir().join(format!("lc-photos-headless-drop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.jpg");
+        std::fs::write(&file, b"jpeg").unwrap();
+        let marker = dir.join("imported");
+        let m = marker.clone();
+        // Photos "imports" when `go` arrives (at most 20 s): released 0.8 s into the drop below
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let wait = std::sync::Mutex::new(wait);
+        h.app.session.apple_photos = Some(Arc::new(move |_: &[String], _| {
+            let _ = wait.lock().unwrap().recv_timeout(Duration::from_secs(20));
+            std::fs::write(&m, b"done").unwrap();
+            Ok(lightcraft_engine::apple_photos::Output { status: Some(0), stdout: "ID\n".into(), stderr: String::new() })
+        }));
+        let r =
+            h.request("engine.execute", json!({"command": "export.addToPhotos", "params": {"paths": [file.to_string_lossy()], "wait": false}}), t);
+        assert_eq!(r["result"]["running"], true, "{r}");
+        assert!(!marker.exists(), "still importing");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(800));
+            let _ = go.send(());
+        });
+        drop(h);
+        assert!(marker.exists(), "the import finished before the run ended");
+        release.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review of #236: a snapshot that ends (an error in its script, say) while its background
+    /// export is still writing waits through the writing and then the import the export starts.
+    #[test]
+    fn a_headless_run_waits_for_its_exports_photos_import() {
+        if !cfg!(target_os = "macos") {
+            return; // addToPhotos is refused before exporting elsewhere
+        }
+        let mut h = demo([800.0, 600.0]);
+        let t = Duration::from_secs(10);
+        let dir = std::env::temp_dir().join(format!("lc-photos-headless-export-drop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let marker = dir.join("imported");
+        h.app.services.write_shared = Some(Arc::new(|p: &str, bytes: &[u8]| {
+            std::thread::sleep(Duration::from_millis(300)); // a slow disk: still writing at the drop
+            lightcraft_engine::export::write_file(p, bytes)
+        }));
+        let m = marker.clone();
+        h.app.session.apple_photos = Some(Arc::new(move |_: &[String], _| {
+            std::thread::sleep(Duration::from_millis(500));
+            std::fs::write(&m, b"done").unwrap();
+            Ok(lightcraft_engine::apple_photos::Output { status: Some(0), stdout: "ID\n".into(), stderr: String::new() })
+        }));
+        let p = json!({"dir": dir.join("out").to_string_lossy(), "longEdge": 32, "addToPhotos": true, "background": true});
+        let r = h.request("engine.execute", json!({"command": "app.export", "params": p}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(h.app.session.apple_photos_imports.running().is_some(), "reserved while writing");
+        drop(h);
+        assert!(marker.exists(), "the export's import finished before the run ended");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review of #236: a background export adding to Photos holds the import from before it
+    /// writes. While its files are being written, `export.addToPhotos` is refused with the
+    /// export's job number; the export then adds its files under that job.
+    #[test]
+    fn a_background_export_holds_photos_while_it_writes() {
+        if !cfg!(target_os = "macos") {
+            return; // addToPhotos is refused before exporting elsewhere
+        }
+        let mut h = demo([1000.0, 700.0]);
+        let t = Duration::from_secs(10);
+        let out = std::env::temp_dir().join(format!("lc-photos-hold-ui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out);
+        std::fs::create_dir_all(&out).unwrap();
+        let other = out.join("other.jpg");
+        std::fs::write(&other, b"jpeg").unwrap();
+        // the writer waits for `go`: the export is still writing while we try another import
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let wait = std::sync::Mutex::new(wait);
+        h.app.services.write_shared = Some(Arc::new(move |p: &str, bytes: &[u8]| {
+            let _ = wait.lock().unwrap().recv_timeout(Duration::from_secs(20));
+            lightcraft_engine::export::write_file(p, bytes)
+        }));
+        let calls = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let c = calls.clone();
+        h.app.session.apple_photos_background = true;
+        h.app.session.apple_photos = Some(Arc::new(move |args: &[String], _| {
+            c.lock().unwrap().push(args.to_vec());
+            Ok(lightcraft_engine::apple_photos::Output { status: Some(0), stdout: "ID\n".into(), stderr: String::new() })
+        }));
+        let p = json!({"dir": out.join("export").to_string_lossy(), "longEdge": 32, "addToPhotos": true, "photosAlbum": "Held", "background": true});
+        let r = h.request("engine.execute", json!({"command": "app.export", "params": p}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(h.app.export.is_some(), "writing in the background");
+        let r = h.request("engine.execute", json!({"command": "export.addToPhotos", "params": {"paths": [other.to_string_lossy()]}}), t);
+        assert_eq!(r["ok"], false, "{r}");
+        assert!(r["error"].as_str().unwrap().contains("An export is about to add its files to Apple Photos (import 1)"), "{r}");
+        go.send(()).unwrap();
+        let t0 = Instant::now();
+        while h.app.export.is_some() {
+            assert!(t0.elapsed() < Duration::from_secs(20), "the export finishes");
+            h.step();
+        }
+        let last = h.app.last_export_result.clone().unwrap();
+        assert_eq!((last["applePhotos"]["job"].as_u64(), last["applePhotos"]["imported"].as_u64()), (Some(1), Some(1)), "{last}");
+        let args = calls.lock().unwrap().clone();
+        assert_eq!(args.len(), 1, "only the export's files went to Photos");
+        assert!(args[0].last().unwrap().contains("export"), "{:?}", args[0].last());
+        let _ = std::fs::remove_dir_all(&out);
     }
 
     /// Dragging grid photos onto an album row adds them to the album.
@@ -1545,6 +2726,7 @@ mod tests {
                 file_size: ph.file_size,
                 content_hash: ph.content_hash.clone(),
                 preview_only: Some("Nikon Huffman-compressed NEF (no clean-room description available)".into()),
+                preview_checked: lightcraft_catalog::APP_VERSION.into(),
             })
             .unwrap();
         h.settle(SETTLE);
@@ -1561,15 +2743,66 @@ mod tests {
         h.settle(SETTLE);
         let n = ids(&mut h, "notice:previewOnly:");
         assert!(n.contains(&"notice:previewOnly:loupe".to_string()) && n.contains(&"notice:previewOnly:edit".to_string()), "{n:?}");
+        // with a Reload from Disk button (issue #662)
+        assert_eq!(ids(&mut h, "button:reloadPreviewOnly:"), vec!["button:reloadPreviewOnly:edit".to_string()]);
         // Info
         h.app.ui.right = crate::state::RightPanel::Info;
         h.settle(SETTLE);
         assert!(ids(&mut h, "notice:previewOnly:").contains(&"notice:previewOnly:info".to_string()));
+        assert_eq!(ids(&mut h, "button:reloadPreviewOnly:"), vec!["button:reloadPreviewOnly:info".to_string()]);
+        // …which re-reads the file and says what came of it (a demo photo has none to re-read)
+        let r = h.request("ui.clickWidget", json!({"id": "button:reloadPreviewOnly:info"}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        h.settle(SETTLE);
+        assert_eq!(h.app.ui.toast.clone().map(|x| x.0).as_deref(), Some("This raw variant still can't be decoded"));
         // a regular photo: no notice
         h.request("engine.execute", json!({"command": "library.select", "params": {"ids": [other.0]}}), t);
         h.app.ui.right = crate::state::RightPanel::Edit;
         h.settle(SETTLE);
         assert!(ids(&mut h, "notice:previewOnly:").is_empty());
+    }
+
+    #[test]
+    fn crop_default_browsing_is_read_only_and_drag_is_one_edit() {
+        let mut h = demo([1200.0, 800.0]);
+        let photos: Vec<_> = h.app.session.visible_cloned().into_iter().filter(|id| !h.app.session.catalog.photo(*id).unwrap().is_edited()).collect();
+        h.app.run("library.select", json!({"ids": [photos[0].0]})).unwrap();
+        h.app.ui.right = crate::state::RightPanel::Crop;
+        h.app.run("crop.aspect", json!({"aspect": "1x1"})).unwrap();
+        let saved = serde_json::to_value(&h.app.ui).unwrap();
+        for &photo in &photos[1..3] {
+            h.app.run("library.select", json!({"ids": [photo.0]})).unwrap();
+            let before = h.app.session.catalog.photo(photo).unwrap().clone();
+            let undo = h.app.session.undo.len();
+            h.settle(SETTLE);
+            let after = h.app.session.catalog.photo(photo).unwrap();
+            assert_eq!(after.develop, before.develop);
+            assert_eq!(after.history.len(), before.history.len());
+            assert!(!after.is_edited());
+            assert_eq!(h.app.session.undo.len(), undo);
+            assert_eq!(h.app.crop_tool_aspect(), Some((100, 100)));
+        }
+        let photo = photos[2];
+        let before = h.app.session.develop_of(photo).unwrap();
+        let undo = h.app.session.undo.len();
+        h.app.run("develop.beginInteraction", json!({"label": "Crop"})).unwrap();
+        h.app.begin_crop().unwrap();
+        h.app.run("crop.drag", json!({"handle": "bottomRight", "from": [0.8, 0.8], "to": [0.7, 0.7]})).unwrap();
+        h.app.run("develop.endInteraction", json!({})).unwrap();
+        assert_eq!(h.app.session.develop_of(photo).unwrap().crop.aspect, Some((100, 100)));
+        assert_eq!(h.app.session.undo.len(), undo + 1);
+        h.app.run("edit.undo", json!({})).unwrap();
+        assert_eq!(h.app.session.develop_of(photo).unwrap(), before);
+        h.app.ui = serde_json::from_value(saved).unwrap();
+        assert_eq!(h.app.crop_tool_aspect(), Some((100, 100)));
+        h.app.run("crop.aspect", json!({"aspect": "toggle"})).unwrap();
+        assert_eq!(h.app.ui.crop_default_aspect, Some(json!("free")));
+        assert_eq!(h.app.session.develop_of(photo).unwrap(), before);
+        h.app.ui.crop_default_aspect = Some(json!("original"));
+        let p = h.app.session.catalog.photo(photo).unwrap();
+        assert_eq!(h.app.crop_tool_aspect(), Some((p.width * 100, p.height * 100)));
+        h.settle(SETTLE);
+        assert_eq!(h.app.session.develop_of(photo).unwrap(), before);
     }
 
     /// While cropping: O cycles the guides, ⇧O mirrors them, A locks / unlocks the aspect.
@@ -1586,12 +2819,14 @@ mod tests {
         h.request("ui.key", json!({"key": "O", "shift": true}), t);
         assert_eq!(h.app.ui.crop_overlay_orient, 1);
         assert_eq!(h.app.ui.mask_overlay, mask_overlay, "O doesn't toggle the mask overlay while cropping");
-        let locked = |h: &Headless| h.app.session.develop_of(h.app.session.active().unwrap()).unwrap().crop.aspect.is_some();
-        assert!(!locked(&h));
-        h.request("ui.key", json!({"key": "A"}), t);
+        // an untouched photo starts locked to its own shape (#991): A unlocks, A again locks
+        let locked = |h: &Headless| h.app.crop_tool_aspect().is_some();
         assert!(locked(&h));
         h.request("ui.key", json!({"key": "A"}), t);
         assert!(!locked(&h));
+        assert_eq!(h.app.ui.crop_default_aspect, Some(json!("free")));
+        h.request("ui.key", json!({"key": "A"}), t);
+        assert!(locked(&h));
         assert!(!h.app.ui.visualize_spots);
     }
 
@@ -1620,6 +2855,49 @@ mod tests {
         // the copyright status picker is on the panel too
         let w = h.request("ui.widgets", json!({"filter": "copyrightStatus"}), t);
         assert!(w["result"].to_string().contains("field:copyrightStatus"), "{w}");
+    }
+
+    /// Info panel fields are shared text fields. The caption takes several lines: Return starts a
+    /// new one and only leaving the field saves it. Esc gives up an edit (the title stays as it
+    /// was, nothing saved), and right-click ▸ Paste works there too.
+    #[test]
+    fn info_fields_take_lines_esc_and_the_menu() {
+        let mut h = demo([1300.0, 1000.0]);
+        let t = Duration::from_secs(10);
+        h.request("ui.set", json!({"view": "detail", "right": "info"}), t);
+        h.settle(SETTLE);
+        let meta = |h: &Headless| h.app.session.catalog.photo(h.app.session.active().unwrap()).unwrap().meta.clone();
+        let ask = |h: &mut Headless, method: &str, params: serde_json::Value| {
+            let r = h.request(method, params.clone(), t);
+            assert_eq!(r["ok"], true, "{method} {params}: {r}");
+            h.step();
+            h.step();
+        };
+        let (title, undo) = (meta(&h).title, h.app.session.undo.len());
+        // the caption: two lines, saved on leaving
+        ask(&mut h, "ui.clickWidget", json!({"id": "field:caption"}));
+        ask(&mut h, "ui.key", json!({"key": "A", "cmd": true}));
+        ask(&mut h, "ui.text", json!({"text": "Harbour at dusk"}));
+        ask(&mut h, "ui.key", json!({"key": "Enter"}));
+        ask(&mut h, "ui.text", json!({"text": "Lisbon, 2026"}));
+        assert_eq!(h.app.session.undo.len(), undo, "Return in the caption saves nothing yet");
+        ask(&mut h, "ui.key", json!({"key": "Tab"}));
+        assert_eq!(meta(&h).caption, "Harbour at dusk\nLisbon, 2026");
+        // the title: Esc gives the edit up
+        let undo = h.app.session.undo.len();
+        ask(&mut h, "ui.clickWidget", json!({"id": "field:title"}));
+        ask(&mut h, "ui.text", json!({"text": " (draft)"}));
+        ask(&mut h, "ui.key", json!({"key": "Escape"}));
+        h.settle(SETTLE);
+        assert_eq!((meta(&h).title, h.app.session.undo.len()), (title, undo), "Esc saved nothing");
+        // the menu
+        h.view.clipboard = "Wedding in Sintra".into();
+        ask(&mut h, "ui.clickWidget", json!({"id": "field:title"}));
+        ask(&mut h, "ui.key", json!({"key": "A", "cmd": true}));
+        ask(&mut h, "ui.clickWidget", json!({"id": "field:title", "button": "right"}));
+        ask(&mut h, "ui.clickWidget", json!({"id": "field:title:paste"}));
+        ask(&mut h, "ui.key", json!({"key": "Enter"}));
+        assert_eq!(meta(&h).title, "Wedding in Sintra");
     }
 
     /// Local: a folder's photos show without joining the library; the breadcrumb, Include
@@ -1663,6 +2941,15 @@ mod tests {
         assert_eq!(h.request("ui.clickWidget", json!({"id": "button:addToLibrary"}), t)["ok"], true);
         h.settle(SETTLE);
         assert_eq!(h.app.session.catalog.photos().filter(|p| !p.local).count(), library_before + 2);
+        // Truncated ancestors remain clickable and still open the original, unabridged path.
+        let inner = dir.join("inner");
+        h.request("engine.execute", json!({"command": "library.browse", "params": {"path": inner.to_string_lossy()}}), t);
+        h.settle(SETTLE);
+        let parent_index = dir.to_string_lossy().split(['/', '\\']).filter(|p| !p.is_empty()).count() - 1;
+        assert_eq!(h.request("ui.clickWidget", json!({"id": format!("crumb:{parent_index}")}), t)["ok"], true);
+        h.settle(SETTLE);
+        // the same folder, whatever the platform's separators (issue #538)
+        assert_eq!(std::path::Path::new(&h.app.session.browse.as_ref().unwrap().path), dir.as_path());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1721,15 +3008,56 @@ mod tests {
         assert!(restore[1] >= 0.0 && restore[1] + restore[3] <= f64::from(size[1]), "the restore row is in view: {restore:?} {after_ids:?}");
         assert!(h.app.session.browse.is_some(), "hiding does not stop browsing");
         assert!(dir.is_dir(), "the folder itself is untouched");
+        // a second hidden place: the row lists them, and each comes back on its own (issue #2114:
+        // the row used to bring every hidden place back at once)
+        let dir2 = std::env::temp_dir().join(format!("lc-ui-hide-{}-b", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir2);
+        std::fs::create_dir_all(&dir2).unwrap();
+        let path2 = dir2.to_string_lossy().to_string();
+        for (command, params) in [("local.addRoot", json!({"path": path2})), ("local.hide", json!({"path": path2}))] {
+            let r = h.request("engine.execute", json!({"command": command, "params": params}), t);
+            assert_eq!(r["ok"], true, "{r}");
+        }
+        h.settle(SETTLE);
+        let menu = |h: &mut Headless| -> Vec<String> {
+            let w = h.request("ui.widgets", json!({"filter": "local:restoreHidden:"}), t);
+            w["result"].as_array().unwrap().iter().map(|x| x["id"].as_str().unwrap().to_string()).collect()
+        };
+        assert!(menu(&mut h).is_empty(), "the list opens from the row");
         assert_eq!(h.request("ui.clickWidget", json!({"id": "source:local:restoreHidden"}), t)["ok"], true);
         h.settle(SETTLE);
-        assert!(h.app.ui.hidden_locations.is_empty());
+        let items = menu(&mut h);
+        assert!(items.contains(&format!("local:restoreHidden:{path}")) && items.contains(&"local:restoreHidden:all".to_string()), "{items:?}");
+        assert_eq!(h.request("ui.clickWidget", json!({"id": format!("local:restoreHidden:{path}")}), t)["ok"], true);
+        h.settle(SETTLE);
+        assert!(!h.app.ui.hidden_locations.iter().any(|x| x == &path), "{:?}", h.app.ui.hidden_locations);
+        assert!(h.app.ui.hidden_locations.iter().any(|x| x == &path2), "the other place stays hidden");
+        assert!(ids(&mut h).iter().any(|i| i == "source:local:restoreHidden"), "still something to restore");
+        // two hidden again: Restore All brings every one back
+        let r = h.request("engine.execute", json!({"command": "local.hide", "params": {"path": path}}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        h.settle(SETTLE);
+        assert!(h.app.ui.hidden_locations.len() >= 2, "{:?}", h.app.ui.hidden_locations);
+        assert_eq!(h.request("ui.clickWidget", json!({"id": "source:local:restoreHidden"}), t)["ok"], true);
+        h.settle(SETTLE);
+        assert_eq!(h.request("ui.clickWidget", json!({"id": "local:restoreHidden:all"}), t)["ok"], true);
+        h.settle(SETTLE);
+        assert!(h.app.ui.hidden_locations.is_empty(), "{:?}", h.app.ui.hidden_locations);
         assert!(!ids(&mut h).iter().any(|i| i == "source:local:restoreHidden"), "nothing left to restore");
+        // one hidden: the row brings it back itself, no list
+        let r = h.request("engine.execute", json!({"command": "local.hide", "params": {"path": path2}}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        h.settle(SETTLE);
+        assert_eq!(h.request("ui.clickWidget", json!({"id": "source:local:restoreHidden"}), t)["ok"], true);
+        h.settle(SETTLE);
+        assert!(menu(&mut h).is_empty(), "no list for a single hidden place");
+        assert!(h.app.ui.hidden_locations.is_empty(), "{:?}", h.app.ui.hidden_locations);
         if !hidden_before {
             // (with Home hidden for this test, the folder is back inside Home's tree instead)
             assert!(ids(&mut h).contains(&format!("source:local:{path}")));
         }
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     /// Local: a kept folder stays a root while its subfolders (and other locations) are
@@ -1864,6 +3192,72 @@ mod tests {
         assert_eq!(h.app.session.undo.len(), undo0 + 1);
     }
 
+    /// Reset takes precedence over the value being typed when its button is clicked.
+    #[test]
+    fn reset_button_wins_over_an_active_numeric_draft() {
+        let mut h = demo([960.0, 600.0]);
+        let t = Duration::from_secs(10);
+        let ask = |h: &mut Headless, method: &str, params: serde_json::Value| {
+            let r = h.request(method, params, t);
+            assert_eq!(r["ok"], true, "{method}: {r}");
+            r["result"].clone()
+        };
+        ask(&mut h, "engine.execute", json!({"command": "app.gpu", "params": {"enabled": false}}));
+        ask(&mut h, "ui.set", json!({"settings": {"gpu": false, "previewEdge": 1280}, "presets": false}));
+        ask(&mut h, "engine.execute", json!({"command": "library.select", "params": {"ids": [1], "active": 1}}));
+        ask(
+            &mut h,
+            "ui.set",
+            json!({"view": "detail", "right": "edit", "leftPanel": false, "rightWidth": 330, "openSections": ["light"], "histogram": false}),
+        );
+        let active = h.app.session.active().unwrap();
+        for (text, terminal) in [("0.75", "Enter"), ("-1,5", "Escape")] {
+            ask(&mut h, "ui.clickWidget", json!({"id": "sliderValue:light.exposure"}));
+            ask(&mut h, "ui.text", json!({"text": text}));
+            ask(&mut h, "ui.key", json!({"key": terminal}));
+            let value = ask(&mut h, "engine.execute", json!({"command": "develop.get", "params": {}}));
+            assert_eq!(value["light"]["exposure"].as_f64(), Some(0.75), "{terminal}: {value}");
+        }
+        ask(&mut h, "ui.clickWidget", json!({"id": "sliderValue:light.exposure"}));
+        ask(&mut h, "ui.text", json!({"text": "2.0"}));
+        assert_eq!(h.view.ctx.memory(|m| m.focused()), Some(crate::text_field::id("sliderField:light.exposure")));
+        assert!(h.app.widgets.iter().any(|(id, _)| id == "sliderField:light.exposure"));
+        assert!(h.painted_text().iter().any(|text| text == "2.0"), "the replacement draft must be visible before Reset");
+        assert_eq!(h.app.session.develop_of(active).unwrap().light.exposure, 0.75, "the draft is not committed yet");
+        ask(&mut h, "ui.clickWidget", json!({"id": "button:reset"}));
+        let reset = ask(&mut h, "engine.execute", json!({"command": "develop.get", "params": {}}));
+        assert_eq!(
+            reset["light"]["exposure"].as_f64(),
+            Some(0.0),
+            "Reset must win over the active numeric draft: {reset}; history={:?}; last_inverse={:?}; focus={:?}",
+            h.app.session.undo.iter().map(|entry| entry.label.as_str()).collect::<Vec<_>>(),
+            h.app.session.undo.last().map(|entry| &entry.op),
+            h.view.ctx.memory(|m| m.focused()),
+        );
+    }
+
+    /// A slider's typed value is a shared text field: right-click ▸ Paste replaces the value
+    /// (selected when the field opens) and Return applies it; the menu doesn't close the field.
+    #[test]
+    fn a_slider_value_pastes_from_its_menu() {
+        let mut h = demo([1300.0, 900.0]);
+        let t = Duration::from_secs(10);
+        h.request("ui.set", json!({"view": "detail", "right": "edit"}), t);
+        h.settle(SETTLE);
+        h.view.clipboard = "0.75".into();
+        for (id, button) in
+            [("sliderValue:light.exposure", "left"), ("sliderField:light.exposure", "right"), ("sliderField:light.exposure:paste", "left")]
+        {
+            let r = h.request("ui.clickWidget", json!({"id": id, "button": button}), t);
+            assert_eq!(r["ok"], true, "{id}: {r}");
+            h.settle(SETTLE);
+        }
+        h.request("ui.key", json!({"key": "Enter"}), t);
+        h.settle(SETTLE);
+        let exposure = h.app.session.develop_of(h.app.session.active().unwrap()).unwrap().light.exposure;
+        assert!((exposure - 0.75).abs() < 1e-9, "{exposure}");
+    }
+
     /// The eye on a section header switches the section off and on again, one undo step each
     /// (issue #316).
     #[test]
@@ -1967,6 +3361,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Switching Settings tabs keeps the window's top edge (and its tab row) where it is and never makes it
+    /// narrower, though the tabs are of different heights and widths.
+    #[test]
+    fn settings_tabs_keep_the_window_in_place() {
+        let mut h = demo([1300.0, 820.0]);
+        let t = Duration::from_secs(10);
+        let window = |h: &Headless| h.app.widgets.iter().find(|(w, _)| w == "dialog:window").map(|(_, r)| *r).expect("the dialog");
+        let r = h.request("engine.execute", json!({"command": "app.settings", "params": {"tab": "general"}}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        h.settle(SETTLE);
+        let first = window(&h);
+        let mut heights = Vec::new();
+        for tab in ["display", "import", "performance", "general", "interface", "display"] {
+            h.request("ui.clickWidget", json!({"id": format!("button:settingsTab-{tab}")}), t);
+            h.settle(SETTLE);
+            let now = window(&h);
+            assert!((now.top() - first.top()).abs() < 1.0, "{tab}: top {} → {}", first.top(), now.top());
+            assert!(now.width() >= first.width() - 1.0, "{tab}: width {} → {}", first.width(), now.width());
+            heights.push(now.height());
+        }
+        assert!(heights.iter().any(|h| (h - first.height()).abs() > 20.0), "the tabs differ in height: {heights:?}");
+    }
+
+    /// Settings → Import → "Show the import review when a camera or card is connected": a card that
+    /// was already in doesn't ask, a new one opens Import from Device (copying), and a busy window
+    /// asks once it's free.
+    #[test]
+    fn a_connected_card_opens_the_import_review() {
+        let mut h = demo([1200.0, 900.0]);
+        let t = Duration::from_secs(10);
+        let root = std::env::temp_dir().join(format!("lc-card-{}", std::process::id()));
+        let dcim = root.join("DCIM/100NIKON");
+        std::fs::create_dir_all(&dcim).unwrap();
+        let img = lightcraft_raster::Rgba8::from_fn(8, 8, |x, y| [(x * 9) as u8, (y * 12) as u8, 80, 255]);
+        let o = lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() };
+        std::fs::write(dcim.join("DSC_0001.png"), lightcraft_engine::export::encode_image(&img, &o).unwrap()).unwrap();
+        let card = lightcraft_engine::devices::Device {
+            name: "NIKON Z 8".into(),
+            path: root.join("DCIM").to_string_lossy().to_string(),
+            root: root.to_string_lossy().to_string(),
+        };
+        h.app.ui.dialog = None;
+        // first look: the card was already in
+        crate::import::cards_seen(&mut h.app, vec![card.clone()]);
+        assert!(h.app.scan.is_none() && h.app.ui.dialog.is_none(), "a card that was already in doesn't ask");
+        crate::import::cards_seen(&mut h.app, vec![card.clone()]);
+        assert!(h.app.scan.is_none());
+        // taken out, then put back while another dialog is open: it waits
+        crate::import::cards_seen(&mut h.app, Vec::new());
+        h.app.ui.dialog = Some(crate::state::Dialog::About);
+        crate::import::cards_seen(&mut h.app, vec![card.clone()]);
+        assert!(h.app.scan.is_none(), "a busy window isn't interrupted");
+        h.app.ui.dialog = None;
+        crate::import::cards_seen(&mut h.app, vec![card.clone()]);
+        assert!(h.app.scan.is_some(), "the card is scanned once the window is free");
+        assert!(h.step_until(t, |h| matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. }))));
+        let Some(crate::state::Dialog::Import { opts }) = &h.app.ui.dialog else { panic!("no import review") };
+        assert!(opts.copy, "a card is copied into the library");
+        // with the option off nothing is remembered, so turning it on again starts with a first look
+        assert!(!h.app.session.import_defaults.show_on_card);
+        h.step();
+        assert!(h.app.ui.known_cards.is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The folder scan runs in the background: the request returns at once and the review opens
     /// when the scan finishes (a folder on a network share must not freeze the window).
     /// Clicking the folder being read again keeps the running read (and its progress).
@@ -1999,6 +3458,67 @@ mod tests {
         gate.store(true, std::sync::atomic::Ordering::Relaxed);
         h.settle(SETTLE);
         assert_eq!(h.app.session.visible_cloned().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Browsing a folder from the UI (read on a worker thread) records it as browsed, as `library.browse` does:
+    /// untouched Local photos are only forgotten from folders not browsed for the set number of days.
+    #[test]
+    fn browsing_from_the_ui_records_the_folder() {
+        let mut h = demo([1200.0, 900.0]);
+        let t = Duration::from_secs(10);
+        let dir = std::env::temp_dir().join(format!("lc-browse-stamp-{}", std::process::id()));
+        let day = dir.join("2026/10/14");
+        std::fs::create_dir_all(&day).unwrap();
+        let img = lightcraft_raster::Rgba8::from_fn(8, 8, |x, y| [(x * 9) as u8, (y * 12) as u8, 80, 255]);
+        let o = lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() };
+        std::fs::write(day.join("a.png"), lightcraft_engine::export::encode_image(&img, &o).unwrap()).unwrap();
+        let root = dir.to_string_lossy().trim_end_matches(['/', '\\']).to_string();
+        let day_s = day.to_string_lossy().to_string();
+        assert!(h.app.session.catalog.last_browsed(&root).is_none());
+        let r = h.request("engine.execute", json!({"command": "library.browse", "params": {"path": root, "subfolders": true}}), t);
+        assert_eq!(r["result"]["scanning"], true, "{r}");
+        h.settle(SETTLE);
+        assert_eq!(h.app.session.visible_cloned().len(), 1);
+        assert!(h.app.session.catalog.last_browsed(&root).is_some(), "the browsed folder");
+        assert!(h.app.session.catalog.last_browsed(&day_s).is_some(), "the folder its photo is in");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Browsing a folder again from the sidebar forgets the untouched Local records of files deleted from it by
+    /// another app, as `library.browse` does (issue #1392).
+    #[test]
+    fn browsing_again_from_the_ui_forgets_deleted_files() {
+        let mut h = demo([1200.0, 900.0]);
+        let t = Duration::from_secs(10);
+        let dir = std::env::temp_dir().join(format!("lc-browse-gone-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = lightcraft_raster::Rgba8::from_fn(8, 8, |x, y| [(x * 9) as u8, (y * 12) as u8, 80, 255]);
+        let o = lightcraft_engine::export::ExportOptions { format: lightcraft_engine::export::ExportFormat::Png, ..Default::default() };
+        let png = lightcraft_engine::export::encode_image(&img, &o).unwrap();
+        std::fs::write(dir.join("a.png"), &png).unwrap();
+        std::fs::write(dir.join("b.png"), &png).unwrap();
+        let path = dir.to_string_lossy().to_string();
+        let browse = |h: &mut Headless| {
+            let r = h.request("engine.execute", json!({"command": "library.browse", "params": {"path": path}}), t);
+            assert_eq!(r["result"]["scanning"], true, "{r}");
+            h.settle(SETTLE);
+        };
+        browse(&mut h);
+        assert_eq!(h.app.session.visible_cloned().len(), 2);
+        // another app deletes the photo that isn't selected (a selected or open one stays, shown as missing)
+        let held: Vec<lightcraft_catalog::PhotoId> =
+            h.app.session.selection.ids.iter().copied().chain(h.app.session.selection.active).chain(h.app.session.previous_active).collect();
+        let name = |id: &lightcraft_catalog::PhotoId| h.app.session.catalog.photo(*id).map(|p| p.file_name.clone()).unwrap_or_default();
+        let gone = if held.iter().any(|id| name(id) == "b.png") { "a.png" } else { "b.png" };
+        std::fs::remove_file(dir.join(gone)).unwrap();
+        // a later session: the browse's "Add 2 Photos" step is no longer in the undo history (photos it refers to
+        // are kept, like selected ones)
+        h.app.session.undo.clear();
+        h.app.session.redo.clear();
+        // the folder clicked again in the sidebar
+        browse(&mut h);
+        assert_eq!(h.app.session.visible_cloned().len(), 1, "the deleted file's record is forgotten");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2055,9 +3575,14 @@ mod tests {
         assert!(!h.app.scan.as_ref().unwrap().copy, "the running scan keeps its options");
         let r = h.request("ui.inspect", json!({}), t);
         assert!(r["result"]["scan"].is_object(), "{r}");
-        let r = h.request("ui.clickWidget", json!({"id": "button:scanCancel"}), t);
+        // Cancel is the ✕ of the scan's row in the activity stack (shown once it is half a second old)
+        let id = h.app.session.activity.list().first().map(|t| t.id).expect("a scan row");
+        let cross = format!("activity:cancel:{id}");
+        assert!(h.step_until(t, |h| h.app.widgets.iter().any(|(w, _)| *w == cross)), "the row shows");
+        let r = h.request("ui.clickWidget", json!({"id": cross}), t);
         assert_eq!(r["ok"], true, "{r}");
-        assert!(h.app.scan.is_none(), "Cancel closes the scan at once");
+        h.step();
+        assert!(h.app.scan.is_none(), "✕ closes the scan at once");
         gate.store(true, std::sync::atomic::Ordering::Relaxed);
         h.settle(SETTLE);
         assert!(h.app.ui.dialog.is_none(), "a cancelled scan opens no review");
@@ -2105,9 +3630,19 @@ mod tests {
         h.request("engine.execute", json!({"command": "library.select", "params": {"ids": [id.0]}}), t);
         h.request("ui.set", json!({"view": "detail", "right": "info"}), t);
         let before = h.app.session.catalog.photo(id).unwrap().captured.clone().unwrap();
+        // The dock header leaves less vertical space; bring the metadata action into view.
+        let panel = h.app.widgets.iter().find(|(id, _)| id == "panel:right_panel").unwrap().1;
+        let clipped_action = h.app.widgets.iter().find(|(id, _)| id == "icon:editCaptureTime").unwrap().1;
+        assert!(!panel.contains_rect(clipped_action), "the capture-time action starts below the visible panel: {clipped_action:?}");
+        h.request("ui.move", json!({"x": panel.center().x, "y": panel.center().y}), t);
+        h.request("ui.scroll", json!({"dy": -160.0}), t);
+        h.settle(SETTLE);
+        let action = h.app.widgets.iter().find(|(id, _)| id == "icon:editCaptureTime").unwrap().1;
+        assert!(panel.contains_rect(action), "capture-time action must be visible before clicking: {action:?} in {panel:?}");
         let r = h.request("ui.clickWidget", json!({"id": "icon:editCaptureTime"}), t);
         assert_eq!(r["ok"], true, "{r}");
-        h.request("ui.clickWidget", json!({"id": "button:captureMode-2"}), t);
+        let r = h.request("ui.clickWidget", json!({"id": "button:captureMode-2"}), t);
+        assert_eq!(r["ok"], true, "{r}");
         if let Some(crate::state::Dialog::CaptureTime { zone, .. }) = &mut h.app.ui.dialog {
             *zone = -3.0;
         } else {
@@ -2207,9 +3742,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The import review offers what to do with files that are in Recently Deleted (issue #298):
-    /// they are unchecked until Restore or Import as new is chosen; then confirming restores the
-    /// photo (with its edits) or imports the file afresh.
+    /// The import review offers what to do with files that are in Recently Deleted (issues #298,
+    /// #706): they are checked, to be restored, by default; Leave them unchecks them; confirming
+    /// restores the photo (with its edits) or, with Import as new, imports the file afresh.
     #[test]
     fn import_review_offers_recently_deleted_files() {
         for (choice, tag) in [("restore", "r"), ("fresh", "f")] {
@@ -2236,9 +3771,12 @@ mod tests {
             h.request("engine.execute", json!({"command": "file.addPhotos", "params": {"paths": [dir.to_string_lossy()]}}), t);
             h.step_until(SETTLE, |h| matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })));
             let Some(crate::state::Dialog::Import { opts }) = &mut h.app.ui.dialog else { panic!("no import review") };
-            assert_eq!(opts.selected_paths().len(), 1, "only the new file: the trashed one waits for a choice");
+            assert_eq!(opts.on_deleted, "restore", "the default brings a deleted photo back");
+            assert_eq!(opts.selected_paths().len(), 2, "the trashed file is checked from the start: it will be restored");
+            opts.set_on_deleted("");
+            assert_eq!(opts.selected_paths().len(), 1, "Leave them: only the new file");
             opts.set_on_deleted(choice);
-            assert_eq!(opts.selected_paths().len(), 2, "the trashed file is checked once a choice is made");
+            assert_eq!(opts.selected_paths().len(), 2, "the trashed file is checked again once a choice is made");
             // a per-cell choice survives switching between the two options, and "Leave them" unchecks
             let trashed = (0..opts.candidates.len()).find(|i| opts.is_trashed(*i)).unwrap();
             opts.checked[trashed] = false;
@@ -2270,6 +3808,70 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// With "Leave them", a file in Recently Deleted is left unchecked but a click on its checkbox
+    /// (or on its "In Recently Deleted" badge) still checks it, and importing it restores the
+    /// photo (issue #1285).
+    #[test]
+    fn import_review_checks_a_recently_deleted_file_by_hand() {
+        let dir = std::env::temp_dir().join(format!("lc-ui-import-trash-click-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..2u8 {
+            let data: Vec<[u8; 4]> = (0..40 * 30).map(|k| [(k % 40 * 6) as u8, i * 90, 7, 255]).collect();
+            let img = lightcraft_raster::Rgba8 { width: 40, height: 30, data };
+            let png = lightcraft_codecs::encode_png(&lightcraft_codecs::EncodeImage::rgba8(&img), &lightcraft_codecs::EncodeMeta::default()).unwrap();
+            std::fs::write(dir.join(format!("img{i}.png")), png).unwrap();
+        }
+        let services = crate::Services { png: None, ..Default::default() };
+        let mut app = LightcraftApp::new(lightcraft_engine::Session::new().with_fs(), services);
+        app.ui.view = crate::state::ViewMode::PhotoGrid;
+        let mut h = Headless::new(app, [1300.0, 900.0], 1.0);
+        let t = Duration::from_secs(10);
+        let r = h.request("engine.execute", json!({"command": "library.import", "params": {"paths": [dir.join("img0.png").to_string_lossy()]}}), t);
+        let id = r["result"]["imported"][0].as_u64().unwrap();
+        h.request("engine.execute", json!({"command": "photo.rate", "params": {"ids": [id], "rating": 3}}), t);
+        h.request("engine.execute", json!({"command": "photo.delete", "params": {"ids": [id]}}), t);
+        h.request("engine.execute", json!({"command": "file.addPhotos", "params": {"paths": [dir.to_string_lossy()]}}), t);
+        h.step_until(SETTLE, |h| matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })));
+        let Some(crate::state::Dialog::Import { opts }) = &mut h.app.ui.dialog else { panic!("no import review") };
+        let trashed = (0..opts.candidates.len()).find(|i| opts.is_trashed(*i)).expect("a file in Recently Deleted");
+        opts.set_on_deleted("");
+        h.settle(SETTLE);
+        let checked = |h: &Headless| matches!(&h.app.ui.dialog, Some(crate::state::Dialog::Import { opts }) if opts.checked[trashed]);
+        assert!(!checked(&h), "Leave them: unchecked");
+        let cell = |h: &mut Headless| {
+            let r = h.request("ui.widgets", json!({"filter": format!("import:{trashed}")}), t);
+            let w = r["result"].as_array().and_then(|a| a.iter().find(|w| w["id"] == format!("import:{trashed}"))).cloned().expect("cell on screen");
+            [0usize, 1, 2, 3].map(|i| w["rect"][i].as_f64().unwrap())
+        };
+        // the checkbox: 16 pt, 6 pt in from the cell's top-left corner
+        let [x, y, ..] = cell(&mut h);
+        h.request("ui.click", json!({"x": x + 14.0, "y": y + 14.0}), t);
+        h.settle(SETTLE);
+        assert!(checked(&h), "a click on the checkbox checks the file");
+        // the badges ("Will be restored" at the top right, "In Recently Deleted" under the
+        // checkbox) don't swallow the click either
+        let [x, y, w, _] = cell(&mut h);
+        h.request("ui.click", json!({"x": x + w - 14.0, "y": y + 12.0}), t);
+        h.settle(SETTLE);
+        assert!(!checked(&h), "a click on the badge unchecks it again");
+        h.request("ui.click", json!({"x": x + w - 14.0, "y": y + 34.0}), t);
+        h.settle(SETTLE);
+        assert!(checked(&h));
+        let r = h.request("ui.dialog.confirm", json!({}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        let t0 = std::time::Instant::now();
+        while h.app.import.is_some() && t0.elapsed() < Duration::from_secs(30) {
+            h.step();
+        }
+        assert!(h.app.import.is_none(), "finished");
+        let photos = &h.app.session.catalog;
+        assert!(photos.photo(lightcraft_catalog::PhotoId(id)).is_some_and(|p| !p.deleted && p.rating == 3), "restored with its edits");
+        assert_eq!(photos.photos().filter(|p| !p.deleted).count(), 2);
+        assert_eq!(photos.len(), 2, "restored, not imported a second time");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The import review opens bigger than the old fixed 6 × 2.5 grid and can be resized by its
@@ -2323,9 +3925,10 @@ mod tests {
         assert!(matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })), "still open");
     }
 
-    /// Adding a file again that is in Recently Deleted shows it there (side panel opened, photo
-    /// selected) instead of only saying "duplicate skipped"; its menus offer Restore, and once
-    /// restored a re-add selects it in All Photos.
+    /// Adding a file again (dropped on the window, no review) whose photo is in Recently Deleted
+    /// brings the photo back, selected in All Photos, and says so (issue #706) — it is not
+    /// skipped as a duplicate; the trash view's menus offer Restore and Delete Permanently, and a
+    /// re-add of a photo that is in the library selects it in All Photos.
     #[test]
     fn readding_a_deleted_photo_shows_it_in_recently_deleted() {
         let dir = std::env::temp_dir().join(format!("lc-ui-readd-{}", std::process::id()));
@@ -2352,6 +3955,7 @@ mod tests {
         crate::import::start_paths(&mut h.app, paths.clone()).unwrap();
         h.settle(SETTLE);
         let id = h.app.session.selection.active.expect("imported photo selected");
+        let n0 = h.app.session.catalog.len();
         h.request("engine.execute", json!({"command": "photo.delete", "params": {"ids": [id.0]}}), t);
         assert!(h.app.session.catalog.photo(id).unwrap().deleted);
         let photo_items = |app: &LightcraftApp| -> Vec<String> {
@@ -2361,14 +3965,22 @@ mod tests {
         };
         assert!(!photo_items(&h.app).contains(&"photo.restore".to_string()), "Restore only for deleted photos");
 
-        h.app.ui.left_panel = false;
         crate::import::start_paths(&mut h.app, paths.clone()).unwrap();
         finish_import(&mut h);
-        assert_eq!(h.app.session.source, lightcraft_engine::LibrarySource::RecentlyDeleted);
-        assert_eq!(h.app.session.selection.ids, vec![id]);
-        assert!(h.app.ui.left_panel, "the side panel listing Recently Deleted is opened");
+        assert!(!h.app.session.catalog.photo(id).unwrap().deleted, "re-adding the file restores the photo");
+        assert_eq!(h.app.session.catalog.len(), n0, "no second record");
+        assert_eq!(h.app.session.source, lightcraft_engine::LibrarySource::All);
+        assert_eq!(h.app.session.selection.ids, vec![id], "the restored photo is selected");
         let toast = h.app.ui.toast.clone().expect("toast").0;
-        assert!(toast.contains("Recently Deleted") && toast.contains("Restore"), "{toast}");
+        assert!(toast.contains("Restored 1 photo from Recently Deleted"), "{toast}");
+        assert!(!photo_items(&h.app).contains(&"photo.restore".to_string()));
+        // undo of the re-add puts it back in Recently Deleted; the trash view's menus offer Restore
+        h.request("engine.execute", json!({"command": "edit.undo"}), t);
+        assert!(h.app.session.catalog.photo(id).unwrap().deleted, "one undo step");
+        h.request("engine.execute", json!({"command": "library.source", "params": {"kind": "recentlyDeleted"}}), t);
+        h.request("engine.execute", json!({"command": "library.select", "params": {"ids": [id.0]}}), t);
+        h.settle(SETTLE);
+        assert_eq!(h.app.session.source, lightcraft_engine::LibrarySource::RecentlyDeleted);
         let items = photo_items(&h.app);
         assert!(items.contains(&"photo.restore".to_string()) && items.contains(&"photo.deletePermanently".to_string()), "{items:?}");
         assert!(!items.contains(&"photo.delete".to_string()), "{items:?}");
@@ -2404,6 +4016,40 @@ mod tests {
         let fresh = h.app.session.selection.active.expect("re-imported photo selected");
         assert_ne!(fresh, id);
         assert!(!h.app.session.catalog.photo(fresh).unwrap().deleted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Importing while an album is shown (issue #1446): the new photos aren't in it, so the view
+    /// switches to All Photos with the first of them active, instead of an active photo the grid
+    /// and the filmstrip don't show.
+    #[test]
+    fn an_import_from_an_album_view_shows_the_first_new_photo() {
+        let dir = std::env::temp_dir().join(format!("lc-ui-import-show-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..3u8 {
+            let img = lightcraft_raster::Rgba8 { width: 8, height: 8, data: vec![[i * 40, 3, 9, 255]; 64] };
+            let png = lightcraft_codecs::encode_png(&lightcraft_codecs::EncodeImage::rgba8(&img), &lightcraft_codecs::EncodeMeta::default()).unwrap();
+            std::fs::write(dir.join(format!("IMG_{i:02}.png")), png).unwrap();
+        }
+        let mut h = demo([1300.0, 900.0]);
+        let t = Duration::from_secs(10);
+        let album = h.app.session.catalog.albums().find(|a| !a.folder && !a.is_smart()).map(|a| a.id.0).expect("a demo album");
+        let r = h.request("engine.execute", json!({"command": "library.source", "params": {"kind": "album", "id": album}}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        h.settle(SETTLE);
+        let before: Vec<lightcraft_catalog::PhotoId> = h.app.session.catalog.photos().map(|p| p.id).collect();
+        let r = h.request("engine.execute", json!({"command": "file.addPhotos", "params": {"paths": [dir.to_string_lossy()]}}), t);
+        assert_eq!(r["result"]["scanning"], true, "{r}");
+        h.step_until(SETTLE, |h| matches!(h.app.ui.dialog, Some(crate::state::Dialog::Import { .. })));
+        let r = h.request("ui.dialog.confirm", json!({}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        h.settle(SETTLE);
+        assert!(h.app.import.is_none(), "finished");
+        let active = h.app.session.selection.active.expect("a photo is active");
+        assert!(!before.contains(&active), "the active photo is a new one: {active:?}");
+        assert_eq!(h.app.session.source, lightcraft_engine::LibrarySource::All);
+        assert!(h.app.session.visible_cloned().contains(&active), "the grid shows the active photo");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2468,10 +4114,16 @@ mod tests {
         let img = lightcraft_raster::Rgba8 { width: 8, height: 8, data: vec![[40, 3, 9, 255]; 64] };
         let png = lightcraft_codecs::encode_png(&lightcraft_codecs::EncodeImage::rgba8(&img), &lightcraft_codecs::EncodeMeta::default()).unwrap();
         std::fs::write(src.join("IMG_01.png"), png).unwrap();
+        // undated files are filed by the file's date (2026-01-14T05:58:48)
+        std::fs::File::options()
+            .write(true)
+            .open(src.join("IMG_01.png"))
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_768_370_328))
+            .unwrap();
         let dest_s = dest.to_string_lossy().to_string();
         let services = crate::Services { png: None, pick_folder: Some(Box::new(move || Some(dest_s.clone()))), ..Default::default() };
         let mut session = lightcraft_engine::Session::with_demo().with_fs();
-        // undated files are filed by the import time
         session.clock = Box::new(|| "2026-01-14T05:58:48".to_string());
         let mut app = LightcraftApp::new(session, services);
         app.ui.view = crate::state::ViewMode::PhotoGrid;
@@ -2521,6 +4173,12 @@ mod tests {
             let img = lightcraft_raster::Rgba8 { width: 8, height: 8, data: vec![[40 + i, 3, 9, 255]; 64] };
             let png = lightcraft_codecs::encode_png(&lightcraft_codecs::EncodeImage::rgba8(&img), &lightcraft_codecs::EncodeMeta::default()).unwrap();
             std::fs::write(src.join(format!("IMG_0{i}.png")), png).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(src.join(format!("IMG_0{i}.png")))
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_768_370_328))
+                .unwrap();
         }
         let dest_s = dest.to_string_lossy().to_string();
         let services = crate::Services { png: None, pick_folder: Some(Box::new(move || Some(dest_s.clone()))), ..Default::default() };
@@ -2586,6 +4244,8 @@ mod tests {
         if let Some(crate::state::Dialog::Import { opts }) = &mut h.app.ui.dialog {
             opts.rename = "Trip-_x".into();
         }
+        // Paint the edited template before locating the Tags button in the resized dialog.
+        assert!(h.settle(SETTLE), "Copy dialog layout should settle before locating Tags");
         // the cursor sits after "Trip-"
         let id = egui::Id::new("import-rename");
         let mut st = egui::text_edit::TextEditState::default();
@@ -2633,6 +4293,147 @@ mod tests {
         assert_eq!(h.app.ui.dialog, Some(crate::state::Dialog::About), "switching tabs keeps the dialog open");
     }
 
+    /// Settings ▸ Display / `app.displayProfile`: previews are shown through the monitor profile
+    /// (the loupe rendered for the display, thumbnails converted from sRGB, the histogram still
+    /// sRGB); a file that can't be used is an error, or, as the setting, reported with previews
+    /// left sRGB.
+    #[test]
+    fn display_profile_converts_previews() {
+        use crate::render::Slot;
+        let dir = std::env::temp_dir().join(format!("lightcraft-display-ui-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p3 = dir.join("p3.icc");
+        std::fs::write(&p3, lightcraft_codecs::icc::write_named(lightcraft_codecs::NamedSpace::DisplayP3)).unwrap();
+        let bad = dir.join("bad.icc");
+        std::fs::write(&bad, b"not a profile").unwrap();
+        let (p3, bad) = (p3.to_string_lossy().to_string(), bad.to_string_lossy().to_string());
+
+        let mut h = demo([1000.0, 700.0]);
+        let t = Duration::from_secs(10);
+        h.request("ui.set", json!({"view": "detail"}), t);
+        let thumb_slot =
+            |h: &Headless| h.app.renderer.textures.keys().copied().filter(|s| matches!(s, Slot::Thumb(_))).min_by_key(|s| format!("{s:?}"));
+        let ready = |h: &Headless| {
+            h.app.renderer.textures.get(&Slot::Main).is_some_and(|t| t.pixels.is_some())
+                && thumb_slot(h).is_some()
+                && !h.app.renderer.is_pending(Slot::Main)
+        };
+        assert!(h.step_until(SETTLE, ready));
+        h.settle(SETTLE);
+        let rgba = |c: &egui::ColorImage| lightcraft_raster::Rgba8 {
+            width: c.size[0],
+            height: c.size[1],
+            data: c.pixels.iter().map(|p| p.to_array()).collect(),
+        };
+        let tex = |h: &Headless, s: Slot| rgba(h.app.renderer.textures.get(&s).and_then(|t| t.pixels.clone()).as_deref().unwrap());
+        let thumb = thumb_slot(&h).unwrap();
+        let (main0, thumb0) = (tex(&h, Slot::Main), tex(&h, thumb));
+        let hist0 = h.app.renderer.textures[&Slot::Main].histogram.clone().unwrap();
+
+        // the command loads it (and keeps it as the setting); textures are made again
+        let r = h.request("engine.execute", json!({"command": "app.displayProfile", "params": {"path": p3}}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(r["result"]["kind"], "matrix");
+        assert_eq!(h.app.ui.settings.display_profile, p3);
+        let d = h.app.renderer.display().cloned().unwrap();
+        assert!(h.step_until(SETTLE, |h| ready(h) && h.app.renderer.textures.contains_key(&thumb)));
+        h.settle(SETTLE);
+        let (main1, thumb1) = (tex(&h, Slot::Main), tex(&h, thumb));
+        let mut want = thumb0.clone();
+        d.profile.from_srgb(&mut want).unwrap();
+        let max_diff = |a: &lightcraft_raster::Rgba8, b: &lightcraft_raster::Rgba8| {
+            a.data.iter().zip(&b.data).flat_map(|(p, q)| (0..3).map(move |k| (p[k] as i32 - q[k] as i32).abs())).max().unwrap_or(0)
+        };
+        assert_eq!((thumb1.width, thumb1.height), (thumb0.width, thumb0.height));
+        assert!(max_diff(&thumb1, &want) <= 1, "thumbnails are converted from sRGB: {}", max_diff(&thumb1, &want));
+        assert_ne!(thumb1, thumb0);
+        // the loupe: rendered for the display; colours sRGB holds look as they did
+        assert_eq!((main1.width, main1.height), (main0.width, main0.height));
+        assert_ne!(main1, main0);
+        let mut main_want = main0.clone();
+        d.profile.from_srgb(&mut main_want).unwrap();
+        let mean = main1.data.iter().zip(&main_want.data).map(|(p, q)| (0..3).map(|k| (p[k] as f64 - q[k] as f64).abs()).sum::<f64>()).sum::<f64>()
+            / (3 * main1.data.len()) as f64;
+        assert!(mean < 1.5, "{mean}");
+        let hist1 = h.app.renderer.textures[&Slot::Main].histogram.clone().unwrap();
+        assert_eq!(hist1.total, hist0.total, "the histogram stays sRGB");
+
+        // a bad file: an error, nothing changes
+        let r = h.request("engine.execute", json!({"command": "app.displayProfile", "params": {"path": bad}}), t);
+        assert_eq!(r["ok"], false, "{r}");
+        assert_eq!(h.app.renderer.display_id(), Some(d.id()));
+        assert_eq!(h.app.ui.settings.display_profile, p3);
+        // …chosen as the setting (Settings ▸ Display), it is reported and previews go back to sRGB
+        h.app.ui.settings.display_profile = bad.clone();
+        h.step();
+        assert!(h.app.display_error.as_deref().is_some_and(|e| e.contains("not a valid ICC profile")), "{:?}", h.app.display_error);
+        assert_eq!(h.app.renderer.display_id(), None);
+        // the Display tab shows it
+        let r = h.request("engine.execute", json!({"command": "app.settings", "params": {"tab": "display"}}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        h.step();
+        h.step();
+        // none: sRGB again
+        let r = h.request("engine.execute", json!({"command": "app.displayProfile", "params": {"path": null}}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        assert!(r["result"]["path"].is_null());
+        assert!(h.app.ui.settings.display_profile.is_empty() && h.app.display_error.is_none());
+        assert!(h.step_until(SETTLE, |h| ready(h) && h.app.renderer.textures.contains_key(&thumb)));
+        h.settle(SETTLE);
+        assert_eq!(tex(&h, thumb), thumb0, "back to the sRGB thumbnail");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With no profile chosen, previews follow the profile of the screen showing the window (the
+    /// host's `screen_profile`: macOS doesn't colour-manage the window, issue #787), read again so
+    /// a move to another screen is followed. A chosen profile wins; choosing none goes back to the
+    /// screen's at once; a screen without a profile is sRGB.
+    #[test]
+    fn previews_follow_the_screen_profile_while_none_is_chosen() {
+        use lightcraft_codecs::{NamedSpace, icc::write_named};
+        use std::sync::{Arc, Mutex};
+        let id = |space| lightcraft_engine::display::Display::from_bytes("", &write_named(space)).unwrap().id();
+        let dir = std::env::temp_dir().join(format!("lightcraft-screen-profile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let chosen = dir.join("prophoto.icc");
+        std::fs::write(&chosen, write_named(NamedSpace::ProPhoto)).unwrap();
+        let chosen = chosen.to_string_lossy().to_string();
+
+        let screen = Arc::new(Mutex::new(Some(write_named(NamedSpace::DisplayP3))));
+        let mut h = demo([1000.0, 700.0]);
+        let read = screen.clone();
+        h.app.services.screen_profile = Some(Box::new(move || read.lock().unwrap().clone()));
+        let t = Duration::from_secs(10);
+        h.step();
+        assert_eq!(h.app.renderer.display_id(), Some(id(NamedSpace::DisplayP3)), "the screen's profile");
+        let r = h.request("engine.execute", json!({"command": "app.displayProfile", "params": {}}), t);
+        assert_eq!((r["result"]["screen"].clone(), r["result"]["path"].clone()), (json!(true), Value::Null), "{r}");
+        assert!(h.app.ui.settings.display_profile.is_empty(), "nothing is saved as the setting");
+
+        // the window moves to another screen
+        *screen.lock().unwrap() = Some(write_named(NamedSpace::AdobeRgb));
+        assert!(h.step_until(SETTLE, |h| h.app.renderer.display_id() == Some(id(NamedSpace::AdobeRgb))));
+
+        // a chosen profile wins over the screen's
+        let r = h.request("engine.execute", json!({"command": "app.displayProfile", "params": {"path": chosen}}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        *screen.lock().unwrap() = Some(write_named(NamedSpace::DisplayP3));
+        for _ in 0..90 {
+            h.step();
+        }
+        assert_eq!(h.app.renderer.display_id(), Some(id(NamedSpace::ProPhoto)));
+
+        // none chosen again: the screen's profile, at once
+        let r = h.request("engine.execute", json!({"command": "app.displayProfile", "params": {"path": null}}), t);
+        assert_eq!(r["result"]["screen"], true, "{r}");
+        assert_eq!(h.app.renderer.display_id(), Some(id(NamedSpace::DisplayP3)));
+
+        // a screen without a profile: sRGB
+        *screen.lock().unwrap() = None;
+        assert!(h.step_until(SETTLE, |h| h.app.renderer.display_id().is_none()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Settings (⌘,): tabs switch, app settings change the UI state, library settings go through
     /// the engine; the delete confirmation guards ⌫.
     #[test]
@@ -2642,22 +4443,36 @@ mod tests {
         let r = h.request("ui.key", json!({"key": ",", "cmd": true}), t);
         assert_eq!(r["ok"], true, "{r}");
         assert_eq!(h.app.ui.dialog, Some(crate::state::Dialog::Settings { tab: "general".into() }));
-        for tab in ["import", "performance", "interface", "general"] {
+        for tab in ["import", "performance", "display", "interface", "general"] {
             let r = h.request("ui.clickWidget", json!({"id": format!("button:settingsTab-{tab}")}), t);
             assert_eq!(r["ok"], true, "{tab}: {r}");
             assert_eq!(h.app.ui.dialog, Some(crate::state::Dialog::Settings { tab: tab.into() }));
         }
-        // General: confirm before delete, startup view
+        // General: confirm before delete (on by default), startup view
+        assert!(h.app.ui.settings.confirm_delete);
+        h.request("ui.clickWidget", json!({"id": "check:settings.confirmDelete"}), t);
+        assert!(!h.app.ui.settings.confirm_delete);
         h.request("ui.clickWidget", json!({"id": "check:settings.confirmDelete"}), t);
         assert!(h.app.ui.settings.confirm_delete);
         h.request("ui.clickWidget", json!({"id": "button:settingsStartup-2"}), t);
         assert_eq!(h.app.ui.settings.startup_view, crate::state::StartupView::Detail);
         // Interface: filmstrip names off, grid badges always
         h.request("ui.clickWidget", json!({"id": "button:settingsTab-interface"}), t);
+        // Appearance cards (one row per theme, with its favorite star) sit above these controls;
+        // scroll the compact settings viewport past them.
+        h.request("ui.hoverWidget", json!({"id": "radio:theme-charcoal"}), t);
+        h.request("ui.scroll", json!({"dy": -700.0}), t);
+        for _ in 0..4 {
+            h.step();
+        }
         h.request("ui.clickWidget", json!({"id": "check:settings.filmNames"}), t);
         assert!(!h.app.ui.settings.film_names);
         h.request("ui.clickWidget", json!({"id": "button:settingsGridBadges-1"}), t);
         assert_eq!(h.app.ui.settings.grid_badges, crate::state::GridBadges::Always);
+        h.request("ui.scroll", json!({"dy": 700.0}), t);
+        for _ in 0..4 {
+            h.step();
+        }
         // Performance: the thumbnail cache size goes to the library preferences
         h.request("ui.clickWidget", json!({"id": "button:settingsTab-performance"}), t);
         h.request("ui.clickWidget", json!({"id": "button:settingsCache-0"}), t);
@@ -2734,6 +4549,65 @@ mod tests {
         h.settle(SETTLE);
     }
 
+    /// #911 (toast labels only): cycling the overlay announces each mode in the UI language.
+    #[test]
+    fn info_overlay_toasts_are_painted_in_the_users_language() {
+        use crate::i18n::Locale;
+
+        struct RestoreLanguage(Locale);
+        impl Drop for RestoreLanguage {
+            fn drop(&mut self) {
+                crate::i18n::set_language(self.0);
+            }
+        }
+        let _restore = RestoreLanguage(crate::i18n::language());
+        let mut h = demo([1000.0, 700.0]);
+        let t = Duration::from_secs(10);
+        assert_eq!(h.request("ui.set", json!({"view": "detail", "infoOverlay": "off"}), t)["ok"], true);
+        for (command, locale) in [("app.language.german", Locale::De), ("app.language.french", Locale::Fr), ("app.language.english", Locale::En)] {
+            assert_eq!(h.request("engine.execute", json!({"command": command}), t)["ok"], true);
+            assert_eq!(h.app.ui.language, locale);
+            assert_eq!(crate::i18n::language(), locale);
+            for (mode, key) in [("basic", "Info Overlay: File"), ("exposure", "Info Overlay: Exposure"), ("off", "Info Overlay Off")] {
+                let expected = locale.tr(key);
+                assert_eq!(h.request("ui.key", json!({"key": "i", "cmd": true}), t)["ok"], true);
+                assert_eq!(serde_json::to_value(h.app.ui.info_overlay).unwrap(), json!(mode));
+                assert_eq!(h.app.ui.toast.as_ref().expect("overlay toast").0, expected);
+                h.step();
+                let painted = h.painted_text();
+                assert!(painted.iter().any(|text| text == expected), "{painted:?}");
+            }
+        }
+    }
+
+    /// ⌘J opens View ▸ View Options; its menus choose Info 1's and Info 2's lines, Use Defaults puts
+    /// them back, and `view.viewOptions` sets them for an agent (refusing a line it doesn't know).
+    #[test]
+    fn view_options_choose_the_info_overlay_lines() {
+        use crate::state::{LoupeInfo, LoupeInfoField as F};
+        let mut h = demo([1000.0, 700.0]);
+        let t = Duration::from_secs(10);
+        h.request("ui.set", json!({"view": "detail"}), t);
+        assert_eq!(h.request("ui.key", json!({"key": "j", "cmd": true}), t)["ok"], true);
+        assert_eq!(h.app.ui.dialog, Some(crate::state::Dialog::ViewOptions));
+        h.step();
+        assert_eq!(h.request("ui.clickWidget", json!({"id": "combo:viewOptionsInfo1Line2"}), t)["ok"], true);
+        h.step();
+        assert_eq!(h.request("ui.clickWidget", json!({"id": "button:viewOptionsInfo1Line2-lens"}), t)["ok"], true);
+        h.step();
+        assert_eq!(h.app.ui.settings.loupe_info.info1, [F::FileName, F::Lens, F::Dimensions]);
+        assert_eq!(h.request("ui.clickWidget", json!({"id": "button:viewOptionsDefaults1"}), t)["ok"], true);
+        h.step();
+        assert_eq!(h.app.ui.settings.loupe_info.info1, LoupeInfo::INFO1);
+
+        let r = h.request("engine.execute", json!({"command": "view.viewOptions", "params": {"info2": ["camera", "none", "fileName"]}}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        assert_eq!(h.app.ui.settings.loupe_info.info2, [F::Camera, F::None, F::FileName]);
+        let r = h.request("engine.execute", json!({"command": "view.viewOptions", "params": {"info2": ["rating", "none", "none"]}}), t);
+        assert_eq!(r["ok"], false, "{r}");
+        assert_eq!(h.app.ui.settings.loupe_info.info2, [F::Camera, F::None, F::FileName], "a refused change changes nothing");
+    }
+
     /// A click on the image zooms to the chosen click-zoom ratio (1:1 by default), animating the
     /// loupe while rendering once at the final size; Z uses the same ratio; a second click returns to Fit.
     #[test]
@@ -2774,6 +4648,43 @@ mod tests {
         h.request("ui.key", json!({"key": "z"}), t);
         assert_eq!(h.app.ui.zoom, Zoom::Fit);
         h.settle(SETTLE);
+    }
+
+    /// A hover preview gets the loupe's display fit: it is the size the photo is drawn at, as the
+    /// loupe render is, not a preview-level render the GPU shrinks.
+    #[test]
+    fn a_hover_preview_is_fitted_to_the_drawn_size() {
+        use crate::render::Slot;
+        let mut h = demo([1400.0, 900.0]);
+        let t = Duration::from_secs(10);
+        h.request("ui.set", json!({"view": "detail"}), t);
+        h.request("engine.execute", json!({"command": "panel.profiles"}), t);
+        h.settle(SETTLE);
+        h.step_until(SETTLE, |h| !h.app.renderer.is_pending(Slot::Main));
+        let r = h.request("ui.hoverWidget", json!({"id": "profileCell:lc.vivid"}), t);
+        assert_eq!(r["ok"], true, "{r}");
+        h.step_until(SETTLE, |h| h.app.loupe_shown.map(|l| l.1) == Some("hover"));
+        let size = |s: Slot| h.app.renderer.textures.get(&s).map(|t| t.size);
+        let (main, hover) = (size(Slot::Main).expect("loupe render"), size(Slot::Hover).expect("hover render"));
+        assert!(main[0].max(main[1]) < lightcraft_engine::SourceLevel::Preview.max_edge(), "the loupe render is fitted: {main:?}");
+        assert!(hover[0].abs_diff(main[0]) <= 1 && hover[1].abs_diff(main[1]) <= 1, "hover {hover:?} vs loupe {main:?}");
+    }
+
+    /// Zoomed in under a window render, the hidden whole-frame render stays canvas-sized instead of
+    /// rising to the preview level.
+    #[test]
+    fn a_zoomed_view_keeps_its_whole_frame_render_canvas_sized() {
+        use crate::render::Slot;
+        let mut h = demo([1000.0, 700.0]);
+        let t = Duration::from_secs(10);
+        h.request("ui.set", json!({"view": "detail", "right": "none"}), t);
+        h.settle(SETTLE);
+        h.request("ui.clickWidget", json!({"id": "canvas:image", "fx": 0.5, "fy": 0.5}), t);
+        h.settle(SETTLE);
+        assert_eq!(h.app.ui.zoom, crate::state::Zoom::Percent(100.0));
+        h.step_until(SETTLE, |h| !h.app.renderer.is_pending(Slot::Main));
+        let main = h.app.renderer.textures.get(&Slot::Main).expect("whole-frame render").size;
+        assert!(main[0].max(main[1]) < lightcraft_engine::SourceLevel::Preview.max_edge(), "{main:?}");
     }
 
     #[test]
@@ -2864,6 +4775,28 @@ mod tests {
         h.request("ui.scroll", json!({"dx": 100, "dy": 100}), t);
         assert_eq!(h.app.ui.zoom, Zoom::Fit);
         assert_eq!(h.app.ui.pan, (0.5, 0.5));
+    }
+
+    #[test]
+    fn mouse_wheel_zooms_the_loupe_with_and_without_ctrl() {
+        use crate::state::Zoom;
+        let mut h = demo([1000.0, 700.0]);
+        let t = Duration::from_secs(10);
+        h.request("ui.set", json!({"view": "detail", "right": "none", "leftPanel": false, "filmstrip": false}), t);
+        h.settle(SETTLE);
+        for (unit, y, modifiers) in [
+            (egui::MouseWheelUnit::Line, 1.0, egui::Modifiers::NONE),
+            (egui::MouseWheelUnit::Line, 1.0, egui::Modifiers::CTRL),
+            (egui::MouseWheelUnit::Point, 50.0, egui::Modifiers::CTRL),
+        ] {
+            h.request("ui.set", json!({"zoom": "fit", "pan": [0.5, 0.5]}), t);
+            h.request("ui.hoverWidget", json!({"id": "canvas:image"}), t);
+            h.app.synthetic.push(egui::Event::MouseWheel { unit, delta: egui::vec2(0.0, y), phase: egui::TouchPhase::Move, modifiers });
+            for _ in 0..10 {
+                h.step();
+            }
+            assert!(matches!(h.app.ui.zoom, Zoom::Percent(_)), "wheel {unit:?} {modifiers:?} must zoom in, got {:?}", h.app.ui.zoom);
+        }
     }
 
     #[test]
@@ -2973,6 +4906,82 @@ mod tests {
         h.request("engine.execute", json!({"command": "view.navigator"}), t);
         h.settle(SETTLE);
         assert!(!h.app.widgets.iter().any(|(w, _)| w == "canvas:navigator"), "toggled off");
+    }
+
+    /// While an edit renders, the loupe shows the last render: it says "Rendering…" once that has
+    /// lasted a moment (not at once after a spell away from the loupe, when no frames were drawn),
+    /// and stops when the render lands.
+    #[test]
+    fn the_loupe_says_rendering_while_an_edit_renders() {
+        use crate::render::Slot;
+        use std::{cell::Cell, rc::Rc};
+        let pill = |h: &Headless| h.app.widgets.iter().any(|(w, _)| w == "loupe:rendering");
+        let mut h = demo([1000.0, 700.0]);
+        let t = Duration::from_secs(10);
+        h.request("ui.set", json!({"view": "detail", "right": "none"}), t);
+        h.settle(SETTLE);
+        assert!(!pill(&h), "a finished render");
+        let open = Rc::new(Cell::new(false));
+        h.app.renderer.set_offload(Box::new(super::RenderGate::new(open.clone())));
+        // half a second in the grid: the loupe draws no frames
+        h.request("ui.set", json!({"view": "photoGrid"}), t);
+        for _ in 0..30 {
+            h.step();
+        }
+        h.request("engine.execute", json!({"command": "develop.set", "params": {"control": "light.exposure", "value": 0.5}}), t);
+        h.request("ui.set", json!({"view": "detail"}), t);
+        for _ in 0..12 {
+            h.step();
+        }
+        assert!(h.app.renderer.is_pending(Slot::Main), "the edit's render is held");
+        assert!(!pill(&h), "not at once");
+        for _ in 0..30 {
+            h.step();
+        }
+        assert!(pill(&h), "the last render is on screen and the edit's is on its way");
+        open.set(true);
+        assert!(h.step_until(SETTLE, |h| !pill(h)), "gone once the render lands");
+        assert!(!h.app.renderer.is_pending(Slot::Main));
+    }
+
+    /// A render that fails while the loupe shows a stand-in (the embedded JPEG, a thumbnail) left
+    /// the stand-in up as if it were the photo: the loupe says the photo can't be opened, with the
+    /// error on hover, and keeps saying so while a library change retries it.
+    #[test]
+    fn the_loupe_says_so_when_the_render_behind_a_stand_in_fails() {
+        use crate::render::Slot;
+        use std::{cell::Cell, rc::Rc};
+        let has = |h: &Headless, id: &str| h.app.widgets.iter().any(|(w, _)| w == id);
+        let mut h = demo([1000.0, 700.0]);
+        let t = Duration::from_secs(10);
+        h.request("ui.set", json!({"view": "detail", "right": "none"}), t);
+        h.settle(SETTLE);
+        assert!(!has(&h, "loupe:renderFailed"));
+        let first = h.app.session.active().expect("a photo is open").0;
+        // every loupe render fails, as an undecodable raw's would; the rest render
+        let open = Rc::new(Cell::new(true));
+        h.app.renderer.set_offload(Box::new(super::RenderGate::failing(open.clone(), |s| s == Slot::Main)));
+        let other = h.app.session.visible_cloned().get(1).copied().expect("a second photo").0;
+        h.request("engine.execute", json!({"command": "library.select", "params": {"ids": [other], "active": other}}), t);
+        assert!(h.step_until(SETTLE, |h| has(h, "loupe:renderFailed")), "the failure is said");
+        let shown = h.app.loupe_shown.map(|l| l.1);
+        assert!(!matches!(shown, Some("render" | "none")), "over a stand-in: {shown:?}");
+        assert!(!has(&h, "loupe:rendering"));
+        let r = h.request("ui.inspect", json!({}), t);
+        assert_eq!(r["result"]["loupe"]["failed"], "no decoder for this raw", "{}", r["result"]["loupe"]);
+        // a library change (here a rating) retries it: the failure stays said, no "Rendering…"
+        open.set(false);
+        h.request("engine.execute", json!({"command": "photo.rate", "params": {"rating": 2}}), t);
+        for _ in 0..45 {
+            h.step();
+        }
+        assert!(h.app.renderer.is_pending(Slot::Main), "the retry is held");
+        assert!(has(&h, "loupe:renderFailed") && !has(&h, "loupe:rendering"), "no blink while it retries");
+        // back on a photo that rendered: nothing to say
+        open.set(true);
+        h.request("engine.execute", json!({"command": "library.select", "params": {"ids": [first], "active": first}}), t);
+        h.app.renderer.set_offload(Box::new(super::RenderGate::new(open.clone())));
+        assert!(h.step_until(SETTLE, |h| h.app.loupe_shown.is_some_and(|l| l.1 == "render") && !has(h, "loupe:renderFailed")));
     }
 
     #[test]

@@ -39,6 +39,9 @@ pub enum Slot {
     Preview,
     Before,
     Compare(u8),
+    /// Compare or Reference zoomed past what `Compare(i)` holds: the window of pane `i`'s frame
+    /// that is on screen, drawn over it (see [`crate::region`] and `panels::compare`).
+    CompareRegion(u8),
     /// Background preparation of a neighbouring photo (no texture: its decoded source and view
     /// render are cached by the engine). 0 = next, 1 = previous.
     Prefetch(u8),
@@ -52,6 +55,15 @@ pub enum Slot {
     Import(u32),
     /// The second window's view of the active photo.
     Second,
+    /// A slideshow slide (the one up, the one fading out, the next ones prepared in advance; see
+    /// [`crate::panels::slideshow`]): a photo's, or a title screen.
+    Slide(lightcraft_engine::slideshow::Item),
+    /// The small composed slide in Settings ▸ Slideshow (the active photo with the layout being
+    /// edited).
+    SlidePreview,
+    /// A slider drag's live HDR histogram: a small full-quality render of an HDR edit, beside the
+    /// drafts (which have no HDR histogram), with no texture ([`Renderer::live_hdr_histogram`]).
+    HdrHistogram,
 }
 
 pub struct Tex {
@@ -75,6 +87,20 @@ pub trait RenderOffload {
     fn try_start(&mut self, slot: Slot, job: RenderJob) -> Option<RenderJob>;
     /// Finished jobs since the last call: (slot, result, run time in ms).
     fn finished(&mut self) -> Vec<(Slot, RenderResult, f64)>;
+}
+
+/// A job's result as the pool hands it back: the render and its texture pixels, converted on the
+/// worker (`None` for prefetches and failures). A 10 MP zoom window's conversion took a few ms of
+/// the UI thread on every slider step.
+struct Finished {
+    result: RenderResult,
+    color: Option<Arc<egui::ColorImage>>,
+}
+
+/// Immutable identity captured when a request is submitted, not when its result is collected.
+struct Requested {
+    id: u64,
+    source: Option<lightcraft_catalog::Source>,
 }
 
 struct Queued {
@@ -111,7 +137,7 @@ const HARD_FACTOR: usize = 4;
 pub(crate) fn stage_trim_order(sizes: &[(Slot, usize)], budget: usize) -> Vec<Slot> {
     let idle_rank = |s: Slot| match s {
         Slot::Hover => 0,
-        Slot::Compare(_) => 2,
+        Slot::Compare(_) | Slot::CompareRegion(_) => 2,
         Slot::Second => 3,
         _ => 5,
     };
@@ -163,7 +189,9 @@ const VARIANT_PRIORITY: u32 = 6;
 pub struct Renderer {
     #[cfg(test)]
     pub(crate) thumb_jobs_built: usize,
-    request_ids: HashMap<Slot, u64>,
+    requests: HashMap<Slot, Requested>,
+    #[cfg(test)]
+    failure_messages: Vec<String>,
     /// Request id of the pixels each interactive view (loupe, before, hover) shows: a draft that
     /// finishes after a newer request was made still replaces older pixels, so a long slider drag
     /// keeps updating the loupe instead of waiting for the drag to pause.
@@ -174,7 +202,9 @@ pub struct Renderer {
     /// Last thumbnail inputs; weak identities do not retain photo histories or force deep clones.
     /// (photo, size bucket, job key, whether the request went through an embedded stand-in)
     thumb_inputs: HashMap<PhotoId, (std::sync::Weak<lightcraft_catalog::Photo>, usize, u64, bool)>,
-    pool: JobPool<Slot, RenderResult>,
+    /// Photos whose grid thumbnail is the camera's embedded preview itself (no render behind it).
+    embedded_thumbs: HashMap<PhotoId, (std::sync::Weak<lightcraft_catalog::Photo>, usize, u64)>,
+    pool: JobPool<Slot, Finished>,
     /// Jobs run elsewhere (see [`RenderOffload`]); `queue` holds the ones not started yet.
     offload: Option<Box<dyn RenderOffload>>,
     queue: Vec<Queued>,
@@ -182,6 +212,8 @@ pub struct Renderer {
     /// Slot → (key, priority) of the request in flight (queued or running).
     pending: HashMap<Slot, (u64, u32)>,
     pub textures: HashMap<Slot, Tex>,
+    /// The last [`Slot::HdrHistogram`] result: (photo, job key, histogram).
+    pub live_hdr_histogram: Option<(PhotoId, u64, Histogram)>,
     pub last_main_ms: f64,
     /// Jobs finished since start (for inspect/perf).
     pub completed: u64,
@@ -192,9 +224,10 @@ pub struct Renderer {
     stages: HashMap<Slot, Arc<StageCache>>,
     /// Slot → key of the last quick job requested for it (each is tried once).
     quick_tried: HashMap<Slot, u64>,
-    /// Jobs that failed (unreadable or missing file…), by slot and job key, with the error: not
-    /// requested again until the key changes (an edit, another size) — the grid asks every frame.
-    failed: HashMap<Slot, (u64, String, u64)>,
+    /// Jobs that failed (unreadable or missing file…), by slot and job key, with the error and
+    /// the photo: not requested again until the key changes (an edit, another size) — the grid
+    /// asks every frame.
+    failed: HashMap<Slot, (u64, String, u64, PhotoId)>,
     /// The catalog revision seen at the last poll: a failure is retried once the catalog changes
     /// (a relinked or re-imported file).
     catalog_rev: u64,
@@ -206,11 +239,15 @@ pub struct Renderer {
     variant_want: usize,
     /// Frames polled so far.
     frame: u64,
+    /// Slideshow slides may be held ([`Self::release_slides`] has something to do).
+    slides_live: bool,
     /// Stage caches cleared to stay in budget (see [`stage_trim_order`]).
     stages_trimmed: u64,
     /// A budget other than the memory budget's share (tests).
     #[cfg(test)]
     pub(crate) stage_budget_override: Option<usize>,
+    /// The monitor profile textures are made for (`app.displayProfile`; `None`: sRGB).
+    display: Option<Arc<lightcraft_engine::display::Display>>,
     /// Since when nothing has been pending, and whether the GPU pool was trimmed since.
     #[cfg(not(target_arch = "wasm32"))]
     idle: Option<(std::time::Instant, bool)>,
@@ -224,13 +261,13 @@ impl Slot {
     /// An interactive view of the open photo: slider drags redo only the stages they feed, and a
     /// draft that finishes late still replaces older pixels.
     pub fn is_view(self) -> bool {
-        matches!(self, Slot::Main | Slot::Region | Slot::RegionBefore | Slot::Before | Slot::Hover)
+        matches!(self, Slot::Main | Slot::Region | Slot::RegionBefore | Slot::Before | Slot::Hover | Slot::HdrHistogram)
     }
 }
 
 impl Default for Renderer {
     fn default() -> Self {
-        let threads = if cfg!(target_arch = "wasm32") { 0 } else { JobPool::<Slot, RenderResult>::default_threads().min(6) };
+        let threads = if cfg!(target_arch = "wasm32") { 0 } else { JobPool::<Slot, Finished>::default_threads().min(6) };
         Self::with_worker_threads(threads)
     }
 }
@@ -243,17 +280,21 @@ impl Renderer {
         Renderer {
             #[cfg(test)]
             thumb_jobs_built: 0,
-            request_ids: HashMap::new(),
+            requests: HashMap::new(),
+            #[cfg(test)]
+            failure_messages: Vec::new(),
             shown_ids: HashMap::new(),
             epoch: 0,
             preview_generation: None,
             pool: JobPool::new(threads),
             thumb_inputs: HashMap::new(),
+            embedded_thumbs: HashMap::new(),
             offload: None,
             queue: Vec::new(),
             seq: 0,
             pending: HashMap::new(),
             textures: HashMap::new(),
+            live_hdr_histogram: None,
             last_main_ms: 0.0,
             completed: 0,
             keep_pixels: false,
@@ -265,9 +306,11 @@ impl Renderer {
             variant_used: HashMap::new(),
             variant_want: 0,
             frame: 0,
+            slides_live: false,
             stages_trimmed: 0,
             #[cfg(test)]
             stage_budget_override: None,
+            display: None,
             #[cfg(not(target_arch = "wasm32"))]
             idle: None,
         }
@@ -285,13 +328,56 @@ impl Renderer {
         if quick && !self.textures.contains_key(&slot) {
             // Stand-in path (`grid::request_thumb`): the embedded preview is still on its way, or
             // the real thumbnail is requested at the background priority whatever the caller's.
-            return self.pending.get(&Slot::ThumbQuick(photo.id)).is_some_and(|p| p.0 == key)
-                || !self.request_needed(slot, key, crate::panels::grid::BACKGROUND_THUMB_PRIORITY);
+            let quick_slot = Slot::ThumbQuick(photo.id);
+            if let Some(&(k, p)) = self.pending.get(&quick_slot)
+                && k == key
+            {
+                return p == priority.saturating_add(1) || !self.is_queued(quick_slot);
+            }
+            return !self.request_needed(slot, key, crate::panels::grid::BACKGROUND_THUMB_PRIORITY);
         }
         !self.request_needed(slot, key, priority)
     }
 
     /// Remember the inputs of the thumbnail just requested (`quick`: through a stand-in).
+    /// Whether the camera's embedded preview *is* this photo's thumbnail: its quick render arrived
+    /// (so `Slot::ThumbQuick` holds the picture) and no edit has moved the photo on to a settings
+    /// hash of its own. The grid stops here instead of decoding the raw behind a thumbnail the
+    /// embedded JPEG already covers — see `grid::skips_the_real_render`.
+    pub fn thumb_quick_is_final(&self, photo: &Arc<lightcraft_catalog::Photo>, bucket: usize, priority: u32) -> bool {
+        let Some((old, size, key)) = self.embedded_thumbs.get(&photo.id) else { return false };
+        old.as_ptr() == Arc::as_ptr(photo) && *size == bucket && !self.request_needed(Slot::ThumbQuick(photo.id), *key, priority)
+    }
+
+    /// Whether this photo's embedded-preview thumbnail is pending at the requested priority, or
+    /// already running. A queued priority change must reach the grid's stand-in request.
+    pub fn thumb_quick_pending(&self, photo: &Arc<lightcraft_catalog::Photo>, bucket: usize, priority: u32) -> bool {
+        let Some((old, size, key, quick)) = self.thumb_inputs.get(&photo.id) else { return false };
+        let slot = Slot::ThumbQuick(photo.id);
+        old.as_ptr() == Arc::as_ptr(photo)
+            && *size == bucket
+            && *quick
+            && self.pending.contains_key(&slot)
+            && !self.request_needed(slot, *key, priority.saturating_add(1))
+    }
+
+    /// Remember that the camera's embedded preview is this photo's final thumbnail, so the grid's
+    /// per-frame requests stop at it (the quick render's key, which [`Self::thumb_quick_is_final`]
+    /// compares against).
+    pub fn remember_embedded_thumb(&mut self, photo: &Arc<lightcraft_catalog::Photo>, bucket: usize, key: u64) {
+        let slot = Slot::Thumb(photo.id);
+        if self.pending.get(&slot).is_some_and(|(pending_key, _)| *pending_key != key) {
+            // An edit can still be rendering when Undo restores this embedded-final thumbnail.
+            // Retire its full-render identity before it can replace the correct stand-in.
+            self.pending.remove(&slot);
+            self.requests.remove(&slot);
+            self.pool.reprioritize(|s, p| if *s == slot { None } else { Some(p) });
+            self.queue.retain(|q| q.slot != slot);
+        }
+        self.remember_thumb(photo, bucket, key, true);
+        self.embedded_thumbs.insert(photo.id, (Arc::downgrade(photo), bucket, key));
+    }
+
     pub fn remember_thumb(&mut self, photo: &Arc<lightcraft_catalog::Photo>, bucket: usize, key: u64, quick: bool) {
         if self.thumb_inputs.len() >= 1024 && !self.thumb_inputs.contains_key(&photo.id) {
             self.thumb_inputs.retain(|_, (p, _, _, _)| p.strong_count() > 0);
@@ -302,6 +388,58 @@ impl Renderer {
             }
         }
         self.thumb_inputs.insert(photo.id, (Arc::downgrade(photo), bucket, key, quick));
+    }
+
+    /// Views that render straight into the display profile's primaries (wide gamut); everything
+    /// else is rendered for sRGB and converted ([`lightcraft_engine::display::present`]).
+    fn renders_for_display(slot: Slot) -> bool {
+        matches!(
+            slot,
+            Slot::Main
+                | Slot::Region
+                | Slot::Before
+                | Slot::RegionBefore
+                | Slot::Hover
+                | Slot::Compare(_)
+                | Slot::CompareRegion(_)
+                | Slot::Second
+                | Slot::Slide(_)
+        )
+    }
+
+    /// `job` as [`Self::request`] would run it for `slot` (its key included): views render for
+    /// the display profile in use.
+    pub fn job_for(&self, slot: Slot, job: RenderJob) -> RenderJob {
+        if Self::renders_for_display(slot) { job.with_display(self.display.clone()) } else { job }
+    }
+
+    /// The display profile in use (id).
+    pub fn display_id(&self) -> Option<u64> {
+        self.display.as_ref().map(|d| d.id())
+    }
+
+    /// The display profile textures are made for (`None`: sRGB).
+    pub fn display(&self) -> Option<&Arc<lightcraft_engine::display::Display>> {
+        self.display.as_ref()
+    }
+
+    /// Show previews through `display` from now on (`app.displayProfile`): when it changes, every
+    /// texture is made again for the new one.
+    pub fn set_display(&mut self, display: Option<Arc<lightcraft_engine::display::Display>>) {
+        if display.as_ref().map(|d| d.id()) != self.display_id() {
+            self.forget_all();
+        }
+        self.display = display;
+    }
+
+    /// Run `job` and make its image ready for `display` (on the worker thread).
+    fn run_for(job: impl FnOnce() -> RenderResult, display: &Option<Arc<lightcraft_engine::display::Display>>) -> Finished {
+        let mut r = job();
+        if let Some(d) = display {
+            lightcraft_engine::display::present(&mut r, d);
+        }
+        let color = r.rendered.as_ref().ok().map(|x| Arc::new(color_image(&x.image)));
+        Finished { result: r, color }
     }
 
     fn request_needed(&self, slot: Slot, key: u64, priority: u32) -> bool {
@@ -340,13 +478,17 @@ impl Renderer {
     }
 
     /// Request a render for `slot` (no-op if already current or pending at the same priority).
-    pub fn request(&mut self, slot: Slot, mut job: RenderJob, priority: u32) {
+    pub fn request(&mut self, slot: Slot, job: RenderJob, priority: u32) {
+        if matches!(slot, Slot::Slide(_)) {
+            self.slides_live = true;
+        }
+        let mut job = self.job_for(slot, job);
         if !self.request_needed(slot, job.key, priority) {
             return;
         }
         self.pending.insert(slot, (job.key, priority));
         job.request_id = lightcraft_preview::next_tick();
-        self.request_ids.insert(slot, job.request_id);
+        self.requests.insert(slot, Requested { id: job.request_id, source: Some(job.origin.clone()) });
         // (an offload keeps its own per-view stage caches; the flag tells it to)
         let job = if slot.is_view() { job.with_stages(self.stages.entry(slot).or_default().clone()) } else { job };
         if self.offload.is_some() {
@@ -358,25 +500,69 @@ impl Renderer {
         }
         let key = job.key;
         let background = matches!(slot, Slot::Thumb(_) | Slot::ThumbQuick(_) | Slot::Prefetch(_));
+        let display = self.display.clone();
         self.pool.submit(
             slot,
             key,
             priority,
-            Box::new(move || if background { lightcraft_engine::memory::in_background(|| job.run()) } else { job.run() }),
+            Box::new(move || {
+                let run = || if background { lightcraft_engine::memory::in_background(|| job.run()) } else { job.run() };
+                Self::run_for(run, &display)
+            }),
         );
     }
 
     /// Request a stand-in for `slot` (once per job key).
     pub fn request_quick(&mut self, slot: Slot, mut job: QuickJob, priority: u32) {
         if self.quick_tried.get(&slot) == Some(&job.key) {
+            if self.pending.get(&slot).is_some_and(|p| p.0 == job.key && p.1 != priority) {
+                // Scrolling changes a stand-in's priority too. Keep the original closure and
+                // request identity; running or completed work must never be started again.
+                let mut queued = false;
+                self.pool.reprioritize(|s, p| {
+                    if *s == slot {
+                        queued = true;
+                        Some(priority)
+                    } else {
+                        Some(p)
+                    }
+                });
+                if queued && let Some(p) = self.pending.get_mut(&slot) {
+                    p.1 = priority;
+                }
+            }
             return;
         }
         self.quick_tried.insert(slot, job.key);
         self.pending.insert(slot, (job.key, priority));
         job.request_id = lightcraft_preview::next_tick();
-        self.request_ids.insert(slot, job.request_id);
+        let source = job
+            .small
+            .as_ref()
+            .map(|job| job.origin.clone())
+            .or_else(|| job.embedded.as_ref().map(|(path, _, _)| lightcraft_catalog::Source::File { path: path.clone() }));
+        self.requests.insert(slot, Requested { id: job.request_id, source });
         let key = job.key;
-        self.pool.submit(slot, key, priority, Box::new(move || job.run()));
+        let display = self.display.clone();
+        self.pool.submit(slot, key, priority, Box::new(move || Self::run_for(|| job.run(), &display)));
+    }
+
+    /// Render a slideshow title screen into `slot` (once per screen key, like [`Self::request`]):
+    /// a slide with no photo, composed on a worker (on wasm: the job pool's inline runs, not the
+    /// offload, which only knows photo renders).
+    pub fn request_title(&mut self, slot: Slot, compose: Arc<lightcraft_engine::slide_title::TitleCompose>, priority: u32) {
+        if matches!(slot, Slot::Slide(_)) {
+            self.slides_live = true;
+        }
+        let key = compose.key();
+        if !self.request_needed(slot, key, priority) {
+            return;
+        }
+        self.pending.insert(slot, (key, priority));
+        let request_id = lightcraft_preview::next_tick();
+        self.requests.insert(slot, Requested { id: request_id, source: None });
+        let display = self.display.clone();
+        self.pool.submit(slot, key, priority, Box::new(move || Self::run_for(|| compose.result(request_id), &display)));
     }
 
     /// Prepare a photo in the background (a [`Slot::Prefetch`] job runs once per key; a newer one
@@ -388,15 +574,37 @@ impl Renderer {
         self.prefetched.insert(slot, job.key);
         self.pending.insert(slot, (job.key, priority));
         job.request_id = lightcraft_preview::next_tick();
-        self.request_ids.insert(slot, job.request_id);
+        self.requests.insert(slot, Requested { id: job.request_id, source: Some(job.origin.clone()) });
         let key = job.key;
-        self.pool.submit(slot, key, priority, Box::new(move || lightcraft_engine::memory::in_background(|| job.run())));
+        self.pool.submit(
+            slot,
+            key,
+            priority,
+            Box::new(move || Finished { result: lightcraft_engine::memory::in_background(|| job.run()), color: None }),
+        );
+    }
+
+    /// Drop the slideshow slides other than `keep`: their textures and their requests that have
+    /// not started (a slide that is no longer near is not worth rendering).
+    pub fn release_slides(&mut self, keep: &[lightcraft_engine::slideshow::Item]) {
+        if !self.slides_live {
+            return;
+        }
+        let gone = |s: &Slot| matches!(s, Slot::Slide(id) if !keep.contains(id));
+        self.textures.retain(|s, _| !gone(s));
+        let _ = self.pool.reprioritize(|s, p| if gone(s) { None } else { Some(p) });
+        self.queue.retain(|q| !gone(&q.slot));
+        // (a render already running finishes unclaimed: its result is dropped)
+        self.pending.retain(|s, _| !gone(s));
+        self.requests.retain(|s, _| !gone(s));
+        self.failed.retain(|s, _| !gone(s));
+        self.slides_live = !keep.is_empty();
     }
 
     /// Is a request for `slot` queued or running?
     /// Drop every texture and cached stage (another library was opened: photo ids changed meaning).
     pub fn forget_all(&mut self) {
-        self.request_ids.clear();
+        self.requests.clear();
         self.shown_ids.clear();
         self.epoch = lightcraft_preview::next_tick();
         self.preview_generation = None;
@@ -413,6 +621,19 @@ impl Renderer {
 
     pub fn is_pending(&self, slot: Slot) -> bool {
         self.pending.contains_key(&slot)
+    }
+
+    /// The app is closing: drop the jobs that have not started and wait up to `timeout` for the
+    /// ones running on the worker threads. Returns whether all of them have ended. Nothing is
+    /// rendered afterwards.
+    pub fn shutdown(&mut self, timeout: std::time::Duration) -> bool {
+        self.queue.clear();
+        self.pool.shutdown(timeout)
+    }
+
+    /// Worker threads that are still alive (0 before the first render).
+    pub fn live_workers(&self) -> usize {
+        self.pool.live_workers()
     }
 
     /// The texture to show for a grid/filmstrip thumbnail: the rendered one, else its stand-in.
@@ -444,6 +665,18 @@ impl Renderer {
     /// Why the last render for `slot` failed (until a render with another key succeeds).
     pub fn failure(&self, slot: Slot) -> Option<&str> {
         self.failed.get(&slot).map(|f| f.1.as_str())
+    }
+
+    /// Why the last render of `photo` for `slot` failed: a view slot shows one photo after
+    /// another, and another photo's error isn't this one's.
+    pub fn failure_of(&self, slot: Slot, photo: PhotoId) -> Option<&str> {
+        self.failed.get(&slot).filter(|f| f.3 == photo).map(|f| f.1.as_str())
+    }
+
+    /// Whether `slot`'s pending render asks again for the key that last failed (a library change
+    /// retries failures): what is on screen stays what the failure left until it answers.
+    pub fn retrying(&self, slot: Slot) -> bool {
+        self.pending.get(&slot).zip(self.failed.get(&slot)).is_some_and(|(p, f)| p.0 == f.0)
     }
 
     /// The slots with a render pending (diagnostics: `ui.inspect`).
@@ -496,14 +729,14 @@ impl Renderer {
         });
         for s in dropped {
             self.pending.remove(&s);
-            self.request_ids.remove(&s);
+            self.requests.remove(&s);
         }
-        let request_ids = &mut self.request_ids;
+        let requests = &mut self.requests;
         let pending = &mut self.pending;
         self.queue.retain(|q| match q.slot {
             Slot::Variant(k) if stale(used.get(&k)) => {
                 pending.remove(&q.slot);
-                request_ids.remove(&q.slot);
+                requests.remove(&q.slot);
                 false
             }
             _ => true,
@@ -554,24 +787,59 @@ impl Renderer {
         };
         #[cfg(not(target_arch = "wasm32"))]
         let inline_ms = 0.0;
+        let changed = self.collect(ctx, session, inline_ms);
+        self.evict_variants();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.trim_when_idle(ctx);
+        if !self.pending.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+        changed
+    }
+
+    /// In a slider drag, give the loupe's draft (just requested) until `budget` to finish, so that it
+    /// is drawn in this frame rather than picked up at the start of the next one. Only when the last
+    /// loupe render took well under the budget (a GPU draft takes a few milliseconds; a CPU render
+    /// that would only make the frame late is not waited for).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn wait_for_draft(&mut self, ctx: &egui::Context, session: &mut Session, budget: std::time::Duration) {
+        if self.offload.is_some() || self.last_main_ms * 1.5 >= budget.as_secs_f64() * 1e3 {
+            return;
+        }
+        let Some(deadline) = std::time::Instant::now().checked_add(budget) else { return };
+        while self.is_pending(Slot::Main) {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() || !self.pool.wait(left) {
+                break;
+            }
+            self.collect(ctx, session, 0.0);
+        }
+    }
+
+    /// Turn finished jobs into textures. Returns true if anything changed.
+    fn collect(&mut self, ctx: &egui::Context, session: &mut Session, inline_ms: f64) -> bool {
         let mut finished = Vec::new();
         while let Some(done) = self.pool.try_recv() {
-            finished.push((done.slot, done.result, if done.ms > 0.0 { done.ms } else { inline_ms }));
+            finished.push((done.slot, done.result.result, done.result.color, if done.ms > 0.0 { done.ms } else { inline_ms }));
         }
         if let Some(off) = self.offload.as_mut() {
-            finished.extend(off.finished());
+            finished.extend(off.finished().into_iter().map(|(slot, r, ms)| (slot, r, None, ms)));
         }
         self.dispatch();
         let mut changed = false;
-        for (mut slot, r, ms) in finished {
+        for (mut slot, mut r, mut color, ms) in finished {
             self.completed += 1;
+            // made for another display profile than the one in use: obsolete
+            if r.display.is_some_and(|id| Some(id) != self.display_id()) {
+                continue;
+            }
             // Ignore obsolete pixels, failures and decoded sources, even for the same render key;
             // an interactive view still takes a superseded draft that is newer than what it
             // shows, and the source it decoded: a drag supersedes every request before it
             // finishes, and a source thrown away with them is decoded again for every tick.
-            if self.request_ids.get(&slot) != Some(&r.request_id) {
+            let source = if self.requests.get(&slot).map(|request| request.id) != Some(r.request_id) {
                 let newer_draft = slot.is_view()
-                    && self.request_ids.contains_key(&slot)
+                    && self.requests.contains_key(&slot)
                     && r.request_id >= self.epoch
                     && self.shown_ids.get(&slot).is_none_or(|shown| r.request_id > *shown)
                     && r.rendered.is_ok();
@@ -579,12 +847,22 @@ impl Renderer {
                     continue;
                 }
                 session.accept(&r);
+                None // superseded successful drafts have no failure diagnostic
             } else {
-                self.request_ids.remove(&slot);
+                let source = self.requests.remove(&slot).and_then(|request| request.source);
                 session.accept(&r);
-            }
+                source
+            };
             if slot.is_view() {
                 self.shown_ids.insert(slot, r.request_id);
+            }
+            // (results from an offload, which doesn't know the display profile: converted here)
+            if let Some(d) = &self.display {
+                let before = r.display;
+                lightcraft_engine::display::present(&mut r, d);
+                if r.display != before {
+                    color = None; // converted after the worker made its texture pixels
+                }
             }
             if self.pending.get(&slot).is_some_and(|p| p.0 == r.key) {
                 self.pending.remove(&slot);
@@ -596,13 +874,23 @@ impl Renderer {
                 }
                 Err(e) => {
                     if !matches!(slot, Slot::Prefetch(_)) {
-                        log::warn!("render {slot:?}: {e}");
-                        self.failed.insert(slot, (r.key, e, self.catalog_rev));
+                        let message = render_failure_message(slot, r.photo, source.as_ref(), &e);
+                        #[cfg(test)]
+                        self.failure_messages.push(message.clone());
+                        log::warn!("{message}");
+                        self.failed.insert(slot, (r.key, e, self.catalog_rev, r.photo));
                     }
                     continue;
                 }
             };
             if matches!(slot, Slot::Prefetch(_)) {
+                continue;
+            }
+            if slot == Slot::HdrHistogram {
+                if rendered.histogram.hdr.is_some() {
+                    self.live_hdr_histogram = Some((r.photo, r.key, rendered.histogram));
+                    changed = true;
+                }
                 continue;
             }
             if let Slot::ThumbQuick(id) = slot {
@@ -618,7 +906,7 @@ impl Renderer {
                 self.textures.remove(&Slot::ThumbQuick(id));
             }
             let img = &rendered.image;
-            let color = std::sync::Arc::new(color_image(img));
+            let color = color.unwrap_or_else(|| Arc::new(color_image(img)));
             let pixels = self.keep_pixels.then(|| color.clone());
             let name = format!("{slot:?}");
             match self.textures.get_mut(&slot) {
@@ -654,20 +942,16 @@ impl Renderer {
             }
             changed = true;
         }
-        self.evict_variants();
-        #[cfg(not(target_arch = "wasm32"))]
-        self.trim_when_idle(ctx);
-        if !self.pending.is_empty() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(16));
-        }
         changed
     }
 
     /// Free the GPU renderer's recycled buffers once nothing has rendered for [`IDLE_TRIM`] (they
-    /// are reallocated by the next render; while working, renders reuse them).
+    /// are reallocated by the next render; while working, renders reuse them). A zoomed view
+    /// showing its windows is not idle: the device copy of the original they are cut from stays for
+    /// the next pan (a 64 MP raw is 800 MB to upload again, over a second).
     #[cfg(not(target_arch = "wasm32"))]
     fn trim_when_idle(&mut self, ctx: &egui::Context) {
-        if !self.pending.is_empty() {
+        if !self.pending.is_empty() || self.textures.contains_key(&Slot::Region) || self.textures.contains_key(&Slot::RegionBefore) {
             self.idle = None;
             return;
         }
@@ -728,7 +1012,7 @@ impl Renderer {
         self.pool.reprioritize(|s, p| if matches!(s, Slot::Import(_)) { None } else { Some(p) });
         self.queue.retain(|q| !matches!(q.slot, Slot::Import(_)));
         self.pending.retain(|s, _| !matches!(s, Slot::Import(_)));
-        self.request_ids.retain(|s, _| !matches!(s, Slot::Import(_)));
+        self.requests.retain(|s, _| !matches!(s, Slot::Import(_)));
         self.textures.retain(|s, _| !matches!(s, Slot::Import(_)));
         self.quick_tried.retain(|s, _| !matches!(s, Slot::Import(_)));
     }
@@ -743,15 +1027,15 @@ impl Renderer {
         });
         for s in dropped {
             self.pending.remove(&s);
-            self.request_ids.remove(&s);
+            self.requests.remove(&s);
             self.quick_tried.remove(&s);
         }
-        let request_ids = &mut self.request_ids;
+        let requests = &mut self.requests;
         let pending = &mut self.pending;
         self.queue.retain(|q| match q.slot {
             Slot::Thumb(id) if !keep.contains(&id) && q.priority <= 10 => {
                 pending.remove(&q.slot);
-                request_ids.remove(&q.slot);
+                requests.remove(&q.slot);
                 false
             }
             _ => true,
@@ -765,10 +1049,42 @@ impl Renderer {
     }
 }
 
+/// Include the source identity in diagnostics for every catalog-backed render slot (#1890).
+/// Debug-format paths so whitespace/control characters cannot forge another log entry.
+fn render_failure_message(slot: Slot, photo: PhotoId, source: Option<&lightcraft_catalog::Source>, error: &str) -> String {
+    match source {
+        Some(lightcraft_catalog::Source::File { path }) => format!("render {slot:?}, {photo:?}, file {path:?}: {error}"),
+        Some(lightcraft_catalog::Source::Demo { scene }) => format!("render {slot:?}, {photo:?}, demo scene {scene}: {error}"),
+        None => format!("render {slot:?}, {photo:?}, source unavailable: {error}"),
+    }
+}
+
 #[cfg(test)]
 mod thumbnail_tests {
     use super::*;
     use lightcraft_catalog::{Catalog, Op, Photo, Source};
+
+    #[test]
+    fn render_failures_identify_the_file_for_thumbnail_and_view_slots() {
+        let source = Source::File { path: "/photos/trip/IMG_0042.nef".into() };
+        for slot in [Slot::Thumb(PhotoId(42)), Slot::Main, Slot::Before, Slot::Compare(1), Slot::Region] {
+            let message = render_failure_message(slot, PhotoId(42), Some(&source), "unsupported compression");
+            assert!(message.contains("/photos/trip/IMG_0042.nef"), "{message}");
+            assert!(message.contains("PhotoId(42)"), "{message}");
+            assert!(message.ends_with(": unsupported compression"), "{message}");
+        }
+    }
+
+    #[test]
+    fn render_failure_paths_are_escaped_and_missing_sources_still_identified() {
+        let source = Source::File { path: "line\nbreak.nef".into() };
+        let message = render_failure_message(Slot::Main, PhotoId(42), Some(&source), "decode failed");
+        assert!(!message.contains('\n'));
+        assert!(message.contains("line\\nbreak.nef"));
+        assert!(render_failure_message(Slot::Main, PhotoId(42), None, "decode failed").contains("PhotoId(42), source unavailable"));
+        let demo = Source::Demo { scene: 7 };
+        assert!(render_failure_message(Slot::Main, PhotoId(42), Some(&demo), "decode failed").contains("demo scene 7"));
+    }
 
     struct Blocked;
     impl RenderOffload for Blocked {
@@ -806,6 +1122,7 @@ mod thumbnail_tests {
                 file_size: 99,
                 content_hash: Some("changed".into()),
                 preview_only: None,
+                preview_checked: String::new(),
             })
             .unwrap();
         assert!(!r.thumb_current(catalog.photo(PhotoId(1)).unwrap(), 384, 10));
@@ -836,6 +1153,65 @@ mod thumbnail_tests {
         r.evict_thumbs(&Default::default(), 600);
         assert!(r.thumb_inputs.is_empty());
     }
+    fn queued_quick_thumbnail(id: PhotoId) -> (Arc<Photo>, QuickJob) {
+        let mut session = Session::new();
+        session.media.preview_loader =
+            Some(Arc::new(|_, _| Some(lightcraft_raster::Rgba8 { width: 4, height: 4, data: vec![[200, 100, 50, 255]; 16] })));
+        let mut raw = (*photo()).clone();
+        raw.id = id;
+        raw.kind = lightcraft_catalog::MediaKind::Raw;
+        raw.develop = Arc::new(raw.camera_defaults());
+        session.catalog.apply(Op::AddPhoto { photo: Box::new(raw) }).unwrap();
+        let p = session.catalog.photo(id).unwrap().clone();
+        let job = session.thumb_job(id, 384).unwrap();
+        (p, session.quick_thumb_job(&job).unwrap())
+    }
+
+    #[test]
+    fn queued_standin_promotes_from_prefetch_to_visible_without_restarting() {
+        let (p, quick) = queued_quick_thumbnail(PhotoId(1));
+        let (_, other) = queued_quick_thumbnail(PhotoId(2));
+        let slot = Slot::ThumbQuick(p.id);
+        // Deterministic queue: no native worker starts.
+        let mut r = Renderer { pool: JobPool::new(0), ..Default::default() };
+        r.remember_thumb(&p, 384, quick.key, true);
+        r.request_quick(slot, quick.clone(), 6); // grid prefetch: 5 + 1
+        r.request_quick(Slot::ThumbQuick(PhotoId(2)), other, 9); // filmstrip: 8 + 1
+        let request_id = r.requests[&slot].id;
+        assert!(r.thumb_current(&p, 384, 5));
+        assert!(!r.thumb_current(&p, 384, 10));
+        r.request_quick(slot, quick.clone(), 11); // visible grid: 10 + 1
+        assert!(r.thumb_current(&p, 384, 10));
+        r.request_quick(slot, quick.clone(), 11);
+        assert_eq!(r.requests[&slot].id, request_id);
+        assert_eq!(r.pool.queued(), 2);
+        r.pool.run_inline(1);
+        let done = r.pool.try_recv().unwrap();
+        assert_eq!(done.slot, slot);
+        assert_eq!(done.result.result.request_id, request_id);
+        assert_eq!(done.result.result.quick, Some(QuickSource::Embedded));
+        // A finished result awaiting collection also must not start another extraction.
+        r.request_quick(slot, quick, 6);
+        assert!(r.thumb_current(&p, 384, 5));
+        assert_eq!(r.pool.queued(), 1);
+    }
+
+    #[test]
+    fn queued_standin_demotes_when_it_leaves_the_visible_grid() {
+        let (p, quick) = queued_quick_thumbnail(PhotoId(1));
+        let (_, other) = queued_quick_thumbnail(PhotoId(2));
+        let slot = Slot::ThumbQuick(p.id);
+        let mut r = Renderer { pool: JobPool::new(0), ..Default::default() };
+        r.remember_thumb(&p, 384, quick.key, true);
+        r.request_quick(slot, quick.clone(), 11);
+        r.request_quick(Slot::ThumbQuick(PhotoId(2)), other, 9);
+        assert!(!r.thumb_current(&p, 384, 5));
+        r.request_quick(slot, quick, 6);
+        assert!(r.thumb_current(&p, 384, 5));
+        r.pool.run_inline(1);
+        assert_eq!(r.pool.try_recv().unwrap().slot, Slot::ThumbQuick(PhotoId(2)));
+    }
+
     #[test]
     fn failures_retry_after_revision_and_quick_only_is_not_final() {
         let p = photo();
@@ -844,10 +1220,34 @@ mod thumbnail_tests {
         r.remember_thumb(&p, 384, 77, false);
         r.pending.insert(Slot::ThumbQuick(p.id), (77, 11));
         assert!(!r.thumb_current(&p, 384, 10));
-        r.failed.insert(slot, (77, "no decoder".into(), 0));
+        r.failed.insert(slot, (77, "no decoder".into(), 0, p.id));
         assert!(r.thumb_current(&p, 384, 10));
+        assert_eq!(r.failure_of(slot, p.id), Some("no decoder"));
+        assert_eq!(r.failure_of(slot, PhotoId(p.id.0 + 1)), None, "another photo's error");
         r.catalog_rev = 1;
         assert!(!r.thumb_current(&p, 384, 10));
+    }
+
+    #[test]
+    fn a_fast_draft_is_drawn_in_the_frame_that_asked_for_it() {
+        let mut s = Session::new();
+        s.media.file_loader = Some(Arc::new(|_, _| Ok((lightcraft_raster::Rgb32f::new(8, 8), Default::default()))));
+        s.catalog.apply(Op::AddPhoto { photo: Box::new((*photo()).clone()) }).unwrap();
+        let mut r = Renderer::with_worker_threads(1);
+        let ctx = egui::Context::default();
+        let budget = std::time::Duration::from_secs(10);
+        // the last loupe render took longer than the budget (a CPU render): not waited for
+        r.last_main_ms = 1e6;
+        r.request(Slot::Main, s.render_job(PhotoId(1), 64, 64, false, true).unwrap(), 100);
+        r.wait_for_draft(&ctx, &mut s, budget);
+        assert!(r.is_pending(Slot::Main) && !r.textures.contains_key(&Slot::Main));
+        // a fast one (GPU drafts): the texture is the new render when the wait returns
+        r.last_main_ms = 1.0;
+        r.request(Slot::Main, s.render_job(PhotoId(1), 32, 32, false, true).unwrap(), 100);
+        let want = r.wanted(Slot::Main);
+        r.wait_for_draft(&ctx, &mut s, budget);
+        assert!(!r.is_pending(Slot::Main));
+        assert_eq!(r.textures.get(&Slot::Main).map(|t| t.key), want);
     }
 
     #[derive(Default)]
@@ -874,6 +1274,8 @@ mod thumbnail_tests {
             image.data.fill([0.3, 0.2, 0.1]);
             Ok((image, Default::default()))
         }));
+        // (`with_fs` sets the file system's thumbnail loader, which wins over `file_loader`: thumbnails use the stub too)
+        s.media.reduced_loader = None;
         s.catalog.apply(Op::AddPhoto { photo: Box::new(photo) }).unwrap();
         let mut app = crate::LightcraftApp::new(s, crate::Services::default());
         app.renderer.keep_pixels = true;
@@ -894,6 +1296,107 @@ mod thumbnail_tests {
         crate::panels::grid::request_thumb(app, PhotoId(1), 256, 10);
     }
 
+    fn relink_destination() -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("lc-render-relinked-{}-{}.nef", std::process::id(), lightcraft_preview::next_tick()));
+        std::fs::write(&path, b"replacement source").unwrap();
+        path
+    }
+
+    #[test]
+    fn completed_failure_keeps_requested_source_after_relink() {
+        let replacement = relink_destination();
+        for slot in [Slot::Thumb(PhotoId(1)), Slot::Main, Slot::Before, Slot::Compare(1), Slot::Region] {
+            let (mut app, work, ctx) = fixture();
+            app.session.media.file_loader = Some(Arc::new(|_, _| Err("simulated decode failure".into())));
+            let job = app.session.render_job(PhotoId(1), 64, 64, false, true).unwrap();
+            app.renderer.request(slot, job, 100);
+            let (submitted, job) = take_job(&work);
+            assert_eq!(submitted, slot);
+            let result = job.run();
+            assert!(result.rendered.is_err(), "the old request has already failed");
+            app.session.execute("photo.relink", &serde_json::json!({"id": 1, "path": replacement})).unwrap();
+            assert!(
+                matches!(&app.session.catalog.photo(PhotoId(1)).unwrap().source, Source::File { path } if path.ends_with(replacement.file_name().unwrap().to_str().unwrap()))
+            );
+            finish(&mut app, &work, &ctx, slot, result);
+            assert_eq!(app.renderer.failure(slot), Some("simulated decode failure"));
+            assert!(!app.renderer.is_pending(slot));
+            let message = app.renderer.failure_messages.last().expect("the collector emitted a diagnostic");
+            assert!(message.contains("audit.jpg"), "{message}");
+            assert!(!message.contains("lc-render-relinked-"), "the failed request did not read the replacement: {message}");
+            assert!(message.ends_with(": simulated decode failure"), "{message}");
+        }
+        std::fs::remove_file(replacement).unwrap();
+    }
+
+    #[test]
+    fn superseded_failure_does_not_take_the_new_requests_source() {
+        let replacement = relink_destination();
+        let (mut app, work, ctx) = fixture();
+        app.session.media.file_loader = Some(Arc::new(|_, _| Err("simulated decode failure".into())));
+        let slot = Slot::Main;
+        let old_job = app.session.render_job(PhotoId(1), 64, 64, false, true).unwrap();
+        app.renderer.request(slot, old_job, 100);
+        let (_, old_job) = take_job(&work);
+        let old_result = old_job.run();
+        app.session.execute("photo.relink", &serde_json::json!({"id": 1, "path": replacement})).unwrap();
+        let new_job = app.session.render_job(PhotoId(1), 64, 64, false, true).unwrap();
+        app.renderer.request(slot, new_job, 100);
+        let (_, new_job) = take_job(&work);
+        finish(&mut app, &work, &ctx, slot, old_result);
+        assert!(app.renderer.failure_messages.is_empty(), "obsolete failures stay suppressed");
+        assert!(app.renderer.is_pending(slot));
+        finish(&mut app, &work, &ctx, slot, new_job.run());
+        let message = app.renderer.failure_messages.last().expect("new failure is reported");
+        assert!(message.contains("lc-render-relinked-"), "{message}");
+        assert!(!message.contains("audit.jpg"), "{message}");
+        assert!(app.renderer.requests.is_empty(), "completed request identity is released");
+        std::fs::remove_file(replacement).unwrap();
+    }
+
+    #[test]
+    fn grid_queued_standin_changes_priority_without_restarting() {
+        let mut s = Session::new();
+        s.media.preview_loader = Some(Arc::new(|_, _| Some(lightcraft_raster::Rgba8 { width: 4, height: 4, data: vec![[200, 100, 50, 255]; 16] })));
+        let mut raw = (*photo()).clone();
+        raw.kind = lightcraft_catalog::MediaKind::Raw;
+        raw.develop = Arc::new(raw.camera_defaults());
+        let (mut app, work, ctx) = fixture_with(s, raw);
+        app.renderer.pool = JobPool::new(0); // deterministic: no quick job starts until run_inline
+        let id = PhotoId(1);
+        let slot = Slot::ThumbQuick(id);
+
+        crate::panels::grid::request_thumb(&mut app, id, 384, 5);
+        let request_id = app.renderer.requests[&slot].id;
+        assert_eq!(app.renderer.pending[&slot].1, 6);
+        assert_eq!(app.renderer.pool.queued(), 1);
+        crate::panels::grid::request_thumb(&mut app, id, 384, 10);
+        assert_eq!(app.renderer.pending[&slot].1, 11, "the grid must promote its queued stand-in");
+        assert_eq!(app.renderer.requests[&slot].id, request_id);
+        assert_eq!(app.renderer.pool.queued(), 1);
+
+        crate::panels::grid::request_thumb(&mut app, id, 384, 5);
+        assert_eq!(app.renderer.pending[&slot].1, 6, "the grid must demote its queued stand-in");
+        assert_eq!(app.renderer.requests[&slot].id, request_id);
+        assert_eq!(app.renderer.pool.queued(), 1);
+        let built = app.renderer.thumb_jobs_built;
+        app.renderer.pool.run_inline(1);
+        crate::panels::grid::request_thumb(&mut app, id, 384, 10);
+        assert_eq!(app.renderer.pending[&slot].1, 6, "completed work must not be restarted");
+        assert_eq!(app.renderer.requests[&slot].id, request_id);
+        assert_eq!(app.renderer.pool.queued(), 0);
+        app.renderer.poll(&ctx, &mut app.session);
+        assert_eq!(app.renderer.textures[&slot].quick, Some(QuickSource::Embedded));
+
+        crate::panels::grid::request_thumb(&mut app, id, 384, 10);
+        crate::panels::grid::request_thumb(&mut app, id, 384, 5);
+        assert_eq!(app.renderer.thumb_jobs_built, built);
+        assert_eq!(app.renderer.pool.queued(), 0);
+        assert!(!app.renderer.is_pending(Slot::Thumb(id)));
+        assert!(!app.renderer.textures.contains_key(&Slot::Thumb(id)));
+        assert!(work.borrow().jobs.is_empty(), "the final embedded thumbnail needs no real render");
+    }
+
     #[test]
     fn unchanged_ready_and_running_frames_build_no_jobs() {
         let (mut app, work, ctx) = fixture();
@@ -910,6 +1413,26 @@ mod thumbnail_tests {
         }
         assert_eq!(app.renderer.thumb_jobs_built, 1);
         assert!(work.borrow().jobs.is_empty());
+    }
+
+    #[test]
+    fn a_slider_drag_leaves_the_edited_photos_thumbnail_until_it_ends() {
+        let (mut app, work, ctx) = fixture();
+        request(&mut app);
+        let (slot, job) = take_job(&work);
+        finish(&mut app, &work, &ctx, slot, job.run());
+        app.session.execute("library.select", &serde_json::json!({"ids": [1], "active": 1})).unwrap();
+        app.session.execute("develop.beginInteraction", &serde_json::json!({"label": "Exposure"})).unwrap();
+        for v in [0.1, 0.2, 0.3] {
+            app.session.execute("develop.set", &serde_json::json!({"control": "light.exposure", "value": v})).unwrap();
+            app.renderer.poll(&ctx, &mut app.session);
+            request(&mut app);
+        }
+        assert_eq!(app.renderer.thumb_jobs_built, 1, "the drag's frames render no thumbnail of the photo");
+        assert!(work.borrow().jobs.is_empty());
+        app.session.execute("develop.endInteraction", &serde_json::json!({})).unwrap();
+        request(&mut app);
+        assert_eq!(app.renderer.thumb_jobs_built, 2, "the thumbnail follows once the drag ends");
     }
 
     #[test]
@@ -954,10 +1477,44 @@ mod thumbnail_tests {
         let _ = std::fs::remove_dir_all(&lib);
     }
 
+    /// A render that panics (a decoder bug) is a failure like any other: the slot stops waiting,
+    /// the error is kept (not retried every frame), and the pool's workers live on. Before, the
+    /// worker died without an answer and the slot stayed pending forever.
+    #[test]
+    fn a_panicking_render_is_a_failure_not_a_dead_worker() {
+        let (mut app, _, ctx) = fixture_with(Session::new(), (*photo()).clone());
+        app.session.media.file_loader = Some(Arc::new(|_, _| panic!("decoder bug")));
+        app.renderer.offload = None; // the real job pool
+        let slot = Slot::Thumb(PhotoId(1));
+        let ask = |app: &mut crate::LightcraftApp| {
+            if let Some(job) = app.session.thumb_job(PhotoId(1), 256) {
+                app.renderer.request(slot, job, 30);
+            }
+            app.renderer.poll(&ctx, &mut app.session);
+        };
+        ask(&mut app);
+        let t0 = std::time::Instant::now();
+        while app.renderer.is_pending(slot) {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(20), "the render never answered");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            app.renderer.poll(&ctx, &mut app.session);
+        }
+        assert_eq!(app.renderer.failure(slot), Some("the render failed unexpectedly: decoder bug"));
+        let workers = app.renderer.live_workers();
+        assert!(workers > 0, "the worker that panicked is still there");
+        let done = app.renderer.completed;
+        for _ in 0..30 {
+            ask(&mut app);
+        }
+        assert!(!app.renderer.is_pending(slot) && app.renderer.completed == done, "no retry loop");
+        assert_eq!(app.renderer.live_workers(), workers);
+    }
+
     #[test]
     fn raw_quick_path_frames_build_no_jobs() {
-        // an unedited raw: the grid shows its embedded preview first (held here until released),
-        // then queues the real thumbnail behind everything on screen
+        // an unedited raw: the grid shows its embedded preview (held here until released) and stops
+        // there — the camera JPEG at 4 416 × 2 944 already covers a 512 px thumbnail, so decoding the
+        // whole raw behind it only costs the file read (45 s a photo on a 1.2 MB/s share)
         let gate = Arc::new(std::sync::Mutex::new(()));
         let held = gate.lock().unwrap();
         let mut s = Session::new();
@@ -985,14 +1542,30 @@ mod thumbnail_tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
             app.renderer.poll(&ctx, &mut app.session);
         }
-        // the stand-in is shown: one more job queues the real thumbnail at background priority,
-        // and the grid asking at its own (higher) priority every frame does not rebuild it
+        // the embedded preview is the thumbnail: no real render is queued behind it, and the grid
+        // asking every frame neither rebuilds the job nor re-requests the preview
         for _ in 0..180 {
             request(&mut app);
         }
-        assert_eq!(app.renderer.thumb_jobs_built, 2);
-        assert_eq!(app.renderer.queue.len(), 1);
-        assert_eq!(app.renderer.pending.get(&Slot::Thumb(PhotoId(1))).map(|p| p.1), Some(crate::panels::grid::BACKGROUND_THUMB_PRIORITY));
+        assert_eq!(app.renderer.thumb_jobs_built, 1, "an unedited raw's embedded preview is the thumbnail");
+        assert!(app.renderer.queue.is_empty(), "nothing is decoded behind it");
+        assert!(!app.renderer.is_pending(Slot::Thumb(PhotoId(1))));
+
+        // an edit takes the embedded preview out of the picture: the real thumbnail is rendered then
+        let mut edited = (*photo()).clone();
+        edited.kind = lightcraft_catalog::MediaKind::Raw;
+        edited.develop = Arc::new({
+            let mut d = edited.camera_defaults();
+            d.light.exposure = 0.5;
+            d
+        });
+        let (mut app, _, _ctx) = fixture_with(Session::new(), edited);
+        app.renderer.set_offload(Box::new(Blocked));
+        for _ in 0..180 {
+            request(&mut app);
+        }
+        assert_eq!(app.renderer.thumb_jobs_built, 1);
+        assert!(app.renderer.is_pending(Slot::Thumb(PhotoId(1))) || !app.renderer.queue.is_empty(), "an edited raw renders its thumbnail");
     }
 
     #[test]
@@ -1039,6 +1612,33 @@ mod thumbnail_tests {
         finish(&mut app, &work, &ctx, Slot::Main, second.run());
         assert_eq!(app.renderer.textures.get(&Slot::Main).map(|t| t.key), Some(keys[2]));
         assert!(!app.renderer.is_pending(Slot::Main));
+    }
+
+    #[test]
+    fn a_drag_gets_its_live_hdr_histogram_beside_the_drafts() {
+        let (mut app, work, ctx) = fixture();
+        let mut jobs = Vec::new();
+        for exposure in [1.0, 2.0] {
+            let mut edit = lightcraft_develop::DevelopSettings::default();
+            edit.hdr.enabled = true;
+            edit.light.exposure = exposure;
+            app.session.catalog.apply(Op::SetDevelop { id: PhotoId(1), settings: Arc::new(edit), label: "drag".into(), edited: None }).unwrap();
+            let job = app.session.render_job(PhotoId(1), 32, 32, false, true).unwrap();
+            app.renderer.request(Slot::HdrHistogram, job, 95);
+            jobs.push(take_job(&work).1);
+        }
+        let keys: Vec<u64> = jobs.iter().map(|j| j.key).collect();
+        let mut jobs = jobs.into_iter();
+        let (first, last) = (jobs.next().unwrap(), jobs.next().unwrap());
+        // superseded while the drag goes on, it still lands: the histogram keeps moving
+        finish(&mut app, &work, &ctx, Slot::HdrHistogram, first.run());
+        let live = app.renderer.live_hdr_histogram.clone().expect("a live HDR histogram");
+        assert_eq!((live.0, live.1), (PhotoId(1), keys[0]));
+        assert!(live.2.hdr.is_some(), "HDR bins");
+        finish(&mut app, &work, &ctx, Slot::HdrHistogram, last.run());
+        assert_eq!(app.renderer.live_hdr_histogram.as_ref().map(|l| l.1), Some(keys[1]));
+        // only the histogram is kept: no texture
+        assert!(!app.renderer.textures.contains_key(&Slot::HdrHistogram));
     }
 
     #[test]
@@ -1163,6 +1763,74 @@ mod thumbnail_tests {
             expected.as_bytes()
         );
     }
+
+    #[test]
+    fn undo_to_embedded_thumb_rejects_late_full_render() {
+        let mut s = Session::new();
+        s.media.preview_loader = Some(Arc::new(|_, _| Some(lightcraft_raster::Rgba8 { width: 4, height: 4, data: vec![[200, 100, 50, 255]; 16] })));
+        let mut raw = (*photo()).clone();
+        raw.kind = lightcraft_catalog::MediaKind::Raw;
+        raw.develop = Arc::new(raw.camera_defaults());
+        let (mut app, work, ctx) = fixture_with(s, raw);
+        app.renderer.pool = JobPool::new(0);
+        let id = PhotoId(1);
+        let quick_slot = Slot::ThumbQuick(id);
+        let full_slot = Slot::Thumb(id);
+        let settings_a = app.session.catalog.photo(id).unwrap().develop.clone();
+
+        crate::panels::grid::request_thumb(&mut app, id, 384, 10);
+        assert_eq!(app.renderer.pool.run_inline(1), 1);
+        app.renderer.poll(&ctx, &mut app.session);
+        let (key_a, pixels_a) = {
+            let shown = app.renderer.thumb(id).unwrap();
+            assert_eq!(shown.quick, Some(QuickSource::Embedded));
+            (shown.key, shown.pixels.as_ref().unwrap().pixels.clone())
+        };
+        assert!(app.renderer.textures.contains_key(&quick_slot));
+        assert!(!app.renderer.textures.contains_key(&full_slot));
+        assert!(work.borrow().jobs.is_empty());
+
+        let mut settings_b = (*settings_a).clone();
+        settings_b.light.exposure += 0.5;
+        app.session.commit("Exposure", Op::SetDevelop { id, settings: Arc::new(settings_b), label: "Exposure".into(), edited: None }).unwrap();
+        assert!(!app.session.embedded_thumb_is_final(app.session.catalog.photo(id).unwrap()));
+        crate::panels::grid::request_thumb(&mut app, id, 384, 10);
+        // Manual owns dispatched jobs: hold B until the real Undo command restores A.
+        let (slot, held_b) = take_job(&work);
+        assert_eq!(slot, full_slot);
+        let key_b = held_b.key;
+        assert_ne!(key_b, key_a);
+        assert!(app.renderer.is_pending(full_slot));
+
+        app.run("edit.undo", serde_json::json!({})).unwrap();
+        assert_eq!(app.session.catalog.photo(id).unwrap().develop.as_ref(), settings_a.as_ref());
+        assert!(app.session.embedded_thumb_is_final(app.session.catalog.photo(id).unwrap()));
+        crate::panels::grid::request_thumb(&mut app, id, 384, 10);
+        {
+            let restored = app.renderer.thumb(id).unwrap();
+            assert_eq!(restored.key, key_a);
+            assert_eq!(restored.pixels.as_ref().unwrap().pixels, pixels_a);
+            assert_eq!(restored.quick, Some(QuickSource::Embedded));
+        }
+        assert!(work.borrow().jobs.is_empty(), "restoring embedded-final A needs no full render");
+        assert_eq!(app.renderer.pool.queued(), 0);
+
+        let result_b = held_b.run();
+        assert_eq!(result_b.key, key_b);
+        let rendered_b = result_b.rendered.as_ref().expect("held edited thumbnail must render before the stale-result oracle");
+        assert_ne!(color_image(&rendered_b.image).pixels, pixels_a, "the held result must be distinguishable from A");
+        finish(&mut app, &work, &ctx, slot, result_b);
+
+        let shown = app.renderer.thumb(id).unwrap();
+        assert_eq!(shown.key, key_a, "late edited Thumb(B) must not replace restored embedded ThumbQuick(A)");
+        assert_eq!(shown.pixels.as_ref().unwrap().pixels, pixels_a);
+        assert_eq!(shown.quick, Some(QuickSource::Embedded));
+        let quick = app.renderer.textures.get(&quick_slot).expect("the correct embedded thumbnail must remain installed");
+        assert_eq!(quick.key, key_a);
+        assert_eq!(quick.quick, Some(QuickSource::Embedded));
+        assert_eq!(quick.pixels.as_ref().unwrap().pixels, pixels_a);
+        assert!(!app.renderer.is_pending(full_slot));
+    }
 }
 
 #[cfg(test)]
@@ -1170,6 +1838,25 @@ mod stage_budget_tests {
     use super::*;
 
     const MB: usize = 1 << 20;
+
+    // Given a zoomed view showing a window, the app idling does not free the GPU copy of the
+    // original the next window is cut from; once the windows are gone the idle trim runs again
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_zoomed_view_is_not_trimmed_while_idle() {
+        let ctx = egui::Context::default();
+        let mut r = Renderer::default();
+        let tex = ctx.load_texture("window", egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]), Default::default());
+        r.textures.insert(Slot::Region, Tex { key: 1, photo: PhotoId(1), tex, size: [1, 1], histogram: None, ms: 0.0, quick: None, pixels: None });
+        let long_ago = std::time::Instant::now().checked_sub(IDLE_TRIM * 2).unwrap();
+        r.idle = Some((long_ago, false));
+        r.trim_when_idle(&ctx);
+        assert_eq!(r.idle, None, "a zoomed view is not idle");
+        r.release(Slot::Region);
+        r.idle = Some((long_ago, false));
+        r.trim_when_idle(&ctx);
+        assert_eq!(r.idle, Some((long_ago, true)), "trimmed once the window is gone");
+    }
 
     // Given stage caches within the budget, nothing is cleared
     #[test]
@@ -1273,6 +1960,30 @@ mod color_image_tests {
         let got = color_image(&img);
         assert_eq!(got.size, want.size);
         assert_eq!(got.pixels, want.pixels);
+    }
+
+    // Given a finished render, the worker hands back its texture pixels with it (the UI thread no
+    // longer converts a 10 MP window on every slider step); a failed render has none
+    #[test]
+    fn the_worker_converts_the_texture_pixels() {
+        let image = lightcraft_raster::Rgba8::from_fn(5, 3, |x, y| [(x * 40) as u8, (y * 80) as u8, 7, 255]);
+        let result = |rendered| RenderResult {
+            request_id: 1,
+            source_key: None,
+            photo: PhotoId(1),
+            level: lightcraft_engine::SourceLevel::Preview,
+            key: 1,
+            rendered,
+            gpu_fallback: None,
+            loaded: None,
+            quick: None,
+            display: None,
+        };
+        let histogram = Histogram::of_srgb8(&image);
+        let ok = Renderer::run_for(|| result(Ok(lightcraft_pipeline::Rendered { image: image.clone(), histogram, deep: None })), &None);
+        assert_eq!(ok.color.map(|c| c.pixels.clone()), Some(color_image(&image).pixels));
+        let failed = Renderer::run_for(|| result(Err("unreadable".into())), &None);
+        assert!(failed.color.is_none());
     }
 
     #[test]

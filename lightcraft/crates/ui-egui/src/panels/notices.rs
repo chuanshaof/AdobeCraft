@@ -1,23 +1,64 @@
 //! Things the user must not miss (issue #103): settings files that were damaged or unreadable when
 //! the library opened (and host warnings such as a damaged `ui.json`), and quitting while changes
-//! are only in memory.
+//! are only in memory or while tasks that would be cut short are running (issue #345).
 
 use egui::{Align2, RichText, vec2};
 
-use crate::LightcraftApp;
 use crate::theme::Tokens;
 use crate::widgets::register;
+use crate::{LightcraftApp, QuitPrompt};
 
-/// Collect the library's settings-file warnings (each is shown once).
+/// Collect the library's settings-file warnings (each is shown once), and the no-GPU notice once the GPU device has
+/// been tried.
 pub fn logic(app: &mut LightcraftApp) {
     let new = app.session.take_library_warnings();
     app.notices.extend(new);
+    use lightcraft_engine::gpu;
+    if app.gpu_notice && app.gpu_applied == Some(true) && gpu::ready() {
+        app.gpu_notice = false;
+        if !gpu::available() {
+            app.notices.extend(gpu_notice(gpu::unavailable_reason().as_deref(), app.ui.settings.gpu));
+        }
+    }
 }
 
-/// The window may close now (`true`), or the quit prompt is shown (`false`): changes that
-/// couldn't be written are retried first — the log, then a snapshot of everything in memory.
+/// What to tell the user when GPU rendering is on (`enabled`) but the GPU could not be used for `reason`: only when no
+/// graphics adapter was found at all ("no GPU adapter among …", e.g. no Vulkan loader on Linux), which makes every
+/// render much slower without saying so. Nothing when it was turned off (preference, `LIGHTCRAFT_GPU`), a software
+/// adapter was skipped, or it failed later; Settings ▸ Performance and Help ▸ System Info show those.
+pub fn gpu_notice(reason: Option<&str>, enabled: bool) -> Option<String> {
+    if !enabled || !reason?.starts_with("no GPU adapter") {
+        return None;
+    }
+    let mut text =
+        crate::i18n::tr("No graphics processor found: LightCraft renders on the CPU, which is much slower. Details in Help → System Info.")
+            .to_string();
+    if cfg!(target_os = "linux") {
+        text.push(' ');
+        text.push_str(crate::i18n::tr("On NixOS, start it from `nix develop`."));
+    }
+    Some(text)
+}
+
+/// The window may close now (`true`), or the quit prompt is shown (`false`). Running tasks that
+/// can be cancelled (an import, an export…) are asked about first; then changes that couldn't be
+/// written are retried — the log, then a snapshot of everything in memory.
 pub fn may_close(app: &mut LightcraftApp) -> bool {
-    if app.quit_confirmed || app.session.unsaved().is_none() {
+    if app.quit_confirmed {
+        return true;
+    }
+    // before the library is touched: a Cancel here keeps working with it
+    let running = app.session.activity.running_cancellable();
+    if !running.is_empty() {
+        let names = running.iter().map(|t| crate::i18n::tr(&t.label)).collect::<Vec<_>>().join(", ");
+        app.quit_prompt = Some(QuitPrompt::Tasks(if running.len() == 1 {
+            crate::i18n::tr_format!("1 task is still running: {names}. Quitting stops it.", names = names)
+        } else {
+            crate::i18n::tr_format!("{n} tasks are still running: {names}. Quitting stops them.", n = running.len(), names = names)
+        }));
+        return false;
+    }
+    if app.session.unsaved().is_none() {
         return true;
     }
     let _ = app.session.persist();
@@ -29,13 +70,13 @@ pub fn may_close(app: &mut LightcraftApp) -> bool {
     match app.session.unsaved() {
         None => true,
         Some((n, e)) => {
-            app.quit_prompt = Some(crate::i18n::tr_format!(
+            app.quit_prompt = Some(QuitPrompt::Unsaved(crate::i18n::tr_format!(
                 "{n} change{} couldn't be written to disk: {e}\nIf you quit now, {} lost.",
                 if n == 1 { "" } else { "s" },
                 if n == 1 { "it is" } else { "they are" },
                 n = n,
                 e = e
-            ));
+            )));
             false
         }
     }
@@ -85,7 +126,20 @@ fn window(ctx: &egui::Context, id: &str, title: &str, text: &str, buttons: &[(&s
 }
 
 pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
-    if let Some(text) = app.quit_prompt.clone() {
+    if let Some(QuitPrompt::Tasks(text)) = app.quit_prompt.clone() {
+        let buttons = [("quitAnyway", "Quit Anyway", Choice::QuitAnyway), ("quitCancel", "Cancel", Choice::Cancel)];
+        let Some(i) = window(ctx, "quit-tasks", "Quit while tasks are running?", &text, &buttons) else { return };
+        app.quit_prompt = None;
+        if matches!(buttons[i].2, Choice::QuitAnyway) {
+            app.session.activity.cancel_all();
+            // unsaved changes still get their own question
+            if may_close(app) {
+                app.ui.quit = true;
+            }
+        }
+        return;
+    }
+    if let Some(QuitPrompt::Unsaved(text)) = app.quit_prompt.clone() {
         let buttons = [
             ("quitRetry", "Try Saving Again", Choice::Retry),
             ("quitAnyway", "Quit Anyway", Choice::QuitAnyway),
@@ -113,5 +167,29 @@ pub fn show(app: &mut LightcraftApp, ctx: &egui::Context) {
         if window(ctx, "settings-notice", "Settings file problem", &text, &buttons).is_some() {
             app.notices.remove(0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gpu_notice;
+
+    #[test]
+    fn the_gpu_notice_is_only_for_a_missing_adapter() {
+        let none = "no GPU adapter among Backends(VULKAN | GL) (No suitable graphics adapter found)";
+        let text = gpu_notice(Some(none), true).expect("no adapter: say so");
+        assert!(text.starts_with("No graphics processor found") && text.contains("System Info"), "{text}");
+        assert_eq!(text.contains("nix develop"), cfg!(target_os = "linux"), "{text}");
+        assert_eq!(gpu_notice(Some(none), false), None, "the preference is off");
+        for reason in [
+            "disabled by LIGHTCRAFT_GPU=0",
+            "disabled by LIGHTCRAFT_GPU_BACKEND=off",
+            "disabled by the GPU rendering preference (app.gpu)",
+            "software adapter (llvmpipe (LLVM 19.1.7, 256 bits)) skipped: the CPU pipeline is faster",
+            "stopped after a GPU failure: device lost",
+        ] {
+            assert_eq!(gpu_notice(Some(reason), true), None, "{reason}");
+        }
+        assert_eq!(gpu_notice(None, true), None, "the GPU is in use");
     }
 }

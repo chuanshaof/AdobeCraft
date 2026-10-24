@@ -6,7 +6,7 @@
 //! it: wheel, dragging, and ▲ / ▼ strips that scroll while the pointer rests on them, like
 //! native menus on a small display. The same approach as PhotoCraft's menu bar (its #319).
 
-use egui::{Id, Rect, Sense, Ui, pos2, vec2};
+use egui::{Id, Rect, Sense, Ui, vec2};
 
 /// Height of a scroll-arrow strip.
 pub const ARROW: f32 = 16.0;
@@ -86,10 +86,14 @@ pub fn level(ui: &mut Ui, depth: usize, bar_bottom: Option<f32>, rows: impl FnOn
     // The popup's `Ui` is only as tall as the popup was last frame (egui's default area size on
     // the first), and a scroll area never grows past that. Ask for the room the window has;
     // auto-shrink then fits the area to its rows, so a menu scrolls only when they don't fit.
+    // No scrollbar: the ▲ / ▼ strips, the wheel and dragging scroll a menu, like native menus.
+    // egui's floating bar is drawn over the rows' right edge, where the shortcut text ends, and in
+    // its wide (hovered) state its background hides the last character (issue #691).
     let out = egui::ScrollArea::vertical()
         .id_salt(("menu-level", depth))
         .max_height(height)
         .min_scrolled_height(height)
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
         .scroll_source(egui::containers::scroll_area::ScrollSource::ALL)
         .show(ui, rows);
     let down = over.then(|| ui.allocate_exact_size(vec2(0.0, ARROW), Sense::hover()).0);
@@ -105,13 +109,12 @@ pub fn level(ui: &mut Ui, depth: usize, bar_bottom: Option<f32>, rows: impl FnOn
     for (strip, dir, live) in [(up, -1.0, offset > 0.5), (down, 1.0, offset < max - 0.5)] {
         let strip = Rect::from_x_y_ranges(x, strip.y_range());
         let c = strip.center();
-        let (h, w) = (4.5, 6.0);
-        let tri = if dir < 0.0 {
-            vec![pos2(c.x - w, c.y + h * 0.5), pos2(c.x + w, c.y + h * 0.5), pos2(c.x, c.y - h * 0.5)]
-        } else {
-            vec![pos2(c.x - w, c.y - h * 0.5), pos2(c.x + w, c.y - h * 0.5), pos2(c.x, c.y + h * 0.5)]
-        };
-        ui.painter().add(egui::Shape::convex_polygon(tri, if live { t.text } else { t.text_disabled }, egui::Stroke::NONE));
+        crate::icons::paint(
+            ui.painter(),
+            Rect::from_center_size(c, vec2(16.0, 16.0)),
+            if dir < 0.0 { crate::icons::Icon::ChevronUp } else { crate::icons::Icon::ChevronDown },
+            if live { t.text } else { t.text_disabled },
+        );
         let id = key.with(dir < 0.0);
         let r = ui.interact(strip, id, Sense::hover());
         r.widget_info(|| {
@@ -139,6 +142,7 @@ pub fn level(ui: &mut Ui, depth: usize, bar_bottom: Option<f32>, rows: impl FnOn
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui::pos2;
 
     #[test]
     fn level_room_keeps_every_level_below_the_bar() {

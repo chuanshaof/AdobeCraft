@@ -32,6 +32,7 @@ fn caption(ui: &mut egui::Ui, text: &str) {
 fn toggle(ui: &mut egui::Ui, id: &str, on: bool, tip: &str, draw: impl FnOnce(&egui::Painter, Rect, Color32)) -> egui::Response {
     let t = Tokens::get(ui.ctx());
     let (r, resp) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
+    crate::widgets::announce_selected(&resp, crate::i18n::tr(tip), on);
     register(ui.ctx(), format!("filter:{id}"), r);
     let p = ui.painter();
     if on {
@@ -131,6 +132,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     );
     for i in 1..=5u8 {
         let (r, resp) = ui.allocate_exact_size(vec2(17.0, 26.0), Sense::click());
+        crate::widgets::announce(&resp, format!("{i} ★"));
         register(ui.ctx(), format!("filter:star{i}"), r);
         let filled = i <= f.rating;
         let c = if filled {
@@ -160,6 +162,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
             Flag::Reject if on => t.reject,
             _ => Color32::TRANSPARENT,
         };
+        let icon = if on && flag == Flag::Pick { Icon::FlagPickFilled } else { icon };
         let resp = toggle(ui, id, on, tip, |p, r, c| paint(p, r, icon, if color == Color32::TRANSPARENT { c } else { color }));
         if resp.clicked() {
             filter(app, json!({"flag": if on { Value::Null } else { json!(id) }}));
@@ -280,7 +283,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         let _ = app.run("library.clearFilter", json!({}));
     }
     // filter presets: apply one, save the current filter, delete
-    let presets = ui.button(egui::RichText::new(crate::i18n::tr("Presets ▾")).font(t.font(12.5)));
+    let presets = crate::widgets::dropdown(ui, "filterPresets", crate::i18n::tr("Presets"), t.font(12.5), t.text);
     register(ui.ctx(), "button:filterPresets", presets.rect);
     egui::Popup::menu(&presets).show(|ui| {
         let names: Vec<String> = app.session.filter_presets.iter().map(|f| f.name.clone()).collect();
@@ -289,7 +292,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
             if r.clicked() {
                 let _ = app.run("filter.applyPreset", json!({"name": n}));
             }
-            r.context_menu(|ui| {
+            crate::widgets::context_menu(&r, |ui| {
                 if ui.button(crate::i18n::tr("Delete Preset")).clicked() {
                     let _ = app.run("filter.deletePreset", json!({"name": n}));
                 }

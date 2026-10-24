@@ -16,11 +16,14 @@ const SAME: f32 = 0.93;
 
 fn secs(iso: &str) -> Option<i64> {
     let d = lightcraft_meta::DateTime::parse_iso(iso)?;
-    Some(((d.year as i64 * 372 + d.month as i64 * 31 + d.day as i64) * 24 + d.hour as i64) * 3600 + d.minute as i64 * 60 + d.second as i64)
+    Some(d.unix_seconds())
 }
 
 fn analyze(s: &mut Session, p: &Value) -> Result<Value> {
-    let ids: Vec<PhotoId> = if p.get("ids").is_some() || s.selection.ids.len() > 1 { s.targets(p) } else { s.visible_cloned() };
+    let ids: Vec<PhotoId> = if p.get("ids").is_some() || s.selection.ids.len() > 1 { s.targets(p)? } else { s.visible_cloned() };
+    // a photo listed twice is one photo, not a burst of two look-alikes (first occurrence kept)
+    let mut seen = std::collections::HashSet::new();
+    let ids: Vec<PhotoId> = ids.into_iter().filter(|id| seen.insert(*id)).collect();
     let reject_below = p.get("rejectBelow").and_then(Value::as_f64).map(|v| v as f32);
     let pick_best = p.get("pickBest").and_then(Value::as_bool).unwrap_or(false);
     // measure (thumbnail-level sources: fast, and enough for focus at 512 px)
@@ -87,7 +90,7 @@ fn analyze(s: &mut Session, p: &Value) -> Result<Value> {
 /// content), most similar first; the view is filtered to them.
 fn find_similar(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "library.findSimilar";
-    let id = p.get("id").and_then(Value::as_u64).map(PhotoId).or(s.active()).ok_or_else(|| super::bad(C, "no photo"))?;
+    let id = super::photo_id(p, C)?.or(s.active()).ok_or_else(|| super::bad(C, "no photo"))?;
     let min = p.get("similarity").and_then(Value::as_f64).unwrap_or(0.8) as f32;
     let all: Vec<PhotoId> = s.catalog.photos().filter(|q| q.in_library()).map(|q| q.id).collect();
     let sig = |s: &mut Session, id: PhotoId| -> Option<[f32; 64]> {
@@ -106,13 +109,16 @@ fn find_similar(s: &mut Session, p: &Value) -> Result<Value> {
         if let Some(v) = sig(s, q) {
             let sim = lightcraft_pipeline::cull::similarity(&me, &v);
             if sim >= min {
-                hits.push((q, sim));
+                hits.push((q, sim.clamp(0.0, 1.0)));
             }
         }
     }
     hits.sort_by(|a, b| b.1.total_cmp(&a.1));
     if p.get("filter").and_then(Value::as_bool).unwrap_or(true) {
+        s.shelved_filter = None;
         s.filter.only = hits.iter().map(|h| h.0).collect();
+        // an empty `only` means "no constraint": no hits is its own state that shows no photos
+        s.filter.only_none = s.filter.only.is_empty();
     }
     Ok(json!({"photos": hits.iter().map(|(i, v)| json!({"id": i.0, "similarity": (v * 1000.0).round() / 1000.0})).collect::<Vec<_>>()}))
 }
