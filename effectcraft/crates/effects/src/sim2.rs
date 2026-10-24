@@ -2468,7 +2468,7 @@ mod tests {
             None
         }
         fn comp_scene(&self) -> Option<crate::CompScene> {
-            Some(crate::CompScene { camera: self.camera, light: self.light })
+            Some(crate::CompScene { camera: self.camera, camera_layer: true, light: self.light })
         }
     }
 

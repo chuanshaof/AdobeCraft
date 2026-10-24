@@ -1,5 +1,6 @@
 //! Smaller panels: Preview, Audio, History, Markers and placeholders.
 
+use crate::i18n::{tr, tr_args};
 use egui::{Align2, Color32, Rect, Sense, Stroke, pos2, vec2};
 use serde_json::json;
 
@@ -10,7 +11,7 @@ use crate::{EffectcraftApp, widgets};
 
 pub fn placeholder(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect, p: PanelKind) {
     let t = app.tokens;
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, format!("{} — coming soon", p.title()), Tokens::ui(12.0), t.text_faint);
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, tr_args("{} — coming soon", &[&(p.title())]), Tokens::ui(12.0), t.text_faint);
 }
 
 /// Preview panel: transport controls, the shortcut whose options are shown, and that
@@ -158,7 +159,7 @@ pub fn preview(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         changes.push(json!({"shortcut": current.id(), "frameRate": v}));
     }
     let sx = xv + 106.0;
-    p.text(pos2(sx, yy), Align2::LEFT_CENTER, "Skip", Tokens::ui(12.0), t.text_dim);
+    p.text(pos2(sx, yy), Align2::LEFT_CENTER, tr("Skip"), Tokens::ui(12.0), t.text_dim);
     let (r, nv, _) = widgets::hot_number_at(ui, pos2(sx + 30.0, yy - 9.0), egui::Id::new("pv-skip"), o.skip as f64, 0.1, (0.0, 99.0), 0, "", &t);
     app.auto.add("preview.skip", r, "Skip");
     if let Some(nv) = nv {
@@ -194,7 +195,7 @@ pub fn preview(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     yy += 24.0;
 
     // What stopping does.
-    p.text(pos2(x0, yy), Align2::LEFT_CENTER, format!("On ({}) stop:", current.label()), Tokens::ui(11.5), t.text_dim);
+    p.text(pos2(x0, yy), Align2::LEFT_CENTER, tr_args("On ({}) stop:", &[&(current.label())]), Tokens::ui(11.5), t.text_dim);
     yy += 20.0;
     if check_row(app, ui, &p, pos2(x0 - 2.0, yy), "playCachedFrames", "If caching, play cached frames", o.play_cached_frames) {
         changes.push(json!({"shortcut": current.id(), "playCachedFrames": !o.play_cached_frames}));
@@ -353,7 +354,7 @@ pub fn audio(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             }
         }
         None => {
-            p.text(pos2(lx, top + 12.0), Align2::LEFT_CENTER, "No audio layer selected", Tokens::ui(11.0), t.text_faint);
+            p.text(pos2(lx, top + 12.0), Align2::LEFT_CENTER, tr("No audio layer selected"), Tokens::ui(11.0), t.text_faint);
         }
     }
     if app.meter.active() || app.audio.is_some() {
@@ -425,7 +426,7 @@ pub fn markers(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let scroll = widgets::PanelScroll::begin(ui, egui::Id::new("markers-scroll"), rect);
     let mut y = rect.min.y + 8.0 - scroll.offset;
     if c.markers.is_empty() {
-        p.text(rect.center(), Align2::CENTER_CENTER, "No composition markers", Tokens::ui(12.0), t.text_faint);
+        p.text(rect.center(), Align2::CENTER_CENTER, tr("No composition markers"), Tokens::ui(12.0), t.text_faint);
     }
     for m in &c.markers {
         let r = Rect::from_min_size(pos2(rect.min.x, y), vec2(rect.width(), 22.0));

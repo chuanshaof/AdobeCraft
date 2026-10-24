@@ -6,6 +6,7 @@
 //! Start Capture, pressing in the viewer records the pointer path in real time while the comp
 //! plays; releasing turns it into Position keys.
 
+use crate::i18n::{tr, tr_args};
 use egui::{Align2, Color32, Rect, Sense, Stroke, pos2, vec2};
 use serde_json::json;
 
@@ -170,7 +171,7 @@ pub fn motion_sketch(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     label(&p, x0, y, "Smoothing:", &t);
     st.sketch_smoothing = number(app, ui, pos2(xv, y), "motionSketch.smoothing", st.sketch_smoothing, 0.1, (0.0, 100.0), 1, "");
     y += ROW + 2.0;
-    p.text(pos2(x0, y + 8.0), Align2::LEFT_CENTER, "Show:", Tokens::ui(12.0), t.text_dim);
+    p.text(pos2(x0, y + 8.0), Align2::LEFT_CENTER, tr("Show:"), Tokens::ui(12.0), t.text_dim);
     y += ROW - 6.0;
     st.sketch_wireframe = checkbox(app, ui, pos2(x0 + 8.0, y), "motionSketch.wireframe", "Wireframe", st.sketch_wireframe);
     y += ROW - 4.0;
@@ -183,7 +184,13 @@ pub fn motion_sketch(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let fr = c.frame_rate;
     let (s, e) = (app.session.time(), c.work_area.1);
     let tc = |x| crate::panels::timecode(&app.session, c, x);
-    p.text(pos2(x0, y + 8.0), Align2::LEFT_CENTER, format!("Start: {}   Duration: {}", tc(s), tc(e - s)), Tokens::ui(11.0), t.text_faint);
+    p.text(
+        pos2(x0, y + 8.0),
+        Align2::LEFT_CENTER,
+        tr_args("Start: {}   Duration: {}", &[&(tc(s)), &crate::panels::duration(&app.session, c, e - s)]),
+        Tokens::ui(11.0),
+        t.text_faint,
+    );
     let _ = fr;
     y += ROW;
     let b = Rect::from_min_size(pos2(x0, y), vec2(120.0, 24.0));
@@ -290,7 +297,7 @@ pub fn sketch_overlay(app: &mut EffectcraftApp, ui: &mut egui::Ui) {
             ctx.data_mut(|d| d.insert_temp(capture_id(), c));
         }
         None => {
-            painter.text(area.center_top() + vec2(0.0, 18.0), Align2::CENTER_CENTER, "Motion Sketch: drag to record", Tokens::ui(12.0), Color32::WHITE);
+            painter.text(area.center_top() + vec2(0.0, 18.0), Align2::CENTER_CENTER, tr("Motion Sketch: drag to record"), Tokens::ui(12.0), Color32::WHITE);
         }
     }
 }

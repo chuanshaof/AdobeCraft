@@ -173,7 +173,7 @@ impl VirtualTree {
                 })
             })
             .collect();
-        out.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+        sort_entries(&mut out);
         Ok(out)
     }
 }
@@ -193,11 +193,15 @@ pub struct Entry {
     pub kind: Option<&'static str>,
 }
 
+fn sort_entries(entries: &mut [Entry]) {
+    entries.sort_by_cached_key(|e| (!e.is_dir, e.name.to_lowercase()));
+}
+
 const VIDEO: &[&str] = &["mp4", "m4v", "mov", "webm", "mkv", "avi", "mxf", "gif"];
-const IMAGE: &[&str] = &["png", "jpg", "jpeg", "tif", "tiff", "exr", "bmp", "webp", "psd", "psb", "svg", "tga", "dpx", "hdr"];
+const IMAGE: &[&str] = &["png", "jpg", "jpeg", "tif", "tiff", "exr", "bmp", "webp", "psd", "psb", "svg", "tga", "dpx", "cin", "hdr"];
 const AUDIO: &[&str] = &["wav", "aif", "aiff", "mp3", "m4a", "aac", "flac", "ogg", "opus"];
 const DATA: &[&str] = &["json", "csv", "tsv", "mgjson"];
-const MODEL: &[&str] = &["gltf", "glb", "obj"];
+const MODEL: &[&str] = &["gltf", "glb", "obj", "stl", "fbx"];
 
 /// Kind of file from its extension.
 pub fn kind_of(path: &str) -> Option<&'static str> {
@@ -251,7 +255,7 @@ pub fn list(dir: &str, importable_only: bool) -> Result<Vec<Entry>, String> {
             Some(Entry { name, path, is_dir: md.is_dir(), size: if md.is_dir() { 0 } else { md.len() }, modified: unix(md.modified()), kind })
         })
         .collect();
-    out.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    sort_entries(&mut out);
     Ok(out)
 }
 
@@ -260,22 +264,33 @@ pub fn parent(dir: &str) -> Option<String> {
     std::path::Path::new(dir).parent().map(|p| p.to_string_lossy().to_string()).filter(|p| !p.is_empty())
 }
 
-/// Format seconds since the epoch as an ISO 8601 UTC date-time.
+/// Format seconds since the epoch as an ISO 8601 UTC date-time. Years far outside chrono's own
+/// range are preserved (the old hand-rolled conversion kept them) rather than collapsing to the epoch.
 pub fn iso_date(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    // Civil-from-days (Howard Hinnant's algorithm).
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
+    let (y, t) = utc_parts(secs);
+    // `{:04}` rather than `%Y`, which writes a `+` before years past 9999.
+    format!("{y:04}-{}", t.format("%m-%dT%H:%M:%SZ"))
+}
+
+/// Unix seconds → (proleptic Gregorian year, the same wall-clock instant moved into chrono's range
+/// by whole 400-year cycles). The Gregorian calendar repeats every 400 years (146_097 days), so
+/// month, day and time of day come from chrono and only the year is carried, which keeps every
+/// input exact instead of collapsing out-of-range years to the epoch. `secs` is `u64`, so `days`
+/// always fits an `i64`.
+fn utc_parts(secs: u64) -> (i64, chrono::NaiveDateTime) {
+    use chrono::Datelike;
+    let (days, sod) = ((secs / 86_400) as i64, (secs % 86_400) as i64);
+    let (cycles, rest) = (days.div_euclid(146_097), days.rem_euclid(146_097));
+    // `rest + 719_163` (1970-01-01 is CE day 719_163) is always a valid CE day, and `sod` < 86_400.
+    let date = i32::try_from(rest + 719_163).ok().and_then(chrono::NaiveDate::from_num_days_from_ce_opt);
+    let time = u32::try_from(sod).ok().and_then(|s| chrono::NaiveTime::from_num_seconds_from_midnight_opt(s, 0));
+    match (date, time) {
+        (Some(d), Some(t)) => {
+            let y = i128::from(d.year()) + i128::from(cycles) * 400;
+            (i64::try_from(y).unwrap_or(i64::MAX), d.and_time(t))
+        }
+        _ => (1970, chrono::NaiveDateTime::default()), // unreachable
+    }
 }
 
 /// File dates and size: (created, modified, size).
@@ -302,7 +317,7 @@ fn kind_name(k: FootageKind) -> &'static str {
 
 /// Metadata of footage (the fields the Metadata panel lists).
 pub fn footage_metadata(f: &Footage) -> Value {
-    let (created, modified, size) = file_dates(f.sequence.first().map(String::as_str).unwrap_or(&f.path));
+    let (created, modified, size) = if f.missing { (None, None, None) } else { file_dates(f.sequence.first().map(String::as_str).unwrap_or(&f.path)) };
     json!({
         "path": f.path,
         "kind": kind_name(f.kind),
@@ -312,12 +327,15 @@ pub fn footage_metadata(f: &Footage) -> Value {
         "pixelAspect": f.pixel_aspect,
         "frameRate": f.frame_rate.as_f64(),
         "duration": f.duration.seconds(),
-        "frames": if f.has_video && f.kind != FootageKind::Still { Some(f.frame_rate.frame_at(f.duration)) } else { None },
+        // Rounded like the media pool's frame count: Matroska stores the duration in whole
+        // milliseconds, a hair short of the last frame at 30 fps (#1429).
+        "frames": if f.has_video && f.kind != FootageKind::Still { Some(f.frame_rate.frame_at(f.frame_rate.snap_nearest(f.duration))) } else { None },
         "hasVideo": f.has_video,
         "hasAudio": f.has_audio,
         "alpha": format!("{:?}", f.alpha),
         "colorProfile": f.color_profile.map(|c| format!("{c:?}")).unwrap_or_else(|| "sRGB (default)".into()),
         "linearLight": f.linear_light,
+        "preserveRgb": f.preserve_rgb,
         "fields": format!("{:?}", f.fields),
         "sequenceFiles": f.sequence.len(),
         "dataRows": f.data.as_ref().map(|d| d.lines().count().saturating_sub(1)),
@@ -406,6 +424,10 @@ mod tests {
         assert_eq!(media.len(), 3);
         assert_eq!(parent(&dir.join("Shots").to_string_lossy()).as_deref(), Some(d.as_str()));
         assert!(list(&dir.join("nope").to_string_lossy(), false).is_err());
+        std::fs::write(dir.join("Ω.csv"), b"x").unwrap();
+        std::fs::write(dir.join("作品.csv"), b"x").unwrap();
+        let all = list(&d, false).unwrap();
+        assert_eq!(all.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["Shots", "A.mov", "b.png", "notes.txt", "Ω.csv", "作品.csv"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -436,9 +458,69 @@ mod tests {
     }
 
     #[test]
+    fn listings_keep_folders_first_and_stable_unicode_order() {
+        let mut tree = VirtualTree::default();
+        for name in ["作品.csv", "ä.csv", "Ä.csv", "İ.csv", "B.csv", "a.csv", "A.csv"] {
+            tree.add_file(&format!("/Shoot/{name}"), &format!("/files/{name}"), 1, None);
+        }
+        for name in ["zFolder", "Alpha"] {
+            tree.add_dir(&format!("/Shoot/{name}"));
+        }
+        let entries = tree.list("/Shoot", true).unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            ["Alpha", "zFolder", "A.csv", "a.csv", "B.csv", "İ.csv", "Ä.csv", "ä.csv", "作品.csv"]
+        );
+        assert_eq!(entries[2].path, "/files/A.csv");
+        let mut reversed = entries.iter().rev().cloned().collect::<Vec<_>>();
+        sort_entries(&mut reversed);
+        assert_eq!(
+            reversed.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            ["Alpha", "zFolder", "a.csv", "A.csv", "B.csv", "İ.csv", "ä.csv", "Ä.csv", "作品.csv"]
+        );
+    }
+
+    #[test]
+    #[ignore = "Media Browser filename sorting benchmark"]
+    fn directory_sort_benchmark() {
+        let entries: Vec<_> = (0..1000)
+            .map(|i| Entry {
+                name: format!("作品 {} {:04}.mov", if i % 2 == 0 { "Clip" } else { "clip" }, i * 7919 % 1000),
+                path: format!("/Shoot/{i}.mov"),
+                is_dir: i % 7 == 0,
+                size: 1,
+                modified: None,
+                kind: Some("video"),
+            })
+            .collect();
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        for _ in 0..5 {
+            let mut old = entries.clone();
+            let start = std::time::Instant::now();
+            old.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+            before.push(start.elapsed());
+            let mut new = entries.clone();
+            let start = std::time::Instant::now();
+            sort_entries(&mut new);
+            after.push(start.elapsed());
+            assert_eq!(old, new);
+            std::hint::black_box(new);
+        }
+        before.sort();
+        after.sort();
+        println!("1,000 filename sort, median: {:?} -> {:?}", before[2], after[2]);
+    }
+
+    #[test]
     fn iso_dates() {
         assert_eq!(iso_date(0), "1970-01-01T00:00:00Z");
         assert_eq!(iso_date(1_700_000_000), "2023-11-14T22:13:20Z");
         assert_eq!(iso_date(951_782_400), "2000-02-29T00:00:00Z");
+        // Years far outside chrono's own range are preserved (the old hand-rolled conversion kept
+        // them) rather than collapsing to the epoch.
+        assert_eq!(iso_date(253_402_300_800), "10000-01-01T00:00:00Z");
+        assert_eq!(iso_date(10_000_000_000_000), "318857-05-20T17:46:40Z");
+        assert_eq!(iso_date(u64::MAX), "584554051223-11-09T07:00:15Z");
     }
 }

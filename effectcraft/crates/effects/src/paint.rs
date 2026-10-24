@@ -6,7 +6,7 @@
 //! ```text
 //! Paint                      (effect `ec.paint.paint`; Paint on Transparent)
 //!   Brush 1                  (match `brush` | `clone` | `eraser`)
-//!     Path                   (the recorded stroke, layer space, animatable)
+//!     Path                   (the recorded stroke, effect space, animatable)
 //!     Stroke Options         (Start, End, Color, Diameter, Angle, Hardness, Roundness, Spacing,
 //!                             Channels, Opacity, Flow; clone: Clone Source, Clone Position,
 //!                             Clone Time / Clone Time Shift)
@@ -162,7 +162,7 @@ pub fn specs() -> Vec<EffectSpec> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct StrokeSpec {
     pub kind: StrokeKind,
-    /// Layer-space points.
+    /// Effect-space points.
     pub points: Vec<[f64; 2]>,
     /// Pen pressure per point (0–1); empty = full pressure.
     pub pressure: Vec<f64>,

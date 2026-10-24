@@ -6,7 +6,7 @@ use effectcraft_project::build::{self, Ids};
 use effectcraft_project::{BitDepth, Comp, ItemId, ItemKind, Layer, LayerSource, Project, Quality, Solid};
 use effectcraft_time::{FrameRate, Tick};
 
-use crate::{Image, render_frame};
+use crate::{EvalCtx, Image, NoFootage, RenderOpts, Renderer, render_frame};
 
 fn project() -> Project {
     let mut p = Project::default();
@@ -145,36 +145,53 @@ fn edge_width(img: &Image, y: i64, x0: i64, x1: i64) -> usize {
     (x0..x1).filter(|&x| (0.02..0.98).contains(&img.get(x, y)[3])).count()
 }
 
-#[test]
-fn continuously_rasterized_shape_stays_sharp_when_scaled_up() {
-    let run = |cr: bool| {
-        let mut p = project();
-        let comp = Comp::new(200, 200, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
-        let mut l = build::layer(&mut p, &comp, "Shape", LayerSource::Shape, (200, 200), None);
-        let mut next = p.next_id;
-        let mut ids = Ids(&mut next);
-        let rect = build::shape_rect(&mut ids, [10.0, 10.0], [0.0, 0.0], 0.0);
-        let fill = build::shape_fill(&mut ids, [1.0, 1.0, 1.0, 1.0]);
-        let g = build::shape_group(&mut ids, "Rectangle 1", vec![rect, fill]);
-        p.next_id = next;
-        l.props.sub_mut("contents").unwrap().children.push(g.into());
-        set(&mut l, "transform/anchor", Value::Vec3([0.0, 0.0, 0.0]));
+/// A 10 px white square in a 200×200 comp, scaled 800% either by its own Scale or by a parent
+/// null's, with the Continuously Rasterize switch `cr`.
+fn scaled_square(cr: bool, via_parent: bool) -> Image {
+    let mut p = project();
+    let comp = Comp::new(200, 200, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+    let mut l = build::layer(&mut p, &comp, "Shape", LayerSource::Shape, (200, 200), None);
+    let mut next = p.next_id;
+    let mut ids = Ids(&mut next);
+    let rect = build::shape_rect(&mut ids, [10.0, 10.0], [0.0, 0.0], 0.0);
+    let fill = build::shape_fill(&mut ids, [1.0, 1.0, 1.0, 1.0]);
+    let g = build::shape_group(&mut ids, "Rectangle 1", vec![rect, fill]);
+    p.next_id = next;
+    l.props.sub_mut("contents").unwrap().children.push(g.into());
+    set(&mut l, "transform/anchor", Value::Vec3([0.0, 0.0, 0.0]));
+    l.switches.collapse = cr;
+    let mut c = comp.clone();
+    if via_parent {
+        let mut null = build::layer(&mut p, &comp, "Null", LayerSource::Null, (100, 100), None);
+        set(&mut null, "transform/anchor", Value::Vec3([0.0, 0.0, 0.0]));
+        set(&mut null, "transform/position", Value::Vec3([100.3, 100.3, 0.0]));
+        set(&mut null, "transform/scale", Value::Vec3([800.0, 800.0, 100.0]));
+        set(&mut l, "transform/position", Value::Vec3([0.0, 0.0, 0.0]));
+        l.parent = Some(null.id);
+        c.layers = vec![l, null];
+    } else {
         set(&mut l, "transform/position", Value::Vec3([100.3, 100.3, 0.0]));
         set(&mut l, "transform/scale", Value::Vec3([800.0, 800.0, 100.0]));
-        l.switches.collapse = cr;
-        let mut c = comp;
         c.layers = vec![l];
-        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(c.into()));
-        render_frame(&p, cid, Tick::ZERO, 1.0)
-    };
+    }
+    let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(c.into()));
+    render_frame(&p, cid, Tick::ZERO, 1.0)
+}
+
+/// Shape layers are always continuously rasterised, as in After Effects (#751): a shape scaled up
+/// by its own transform or a parent's is drawn at its on-screen size, with a 1 px anti-aliased
+/// edge, whether or not the Continuously Rasterize switch is on.
+#[test]
+fn shape_scaled_up_stays_sharp_without_the_switch() {
     // The 10 px square scaled 800% spans 60.3..140.3.
-    let soft = run(false);
-    let sharp = run(true);
-    let ws = edge_width(&soft, 100, 50, 75);
-    let wc = edge_width(&sharp, 100, 50, 75);
-    assert!(ws >= 4, "bitmap scaling blurs the edge: {ws}");
-    assert!(wc <= 1, "continuously rasterized edge: {wc}");
-    assert!(sharp.get(100, 100)[3] > 0.99 && sharp.get(55, 100)[3] < 0.01);
+    for cr in [false, true] {
+        for via_parent in [false, true] {
+            let img = scaled_square(cr, via_parent);
+            let w = edge_width(&img, 100, 50, 75);
+            assert!(w <= 1, "switch {cr}, scaled by parent {via_parent}: edge {w} px wide");
+            assert!(img.get(100, 100)[3] > 0.99 && img.get(55, 100)[3] < 0.01);
+        }
+    }
 }
 
 #[test]
@@ -235,8 +252,9 @@ fn collapsed_precomp_of_another_size_renders_through_the_parent_camera() {
     }
 }
 
-/// Text layers are always continuously rasterised (#194): text scaled up with the layer's Scale is drawn
-/// at its on-screen size, as sharp as text set at that font size, without the switch.
+/// Text layers are always continuously rasterised, as text is vector in After Effects (#390, #194):
+/// text scaled up with the layer's Scale is drawn at its on-screen size, as sharp as text set at
+/// that font size, without the switch.
 #[test]
 fn text_scaled_up_stays_sharp_without_the_switch() {
     let run = |size: f64, scale: f64| {
@@ -262,4 +280,60 @@ fn text_scaled_up_stays_sharp_without_the_switch() {
     assert!(native.data.iter().filter(|px| px[3] > 0.98).count() > 1000, "the text renders");
     assert!(ps <= pn + pn / 2, "scaled text is blurred: {ps} soft pixels against {pn}");
     assert!(d < 0.05, "scaled text differs from text set at that size by {d}");
+}
+
+/// Unscaled text is drawn at the output scale wherever it sits: the lengths a position that isn't a
+/// whole number maps the unit vectors to, a rounding error over 1, don't raise its raster scale a
+/// quarter octave (#390: that softened it, and drew it differently at nearby times).
+#[test]
+fn unscaled_text_rasterises_at_the_output_scale() {
+    let mut p = project();
+    let mut comp = Comp::new(240, 160, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+    let mut l = build::layer(&mut p, &comp, "Text", LayerSource::Text, (240, 160), None);
+    l.props.prop_mut("text/sourceText").unwrap().value = Value::Text(Box::new(TextDoc { text: "HE".into(), size: 30.0, ..Default::default() }));
+    comp.layers = vec![l];
+    let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.into()));
+    for i in 0..500 {
+        let pos = [3.1 + i as f64 * 0.37, 7.3 + i as f64 * 0.29, 0.0];
+        set(&mut p.comp_mut(cid).unwrap().layers[0], "transform/position", Value::Vec3(pos));
+        let r = Renderer::new(&p, &NoFootage, RenderOpts::default());
+        let c = p.comp(cid).unwrap();
+        let k = r.raster_scale(&EvalCtx::new(&p, cid, c, Tick::ZERO), &c.layers[0]);
+        assert_eq!(k, 1.0, "text at {pos:?}");
+    }
+}
+
+/// Effects on a shape layer run on its continuously rasterised pixels, still in layer space as
+/// with the switch off in After Effects: a 10 px square scaled 800% with a 2 px blur looks like
+/// an 80 px square with a 16 px blur, not a blurred bitmap enlarged afterwards (#751).
+#[test]
+fn effects_on_a_scaled_shape_follow_its_scale() {
+    let run = |size: f64, scale: f64, blur: f64| {
+        let mut p = project();
+        let comp = Comp::new(200, 200, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+        let mut l = build::layer(&mut p, &comp, "Shape", LayerSource::Shape, (200, 200), None);
+        let mut next = p.next_id;
+        let mut ids = Ids(&mut next);
+        let rect = build::shape_rect(&mut ids, [size, size], [0.0, 0.0], 0.0);
+        let fill = build::shape_fill(&mut ids, [1.0, 1.0, 1.0, 1.0]);
+        let g = build::shape_group(&mut ids, "Rectangle 1", vec![rect, fill]);
+        let spec = effectcraft_effects::find("ec.blur.gaussian").unwrap();
+        let mut fx = effectcraft_effects::instantiate(spec, &mut ids, spec.name, [200.0, 200.0]);
+        p.next_id = next;
+        fx.prop_mut("blurriness").unwrap().value = Value::Scalar(blur);
+        l.props.sub_mut("contents").unwrap().children.push(g.into());
+        l.props.sub_mut("effects").unwrap().children.push(fx.into());
+        set(&mut l, "transform/anchor", Value::Vec3([0.0, 0.0, 0.0]));
+        set(&mut l, "transform/position", Value::Vec3([100.0, 100.0, 0.0]));
+        set(&mut l, "transform/scale", Value::Vec3([scale, scale, 100.0]));
+        let mut c = comp;
+        c.layers = vec![l];
+        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(c.into()));
+        render_frame(&p, cid, Tick::ZERO, 1.0)
+    };
+    let scaled = run(10.0, 800.0, 2.0);
+    let native = run(80.0, 100.0, 16.0);
+    let d = max_diff(&scaled, &native);
+    assert!(scaled.get(100, 100)[3] > 0.99 && scaled.get(70, 100)[3] > 0.05, "the blur spreads the edge");
+    assert!(d < 0.05, "scaled blurred shape differs from the native one by {d}");
 }

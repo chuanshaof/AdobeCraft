@@ -272,4 +272,12 @@ fn guess_alpha_invert_and_linear_light() {
     s.execute("file.rememberInterpretation", json!({"item": h.0})).unwrap();
     s.execute("file.applyInterpretation", json!({"items": [w.0]})).unwrap();
     assert!(foot(&s, w).linear_light);
+    // Color ▸ Preserve RGB (#411) is set, rendered and carried by Apply Interpretation.
+    let out = s.execute("file.interpretFootage", json!({"item": h.0, "preserveRgb": true})).unwrap();
+    assert_eq!(out["items"][0]["preserveRgb"], true);
+    let p = px(&s, c, 0.0, RenderOpts::default(), 1, 1);
+    assert!((p[0] - 0.25).abs() < 0.01, "white at 25 %, unconverted: {p:?}");
+    s.execute("file.rememberInterpretation", json!({"item": h.0})).unwrap();
+    s.execute("file.applyInterpretation", json!({"items": [w.0]})).unwrap();
+    assert!(foot(&s, w).preserve_rgb);
 }

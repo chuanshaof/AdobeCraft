@@ -320,8 +320,7 @@ impl Session {
         if times.len() < 2 {
             return Err("the layer must be at least two frames long".into());
         }
-        let (w, h) = effectcraft_render::source_size(&self.project, l);
-        let size = if w == 0 { [c.width as f64, c.height as f64] } else { [w as f64, h as f64] };
+        let size = effectcraft_render::effect_bounds(&self.project, c, l).0;
         let params = static_params(g);
         let key = tracks_key(&self.project, comp, l, g);
         let settings = ct::settings(&params);

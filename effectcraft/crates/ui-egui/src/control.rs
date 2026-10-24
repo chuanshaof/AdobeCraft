@@ -68,8 +68,8 @@ pub struct JobWaiter {
     pub result: Value,
     /// Ids of the jobs it started (`jobs.list` ids: `render`, `track`, `roto`…).
     pub jobs: Vec<String>,
-    /// Length of [`effectcraft_engine::Session::offload_log`] when it started.
-    pub log_len: usize,
+    /// Absolute completion-log position when it started (including evicted entries).
+    pub log_cursor: usize,
 }
 
 /// Commands that block with `wait` (and its default).
@@ -86,7 +86,7 @@ fn execute_engine(app: &mut EffectcraftApp, id: &str, params: Value) -> Result<O
         return app.session.execute_checked(id, params).map(ok).map_err(|e| e.to_string());
     }
     let before: Vec<String> = app.session.jobs().into_iter().map(|j| j.id).collect();
-    let log_len = app.session.offload_log.len();
+    let log_cursor = app.session.offload_log_start.saturating_add(app.session.offload_log.len());
     let mut p = params.clone();
     p["wait"] = json!(false);
     let result = app.session.execute_checked(id, p).map_err(|e| e.to_string())?;
@@ -94,7 +94,7 @@ fn execute_engine(app: &mut EffectcraftApp, id: &str, params: Value) -> Result<O
     if jobs.is_empty() {
         return Ok(ok(result));
     }
-    Ok(Outcome::AwaitJobs(JobWaiter { command: id.to_string(), params, result, jobs, log_len }))
+    Ok(Outcome::AwaitJobs(JobWaiter { command: id.to_string(), params, result, jobs, log_cursor }))
 }
 
 impl JobWaiter {
@@ -108,8 +108,13 @@ impl JobWaiter {
     pub fn finish(self, app: &mut EffectcraftApp) -> Value {
         let s = &mut app.session;
         s.poll_render();
-        let errors: Vec<String> = s.offload_log.iter().skip(self.log_len).filter_map(|(_, e)| e.clone()).collect();
-        if let Some(e) = errors.first() {
+        let error = s
+            .offload_log
+            .iter()
+            .skip(self.log_cursor.saturating_sub(s.offload_log_start))
+            .filter(|(kind, _)| self.jobs.iter().any(|id| id == kind.job_id()))
+            .find_map(|(_, e)| e.as_ref());
+        if let Some(e) = error {
             return json!({"ok": false, "error": e});
         }
         let mut r = self.result;
@@ -223,8 +228,16 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
                 if let Some(z) = v.get("zoom") {
                     app.ui.viewer.zoom = z.as_f64().map(|z| z as f32);
                 }
+                // The active comp's Resolution (`view.res.*`), saved with the project.
                 if let Some(r) = v.get("res").and_then(Value::as_str) {
-                    app.ui.viewer.res = Resolution::ALL.into_iter().find(|x| x.label().eq_ignore_ascii_case(r)).unwrap_or(app.ui.viewer.res);
+                    let Some(res) = Resolution::ALL.into_iter().find(|x| x.label().eq_ignore_ascii_case(r)) else {
+                        return err(format!("unknown resolution `{r}` (auto, full, half, third, quarter)"));
+                    };
+                    if let Some(cid) = app.session.active_comp_id()
+                        && let Err(e) = app.session.set_resolution(cid, res)
+                    {
+                        return err(e);
+                    }
                 }
                 if let Some(Value::Array(a)) = v.get("pan") {
                     app.ui.viewer.pan = [a.first().and_then(Value::as_f64).unwrap_or(0.0) as f32, a.get(1).and_then(Value::as_f64).unwrap_or(0.0) as f32];
@@ -308,6 +321,29 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
                 Err(e) => return err(e),
             };
             let m = modifiers(p);
+            // Validate the complete gesture before mutating the queue; the loopback control
+            // channel is externally reachable and must not amplify tiny requests into huge work.
+            const MAX_PENDING_EVENTS: usize = 4096;
+            const MAX_CLICK_COUNT: u64 = 512;
+            let pending = app.synthetic.len();
+            let gesture_events = if req.method == "ui.click" {
+                let count = p.get("count").and_then(Value::as_u64).unwrap_or(1);
+                if count == 0 || count > MAX_CLICK_COUNT {
+                    return err(format!("`count` must be between 1 and {MAX_CLICK_COUNT}"));
+                }
+                let Some(events) = usize::try_from(count).ok().and_then(|n| n.checked_mul(2)).and_then(|n| n.checked_add(3)) else {
+                    return err("click event count overflow");
+                };
+                events
+            } else {
+                3
+            };
+            if pending.checked_add(gesture_events).is_none_or(|n| n > MAX_PENDING_EVENTS) {
+                return err("synthetic input queue is full");
+            }
+            // egui keeps the modifiers from `ModifiersChanged` (not the ones on a pointer event)
+            // and the synthetic events arrive one per frame: hold them for the whole gesture.
+            app.synthetic.push(egui::Event::ModifiersChanged(m));
             app.synthetic.push(egui::Event::PointerMoved(pos));
             if req.method == "ui.click" {
                 let button = match s("button") {
@@ -321,6 +357,7 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
                     app.synthetic.push(egui::Event::PointerButton { pos, button, pressed: false, modifiers: m });
                 }
             }
+            app.synthetic.push(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
             Outcome::AfterInput
         }
         "ui.drag" => {
@@ -331,7 +368,17 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
                 (Err(e), _) | (_, Err(e)) => return err(e),
             };
             let steps = p.get("steps").and_then(Value::as_u64).unwrap_or(12).max(2);
+            const MAX_PENDING_EVENTS: usize = 4096;
+            const MAX_DRAG_STEPS: u64 = 2048;
+            if steps > MAX_DRAG_STEPS {
+                return err(format!("`steps` must be at most {MAX_DRAG_STEPS}"));
+            }
+            let Some(gesture_events) = usize::try_from(steps).ok().and_then(|n| n.checked_add(5)) else { return err("drag event count overflow") };
+            if app.synthetic.len().checked_add(gesture_events).is_none_or(|n| n > MAX_PENDING_EVENTS) {
+                return err("synthetic input queue is full");
+            }
             let m = modifiers(p);
+            app.synthetic.push(egui::Event::ModifiersChanged(m));
             app.synthetic.push(egui::Event::PointerMoved(a));
             app.synthetic.push(egui::Event::PointerButton { pos: a, button: egui::PointerButton::Primary, pressed: true, modifiers: m });
             for i in 1..=steps {
@@ -339,6 +386,7 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
                 app.synthetic.push(egui::Event::PointerMoved(a + (b - a) * f));
             }
             app.synthetic.push(egui::Event::PointerButton { pos: b, button: egui::PointerButton::Primary, pressed: false, modifiers: m });
+            app.synthetic.push(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
             Outcome::AfterInput
         }
         "ui.scroll" => {
@@ -368,8 +416,9 @@ pub fn handle(app: &mut EffectcraftApp, ctx: &egui::Context, req: &ControlReques
             let Some((mut m, key)) = crate::menus::parse_shortcut(name) else { return err(format!("unknown key `{name}`")) };
             let extra = modifiers(p);
             m |= extra;
-            app.synthetic.push(egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: m });
-            app.synthetic.push(egui::Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers: m });
+            let physical_key = name.starts_with("Physical+").then_some(key);
+            app.synthetic.push(egui::Event::Key { key, physical_key, pressed: true, repeat: false, modifiers: m });
+            app.synthetic.push(egui::Event::Key { key, physical_key, pressed: false, repeat: false, modifiers: m });
             Outcome::AfterInput
         }
         "ui.type" => {
@@ -507,17 +556,40 @@ pub fn base64(data: &[u8]) -> String {
 
 pub fn inspect(app: &EffectcraftApp, ctx: &egui::Context) -> Value {
     let size = ctx.content_rect().size();
+    let keyboard_focus = ctx.memory(|m| m.focused()).map(|id| {
+        let response = ctx.read_response(id);
+        let rect = response.as_ref().map(|r| [r.rect.min.x, r.rect.min.y, r.rect.width(), r.rect.height()]);
+        // The registry names screen elements independently of egui's internal ids. Report
+        // exact rectangle matches rather than guessing which enclosing panel owns focus.
+        let candidates: Vec<&str> = app
+            .auto
+            .previous
+            .iter()
+            .filter(|e| rect.is_some_and(|r| e.rect.iter().zip(r).all(|(a, b)| (*a - b).abs() < 0.01)))
+            .map(|e| e.id.as_str())
+            .collect();
+        let automation_id = app.auto.elements.iter().chain(app.auto.previous.iter()).find(|e| e.response_id == Some(id)).map(|e| e.id.as_str());
+        json!({"id": format!("{:016x}", id.value()), "rect": rect, "automationId": automation_id, "registryCandidates": candidates})
+    });
+    let mut ui = json!(app.ui);
+    // The viewer's Resolution is the active comp's (kept in the project).
+    if let Some(v) = ui.get_mut("viewer").and_then(Value::as_object_mut) {
+        v.insert("res".into(), json!(app.viewer_res()));
+    }
     json!({
         "window": [size.x, size.y],
         "pixelsPerPoint": ctx.pixels_per_point(),
         "fps": app.fps,
-        "ui": app.ui,
+        "ui": ui,
         "playing": app.playback.playing,
         "time": app.session.time().seconds(),
         "activeComp": app.session.state.active_comp.map(|i| i.0),
         "selectedLayers": app.session.state.selected_layers.iter().map(|c| c.0).collect::<Vec<_>>(),
         "selectedKeys": app.session.state.selected_keys.len(),
         "elements": app.auto.previous.len(),
+        "keyboardFocus": keyboard_focus,
+        "windowFocused": ctx.input(|i| i.focused),
+        "workspaceStorageError": app.workspace_store.error,
         "dialog": app.dialog.map(|d| format!("{d:?}")),
         "renderMs": app.frames.last_ms.lock().map(|v| *v).unwrap_or(0.0),
     })

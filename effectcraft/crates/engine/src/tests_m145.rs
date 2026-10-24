@@ -42,14 +42,14 @@ fn split_layers_go_above_or_below_the_original() {
     let mut s = session();
     let a = solid(&mut s, "#ff0000");
     s.execute("time.set", json!({"time": 1.0})).unwrap();
-    let below = s.execute("edit.splitLayer", json!({"layers": [a]})).unwrap()[0].as_u64().unwrap();
-    let order: Vec<u64> = s.active_comp().unwrap().layers.iter().map(|l| l.id.0).collect();
-    assert_eq!(order, vec![a, below], "off (default): the new part goes below");
-    s.execute("edit.undo", json!({})).unwrap();
-    s.execute("prefs.set", json!({"key": "general.createSplitLayersAbove", "value": true})).unwrap();
     let above = s.execute("edit.splitLayer", json!({"layers": [a]})).unwrap()[0].as_u64().unwrap();
     let order: Vec<u64> = s.active_comp().unwrap().layers.iter().map(|l| l.id.0).collect();
-    assert_eq!(order, vec![above, a]);
+    assert_eq!(order, vec![above, a], "on (default): the new part goes above");
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute("prefs.set", json!({"key": "general.createSplitLayersAbove", "value": false})).unwrap();
+    let below = s.execute("edit.splitLayer", json!({"layers": [a]})).unwrap()[0].as_u64().unwrap();
+    let order: Vec<u64> = s.active_comp().unwrap().layers.iter().map(|l| l.id.0).collect();
+    assert_eq!(order, vec![a, below]);
 }
 
 #[test]
@@ -202,6 +202,23 @@ fn cache_budgets_leave_reserved_ram_and_shrink_when_low() {
     assert!(!p.cache_budgets(Some(low)).reduced);
 }
 
+/// Eight stacked 1080p clips ran the browser build out of its 4 GiB of memory: the footage and
+/// layer caches kept their desktop sizes there, beside the decoders' own frames.
+#[test]
+fn web_cache_budgets_leave_room_for_the_decoders() {
+    use crate::prefs::{WEB_LAYER_CACHE, WEB_MEDIA_CACHE};
+    let mut p = crate::prefs::Prefs::default();
+    p.memory.layer_cache_mb = 4096;
+    p.memory.media_cache_mb = 4096;
+    let web = p.cache_budgets_in(None, true);
+    assert_eq!((web.layer as u64, web.media as u64), (WEB_LAYER_CACHE, WEB_MEDIA_CACHE));
+    assert_eq!(web.preview, p.cache_budgets_in(None, false).preview, "the RAM preview keeps its budget");
+    // Smaller settings stay as they are; the desktop is unchanged.
+    p.memory.media_cache_mb = 128;
+    assert_eq!(p.cache_budgets_in(None, true).media, 128 << 20);
+    assert_eq!(p.cache_budgets_in(None, false).layer, 4096 << 20);
+}
+
 #[test]
 fn motion_path_span_follows_the_composition_setting() {
     let mut p = crate::prefs::Prefs::default();
@@ -237,10 +254,10 @@ fn import_export_helpers() {
     p.import.drag_import_as = "compLayerSizes".into();
     assert_eq!(p.drag_import_as(), "compositionLayerSizes");
     assert_eq!(
-        super::commands::missing_frames_for_tests(&["a_001.png".into(), "a_002.png".into(), "a_005.png".into(), "a_007.png".into()]).unwrap(),
+        crate::sequence::missing_report(&["a_001.png".into(), "a_002.png".into(), "a_005.png".into(), "a_007.png".into()]).unwrap(),
         "3 missing frames (3–4, 6)"
     );
-    assert!(super::commands::missing_frames_for_tests(&["a1.png".into(), "a2.png".into()]).is_none());
+    assert!(crate::sequence::missing_report(&["a1.png".into(), "a2.png".into()]).is_none());
     // Append Bit Depth to File Name.
     assert_eq!(p.output_name("/out/Comp 1.png", 16), "/out/Comp 1.png");
     p.export.append_bits_to_name = true;
@@ -261,6 +278,28 @@ fn import_export_helpers() {
     }
     p.type_.recent_fonts = 2;
     assert_eq!(p.recent_fonts_shown(), ["A".to_string(), "C".to_string()]);
+}
+
+#[test]
+fn render_queue_resolves_a_bare_project_filename_against_the_working_directory() {
+    use effectcraft_project::render_queue::{OutputFormat, RenderQueueItem};
+    let mut s = session();
+    let cid = s.active_comp_id().unwrap();
+    let mut item = RenderQueueItem::new(1, cid);
+    item.output.output = "clip.mp4".into();
+    item.output.format = OutputFormat::H264;
+
+    // `--project ./proj.ecproj`: the parent is `.`, so the output goes beside the project.
+    s.path = Some("./proj.ecproj".into());
+    let dotted = s.resolve_output(&item).unwrap();
+
+    // `--project proj.ecproj`: the parent is the empty path, which must mean the same folder
+    // rather than the unsaved-project default (#1427).
+    s.path = Some("proj.ecproj".into());
+    let bare = s.resolve_output(&item).unwrap();
+
+    assert_eq!(PathBuf::from(&bare), PathBuf::from(&dotted), "a bare filename resolved to {bare} instead of {dotted}");
+    assert_eq!(PathBuf::from(&bare), PathBuf::from("./clip.mp4"));
 }
 
 #[test]
@@ -330,6 +369,34 @@ fn execute_file_needs_the_gate_and_asks_first() {
     assert!(s.drain_events().iter().any(|e| matches!(e, crate::Event::OpenUrl(u) if u.starts_with("file://"))));
     s.execute("prefs.set", json!({"key": "scripting.warnExecutingFiles", "value": false})).unwrap();
     assert!(s.execute("file.executeFile", p).unwrap().get("opened").is_some());
+}
+
+#[test]
+fn a_script_cannot_confirm_executing_a_file_for_itself() {
+    // Warn User When Executing Files: only the user answers the question (#1246).
+    let mut s = session();
+    let f = tmp("script-run.txt");
+    std::fs::write(&f, "x").unwrap();
+    let path = f.to_string_lossy().to_string();
+    let opened = |s: &mut Session| s.drain_events().iter().any(|e| matches!(e, crate::Event::OpenUrl(_)));
+    // Without the gate a script can't run files at all, confirmed or not.
+    assert!(s.execute_for_script("file.executeFile", json!({"path": path, "confirmed": true})).is_err());
+    s.execute("prefs.set", json!({"key": "scripting.allowScriptsWriteFiles", "value": true})).unwrap();
+    s.drain_events();
+    // A script asserting `confirmed` still gets the question, directly or in a batch.
+    let r = s.execute_for_script("file.executeFile", json!({"path": path, "confirmed": true})).unwrap();
+    assert!(r.get("needsConfirmation").is_some(), "{r}");
+    assert!(!opened(&mut s));
+    let steps = json!({"steps": [{"command": "file.executeFile", "params": {"path": path, "confirmed": true}}]});
+    let r = s.execute_for_script("engine.batch", steps).unwrap();
+    assert!(r.to_string().contains("needsConfirmation"), "{r}");
+    assert!(!opened(&mut s));
+    // The user's answer from the frontend's question still opens it.
+    assert!(s.execute("file.executeFile", json!({"path": path, "confirmed": true})).unwrap().get("opened").is_some());
+    assert!(opened(&mut s));
+    // With the warning off a script's request opens the file without a question, as before.
+    s.execute("prefs.set", json!({"key": "scripting.warnExecutingFiles", "value": false})).unwrap();
+    assert!(s.execute_for_script("file.executeFile", json!({"path": path})).unwrap().get("opened").is_some());
 }
 
 // ---------------------------------------------------------------- Edit ▸ History, recent lists
@@ -438,6 +505,15 @@ fn compatibility_report_and_logging() {
     }
     let text = crate::commands::report_text_for_tests(&r);
     assert!(text.contains("Operating system") && text.contains("Import:"));
+    // #596: without a GPU compositor the report says why, and names the window's adapter.
+    s.accel_note = Some("GPU compositor unavailable: no storage textures".into());
+    s.window_adapter = Some("NVIDIA GeForce RTX 4070 (Gl, DiscreteGpu)".into());
+    let r = s.execute("help.systemReport", json!({"quiet": true})).unwrap();
+    assert_eq!(r["gpuNote"], "GPU compositor unavailable: no storage textures");
+    let text = crate::commands::report_text_for_tests(&r);
+    assert!(text.contains("GPU: none (CPU compositing): GPU compositor unavailable: no storage textures"), "{text}");
+    assert!(text.contains("Window graphics: NVIDIA GeForce RTX 4070 (Gl, DiscreteGpu)"), "{text}");
+    assert!(r["issues"][0].as_str().is_some_and(|i| i.contains("no storage textures")), "{r}");
     s.drain_events();
     s.execute("help.systemReport", json!({})).unwrap();
     assert!(s.drain_events().iter().any(|e| matches!(e, crate::Event::Frontend { command, .. } if command == "app.showReport")));
@@ -635,7 +711,13 @@ fn dynamic_menus_and_window_viewer_labels() {
     assert_eq!(crate::menus::dynamic(&s, "history", &Default::default()).0.len(), s.history.undo.len());
     let a = solid(&mut s, "#ff0000");
     s.state.selected_layers = vec![LayerId(a)];
-    let entry = |cmd: &str, panel: &str| crate::menus::MenuEntry { label: "x".into(), command: cmd.into(), params: json!({"panel": panel}), shortcut: None };
+    let entry = |cmd: &str, panel: &str| crate::menus::MenuEntry {
+        label: "x".into(),
+        command: cmd.into(),
+        params: json!({"panel": panel}),
+        shortcut: None,
+        alt_shortcuts: vec![],
+    };
     assert_eq!(crate::menus::entry_label(&s, &entry("window.panel", "composition")), "Composition: Main");
     assert_eq!(crate::menus::entry_label(&s, &entry("window.panel", "timeline")), "Timeline: Main");
     assert!(crate::menus::entry_label(&s, &entry("window.panel", "layer")).starts_with("Layer: "));
@@ -664,4 +746,55 @@ fn dynamic_menus_and_window_viewer_labels() {
     ] {
         assert!(labels.iter().any(|x| x == l), "{l}");
     }
+}
+
+#[test]
+fn unsaved_project_renders_to_movies_or_home_not_the_working_directory() {
+    // A Finder-launched app has `/` as its working directory, where renders fail (#446).
+    let home = tmp("home446");
+    assert_eq!(crate::render_queue::default_output_base(Some(home.clone())), Some(home.clone()));
+    std::fs::create_dir_all(home.join("Movies")).unwrap();
+    assert_eq!(crate::render_queue::default_output_base(Some(home.clone())), Some(home.join("Movies")));
+    assert_eq!(crate::render_queue::default_output_base(None), None);
+}
+
+#[test]
+fn replace_with_precomp_swaps_every_use_of_the_item_for_one_new_comp() {
+    let mut s = session();
+    let main = s.active_comp_id().unwrap();
+    let l = solid(&mut s, "#ff0000");
+    s.execute("prop.set", json!({"layer": l, "path": "transform/position", "value": [10.0, 20.0]})).unwrap();
+    let item = layer(&s, l).source.item().unwrap();
+    let in_main = |s: &Session| s.project.comp(main).unwrap().layer(LayerId(l)).unwrap().clone();
+    let props = in_main(&s).props;
+    // A second comp uses the same solid for its whole 4 s (longer than Main).
+    let other =
+        ItemId(s.execute("comp.new", json!({"name": "Other", "width": 64, "height": 48, "duration": 4, "frameRate": 10})).unwrap()["comp"].as_u64().unwrap());
+    s.execute("layer.addItem", json!({"comp": other.0, "item": item.0, "time": 0.0})).unwrap();
+    let undo_before = s.history.undo.len();
+
+    let r = s.execute("file.replaceWithPrecomp", json!({"item": item.0})).unwrap();
+    assert_eq!(r["replaced"], 2);
+    let pre = ItemId(r["comp"].as_u64().unwrap());
+    let pc = s.project.comp(pre).unwrap();
+    assert_eq!((pc.width, pc.height), (32, 24));
+    assert_eq!(pc.duration, Tick::from_seconds_f64(4.0));
+    assert_eq!(pc.layers.len(), 1);
+    assert_eq!(pc.layers[0].source.item(), Some(item));
+    assert_eq!(s.project.item(pre).unwrap().name, format!("{} Comp", s.project.item(item).unwrap().name));
+    for cid in [main, other] {
+        let c = s.project.comp(cid).unwrap();
+        assert!(c.layers.iter().all(|l| matches!(l.source, effectcraft_project::LayerSource::Comp { item } if item == pre)));
+    }
+    // The layer keeps its transform; the item stays in the project; one undo step.
+    assert_eq!(in_main(&s).props, props);
+    assert!(s.project.item(item).is_some());
+    assert_eq!(s.history.undo.len(), undo_before + 1);
+    s.undo();
+    assert!(s.project.item(pre).is_none());
+    assert_eq!(in_main(&s).source.item(), Some(item));
+
+    // Compositions and folders can't be precomposed this way.
+    assert!(s.execute("file.replaceWithPrecomp", json!({"item": other.0})).is_err());
+    assert!(s.execute("file.replaceWithPrecomp", json!({"item": 999_999})).is_err());
 }

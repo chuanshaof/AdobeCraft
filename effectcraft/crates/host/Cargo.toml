@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 effectcraft-engine = { workspace = true }
 effectcraft-project = { workspace = true }
+log = { workspace = true }
 effectcraft-media = { workspace = true }
 effectcraft-expr = { workspace = true }
 effectcraft-script = { workspace = true }
@@ -31,4 +32,6 @@ effectcraft-raster = { workspace = true }
 effectcraft-time = { workspace = true }
 effectcraft-interchange = { workspace = true }
 image = { workspace = true }
+gif = { workspace = true }
+exr = { workspace = true }
 rayon = { workspace = true }

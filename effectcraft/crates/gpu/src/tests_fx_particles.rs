@@ -3,8 +3,11 @@
 //! and composited at 8 and 32 bpc (`tests_fx_sim`'s harness).
 
 use effectcraft_keyframe::Value;
+use effectcraft_project::{BitDepth, LayerSource, build};
+use effectcraft_render::RenderOpts;
+use effectcraft_time::Tick;
 
-use crate::tests::n;
+use crate::tests::{Scene, check, compare_at, n, opts, set};
 use crate::tests_fx_sim::{case, composited, e, off, on};
 
 fn v2(x: f64, y: f64) -> Value {
@@ -26,6 +29,24 @@ fn particle_world_types_and_modes() {
     }
     // Nothing born yet: the layer as is.
     case("ec.sim.ccparticleworld", &[("birthRate", n(0.0))], 0.0, 0.0);
+}
+
+/// #397: CC Particle World seen through a camera layer (the plan is shared, so the GPU follows
+/// the camera with the CPU).
+#[test]
+fn particle_world_through_the_comp_camera() {
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        let mut s = Scene::new(depth);
+        let mut l = s.footage(70, 44);
+        s.effect(&mut l, "ec.sim.ccparticleworld", &[("birthRate", n(1.5)), ("particle/particleType", e(1)), ("particle/birthSize", n(0.3))]);
+        s.push(l);
+        let mut cam = build::layer(&mut s.p, &s.comp, "Camera", LayerSource::Camera, (97, 61), None);
+        set(&mut cam, "transform/position", Value::Vec3([75.0, 15.0, -120.0]));
+        s.push(cam);
+        let at = Tick::from_seconds_f64(1.0);
+        check(&format!("comp camera {depth:?}"), compare_at(&s, opts(), at), 0.0);
+        check(&format!("comp camera {depth:?} half"), compare_at(&s, RenderOpts { scale: 0.5, ..opts() }, at), 0.0);
+    }
 }
 
 #[test]

@@ -164,6 +164,12 @@ pub fn deform(rest: &[[f64; 2]], tris: &[[usize; 3]], weights: &[f64], h: &Handl
         t[1] /= h.fixed.len() as f64;
     }
     let x0: Vec<[f64; 2]> = rest.iter().map(|p| [p[0] + t[0], p[1] + t[1]]).collect();
+    // One pin and no edge targets: every rotation and scale about the pin costs nothing, and
+    // the regulariser that picks the translation is too weak to stop CG turning round-off
+    // into a visible rotation (#313). The translation is the exact solution.
+    if h.fixed.len() == 1 && h.edges.is_empty() {
+        return x0;
+    }
     let mut fixed = vec![false; n];
     for (i, _) in &h.fixed {
         fixed[*i] = true;

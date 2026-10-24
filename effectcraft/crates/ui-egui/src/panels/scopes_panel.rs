@@ -3,6 +3,7 @@
 //! time, with the colour standard (Rec. 601 / 709 / 2020), 8-bit or float scale and clamp. The
 //! maths is `effectcraft_raster::scopes`; agents read the same numbers with `scopes.analyze`.
 
+use crate::i18n::tr;
 use effectcraft_engine::commands::panels_cmds::scope_frame;
 use effectcraft_engine::raster::scopes::{self, ColorStandard, Scope, ScopeKind, ScopeOpts};
 use egui::{Align2, Color32, Rect, Stroke, pos2, vec2};
@@ -75,7 +76,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     p.rect_filled(area, 2.0, Color32::from_rgb(0x10, 0x10, 0x10));
     app.auto.add("scopes.plot", area, kind.label());
     let Some(cid) = app.session.active_comp_id() else {
-        p.text(area.center(), Align2::CENTER_CENTER, "Open a composition to see its scopes", Tokens::ui(12.0), t.text_faint);
+        p.text(area.center(), Align2::CENTER_CENTER, tr("Open a composition to see its scopes"), Tokens::ui(12.0), t.text_faint);
         return;
     };
     // Plot rectangle: square for vectorscopes.

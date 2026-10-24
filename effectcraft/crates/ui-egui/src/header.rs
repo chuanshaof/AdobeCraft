@@ -1,6 +1,7 @@
 //! The Tools bar: home, the tool slots, tool options, snapping, workspaces and the community
 //! buttons (Discord is always one click away).
 
+use crate::i18n::{tr, tr_args};
 use egui::{Align2, Color32, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use serde_json::json;
 
@@ -11,7 +12,7 @@ use crate::widgets;
 use crate::{Dialog, EffectcraftApp};
 use effectcraft_color::BlendMode;
 use effectcraft_engine::commands::shape_tool::{PaintKind, ToolPaint};
-use effectcraft_engine::project::{LayerId, LayerSource};
+use effectcraft_engine::project::{LayerId, LayerSource, PropGroup};
 use effectcraft_engine::viewer as vw;
 
 pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
@@ -26,18 +27,20 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let brand = Rect::from_min_size(pos2(x, cy - 12.0), vec2(24.0, 24.0));
     paint_logo(&p, brand);
     let bresp = ui.interact(brand, egui::Id::new("brand"), Sense::click());
-    app.auto.add("header.about", brand, "About EffectCraft");
-    if bresp.on_hover_text("About EffectCraft").clicked() {
+    app.auto.add_response("header.about", &bresp, "About EffectCraft");
+    widgets::focus_outline(ui, &bresp, &t);
+    if bresp.on_hover_text(tr("About EffectCraft")).clicked() {
         app.dialog = Some(Dialog::About);
     }
     x += 32.0;
 
     // Home.
     let home = Rect::from_min_size(pos2(x, cy - 13.0), vec2(26.0, 26.0));
-    if widgets::icon_button(ui, home, Icon::Home, app.ui.start_screen, &t, egui::Id::new("tool-home")).on_hover_text("Home").clicked() {
+    let home_response = widgets::icon_button(ui, home, Icon::Home, app.ui.start_screen, &t, egui::Id::new("tool-home")).on_hover_text(tr("Home"));
+    app.auto.add_response("header.home", &home_response, "Home");
+    if home_response.clicked() {
         app.ui.start_screen = !app.ui.start_screen;
     }
-    app.auto.add("header.home", home, "Home");
     x += 30.0;
     p.line_segment([pos2(x, cy - 10.0), pos2(x, cy + 10.0)], Stroke::new(1.0, t.separator));
     x += 6.0;
@@ -61,7 +64,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 Stroke::NONE,
             ));
         }
-        app.auto.add(&format!("tools.{cur:?}"), r, cur.label());
+        app.auto.add_response(&format!("tools.{cur:?}"), &resp, cur.label());
         let tip = match cur.shortcut() {
             Some(s) => format!("{} ({})", cur.label(), crate::menus::shortcut_text(s)),
             None => cur.label().to_string(),
@@ -98,7 +101,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 None
             };
             let close_behavior = if held && resp.clicked() { egui::PopupCloseBehavior::IgnoreClicks } else { egui::PopupCloseBehavior::CloseOnClickOutside };
-            egui::Popup::menu(&resp).open_memory(command).close_behavior(close_behavior).show(|ui| {
+            egui::Popup::menu(&resp).style(crate::widgets::menu_style).open_memory(command).close_behavior(close_behavior).show(|ui| {
                 for tool in slot.iter() {
                     let row = ui.selectable_label(app.ui.tool == *tool, tool.label());
                     app.auto.add(&format!("tools.select.{tool:?}"), row.rect, tool.label());
@@ -130,13 +133,15 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             app.session.state.selected_layers.iter().filter(|id| c.layer(**id).is_some_and(|l| matches!(l.source, LayerSource::Shape))).map(|id| id.0).collect()
         })
         .unwrap_or_default();
-    let layer_paint = shape_layers
-        .first()
-        .and_then(|id| app.session.active_comp()?.layer(LayerId(*id)))
-        .map(|l| effectcraft_engine::commands::shape_stroke::first_paint(l, l.layer_time(app.session.time())));
-    if let Some((fill, stroke, width)) = layer_paint {
+    let layer_paint = shape_layers.first().and_then(|id| app.session.active_comp()?.layer(LayerId(*id))).map(|l| {
+        let lt = l.layer_time(app.session.time());
+        (effectcraft_engine::commands::shape_stroke::first_paint(l, lt), effectcraft_engine::commands::shape_stroke::first_paint_kinds(l, lt))
+    });
+    if let Some(((fill, stroke, width), (fill_kind, stroke_kind))) = layer_paint {
         let rgb = |c: [f64; 4]| [c[0] as f32, c[1] as f32, c[2] as f32];
         let tool = &mut app.session.state.shape_tool;
+        tool.fill.kind = fill_kind;
+        tool.stroke.kind = stroke_kind;
         if let Some(c) = fill {
             tool.fill.color = rgb(c);
         }
@@ -163,6 +168,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if app.ui.tool.puppet_kind().is_some() {
         x = puppet_options(app, ui, &p, x, cy);
     }
+    if app.ui.tool.roto_kind(false).is_some() {
+        x = roto_options(app, ui, &p, x, cy);
+    }
     let snap = Rect::from_min_size(pos2(x, cy - 10.0), vec2(20.0, 20.0));
     // The engine owns snapping (View ▸ Snapping); the checkbox mirrors it.
     app.ui.snapping = app.session.state.snapping;
@@ -171,19 +179,22 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         app.ui.snapping = app.session.state.snapping;
     }
     app.auto.add("header.snapping", snap, "Snapping");
-    let label = p.text(pos2(snap.max.x + 4.0, cy), Align2::LEFT_CENTER, "Snapping", Tokens::ui(12.0), t.text_dim);
+    let label = p.text(pos2(snap.max.x + 4.0, cy), Align2::LEFT_CENTER, tr("Snapping"), Tokens::ui(12.0), t.text_dim);
     snapping_options(app, ui, Rect::from_min_size(pos2(label.max.x + 2.0, cy - 9.0), vec2(18.0, 18.0)));
 
     // Right side: community buttons, workspaces.
     let mut rx = rect.max.x - 10.0;
-    let discord = Rect::from_min_max(pos2(rx - 104.0, cy - 13.0), pos2(rx, cy + 13.0));
+    // The pill fits its label (icon, gap, text) with even padding: it was a fixed 104 px with the
+    // text at its left, which left a wide gap on the right (#581).
+    let label = p.layout_no_wrap(tr("Discord").to_string(), Tokens::semibold(12.0), Color32::WHITE);
+    let discord = Rect::from_min_max(pos2(rx - (10.0 + 14.0 + 6.0 + label.size().x + 12.0), cy - 13.0), pos2(rx, cy + 13.0));
     let dresp = ui.interact(discord, egui::Id::new("hdr-discord"), Sense::click());
     let dc = Color32::from_rgb(0x58, 0x65, 0xf2);
     p.rect_filled(discord, 13.0, if dresp.hovered() { dc.gamma_multiply(1.2) } else { dc });
-    icons::paint(&p, Rect::from_center_size(pos2(discord.min.x + 16.0, cy), vec2(14.0, 14.0)), Icon::Chat, Color32::WHITE);
-    p.text(pos2(discord.min.x + 28.0, cy), Align2::LEFT_CENTER, "Discord", Tokens::semibold(12.0), Color32::WHITE);
+    icons::paint(&p, Rect::from_center_size(pos2(discord.min.x + 17.0, cy), vec2(14.0, 14.0)), Icon::Chat, Color32::WHITE);
+    p.galley(pos2(discord.min.x + 30.0, cy - label.size().y / 2.0), label, Color32::WHITE);
     app.auto.add("header.discord", discord, "Join the ArtCraft Discord");
-    if dresp.on_hover_text("Join the ArtCraft community on Discord").clicked() {
+    if dresp.on_hover_text(tr("Join the ArtCraft community on Discord")).clicked() {
         let _ = app.session.execute("help.discord", json!({}));
     }
     rx = discord.min.x - 6.0;
@@ -197,6 +208,45 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         app.auto.add(&format!("header.{}", &id[4..]), r, tip);
         rx = r.min.x - 4.0;
     }
+    // Appearance: Sync with System, Light, Dark (a monitor, sun or moon), one click to the next.
+    let (icon, mode) = match app.session.prefs.appearance.appearance_mode.as_str() {
+        "auto" => (Icon::Monitor, tr("Sync with System")),
+        "light" => (Icon::Sun, tr("Light")),
+        _ => (Icon::Moon, tr("Dark")),
+    };
+    let tip = tr_args("Appearance Mode: {}", &[&mode]);
+    let r = Rect::from_min_max(pos2(rx - 26.0, cy - 13.0), pos2(rx, cy + 13.0));
+    let response = widgets::icon_button(ui, r, icon, false, &t, egui::Id::new("hdr-appearance")).on_hover_text(&tip);
+    if response.clicked() {
+        app.cycle_appearance(ui.ctx());
+    }
+    response.context_menu(|ui| {
+        let settings = ui.button(tr("Appearance Settings…"));
+        app.auto.add("header.appearanceSettings", settings.rect, "Appearance Settings…");
+        if settings.clicked() {
+            crate::panels::settings::open(app, "appearance");
+            ui.close();
+        }
+        let favorites = app.session.prefs.appearance.favorite_themes.clone();
+        for options in [effectcraft_engine::prefs::LIGHT_THEMES, effectcraft_engine::prefs::DARK_THEMES] {
+            let group: Vec<_> = options.iter().filter(|(_, id)| favorites.iter().any(|saved| saved == id)).collect();
+            if !group.is_empty() {
+                ui.separator();
+            }
+            for (label, id) in group {
+                let r = ui.selectable_label(app.ui.theme.name() == *id, tr(label));
+                app.auto.add(&format!("header.favoriteTheme.{id}"), r.rect, label);
+                if r.clicked() {
+                    if let Some(kind) = crate::theme::ThemeKind::from_name(id) {
+                        app.set_theme(ui.ctx(), kind);
+                    }
+                    ui.close();
+                }
+            }
+        }
+    });
+    app.auto.add("header.appearance", r, &tip);
+    rx = r.min.x - 4.0;
     rx -= 10.0;
     p.line_segment([pos2(rx, cy - 10.0), pos2(rx, cy + 10.0)], Stroke::new(1.0, t.separator));
     rx -= 10.0;
@@ -205,11 +255,11 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let mresp = ui.interact(more, egui::Id::new("ws-more"), Sense::click());
     p.text(more.center(), Align2::CENTER_CENTER, "»", Tokens::ui(15.0), if mresp.hovered() { t.text } else { t.text_dim });
     app.auto.add("header.workspaces", more, "Workspaces");
-    mresp.context_menu(|ui| ws_menu(app, ui));
+    crate::widgets::context_menu(&mresp, |ui| ws_menu(app, ui));
     if mresp.clicked() {
         widgets::open_popup(ui, egui::Id::new("ws-pop"));
     }
-    let names: Vec<String> = crate::dock::WORKSPACES.iter().map(|s| s.to_string()).collect();
+    let names: Vec<String> = crate::dock::WORKSPACES.iter().map(|s| crate::i18n::command_label("window.workspace", s).to_string()).collect();
     if let Some(i) = widgets::popup_menu(
         ui,
         egui::Id::new("ws-pop"),
@@ -224,7 +274,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // Small Screen, Standard.
     let shown = ["Standard", "Small Screen", "Learn", "Review", "Default"];
     for name in shown {
-        let g = p.layout_no_wrap(name.to_string(), Tokens::ui(12.0), t.text);
+        let g = p.layout_no_wrap(crate::i18n::command_label("window.workspace", name).to_string(), Tokens::ui(12.0), t.text);
         let w = g.size().x + 16.0;
         let r = Rect::from_min_max(pos2(rx - w, cy - 13.0), pos2(rx, cy + 13.0));
         if r.min.x < x + 120.0 {
@@ -251,31 +301,21 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
 }
 
-/// The Snapping options menu beside the checkbox: Snap Edges Extended and which layer features
-/// snap (`view.snappingOptions`).
+/// The Snapping options menu beside the checkbox: After Effects' Snap Edges Extended and Snap to
+/// Features in Collapsed Compositions and Text Layers (`view.snappingOptions`).
 fn snapping_options(app: &mut EffectcraftApp, ui: &mut egui::Ui, r: Rect) {
     let t = app.tokens;
     let pop = egui::Id::new("snap-options");
-    if widgets::icon_button(ui, r, Icon::ChevronDown, false, &t, egui::Id::new("snap-options-button")).on_hover_text("Snapping options").clicked() {
+    if widgets::icon_button(ui, r, Icon::ChevronDown, false, &t, egui::Id::new("snap-options-button")).on_hover_text(tr("Snapping options")).clicked() {
         widgets::open_popup(ui, pop);
     }
     app.auto.add("header.snappingOptions", r, "Snapping options");
     if !widgets::popup_is_open(ui, pop) {
         return;
     }
-    // Snap Edges Extended, then the features ("" keys the separator).
     let f = app.session.state.snap_features;
-    let mut keys = vec![];
-    let mut items = vec![];
-    for (i, (k, label)) in vw::SnapFeatures::OPTIONS.into_iter().enumerate() {
-        if i == 1 {
-            keys.push("");
-            items.push("-".to_string());
-        }
-        keys.push(k);
-        items.push(widgets::check_label(f.option(k), label));
-    }
-    if let Some(k) = widgets::popup_menu(ui, pop, r.left_bottom(), &items, None).and_then(|i| keys.get(i))
+    let items: Vec<String> = vw::SnapFeatures::OPTIONS.iter().map(|(k, label)| widgets::check_label(f.option(k), label)).collect();
+    if let Some((k, _)) = widgets::popup_menu(ui, pop, r.left_bottom(), &items, None).and_then(|i| vw::SnapFeatures::OPTIONS.get(i))
         && let Err(e) = app.session.execute("view.snappingOptions", json!({"toggle": k}))
     {
         app.ui.status = e.to_string();
@@ -287,6 +327,24 @@ fn tool_options(app: &mut EffectcraftApp, v: serde_json::Value) {
     if let Err(e) = app.session.execute("shape.toolOptions", v) {
         app.ui.status = e.to_string();
     }
+}
+
+/// The Colors property of the first Gradient Fill (`gfill`) or Gradient Stroke (`gstroke`) on the
+/// shape `layers`, in contents order through nested groups: (layer, property uid). The toolbar's
+/// gradient swatch edits it in the Gradient Editor.
+fn gradient_colors(app: &EffectcraftApp, layers: &[u64], paint: &str) -> Option<(u64, u64)> {
+    fn find(g: &PropGroup, paint: &str, depth: usize) -> Option<u64> {
+        if depth >= 16 {
+            return None;
+        }
+        g.groups().filter(|c| c.enabled).find_map(|c| match c.match_id.as_str() {
+            m if m == paint => c.get("colors").map(|p| p.uid),
+            "group" | "contents" => find(c, paint, depth + 1),
+            _ => None,
+        })
+    }
+    let comp = app.session.active_comp()?;
+    layers.iter().find_map(|&l| comp.layer(LayerId(l)).and_then(|layer| layer.props.sub("contents")).and_then(|c| find(c, paint, 0)).map(|u| (l, u)))
 }
 
 /// The colour picker of the Fill or Stroke swatch.
@@ -341,8 +399,9 @@ fn fill_stroke_options(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Pa
         if wresp.clicked() {
             widgets::open_popup(ui, opts);
         }
-        // The swatch picks a Solid Color's colour and opens the options for the other kinds;
-        // Alt-click steps through the kinds (as in After Effects).
+        // The swatch picks a Solid Color's colour, edits a Linear or Radial Gradient's colours in
+        // the Gradient Editor (the selected shape layer's Gradient Fill / Gradient Stroke), and
+        // opens the options otherwise; Alt-click steps through the kinds (as in After Effects).
         let sr = Rect::from_min_size(pos2(wr.max.x + 6.0, cy - 8.0), vec2(20.0, 16.0));
         let sresp = ui.interact(sr, egui::Id::new(("tool-paint-swatch", key)), Sense::click()).on_hover_text(format!("{title}: {}", tp.kind.label()));
         paint_swatch(p, sr, &tp, sresp.hovered(), &t);
@@ -351,20 +410,28 @@ fn fill_stroke_options(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Pa
             if ui.input(|i| i.modifiers.alt) {
                 let at = PaintKind::ALL.iter().position(|k| *k == tp.kind).unwrap_or(0);
                 let next = PaintKind::ALL.get((at + 1) % PaintKind::ALL.len()).copied().unwrap_or_default();
-                let k = format!("{key}Type");
-                tool_options(app, json!({k: next.id()}));
+                paint_kind(app, shape_layers, key, next);
             } else if tp.kind == PaintKind::Solid {
                 widgets::open_popup(ui, picker_id(key));
+            } else if let Some((layer, prop)) = matches!(tp.kind, PaintKind::Linear | PaintKind::Radial)
+                .then(|| gradient_colors(app, shape_layers, if key == "fill" { "gfill" } else { "gstroke" }))
+                .flatten()
+            {
+                let ctx = ui.ctx().clone();
+                if let Err(e) = crate::menus::invoke(app, &ctx, "prop.editGradient", json!({"layer": layer, "prop": prop})) {
+                    app.ui.status = e;
+                }
             } else {
+                // No selected shape layer with that gradient: its options (new shapes' kind).
                 widgets::open_popup(ui, opts);
             }
         }
         let mut c = tp.color;
-        if color_popup(ui, picker_id(key), sr.left_bottom(), &mut c) {
+        if widgets::color_popup(ui, picker_id(key), sr.left_bottom(), &mut c) {
             tool_options(app, json!({key: c}));
             paint(app, key, json!(c));
         }
-        paint_options_popup(app, ui, key, &options, wr.left_bottom());
+        paint_options_popup(app, ui, shape_layers, key, &options, wr.left_bottom());
         x = sr.max.x + 12.0;
     }
     let width = app.session.state.shape_tool.stroke_width;
@@ -377,9 +444,28 @@ fn fill_stroke_options(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Pa
     r.max.x + 14.0
 }
 
+/// A Fill or Stroke kind: for new shapes, and (as in After Effects) for the selected shape
+/// layers' fills or strokes, which None switches off (#732).
+fn paint_kind(app: &mut EffectcraftApp, shape_layers: &[u64], key: &str, kind: PaintKind) {
+    let k_type = format!("{key}Type");
+    tool_options(app, json!({&k_type: kind.id()}));
+    if shape_layers.is_empty() {
+        return;
+    }
+    let mut v = json!({"layers": shape_layers, k_type: kind.id()});
+    // A Solid Color takes the swatch's colour.
+    let color = if key == "fill" { app.session.state.shape_tool.fill.color } else { app.session.state.shape_tool.stroke.color };
+    if let (PaintKind::Solid, Some(o)) = (kind, v.as_object_mut()) {
+        o.insert(key.to_string(), json!(color));
+    }
+    if let Err(e) = app.session.execute("shape.fillStroke", v) {
+        app.ui.status = e.to_string();
+    }
+}
+
 /// Fill Options / Stroke Options: None, Solid Color, Linear Gradient or Radial Gradient, and the
 /// blend mode and opacity new shapes get (After Effects' dialogs, applied as they change).
-fn paint_options_popup(app: &mut EffectcraftApp, ui: &mut egui::Ui, key: &str, title: &str, pos: egui::Pos2) {
+fn paint_options_popup(app: &mut EffectcraftApp, ui: &mut egui::Ui, shape_layers: &[u64], key: &str, title: &str, pos: egui::Pos2) {
     let id = egui::Id::new(("tool-paint-options", key));
     if !widgets::popup_is_open(ui, id) {
         return;
@@ -388,6 +474,7 @@ fn paint_options_popup(app: &mut EffectcraftApp, ui: &mut egui::Ui, key: &str, t
     let tp = if key == "fill" { &app.session.state.shape_tool.fill } else { &app.session.state.shape_tool.stroke }.clone();
     let blend_pop = id.with("blend");
     let mut set = None;
+    let mut kind = None;
     let mut blend_rect = Rect::NOTHING;
     let area = egui::Area::new(id.with("area")).order(egui::Order::Foreground).fixed_pos(pos + vec2(0.0, 4.0)).show(ui.ctx(), |ui| {
         egui::Frame::popup(ui.style()).show(ui, |ui| {
@@ -404,18 +491,17 @@ fn paint_options_popup(app: &mut EffectcraftApp, ui: &mut egui::Ui, key: &str, t
                 paint_swatch(&p, r.shrink(3.0), &ToolPaint { kind: k, ..tp.clone() }, resp.hovered(), &t);
                 app.auto.add(&format!("header.{key}Options.{}", k.id()), r, k.label());
                 if resp.clicked() {
-                    let k_type = format!("{key}Type");
-                    set = Some(json!({k_type: k.id()}));
+                    kind = Some(k);
                 }
             }
             p.text(row(33.0) + vec2(134.0, 0.0), Align2::LEFT_CENTER, tp.kind.label(), Tokens::ui(11.5), t.text_dim);
-            p.text(row(66.0), Align2::LEFT_CENTER, "Blend Mode:", Tokens::ui(12.0), t.text_dim);
+            p.text(row(66.0), Align2::LEFT_CENTER, tr("Blend Mode:"), Tokens::ui(12.0), t.text_dim);
             blend_rect = Rect::from_min_size(row(56.0) + vec2(84.0, 0.0), vec2(150.0, 20.0));
             if widgets::dropdown(ui, blend_rect, tp.blend.label(), &t, id.with("blend-dd")).clicked() {
                 widgets::open_popup(ui, blend_pop);
             }
             app.auto.add(&format!("header.{key}Options.blend"), blend_rect, "Blend Mode");
-            p.text(row(98.0), Align2::LEFT_CENTER, "Opacity:", Tokens::ui(12.0), t.text_dim);
+            p.text(row(98.0), Align2::LEFT_CENTER, tr("Opacity:"), Tokens::ui(12.0), t.text_dim);
             let (or, v, _) = widgets::hot_number_at(ui, row(89.0) + vec2(84.0, 0.0), id.with("opacity"), tp.opacity, 0.5, (0.0, 100.0), 0, "%", &t);
             app.auto.add(&format!("header.{key}Options.opacity"), or, "Opacity");
             if let Some(v) = v {
@@ -439,12 +525,9 @@ fn paint_options_popup(app: &mut EffectcraftApp, ui: &mut egui::Ui, key: &str, t
     if let Some(v) = set {
         tool_options(app, v);
     }
-}
-
-/// sRGB components (0–1) as a colour.
-fn srgb32(c: [f32; 3]) -> Color32 {
-    let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-    Color32::from_rgb(b(c[0]), b(c[1]), b(c[2]))
+    if let Some(k) = kind {
+        paint_kind(app, shape_layers, key, k);
+    }
 }
 
 /// A Fill or Stroke swatch: its colour, a gradient (white to black), or None's red slash.
@@ -456,7 +539,7 @@ fn paint_swatch(p: &egui::Painter, r: Rect, paint: &ToolPaint, hovered: bool, t:
             clip.line_segment([r.left_bottom(), r.right_top()], Stroke::new(1.5, Color32::from_rgb(0xe0, 0x30, 0x30)));
         }
         PaintKind::Solid => {
-            clip.rect_filled(r, 2.0, srgb32(paint.color));
+            clip.rect_filled(r, 2.0, widgets::srgb32(paint.color));
         }
         PaintKind::Linear => {
             let mut m = egui::Mesh::default();
@@ -480,19 +563,39 @@ fn paint_swatch(p: &egui::Painter, r: Rect, paint: &ToolPaint, hovered: bool, t:
     p.rect_stroke(r, 2.0, Stroke::new(1.0, if hovered { t.text } else { t.field_border }), StrokeKind::Inside);
 }
 
+/// Roto Brush / Refine Edge tool options: the brush Diameter (⌘/Ctrl-drag in the Layer panel
+/// sets it too, as in After Effects). Returns the next x.
+fn roto_options(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, mut x: f32, cy: f32) -> f32 {
+    let t = app.tokens;
+    let refine = app.ui.tool.roto_kind(false).is_some_and(|k| k.starts_with("refine"));
+    let o = &app.session.state.roto;
+    let (key, v) = if refine { ("refineDiameter", o.refine_diameter) } else { ("diameter", o.diameter) };
+    let label = tr("Diameter:");
+    let lr = p.text(pos2(x, cy), Align2::LEFT_CENTER, label, Tokens::ui(12.0), t.text_dim);
+    x = lr.max.x + 6.0;
+    let (r, nv, _) = widgets::hot_number_at(ui, pos2(x, cy - 9.0), egui::Id::new(("roto-opt", key)), v, 0.5, (1.0, 5000.0), 0, " px", &t);
+    app.auto.add("header.roto.diameter", r, label);
+    if let Some(nv) = nv
+        && let Err(e) = app.session.execute("roto.options", json!({key: nv}))
+    {
+        app.ui.status = e.to_string();
+    }
+    r.max.x + 12.0
+}
+
 /// Puppet tool options: Mesh: Show, Expansion, Density (for new meshes and the selected
 /// layer's meshes). Returns the next x.
 fn puppet_options(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, mut x: f32, cy: f32) -> f32 {
     let t = app.tokens;
     let o = app.session.state.puppet.clone();
-    p.text(pos2(x, cy), Align2::LEFT_CENTER, "Mesh:", Tokens::ui(12.0), t.text_dim);
+    p.text(pos2(x, cy), Align2::LEFT_CENTER, tr("Mesh:"), Tokens::ui(12.0), t.text_dim);
     x += 40.0;
     let show = Rect::from_min_size(pos2(x, cy - 10.0), vec2(20.0, 20.0));
     if widgets::checkbox(ui, show, o.show_mesh, &t, egui::Id::new("puppet-show-mesh")).clicked() {
         let _ = app.session.execute("puppet.mesh", json!({"showMesh": !o.show_mesh}));
     }
     app.auto.add("header.puppet.showMesh", show, "Show mesh");
-    p.text(pos2(show.max.x + 2.0, cy), Align2::LEFT_CENTER, "Show", Tokens::ui(12.0), t.text_dim);
+    p.text(pos2(show.max.x + 2.0, cy), Align2::LEFT_CENTER, tr("Show"), Tokens::ui(12.0), t.text_dim);
     x = show.max.x + 44.0;
     for (label, key, v, range) in [("Expansion:", "expansion", o.expansion, (-100.0, 200.0)), ("Density:", "density", o.density, (0.0, 100.0))] {
         p.text(pos2(x, cy), Align2::LEFT_CENTER, label, Tokens::ui(12.0), t.text_dim);
@@ -508,7 +611,7 @@ fn puppet_options(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter
     let label = "Record Options...";
     let w = 104.0;
     let r = Rect::from_min_size(pos2(x, cy - 10.0), vec2(w, 20.0));
-    let resp = ui.interact(r, egui::Id::new("puppet-record-options"), egui::Sense::click()).on_hover_text("⌘/Ctrl-drag a pin to record its motion");
+    let resp = ui.interact(r, egui::Id::new("puppet-record-options"), egui::Sense::click()).on_hover_text(tr("⌘/Ctrl-drag a pin to record its motion"));
     p.rect_stroke(r, 3.0, egui::Stroke::new(1.0, if resp.hovered() { t.accent } else { t.field_border }), egui::StrokeKind::Inside);
     p.text(r.center(), Align2::CENTER_CENTER, label, Tokens::ui(11.5), t.text);
     app.auto.add("header.puppet.recordOptions", r, label);
@@ -523,7 +626,7 @@ fn puppet_options(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter
     let r = Rect::from_min_size(pos2(r.max.x + 8.0, cy - 10.0), vec2(w, 20.0));
     let resp = ui
         .interact(r, egui::Id::new("puppet-follow"), egui::Sense::click())
-        .on_hover_text("Select the leader pin, then Shift-click the pins that should trail it (hair, cloth, tails)");
+        .on_hover_text(tr("Select the leader pin, then Shift-click the pins that should trail it (hair, cloth, tails)"));
     p.rect_stroke(r, 3.0, egui::Stroke::new(1.0, if resp.hovered() { t.accent } else { t.field_border }), egui::StrokeKind::Inside);
     p.text(r.center(), Align2::CENTER_CENTER, label, Tokens::ui(11.5), t.text);
     app.auto.add("header.puppet.follow", r, label);
@@ -536,41 +639,25 @@ fn puppet_options(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter
     r.max.x + 16.0
 }
 
+/// A workspace's drawn name: built-ins read the menu bar's Window ▸ Workspace row; names the user
+/// saved stay verbatim, even when one matches a catalog source such as "Composition".
+fn workspace_label(name: &str) -> &str {
+    if crate::dock::WORKSPACES.contains(&name) { crate::i18n::command_label("window.workspace", name) } else { name }
+}
+
 fn ws_menu(app: &mut EffectcraftApp, ui: &mut egui::Ui) {
     for w in app.workspace_names() {
-        if ui.selectable_label(app.ui.workspace == w, &w).clicked() {
+        if ui.selectable_label(app.ui.workspace == w, workspace_label(&w)).clicked() {
             app.set_workspace(&w);
             ui.close();
         }
     }
     ui.separator();
-    if ui.button("Reset to Saved Layout").clicked() {
+    if ui.button(tr("Reset to Saved Layout")).clicked() {
         let n = app.ui.workspace.clone();
         app.set_workspace(&n);
         ui.close();
     }
-}
-
-/// A small colour picker popup bound to an RGB value.
-pub fn color_popup(ui: &mut egui::Ui, id: egui::Id, pos: egui::Pos2, c: &mut [f32; 3]) -> bool {
-    let open_id = id.with("open");
-    if !ui.data(|d| d.get_temp::<bool>(open_id).unwrap_or(false)) {
-        return false;
-    }
-    let mut changed = false;
-    let area = egui::Area::new(id.with("area")).order(egui::Order::Foreground).fixed_pos(pos + vec2(0.0, 4.0)).show(ui.ctx(), |ui| {
-        egui::Frame::popup(ui.style()).show(ui, |ui| {
-            let mut col = srgb32(*c);
-            if egui::color_picker::color_picker_color32(ui, &mut col, egui::color_picker::Alpha::Opaque) {
-                *c = [col.r() as f32 / 255.0, col.g() as f32 / 255.0, col.b() as f32 / 255.0];
-                changed = true;
-            }
-        });
-    });
-    if widgets::pressed_outside(ui.ctx(), &area.response) || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-        ui.data_mut(|d| d.insert_temp(open_id, false));
-    }
-    changed
 }
 
 /// The ArtCraft mark as supplied in `docs/brand` (the README's and getartcraft.com's logo; used
@@ -612,10 +699,19 @@ mod tests {
     }
 
     #[test]
+    fn saved_workspace_names_stay_verbatim() {
+        crate::i18n::set_current("zh-hans");
+        assert_ne!(workspace_label("Default"), "Default");
+        assert_ne!(crate::i18n::tr("Composition"), "Composition");
+        assert_eq!(workspace_label("Composition"), "Composition");
+        crate::i18n::set_current("en");
+    }
+
+    #[test]
     fn long_press_type_keeps_the_tool_until_vertical_is_selected() {
         let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
         let ctx = egui::Context::default();
-        crate::theme::install(&ctx, &app.tokens);
+        crate::theme::install(&ctx, &app.tokens, crate::i18n::language(&app));
         frame(&mut app, &ctx, 0.0, vec![]);
         frame(&mut app, &ctx, 0.1, vec![]);
         let center = |element: &crate::automation::Element| {

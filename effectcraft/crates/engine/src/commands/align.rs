@@ -1,4 +1,5 @@
-//! Align panel: `layer.align {edge, to}` and `layer.distribute {mode}`.
+//! Align panel: `layer.align {edge, to}` and `layer.distribute {mode}`; the arrow keys'
+//! `layer.nudge {x, y}`.
 //!
 //! Layers are aligned by their content bounds in comp space (source size, text glyphs, shape
 //! contents through the layer's transform and its parents'). Each layer moves by a comp-space
@@ -8,11 +9,11 @@
 
 use effectcraft_geom::{Mat4, Vec3};
 use effectcraft_keyframe::Value as KValue;
-use effectcraft_project::{ItemId, LayerId};
+use effectcraft_project::{ItemId, Layer, LayerId};
 use effectcraft_render::EvalCtx;
 use serde_json::{Value, json};
 
-use super::{CommandSpec, bad, has_layers, layer_mut, layers_p, str_p};
+use super::{CommandSpec, bad, f_p, has_layers, layer_mut, layers_p, merge_p, str_p};
 use crate::{EngineError, Result, Session, cmd};
 
 /// A layer's comp-space bounds and how a comp-space offset maps into its Position.
@@ -43,27 +44,32 @@ fn placed(s: &Session, cid: ItemId, ids: &[LayerId]) -> Result<Vec<Placed>> {
             x1 = x1.max(p.x);
             y1 = y1.max(p.y);
         }
-        // Parent chain: world(layer) = local(pn) ⋯ local(p1) · local(layer).
-        let mut par = Mat4::IDENTITY;
-        let mut cur = l.parent;
-        let mut guard = 0;
-        while let Some(pid) = cur {
-            guard += 1;
-            let Some(p) = comp.layer(pid).filter(|_| guard < 64) else { break };
-            par = ctx.local_matrix(p) * par;
-            cur = p.parent;
-        }
-        let to_parent = par.inverse().unwrap_or(Mat4::IDENTITY);
-        out.push(Placed { id, b: [x0, y0, x1, y1], to_parent });
+        out.push(Placed { id, b: [x0, y0, x1, y1], to_parent: to_parent(&ctx, l) });
     }
     Ok(out)
 }
 
-/// Move layers by comp-space offsets, as one undo step.
-fn apply_moves(s: &mut Session, cid: ItemId, label: &str, moves: Vec<(LayerId, Mat4, [f64; 2])>) -> Result<Value> {
+/// Comp space → the space of `l`'s Position (its parent's).
+fn to_parent(ctx: &EvalCtx, l: &Layer) -> Mat4 {
+    // Parent chain: world(layer) = local(pn) ⋯ local(p1) · local(layer).
+    let mut par = Mat4::IDENTITY;
+    let mut cur = l.parent;
+    let mut guard = 0;
+    while let Some(pid) = cur {
+        guard += 1;
+        let Some(p) = ctx.comp.layer(pid).filter(|_| guard < 64) else { break };
+        par = ctx.local_matrix(p) * par;
+        cur = p.parent;
+    }
+    par.inverse().unwrap_or(Mat4::IDENTITY)
+}
+
+/// Move layers by comp-space offsets, as one undo step (merged into the last one with the same
+/// `merge` key).
+fn apply_moves(s: &mut Session, cid: ItemId, label: &str, moves: Vec<(LayerId, Mat4, [f64; 2])>, merge: Option<&str>) -> Result<Value> {
     let t = s.time();
     let moved: Vec<u64> = moves.iter().filter(|m| m.2[0].abs() > 1e-9 || m.2[1].abs() > 1e-9).map(|m| m.0.0).collect();
-    s.edit(label, None, |proj, _| {
+    s.edit(label, merge, |proj, _| {
         for (lid, to_parent, d) in &moves {
             if d[0].abs() <= 1e-9 && d[1].abs() <= 1e-9 {
                 continue;
@@ -144,7 +150,7 @@ fn align(s: &mut Session, p: &Value) -> Result<Value> {
             (it.id, it.to_parent, d)
         })
         .collect();
-    apply_moves(s, cid, "Align Layers", moves)
+    apply_moves(s, cid, "Align Layers", moves, None)
 }
 
 fn distribute(s: &mut Session, p: &Value) -> Result<Value> {
@@ -170,11 +176,29 @@ fn distribute(s: &mut Session, p: &Value) -> Result<Value> {
             (it.id, it.to_parent, if horiz { [dv, 0.0] } else { [0.0, dv] })
         })
         .collect();
-    apply_moves(s, cid, "Distribute Layers", moves)
+    apply_moves(s, cid, "Distribute Layers", moves, None)
+}
+
+/// The arrow keys in the Composition panel: move the selected (unlocked) layers by `x`, `y` comp
+/// pixels; After Effects nudges 1 pixel at the panel's magnification, 10 with Shift. Each call
+/// is one undo step.
+fn nudge(s: &mut Session, p: &Value) -> Result<Value> {
+    let c = "layer.nudge";
+    let d = [f_p(p, "x").unwrap_or(0.0), f_p(p, "y").unwrap_or(0.0)];
+    if !d.iter().all(|v| v.is_finite()) {
+        return Err(bad(c, "`x` and `y` must be numbers"));
+    }
+    let (cid, ids) = layers_p(s, p)?;
+    let ids = super::unlocked(s, cid, ids, c)?;
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let ctx = EvalCtx { footage: Some(s.footage.as_ref()), expr: s.expr.as_deref(), ..EvalCtx::new(&s.project, cid, comp, s.time()) };
+    let moves = ids.iter().filter_map(|id| comp.layer(*id)).filter(|l| l.transform().is_some()).map(|l| (l.id, to_parent(&ctx, l), d)).collect();
+    apply_moves(s, cid, "Nudge", moves, merge_p(p))
 }
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
+        cmd!("layer.nudge", "Nudge Layers", [], None, "{x?, y? (comp pixels), layers?, merge?}", has_layers, nudge),
         cmd!(
             "layer.align",
             "Align Layers",
@@ -241,6 +265,27 @@ mod tests {
         assert!(s.execute("layer.align", json!({"edge": "diagonal", "layers": [a]})).is_err());
     }
 
+    /// #352: shape layers align and snap by their visual edges (half the stroke, no
+    /// anti-aliasing padding), so two rectangles lined up edge to edge touch with no gap.
+    #[test]
+    fn shape_layers_align_by_their_visual_edges() {
+        let mut s = session();
+        let shape = |s: &mut Session, extra: Value| {
+            let mut p = json!({"kind": "rect", "size": [100, 100], "fill": "#ff0000"});
+            p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            s.execute("layer.newShape", p).unwrap()["layer"].as_u64().unwrap()
+        };
+        let a = shape(&mut s, json!({}));
+        let b = shape(&mut s, json!({"stroke": "#ffffff", "strokeWidth": 10}));
+        let width = |s: &Session, id| {
+            let r = bounds(s, id);
+            r[2] - r[0]
+        };
+        assert!((width(&s, a) - 100.0).abs() < 1e-6 && (width(&s, b) - 110.0).abs() < 1e-6, "{} {}", width(&s, a), width(&s, b));
+        s.execute("layer.align", json!({"edge": "left", "layers": [a, b]})).unwrap();
+        assert!(bounds(&s, a)[0].abs() < 1e-6 && bounds(&s, b)[0].abs() < 1e-6);
+    }
+
     #[test]
     fn align_honours_parent_scale_and_rotation() {
         let mut s = session();
@@ -281,5 +326,39 @@ mod tests {
         assert!(s.active_comp().unwrap().layers.iter().any(|l| l.transform().is_some_and(|t| t.get("positionX").is_some())));
         s.execute("layer.align", json!({"edge": "right", "layers": [a]})).unwrap();
         assert!((bounds(&s, a)[2] - 400.0).abs() < 1e-6);
+    }
+
+    /// The arrow keys' nudge (#290): comp pixels through a parent's scale, sub-pixel steps, one
+    /// undo step each, a key at the current time when Position is animated; locked layers stay.
+    #[test]
+    fn nudge_moves_layers_by_comp_pixels() {
+        let mut s = session();
+        let pos = |s: &Session, id: u64| s.active_comp().unwrap().layer(LayerId(id)).unwrap().props.prop("transform/position").unwrap().value.as_vec3();
+        let a = solid(&mut s, "A", 40, 40, [100.0, 100.0]);
+        let parent = solid(&mut s, "P", 10, 10, [0.0, 0.0]);
+        s.execute("prop.set", json!({"layer": parent, "path": "transform/scale", "value": [200.0, 200.0, 100.0]})).unwrap();
+        let child = solid(&mut s, "C", 10, 10, [10.0, 10.0]);
+        s.execute("layer.setParent", json!({"layers": [child], "parent": parent})).unwrap();
+        let undo = s.history.undo.len();
+        s.execute("layer.nudge", json!({"layers": [a, child], "x": 1.0})).unwrap();
+        s.execute("layer.nudge", json!({"layers": [a, child], "y": -0.25})).unwrap();
+        assert_eq!(pos(&s, a), [101.0, 99.75, 0.0]);
+        assert_eq!(pos(&s, child), [10.5, 9.875, 0.0], "half as far under a 200 % parent");
+        assert_eq!(s.history.undo.len(), undo + 2, "one undo step per nudge");
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(pos(&s, a), [101.0, 100.0, 0.0]);
+        // Animated Position gets a key at the current time.
+        s.execute("prop.addKey", json!({"layer": a, "path": "transform/position", "time": 0.0, "value": [0, 0, 0]})).unwrap();
+        s.execute("time.set", json!({"time": 1.0})).unwrap();
+        s.execute("layer.nudge", json!({"layers": [a], "x": 10.0})).unwrap();
+        let keys = s.active_comp().unwrap().layer(LayerId(a)).unwrap().props.prop("transform/position").unwrap().keys.clone();
+        assert_eq!(
+            keys.iter().map(|k| (k.time, k.value.as_vec3())).collect::<Vec<_>>(),
+            vec![(effectcraft_time::Tick::ZERO, [0.0; 3]), (s.time(), [10.0, 0.0, 0.0])]
+        );
+        // A locked layer doesn't move.
+        s.execute("layer.setSwitch", json!({"layers": [child], "switch": "lock", "value": true})).unwrap();
+        assert!(s.execute("layer.nudge", json!({"layers": [child], "x": 1.0})).is_err());
+        assert_eq!(pos(&s, child), [10.5, 10.0, 0.0]);
     }
 }

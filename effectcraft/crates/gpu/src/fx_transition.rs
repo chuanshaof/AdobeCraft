@@ -448,6 +448,13 @@ fn cylinder(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
     p.u[0][0] = pr.e("render");
     p.f[0] = f4([c.0, c.1, r, h]);
     p.f[2][0] = pr.f("rotation").to_radians() as f32;
+    let (rx, ry, rz) = (pr.f("rotationX"), pr.f("rotationY"), pr.f("rotationZ"));
+    p.u[0][1] = (rx != 0.0 || ry != 0.0 || rz != 0.0) as u32;
+    let m = rot_xyz(rx, ry, rz);
+    // Matrix rows, as for CC Sphere; the kernel uses Rᵀ for mapping.
+    for (i, row) in m.iter().enumerate() {
+        p.f[7 + i] = f4([row[0], row[1], row[2], 0.0]);
+    }
     run(e, "ftr_cylinder", &p, b, None, None)
 }
 
@@ -579,17 +586,19 @@ fn blobbylize(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
     let soft = pr.f("softness").max(0.0) * b.scale;
     let blob = layer_or_self(e, ctx, &b, "blobLayer")?;
     let raw = plane(e, &blob, pr.e("property").min(10));
-    let h = gaussian_blur(e, &raw, soft, soft, true);
+    let h = gaussian_blur(e, &raw, soft * 0.42, soft * 0.42, true);
     let lpos = b.to_px(pr.v2("lightPosition"));
     let lheight = pr.f("lightHeight");
     let (d, el) = (pr.f("lightDirection").to_radians(), (lheight / 100.0).clamp(0.0, 1.0) * std::f64::consts::FRAC_PI_2);
     let ldir = [d.sin() * el.cos(), -d.cos() * el.cos(), el.sin()];
     let span = (b.img.width.max(b.img.height) as f64).max(1.0);
     let mut p = Params::default();
-    p.f[0] = f4([(soft * 0.5).max(1.0), (pr.f("cutAway") / 100.0).clamp(0.0, 0.99), pr.f("lightIntensity") / 100.0, pr.f("ambient") / 100.0]);
+    p.f[0] = f4([(pr.f("cutAway") / 100.0).clamp(0.0, 1.0), pr.f("lightIntensity") / 100.0, pr.f("ambient") / 100.0, soft * 1.5]);
     p.f[1] = f4([pr.f("diffuse") / 100.0, pr.f("specular") / 100.0, (1.0 / pr.f("roughness").clamp(0.001, 1.0)).min(500.0), pr.f("metal") / 100.0]);
     p.f[2] = f4([lpos.0, lpos.1, lheight / 100.0 * span, (pr.e("lightType") == 1) as u32 as f64]);
     p.f[3] = f4([ldir[0], ldir[1], ldir[2], 0.0]);
     p.f[4] = rgb(pr.color("lightColor"), 0.0);
+    p.f[5] = f4([if soft > 0.05 { span / 64.0 } else { 0.0 }, span * 0.34 * b.scale, (soft * 0.65).max(1.0), 1.25]);
+    p.f[6] = f4([span * 0.5, 0.0, 0.0, 0.0]);
     run(e, "ftr_blob", &p, b, Some(&h), None)
 }

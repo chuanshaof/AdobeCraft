@@ -6,6 +6,7 @@
 //! [`build`] is pure and cycle-safe (a comp nested in itself is drawn once, with an edge back),
 //! so agents get the same graph through `flowchart.graph`.
 
+use crate::i18n::tr_args;
 use std::collections::{BTreeMap, BTreeSet};
 
 use effectcraft_engine::project::{ItemId, ItemKind, LayerSource, Project};
@@ -256,7 +257,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let bar = Rect::from_min_size(rect.min, vec2(rect.width(), 30.0));
     p.rect_filled(bar, 0.0, t.panel_bg);
     let root_name = app.session.project.item(rid).map(|i| i.name.clone()).unwrap_or_default();
-    p.text(pos2(bar.min.x + 10.0, bar.center().y), Align2::LEFT_CENTER, format!("Flowchart: {root_name}"), Tokens::medium(12.0), t.text);
+    p.text(pos2(bar.min.x + 10.0, bar.center().y), Align2::LEFT_CENTER, tr_args("Flowchart: {}", &[&root_name]), Tokens::medium(12.0), t.text);
     let mut x = bar.max.x - 8.0;
     let mut cmds: Vec<(String, Value)> = vec![];
     let o = app.ui.flowchart.clone();
@@ -363,7 +364,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 _ => {}
             }
         }
-        resp.on_hover_text(format!("{} — double-click to open, {}-click to reveal", n.label, if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" }));
+        resp.on_hover_text(tr_args("{} — double-click to open, {}-click to reveal", &[&n.label, &(if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" })]));
     }
     for (id, params) in cmds {
         if let Err(e) = crate::menus::invoke(app, &ctx, &id, params) {

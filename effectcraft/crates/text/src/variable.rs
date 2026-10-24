@@ -4,6 +4,19 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// Keep process-wide variation storage bounded; id 0 is the safe default location when full.
+const MAX_INTERNED_LOCATIONS: usize = 8192;
+const MAX_AXES_PER_LOCATION: usize = 32;
+const MAX_AXIS_TAG_BYTES: usize = 16;
+
+type CoordKey = Vec<(String, u32)>;
+
+#[derive(Default)]
+struct Table {
+    values: Vec<Arc<Vec<(String, f32)>>>,
+    by_coords: HashMap<CoordKey, u32>,
+}
+
 use kurbo::BezPath;
 use skrifa::instance::{LocationRef, Size};
 use skrifa::outline::DrawSettings;
@@ -14,15 +27,27 @@ use crate::{CharGlyph, Pen};
 
 /// Intern a set of axis values (0 for none), so `Copy` glyphs can carry them.
 pub fn intern(coords: &[(String, f32)]) -> u32 {
-    if coords.is_empty() {
+    if coords.is_empty() || coords.len() > MAX_AXES_PER_LOCATION || coords.iter().any(|(tag, v)| tag.len() > MAX_AXIS_TAG_BYTES || !v.is_finite()) {
+        return 0;
+    }
+    // Axis order is not significant. Canonicalize it once so equivalent locations share one key.
+    let mut key: CoordKey = coords.iter().map(|(tag, v)| (tag.clone(), if *v == 0.0 { 0 } else { v.to_bits() })).collect();
+    key.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    if key.windows(2).any(|w| w[0].0 == w[1].0) {
         return 0;
     }
     let mut t = table().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(i) = t.iter().position(|c| c.as_slice() == coords) {
-        return i as u32 + 1;
+    if let Some(id) = t.by_coords.get(&key) {
+        return *id;
     }
-    t.push(Arc::new(coords.to_vec()));
-    t.len() as u32
+    if t.values.len() >= MAX_INTERNED_LOCATIONS {
+        return 0;
+    }
+    let Some(id) = u32::try_from(t.values.len()).ok().and_then(|n| n.checked_add(1)) else { return 0 };
+    let value = Arc::new(key.iter().map(|(tag, bits)| (tag.clone(), f32::from_bits(*bits))).collect());
+    t.values.push(value);
+    t.by_coords.insert(key, id);
+    id
 }
 
 /// The axis values of an interned id (empty for 0).
@@ -30,11 +55,11 @@ pub fn coords(id: u32) -> Arc<Vec<(String, f32)>> {
     if id == 0 {
         return Arc::new(Vec::new());
     }
-    table().lock().unwrap_or_else(|e| e.into_inner()).get(id as usize - 1).cloned().unwrap_or_default()
+    table().lock().unwrap_or_else(|e| e.into_inner()).values.get(id as usize - 1).cloned().unwrap_or_default()
 }
 
-fn table() -> &'static Mutex<Vec<Arc<Vec<(String, f32)>>>> {
-    static T: OnceLock<Mutex<Vec<Arc<Vec<(String, f32)>>>>> = OnceLock::new();
+fn table() -> &'static Mutex<Table> {
+    static T: OnceLock<Mutex<Table>> = OnceLock::new();
     T.get_or_init(Default::default)
 }
 
@@ -154,11 +179,15 @@ pub fn char_advance_delta(g: &CharGlyph, deltas: &[(String, f32)]) -> Option<f64
     Some((varied - own) as f64 * sx)
 }
 
-/// The first installed face with variation axes (system fonts are scanned), for tests and
-/// demos: (face, its axes).
+/// The first installed face with variation axes and Latin glyphs (system fonts are scanned), for
+/// tests and demos: (face, its axes). Faces without an `H` or `A` (the name-and-`fvar`-only
+/// fonts tests add) are skipped.
 pub fn find_variable_face() -> Option<(FaceId, Vec<FontAxis>)> {
     fonts::scan_system();
-    (0..fonts::all_faces().len()).map(|f| (f, font_axes(f))).find(|(_, a)| a.iter().any(|x| x.max > x.min))
+    (0..fonts::all_faces().len())
+        .filter(|&f| fonts::face(f).glyph('H').or_else(|| fonts::face(f).glyph('A')).is_some())
+        .map(|f| (f, font_axes(f)))
+        .find(|(_, a)| a.iter().any(|x| x.max > x.min))
 }
 
 #[cfg(test)]
@@ -193,30 +222,60 @@ mod tests {
         let id = intern(&[("wght".into(), 700.0)]);
         assert_eq!(intern(&[("wght".into(), 700.0)]), id);
         assert_eq!(coords(id).as_slice(), &[("wght".to_string(), 700.0)]);
+        assert_eq!(intern(&[("wdth".into(), 20.0), ("wght".into(), 700.0)]), intern(&[("wght".into(), 700.0), ("wdth".into(), 20.0)]));
+        assert_eq!(intern(&[("wght".into(), f32::NAN)]), 0);
+        assert_eq!(intern(&vec![("wght".into(), 1.0); MAX_AXES_PER_LOCATION + 1]), 0);
         let Some((face, axes)) = find_variable_face() else {
             eprintln!("no variable font installed: skipped");
             return;
         };
-        // An axis that changes widths (wdth or wght, else the first that moves).
-        let a = axes.iter().find(|a| a.tag == "wdth" && a.max > a.min).or_else(|| axes.iter().find(|a| a.tag == "wght" && a.max > a.min)).unwrap_or(&axes[0]);
         let info = crate::fonts::face(face).info.clone();
-        let st = |v: f32| crate::TextStyle {
+        // An axis that moves the advance: `wdth` and `wght` usually do, but a monospaced family
+        // keeps its advances fixed along `wght` (Google Sans Code does) and moves them along its
+        // own axis instead, so try the axes in order and take the first one that moves. A face
+        // with no axis carrying a range is the only case that skips: a variation path that broke
+        // completely moves neither the advances nor the outlines, and that has to fail below.
+        let st = |a: &FontAxis, v: f32| crate::TextStyle {
             family: info.family.clone(),
             style: info.style.clone(),
             size: 100.0,
             variations: vec![(a.tag.clone(), v)],
             ..Default::default()
         };
-        let (lo, hi) = (crate::layout::measure("Hamburgefonts", &st(a.min)), crate::layout::measure("Hamburgefonts", &st(a.max)));
+        let ranged: Vec<&FontAxis> = axes.iter().filter(|a| a.max > a.min).collect();
+        if ranged.is_empty() {
+            eprintln!("no variable axis installed here carries a range: skipped");
+            return;
+        }
+        let mut moving = None;
+        for a in &ranged {
+            let (lo, hi) = (crate::layout::measure("Hamburgefonts", &st(a, a.min)), crate::layout::measure("Hamburgefonts", &st(a, a.max)));
+            if (lo - hi).abs() > 1.0 {
+                moving = Some(((*a).clone(), lo, hi));
+                break;
+            }
+        }
         if crate::resolve(&info.family, &info.style).face != face {
             eprintln!("variable face not reachable by family/style: skipped");
             return;
         }
-        assert!((lo - hi).abs() > 1.0, "{} {}..{}: advances {lo} vs {hi}", a.tag, a.min, a.max);
-        let ink = |v: f32| {
-            let l = crate::layout::layout("H", &st(v), &crate::ParagraphStyle::default());
+        let ink = |a: &FontAxis, v: f32| {
+            let l = crate::layout::layout("H", &st(a, v), &crate::ParagraphStyle::default());
             l.glyphs.iter().map(|g| crate::glyph_outline(g).area().abs()).sum::<f64>()
         };
-        assert!((ink(a.min) - ink(a.max)).abs() > 1.0);
+        if let Some((a, lo, hi)) = moving {
+            // The axis was picked because it moves the advance; the outline has to follow it too.
+            assert!((lo - hi).abs() > 1.0, "{} {}..{}: advances {lo} vs {hi}", a.tag, a.min, a.max);
+            let (i_lo, i_hi) = (ink(&a, a.min), ink(&a, a.max));
+            assert!((i_lo - i_hi).abs() > 1.0, "{} {}..{}: outlines do not move", a.tag, a.min, a.max);
+        } else {
+            // Nothing here moves an advance. Holding the advances is what a monospaced family does
+            // on purpose, but it is also what a broken variation path does, so this case still has
+            // to fail rather than skip: the outline must move along `wght`, or, on a face without
+            // one, along the first axis that carries a range.
+            let a = axes.iter().find(|a| a.tag == "wght" && a.max > a.min).unwrap_or(ranged[0]);
+            let (i_lo, i_hi) = (ink(a, a.min), ink(a, a.max));
+            assert!((i_lo - i_hi).abs() > 1.0, "{} {}..{}: neither the advances nor the outlines move, so variation support looks broken", a.tag, a.min, a.max);
+        }
     }
 }

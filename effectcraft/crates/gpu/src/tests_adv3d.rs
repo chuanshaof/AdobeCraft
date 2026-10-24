@@ -17,11 +17,13 @@ use crate::Gpu;
 /// A device of the test's own (the test holds [`crate::tests::hold_gpu_lock`]).
 fn gpu() -> Option<Gpu> {
     crate::tests::hold_gpu_lock();
-    let g = Gpu::headless();
-    if g.is_none() {
-        eprintln!("effectcraft-gpu adv3d tests: no GPU adapter, skipping");
+    match Gpu::try_headless() {
+        Ok(g) => Some(g),
+        Err(e) => {
+            eprintln!("effectcraft-gpu adv3d tests: no GPU ({e}), skipping");
+            crate::tests::require_gpu("effectcraft-gpu adv3d tests", Err(&e))
+        }
     }
-    g
 }
 
 fn add(p: &mut Project, cid: ItemId, src: LayerSource, edit: impl FnOnce(&mut effectcraft_project::Layer)) {
@@ -151,6 +153,56 @@ fn gpu_matches_cpu_unlit_and_full_frames() {
     let gimg = r.comp_frame(cid, Tick::ZERO);
     let diff = cpu.data.iter().zip(&gimg.data).filter(|(a, b)| (0..4).any(|k| (a[k] - b[k]).abs() > 3.0 / 255.0)).count();
     assert!((diff as f64) < 0.02 * cpu.data.len() as f64, "{diff} pixels differ");
+}
+
+#[test]
+fn gpu_matches_cpu_shadow_catcher() {
+    // #1691: the floor plane as a shadow catcher ("Accepts Shadows: Only").
+    let Some(g) = gpu() else { return };
+    let (mut p, cid) = scene_project();
+    let floor = p.comp_mut(cid).unwrap().layers.last_mut().unwrap();
+    set(floor, "materialOptions/acceptsShadows", Value::Enum(2));
+    let s = scene(&p, cid);
+    assert!(s.materials.iter().any(|m| m.shadows_only) && !s.shadows.is_empty());
+    compare(&s, &g);
+}
+
+#[test]
+fn gpu_matches_cpu_wide_penumbrae() {
+    // Both lights cast with wide Shadow Diffusion. Penumbrae cover much of the frame, so a
+    // backend drift in the PCF (jitter hash, tap grid, receiver-plane compare) would hide
+    // inside the scene-wide 1.5 % silhouette budget; here every shadowed pixel off a
+    // silhouette must match the CPU within 2/255.
+    let Some(g) = gpu() else { return };
+    let (mut p, cid) = scene_project();
+    let comp = p.comp_mut(cid).unwrap();
+    set(&mut comp.layers[1], "lightOptions/shadowDiffusion", Value::Scalar(48.0));
+    set(&mut comp.layers[0], "lightOptions/castsShadows", Value::Bool(true));
+    set(&mut comp.layers[0], "lightOptions/shadowDiffusion", Value::Scalar(30.0));
+    let s = scene(&p, cid);
+    let (cpu, gt) = (adv::raster::render(&s), g.raster_3d(&s).expect("gpu raster"));
+    for l in &mut p.comp_mut(cid).unwrap().layers[..2] {
+        set(l, "lightOptions/castsShadows", Value::Bool(false));
+    }
+    let unshadowed = adv::raster::render(&scene(&p, cid));
+    let w = cpu.width as usize;
+    let luma = |c: &[f32; 4]| (c[0] + c[1] + c[2]) / 3.0;
+    // Off a silhouette: the pixel and its four neighbours see one continuous surface.
+    let smooth = |i: usize| -> bool {
+        let (x, y) = (i % w, i / w);
+        let d = cpu.depth[i];
+        x > 0
+            && y > 0
+            && x + 1 < w
+            && i + w < cpu.depth.len()
+            && d.is_finite()
+            && [i - 1, i + 1, i - w, i + w].iter().all(|&j| (cpu.depth[j] - d).abs() < 0.01 * d.abs().max(1.0))
+    };
+    let shadowed: Vec<usize> = (0..cpu.color.len()).filter(|&i| luma(&unshadowed.color[i]) - luma(&cpu.color[i]) > 0.01 && smooth(i)).collect();
+    let bad = shadowed.iter().filter(|&&i| (0..4).any(|k| (cpu.color[i][k] - gt.color[i][k]).abs() / cpu.color[i][k].abs().max(1.0) > 2.0 / 255.0)).count();
+    eprintln!("adv3d wide penumbrae: {bad}/{} shadowed pixels beyond 2/255", shadowed.len());
+    assert!(shadowed.len() > 2000, "the shadows cover a large area: {}", shadowed.len());
+    assert!(bad as f64 <= 0.002 * shadowed.len() as f64, "{bad}/{} shadowed pixels differ", shadowed.len());
 }
 
 #[test]

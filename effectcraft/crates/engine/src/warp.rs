@@ -324,8 +324,7 @@ impl Session {
         if times.len() < 2 {
             return Err("the layer must be at least two frames long".into());
         }
-        let (w, h) = effectcraft_render::source_size(&self.project, l);
-        let size = if w == 0 { [c.width as f64, c.height as f64] } else { [w as f64, h as f64] };
+        let size = effectcraft_render::effect_bounds(&self.project, c, l).0;
         let detailed = g.prop("advanced/detailedAnalysis").is_some_and(|p| p.value.as_bool());
         let n = times.len();
         let work = WarpWork {

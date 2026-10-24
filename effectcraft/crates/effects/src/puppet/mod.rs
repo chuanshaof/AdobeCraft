@@ -387,6 +387,14 @@ pub fn unmap(mesh: &Mesh, deformed: &[[f64; 2]], p: [f64; 2]) -> [f64; 2] {
     }
 }
 
+/// Whether `p` (layer space) is on the mesh as `deformed` places its vertices.
+pub fn contains(mesh: &Mesh, deformed: &[[f64; 2]], p: [f64; 2]) -> bool {
+    mesh.tris.iter().any(|t| match (deformed.get(t[0]), deformed.get(t[1]), deformed.get(t[2])) {
+        (Some(a), Some(b), Some(c)) => bary(*a, *b, *c, p).is_some_and(|l| l.iter().all(|x| *x >= -1e-9)),
+        _ => false,
+    })
+}
+
 #[inline]
 fn bary(a: [f64; 2], b: [f64; 2], c: [f64; 2], p: [f64; 2]) -> Option<[f64; 3]> {
     let d = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1]);

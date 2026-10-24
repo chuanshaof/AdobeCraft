@@ -187,6 +187,45 @@ fn puppet_pins_deform_and_undo() {
 }
 
 #[test]
+fn first_puppet_pin_leaves_the_layer_still() {
+    // #313: an 800×600 solid in a 1920×1080 comp turned about the first pin at these spots.
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "C", "width": 1920, "height": 1080, "duration": 2, "frameRate": 30})).unwrap();
+    let id = s.execute("layer.newSolid", json!({"width": 800, "height": 600, "color": [0, 0, 1]})).unwrap()["layer"].as_u64().unwrap();
+    let cid = s.active_comp_id().unwrap();
+    let before = s.render(cid, Tick::ZERO, RenderOpts::default());
+    for at in [[40, 40], [400, 300], [123, 456]] {
+        s.execute("puppet.addPin", json!({"layer": id, "position": at})).unwrap();
+        let after = s.render(cid, Tick::ZERO, RenderOpts::default());
+        let moved = after.data.iter().zip(&before.data).filter(|(a, b)| (0..4).any(|c| (a[c] - b[c]).abs() > 1e-3)).count();
+        assert_eq!(moved, 0, "pin at {at:?} changed {moved} pixels");
+        s.undo();
+    }
+}
+
+/// #318: a pin added to an already-bent mesh holds the mesh where it is: nothing jumps.
+#[test]
+fn a_pin_added_to_a_bent_mesh_moves_nothing() {
+    let (mut s, id) = setup();
+    s.execute("puppet.addPin", json!({"layer": id, "position": [5, 30]})).unwrap();
+    s.execute("puppet.addPin", json!({"layer": id, "position": [95, 30]})).unwrap();
+    s.set_time(Tick::from_seconds_f64(1.0));
+    s.execute("puppet.movePin", json!({"layer": id, "pin": "Puppet Pin 2", "position": [80, 70]})).unwrap();
+    let cid = s.active_comp_id().unwrap();
+    let t = Tick::from_seconds_f64(1.0);
+    let before = s.render(cid, t, RenderOpts::default());
+    for at in [[50, 54], [30, 42], [70, 62]] {
+        s.execute("puppet.addPin", json!({"layer": id, "position": at})).unwrap();
+        let after = s.render(cid, t, RenderOpts::default());
+        let moved = after.data.iter().zip(&before.data).filter(|(a, b)| (a[3] - b[3]).abs() > 0.25).count();
+        // (Before #318 the pin at [50, 54] moved about 250 edge pixels; the solver's round-off
+        // still touches a few.)
+        assert!(moved <= 16, "a pin at {at:?} moved {moved} pixels");
+        s.undo();
+    }
+}
+
+#[test]
 fn puppet_pin_kinds_and_mesh_options() {
     let (mut s, id) = setup();
     for (k, pos) in [("position", [10, 30]), ("starch", [50, 30]), ("bend", [90, 30]), ("overlap", [30, 30]), ("advanced", [70, 30])] {

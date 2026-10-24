@@ -9,6 +9,10 @@ use crate::{EngineError, Result, Session, cmd, query};
 
 // ---------------------------------------------------------------- prefs
 
+/// Why a script can't change Application Scripting settings.
+const SCRIPT_PERMISSIONS: &str =
+    "Scripts can't change what scripts are allowed to do. Change it yourself in Settings ▸ Scripting & Expressions ▸ Application Scripting.";
+
 fn prefs_get(s: &mut Session, p: &Value) -> Result<Value> {
     let key = str_p(p, "key").unwrap_or("");
     s.prefs.get(key).ok_or_else(|| bad("prefs.get", format!("unknown setting `{key}`")))
@@ -30,6 +34,9 @@ fn prefs_set(s: &mut Session, p: &Value) -> Result<Value> {
     for (k, v) in &pairs {
         next.set(k, v.clone()).map_err(|e| bad("prefs.set", e))?;
     }
+    if s.running_for_script() && !next.scripting.same_permissions(&s.prefs.scripting) {
+        return Err(EngineError::Other(SCRIPT_PERMISSIONS.into()));
+    }
     s.prefs = next;
     s.prefs_changed();
     s.save_prefs();
@@ -39,7 +46,12 @@ fn prefs_set(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn prefs_reset(s: &mut Session, p: &Value) -> Result<Value> {
     let page = str_p(p, "page");
+    let before = s.prefs.scripting.clone();
     s.prefs.reset(page).map_err(|e| bad("prefs.reset", e))?;
+    // A script's reset leaves what scripts may do as the user set it.
+    if s.running_for_script() {
+        s.prefs.scripting.keep_permissions(&before);
+    }
     s.prefs_changed();
     s.save_prefs();
     s.toast(match page {
@@ -271,7 +283,7 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!("shortcuts.export", "Export Keyboard Shortcuts", [], None, "{preset?, path?}", always, sc_export),
         cmd!("shortcuts.import", "Import Keyboard Shortcuts", [], None, "{path? | preset?: exported document, name?}", always, sc_import),
         query!("shortcuts.conflicts", "Keyboard Shortcut Conflicts", "{}", sc_conflicts),
-        cmd!("file.openRecent", "Open Recent", [], None, "{index? | path?}", has_recent, open_recent),
+        cmd!("file.openRecent", "Open Recent", [], Some("Cmd+Alt+Shift+P"), "{index? | path?}", has_recent, open_recent),
         cmd!("file.clearRecent", "Clear Recent Projects", ["File", "Open Recent"], None, "{}", has_recent, clear_recent),
         cmd!("file.autoSave", "Auto-Save Now", [], None, "{}", always, auto_save),
         query!("file.recoveryInfo", "Auto-Save Status", "{}", recovery_info),

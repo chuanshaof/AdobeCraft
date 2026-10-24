@@ -22,6 +22,7 @@ pub enum Icon {
     Ellipse,
     Polygon,
     Star,
+    StarFilled,
     Pen,
     PenAdd,
     PenDelete,
@@ -34,6 +35,8 @@ pub enum Icon {
     Eraser,
     RotoBrush,
     RefineEdge,
+    /// Object Matte: a selection box's corners around a solid object, with a click point.
+    ObjectMatte,
     /// Puppet Position Pin: a pushpin. The other pin tools add a badge at the lower right.
     Puppet,
     PuppetAdvanced,
@@ -59,6 +62,8 @@ pub enum Icon {
     Keyframe,
     PickWhip,
     Flowchart,
+    /// The Timeline's composition marker bin: a marker tab resting in an open tray.
+    MarkerBin,
     // project items
     Folder,
     Comp,
@@ -110,6 +115,13 @@ pub enum Icon {
     Globe,
     Code,
     Sparkle,
+    // appearance modes
+    /// Sync with System: a display on a stand.
+    Monitor,
+    /// Light: a disc with eight rays.
+    Sun,
+    /// Dark: a crescent.
+    Moon,
 }
 
 pub struct Pen16<'a> {
@@ -136,6 +148,8 @@ impl Pen16<'_> {
         let v: Vec<Pos2> = pts.iter().map(|(x, y)| self.p(*x, *y)).collect();
         self.painter.add(PathShape::closed_line(v, PathStroke::new(self.width * self.s(), self.color)));
     }
+    /// Fill a **convex** outline: the tessellator fans a concave one into slivers across its
+    /// notches, so a concave glyph is drawn as overlapping convex pieces (see [`SELECTION_ARROW`]).
     fn fill(&self, pts: &[(f32, f32)]) {
         let v: Vec<Pos2> = pts.iter().map(|(x, y)| self.p(*x, *y)).collect();
         self.painter.add(PathShape::convex_polygon(v, self.color, Stroke::NONE));
@@ -195,6 +209,25 @@ impl Pen16<'_> {
     }
 }
 
+/// The convex pieces of each concave filled glyph. Pieces overlap rather than abut: abutting
+/// antialiased edges would leave a faint seam.
+type Pieces = &'static [&'static [(f32, f32)]];
+
+/// The Selection tool's arrow pointer (tip upper left, a notch each side of the tail): the head
+/// with its left wing, the right wing, and the tail. Only the head reaches the tip: slivers
+/// meeting there would antialias into a spike past it.
+const SELECTION_ARROW: Pieces = &[
+    &[(4.5, 2.0), (4.5, 13.0), (7.2, 10.5), (10.1, 7.39)],
+    &[(7.5, 9.0), (8.9, 9.9), (12.5, 9.7), (10.1, 7.39)],
+    &[(7.8, 8.6), (7.2, 10.5), (9.2, 14.6), (10.8, 13.9), (8.9, 9.9)],
+];
+/// A loudspeaker: the magnet box, running a little into the cone.
+const SPEAKER: Pieces = &[&[(2.0, 6.0), (5.5, 6.0), (5.5, 10.0), (2.0, 10.0)], &[(5.0, 6.0), (9.0, 2.5), (9.0, 13.5), (5.0, 10.0)]];
+/// A four-pointed star: an upright and a level diamond, whose edges cross at the inner corners.
+const SPARKLE: Pieces = &[&[(8.0, 1.5), (9.784, 8.0), (8.0, 14.5), (6.216, 8.0)], &[(1.5, 8.0), (8.0, 6.216), (14.5, 8.0), (8.0, 9.784)]];
+#[cfg(test)]
+const CONCAVE: [Pieces; 3] = [SELECTION_ARROW, SPEAKER, SPARKLE];
+
 /// Paint `icon` centred in `rect`.
 pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
     let pen = Pen16 { painter, rect, color, width: 1.25 };
@@ -204,7 +237,7 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             pen.closed(&[(2.5, 7.5), (8.0, 2.5), (13.5, 7.5), (13.5, 13.5), (2.5, 13.5)]);
             pen.rect(6.5, 9.5, 9.5, 13.5);
         }
-        Selection => pen.fill(&[(4.5, 2.0), (4.5, 13.0), (7.2, 10.5), (9.2, 14.6), (10.8, 13.9), (8.9, 9.9), (12.5, 9.7)]),
+        Selection => SELECTION_ARROW.iter().for_each(|p| pen.fill(p)),
         Hand => {
             pen.line(&[(5.0, 9.0), (5.0, 4.0)]);
             pen.line(&[(7.3, 8.0), (7.3, 2.6)]);
@@ -262,6 +295,18 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             let pts = pen.star(8.0, 8.6, 6.4, 2.7, 5);
             pen.closed(&pts);
         }
+        StarFilled => {
+            // Five triangles fill the concave star without a convex-polygon approximation.
+            let pts = pen.star(8.0, 8.6, 6.4, 2.7, 5);
+            for pair in pts.windows(2) {
+                if let [a, b] = pair {
+                    pen.fill(&[(8.0, 8.6), *a, *b]);
+                }
+            }
+            if let (Some(first), Some(last)) = (pts.first(), pts.last()) {
+                pen.fill(&[(8.0, 8.6), *last, *first]);
+            }
+        }
         Pen => {
             pen.closed(&[(8.0, 1.8), (12.0, 9.0), (8.0, 14.0), (4.0, 9.0)]);
             pen.dot(8.0, 8.6, 1.1);
@@ -305,6 +350,14 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             pen.line(&[(8.0, 14.0), (9.5, 12.5)]);
             pen.line(&[(11.0, 14.0), (12.5, 12.5)]);
         }
+        ObjectMatte => {
+            // Corner brackets of a box around a filled object, and the click on it.
+            for (x, y, dx, dy) in [(2.0, 2.0, 1.0, 1.0), (14.0, 2.0, -1.0, 1.0), (14.0, 14.0, -1.0, -1.0), (2.0, 14.0, 1.0, -1.0)] {
+                pen.line(&[(x, y + 3.0 * dy), (x, y), (x + 3.0 * dx, y)]);
+            }
+            pen.dot(8.0, 8.0, 2.2);
+            pen.circle(8.0, 8.0, 4.4);
+        }
         Puppet => pen.pushpin(8.0),
         PuppetAdvanced => {
             // Rotation ring with its square scale handle.
@@ -336,7 +389,7 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             pen.dot(8.0, 8.0, 2.2);
         }
         Speaker => {
-            pen.fill(&[(2.0, 6.0), (5.0, 6.0), (9.0, 2.5), (9.0, 13.5), (5.0, 10.0), (2.0, 10.0)]);
+            SPEAKER.iter().for_each(|p| pen.fill(p));
             pen.arc(9.0, 8.0, 3.0, -50.0, 50.0);
             pen.arc(9.0, 8.0, 5.5, -50.0, 50.0);
         }
@@ -411,6 +464,10 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             pen.rect(1.5, 2.5, 6.0, 6.5);
             pen.rect(10.0, 9.5, 14.5, 13.5);
             pen.line(&[(6.0, 4.5), (12.25, 4.5), (12.25, 9.5)]);
+        }
+        MarkerBin => {
+            pen.fill(&[(5.0, 2.0), (11.0, 2.0), (11.0, 7.5), (8.0, 10.5), (5.0, 7.5)]);
+            pen.line(&[(2.0, 9.0), (2.0, 14.0), (14.0, 14.0), (14.0, 9.0)]);
         }
         Folder => pen.closed(&[(1.5, 4.0), (6.0, 4.0), (7.5, 5.5), (14.5, 5.5), (14.5, 13.0), (1.5, 13.0)]),
         Comp => {
@@ -608,7 +665,25 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             pen.line(&[(9.4, 2.8), (6.6, 13.2)]);
         }
         Sparkle => {
-            pen.fill(&[(8.0, 1.5), (9.4, 6.6), (14.5, 8.0), (9.4, 9.4), (8.0, 14.5), (6.6, 9.4), (1.5, 8.0), (6.6, 6.6)]);
+            SPARKLE.iter().for_each(|p| pen.fill(p));
+        }
+        Monitor => {
+            pen.rrect(1.8, 2.5, 14.2, 11.0, 1.2);
+            pen.line(&[(8.0, 11.0), (8.0, 13.8)]);
+            pen.line(&[(5.0, 13.8), (11.0, 13.8)]);
+        }
+        Sun => {
+            pen.circle(8.0, 8.0, 2.8);
+            for i in 0..8 {
+                let a = std::f32::consts::FRAC_PI_4 * i as f32;
+                let (c, s) = (a.cos(), a.sin());
+                pen.line(&[(8.0 + 4.6 * c, 8.0 + 4.6 * s), (8.0 + 6.4 * c, 8.0 + 6.4 * s)]);
+            }
+        }
+        Moon => {
+            // The outer edge of a disc, and the inner edge of the disc that eclipses it.
+            pen.arc(8.0, 8.0, 5.8, -20.0, 250.0);
+            pen.arc(10.6, 2.4, 4.6, 52.0, 178.0);
         }
         PenAdd | PenDelete => {
             // A small pen nib with a plus or minus beside it.
@@ -641,13 +716,24 @@ pub fn keyframe(
     left: effectcraft_engine::keyframe::KeyHalf,
     right: effectcraft_engine::keyframe::KeyHalf,
     fill: Color32,
-    outline: Color32,
 ) {
+    painter.extend(keyframe_shapes(center, size, left, right, fill));
+}
+
+/// The halves of a [`keyframe`] glyph. Flat, without a dark outline (as in After Effects), so
+/// keys that overlap read as one shape instead of a tangle of borders (#284); the hairline in
+/// the fill colour closes the seam between the halves.
+fn keyframe_shapes(
+    center: Pos2,
+    size: f32,
+    left: effectcraft_engine::keyframe::KeyHalf,
+    right: effectcraft_engine::keyframe::KeyHalf,
+    fill: Color32,
+) -> Vec<egui::Shape> {
     use effectcraft_engine::keyframe::KeyHalf as H;
     let r = size / 2.0;
-    let half = |pts: Vec<Pos2>| {
-        painter.add(PathShape::convex_polygon(pts, fill, Stroke::new(1.0, outline)));
-    };
+    let mut out = Vec::with_capacity(2);
+    let mut half = |pts: Vec<Pos2>| out.push(PathShape::convex_polygon(pts, fill, Stroke::new(0.5, fill)).into());
     let c = center;
     for (side, h) in [(-1.0f32, left), (1.0, right)] {
         match h {
@@ -675,6 +761,44 @@ pub fn keyframe(
                     hp.push(c + vec2(side * r * 0.8 * t.sin(), r * 0.8 * t.cos()));
                 }
                 half(hp);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use effectcraft_engine::keyframe::KeyHalf as H;
+
+    /// The Selection arrow (and the Speaker and Sparkle) are concave; filled as one polygon they
+    /// rendered as a broken fan. Each is drawn as convex pieces instead.
+    #[test]
+    fn concave_glyphs_are_filled_as_convex_pieces() {
+        for piece in super::CONCAVE.iter().flat_map(|g| g.iter()) {
+            let n = piece.len();
+            let turns: Vec<f32> = (0..n)
+                .map(|i| {
+                    let (a, b, c) = (piece[i], piece[(i + 1) % n], piece[(i + 2) % n]);
+                    (b.0 - a.0) * (c.1 - b.1) - (b.1 - a.1) * (c.0 - b.0)
+                })
+                .collect();
+            assert!(turns.iter().all(|t| *t < 0.0) || turns.iter().all(|t| *t > 0.0), "{piece:?} is not convex: {turns:?}");
+        }
+    }
+
+    /// #284: keyframes have no dark border (overlapping keys looked messy): each half is filled
+    /// and edged in the key's own colour.
+    #[test]
+    fn keyframes_are_drawn_without_a_dark_outline() {
+        let fill = egui::Color32::from_gray(0xc0);
+        for (l, r) in [(H::Linear, H::Linear), (H::Bezier, H::Hold), (H::Auto, H::Linear)] {
+            let shapes = super::keyframe_shapes(egui::pos2(10.0, 10.0), 11.0, l, r, fill);
+            assert_eq!(shapes.len(), 2);
+            for s in shapes {
+                let egui::Shape::Path(p) = s else { panic!("a path: {s:?}") };
+                assert_eq!(p.fill, fill);
+                assert!(p.stroke.width <= 0.5 && p.stroke.color == egui::epaint::ColorMode::Solid(fill), "{:?}", p.stroke);
             }
         }
     }

@@ -1,7 +1,8 @@
 //! Effect menu and Effect Controls gestures.
 
 use effectcraft_project::build::Ids;
-use effectcraft_project::{GroupKind, LayerId, PropGroup, Uid};
+use effectcraft_project::{GroupKind, Layer, LayerId, PropGroup, Uid};
+use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
 use super::{CommandSpec, b_p, bad, f_p, has_layers, layer_mut, layers_p, str_p};
@@ -78,13 +79,7 @@ fn apply(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let sizes: Vec<_> = {
         let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
-        ids.iter()
-            .filter_map(|id| comp.layer(*id))
-            .map(|l| {
-                let (w, h) = effectcraft_render::source_size(&s.project, l);
-                (l.id, if w == 0 { [comp.width as f64, comp.height as f64] } else { [w as f64, h as f64] })
-            })
-            .collect()
+        ids.iter().filter_map(|id| comp.layer(*id)).map(|l| (l.id, effectcraft_render::effect_bounds(&s.project, comp, l).0)).collect()
     };
     let uids = s.edit(&format!("Apply {}", spec.name), None, |proj, st| {
         let mut out = vec![];
@@ -123,13 +118,26 @@ fn find_fx(s: &Session, p: &Value, cmd: &str) -> Result<(effectcraft_project::It
     let g = match p.get("effect") {
         Some(Value::Number(n)) => {
             let n = n.as_u64().unwrap_or(0);
-            fx.groups().find(|g| g.uid == n).or_else(|| fx.groups().nth(n.saturating_sub(1) as usize))
+            fx.groups().find(|g| g.uid == n).or_else(|| usize::try_from(n.saturating_sub(1)).ok().and_then(|i| fx.groups().nth(i)))
         }
         Some(Value::String(name)) => fx.groups().find(|g| &g.name == name || g.match_id == *name),
         _ => s.state.selected_props.iter().find_map(|(l, u)| (*l == lid).then(|| fx.groups().find(|g| g.uid == *u)).flatten()),
     }
     .ok_or_else(|| bad(cmd, "no such effect"))?;
     Ok((cid, lid, g.uid))
+}
+
+/// `effect.warning`: what Effect Controls warns about an effect (a custom OCIO config it can't
+/// read, or transforms it passes through), `null` when it renders as asked.
+fn warning(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "effect.warning";
+    let (cid, lid, uid) = find_fx(s, p, cmd)?;
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let layer = comp.layer(lid).ok_or(EngineError::NoComp)?;
+    let g = layer.effects().and_then(|fx| fx.groups().find(|g| g.uid == uid)).ok_or_else(|| bad(cmd, "no such effect"))?;
+    let t = super::time_p(s, p, Some(comp));
+    let ctx = effectcraft_render::EvalCtx { project: &s.project, comp_id: cid, comp, time: t, expr: s.expr.as_deref(), footage: None };
+    Ok(json!({"effect": uid, "warning": effectcraft_effects::warning(g, &mut |pr| ctx.value(layer, pr))}))
 }
 
 /// A colour parameter's eyedropper on a keyer (Effect Controls): the colour of the effect's input
@@ -178,6 +186,101 @@ fn pick_color(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"prop": uid, "color": color}))
 }
 
+/// What a Cryptomatte effect has at a layer-space point: the ID with the most coverage in its
+/// Cryptomatte layer, with the aux channels (for the manifest) and the effect's Selection.
+struct CryptoHit {
+    at: (effectcraft_project::ItemId, LayerId, Tick),
+    aux: std::sync::Arc<effectcraft_raster::AuxChannels>,
+    layer: String,
+    hash: u32,
+    selection: String,
+    prop: Uid,
+    /// The Selection has an expression: setting its value wouldn't change what it reads.
+    driven: bool,
+}
+
+impl CryptoHit {
+    fn manifest(&self) -> Option<&[(String, u32)]> {
+        self.aux.manifests.iter().find(|(l, _)| *l == self.layer).map(|(_, m)| m.as_slice())
+    }
+    fn reply(&self, sel: &str) -> Value {
+        let selected = effectcraft_effects::selection_hashes(sel, self.manifest()).contains(&self.hash);
+        let name = self.aux.manifest_name(&self.layer, self.hash);
+        json!({"name": name, "hash": format!("{:08x}", self.hash), "layer": self.layer, "selected": selected})
+    }
+}
+
+/// The ID under `{x, y}` (effect space, which is layer space on footage and precomp layers) for
+/// the Cryptomatte effect `{layer?, effect?}`, from the aux channels its render reads. The point
+/// snaps to the centre of the pixel the effect's input buffer samples in a render at `scale`
+/// (the viewer's resolution).
+fn crypto_hit(s: &Session, p: &Value, cmd: &str) -> Result<Option<CryptoHit>> {
+    let (cid, lid, fx_uid) = find_fx(s, p, cmd)?;
+    let (Some(x), Some(y)) = (f_p(p, "x"), f_p(p, "y")) else { return Err(bad(cmd, "missing `x` / `y` (layer pixels)")) };
+    let scale = f_p(p, "scale").unwrap_or(1.0);
+    if !(scale.is_finite() && scale > 0.0 && scale <= 1.0) {
+        return Err(bad(cmd, "`scale` is the preview's resolution factor, above 0 and at most 1"));
+    }
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let layer = comp.layer(lid).ok_or(EngineError::NoComp)?;
+    let fx = layer.effects().ok_or_else(|| bad(cmd, "no effects"))?;
+    let pos = fx.groups().position(|g| g.uid == fx_uid).ok_or_else(|| bad(cmd, "no such effect"))?;
+    let g = fx.groups().nth(pos).ok_or_else(|| bad(cmd, "no such effect"))?;
+    let prop = g.prop("selection").filter(|_| g.match_id == "ec.3d.cryptomatte").ok_or_else(|| bad(cmd, "not a Cryptomatte effect"))?;
+    let t = super::time_p(s, p, Some(comp));
+    let ctx = effectcraft_render::EvalCtx { project: &s.project, comp_id: cid, comp, time: t, expr: s.expr.as_deref(), footage: None };
+    let params = effectcraft_effects::flatten_params(g, &mut |pr| ctx.value(layer, pr));
+    let r = s.renderer(effectcraft_render::RenderOpts { scale, ..Default::default() });
+    let aux = r.layer_aux(&ctx, layer);
+    let want = effectcraft_effects::CRYPTO_LAYERS.get(params.e("layer") as usize).copied().unwrap_or("CryptoAsset");
+    let Some((aux, layer_name)) = aux.and_then(|a| a.resolve_crypto_layer(want).map(|l| (a, l))) else {
+        return Err(bad(cmd, "this layer has no Cryptomatte channels (a multi-layer OpenEXR with Cryptomatte, or a 3D precomp)"));
+    };
+    // The grid of the effect's input buffer (footage keeps native pixels from 3/4 scale up,
+    // proxies have their own size, earlier effects can pad it), rendered and cached.
+    let b = r.layer_input(&ctx, layer, pos).ok_or_else(|| bad(cmd, "this layer has no pixels"))?;
+    let (bs, o) = (b.scale, b.offset);
+    // The centre of its pixel under the point, at the aux point the effect reads there.
+    let [ax, ay] = effectcraft_effects::aux_point(bs, o, [(x * bs + o[0]).floor() + 0.5, (y * bs + o[1]).floor() + 0.5]);
+    let Some(hash) = aux.index_at(ax, ay).and_then(|i| aux.crypto_id_at(&layer_name, i)) else { return Ok(None) };
+    let (selection, driven) = (params.s("selection").to_string(), prop.expr.as_ref().is_some_and(|e| e.enabled));
+    Ok(Some(CryptoHit { at: (cid, lid, t), aux, layer: layer_name, hash, selection, prop: prop.uid, driven }))
+}
+
+/// `effect.cryptomatteAt`: the ID under a point, for the viewer's hover hint. The first call per
+/// frame renders the effect's input to learn its pixel grid (cached afterwards).
+fn crypto_at(s: &mut Session, p: &Value) -> Result<Value> {
+    Ok(crypto_hit(s, p, "effect.cryptomatteAt")?.map_or(Value::Null, |h| h.reply(&h.selection)))
+}
+
+/// The Cryptomatte eyedropper: replace the effect's Selection with the ID under a point, add it
+/// or remove it, in one undo step at the time it was read (none when its meaning stays).
+fn pick_crypto(s: &mut Session, p: &Value) -> Result<Value> {
+    use effectcraft_effects::crypto_select::{PickMode, edit_selection, token_for};
+    let cmd = "effect.pickCryptomatte";
+    let mode = match str_p(p, "mode").unwrap_or("replace") {
+        "replace" => PickMode::Replace,
+        "add" => PickMode::Add,
+        "remove" => PickMode::Remove,
+        m => return Err(bad(cmd, format!("unknown `mode` {m:?} (replace, add or remove)"))),
+    };
+    let h = crypto_hit(s, p, cmd)?.ok_or_else(|| bad(cmd, "no Cryptomatte ID there (empty or outside the layer)"))?;
+    if h.driven {
+        return Err(bad(cmd, "the Selection is driven by an expression; disable it to pick"));
+    }
+    let m = h.manifest();
+    let sel = edit_selection(&h.selection, &token_for(h.aux.manifest_name(&h.layer, h.hash), h.hash, m), h.hash, mode, m);
+    let changed = sel != h.selection;
+    if changed {
+        let (cid, lid, t) = h.at;
+        s.execute("prop.set", json!({"comp": cid.0, "layer": lid.0, "prop": h.prop, "value": sel, "time": t.seconds(), "timeBase": "comp"}))?;
+    }
+    let mut out = h.reply(&sel);
+    out["selection"] = json!(sel);
+    out["changed"] = json!(changed);
+    Ok(out)
+}
+
 fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     let cid = super::comp_id(s, p)?;
     let fx = effects_p(s, p, "effect.remove")?;
@@ -218,6 +321,25 @@ fn toggle(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(g.enabled)
     })?;
     Ok(json!(r))
+}
+
+/// `effect.setLabel`: the effect's colour label (None clears it).
+fn set_label(s: &mut Session, p: &Value) -> Result<Value> {
+    let c = "effect.setLabel";
+    let (cid, lid, uid) = find_fx(s, p, c)?;
+    let lab = match p.get("label") {
+        Some(Value::Number(n)) => n.as_u64().and_then(|i| effectcraft_color::Label::ALL.get(usize::try_from(i).ok()?).copied()),
+        Some(Value::String(name)) => s.prefs.label_from_name(name),
+        _ => None,
+    }
+    .ok_or_else(|| bad(c, "missing or unknown `label` (name or index 0-16; 0 / None clears it)"))?;
+    s.edit("Effect Label", None, |proj, _| {
+        let l = layer_mut(proj, cid, lid)?;
+        let g = l.props.find_group_mut(uid).ok_or_else(|| bad(c, "gone"))?;
+        g.label = (lab != effectcraft_color::Label::None).then_some(lab);
+        Ok(())
+    })?;
+    Ok(Value::Null)
 }
 
 fn reorder(s: &mut Session, p: &Value) -> Result<Value> {
@@ -293,12 +415,108 @@ fn effects_p(s: &Session, p: &Value, cmd: &str) -> Result<Vec<(LayerId, Uid)>> {
     Ok(sel)
 }
 
-/// Edit ▸ Copy with effects selected: puts the effect instances on the effect clipboard.
+fn effect_time_error(cmd: &str) -> EngineError {
+    bad(cmd, "an effect keyframe converts outside the supported time range")
+}
+
+/// Validate before Layer's saturating conversions, so a bad stretch or time never silently
+/// moves a copied key to another frame. Normal-speed layers keep their exact integer ticks.
+fn effect_time(layer: &Layer, time: Tick, to_comp: bool, cmd: &str) -> Result<Tick> {
+    if !layer.stretch.is_finite() || layer.stretch == 0.0 {
+        return Err(bad(cmd, "the layer has an invalid time stretch"));
+    }
+    let in_range = |t: i64| (Tick::MIN.0..=Tick::MAX.0).contains(&t);
+    if !in_range(time.0) {
+        return Err(effect_time_error(cmd));
+    }
+    let offset = if to_comp { time.0 } else { time.0.checked_sub(layer.start_time.0).ok_or_else(|| effect_time_error(cmd))? };
+    let scaled = if (layer.stretch - 100.0).abs() < 1e-9 {
+        offset
+    } else {
+        let scaled = if to_comp { offset as f64 * layer.stretch / 100.0 } else { offset as f64 * 100.0 / layer.stretch };
+        if !scaled.is_finite() || scaled < Tick::MIN.0 as f64 || scaled > Tick::MAX.0 as f64 {
+            return Err(effect_time_error(cmd));
+        }
+        scaled as i64
+    };
+    if !in_range(scaled) {
+        return Err(effect_time_error(cmd));
+    }
+    let time = if to_comp { layer.start_time.0.checked_add(scaled).ok_or_else(|| effect_time_error(cmd))? } else { scaled };
+    if !in_range(time) {
+        return Err(effect_time_error(cmd));
+    }
+    Ok(Tick(time))
+}
+
+/// Change the key time coordinate system throughout an effect, including nested controls.
+/// Ease speeds are per second in that coordinate system; reversed time swaps the key sides.
+fn retime_effect(group: &mut PropGroup, scale: f64, cmd: &str, mut time: impl FnMut(Tick) -> Result<Tick>) -> Result<()> {
+    let mut result = Ok(());
+    group.walk_mut(&mut |pr| {
+        if result.is_err() {
+            return;
+        }
+        for key in &mut pr.keys {
+            let mapped = time(key.time).and_then(|t| {
+                if !scale.is_finite() || scale == 0.0 {
+                    return Err(effect_time_error(cmd));
+                }
+                // Spatial paths and non-numeric values ease along positive progress;
+                // numeric components instead store a signed value derivative.
+                let speed_scale = if pr.spatial || key.value.dims() == 0 { scale.abs() } else { scale };
+                for ease in key.in_ease.iter_mut().chain(&mut key.out_ease) {
+                    ease.speed /= speed_scale;
+                    if !ease.speed.is_finite() {
+                        return Err(bad(cmd, "an effect keyframe ease converts outside the supported range"));
+                    }
+                }
+                if scale < 0.0 {
+                    std::mem::swap(&mut key.in_interp, &mut key.out_interp);
+                    std::mem::swap(&mut key.in_ease, &mut key.out_ease);
+                    std::mem::swap(&mut key.spatial_in, &mut key.spatial_out);
+                }
+                Ok(t)
+            });
+            match mapped {
+                Ok(t) => key.time = t,
+                Err(e) => {
+                    result = Err(e);
+                    return;
+                }
+            }
+        }
+        pr.keys.sort_by_key(|key| key.time);
+        if pr.keys.windows(2).any(|pair| pair[0].time == pair[1].time) {
+            result = Err(bad(cmd, "the layer's time stretch maps effect keyframes to the same tick"));
+        }
+    });
+    result
+}
+
+/// Edit ▸ Copy with effects selected: times on the clipboard are comp-time offsets from the
+/// earliest copied key, shared by all copied effects and their parameters (#989).
 fn copy(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "effect.copy";
     let fx = effects_p(s, p, "effect.copy")?;
     let comp = s.active_comp().ok_or(EngineError::NoComp)?;
-    let groups: Vec<PropGroup> =
-        fx.iter().filter_map(|(l, u)| comp.layer(*l).and_then(|l| l.effects()).and_then(|e| e.groups().find(|g| g.uid == *u)).cloned()).collect();
+    let mut groups = Vec::new();
+    let mut earliest: Option<Tick> = None;
+    for (lid, uid) in fx {
+        let layer = comp.layer(lid).ok_or(EngineError::NoComp)?;
+        let mut group = layer.effects().and_then(|fx| fx.groups().find(|g| g.uid == uid)).cloned().ok_or_else(|| bad(CMD, "the effect no longer exists"))?;
+        retime_effect(&mut group, layer.stretch / 100.0, CMD, |t| {
+            let t = effect_time(layer, t, true, CMD)?;
+            earliest = Some(earliest.map_or(t, |first| first.min(t)));
+            Ok(t)
+        })?;
+        groups.push(group);
+    }
+    if let Some(first) = earliest {
+        for group in &mut groups {
+            retime_effect(group, 1.0, CMD, |t| Ok(Tick(t.0.checked_sub(first.0).ok_or_else(|| effect_time_error(CMD))?)))?;
+        }
+    }
     s.state.clipboard.clear();
     s.state.key_clipboard.clear();
     s.state.contents_clipboard.clear();
@@ -319,8 +537,10 @@ pub(crate) fn unique_name(fx: &PropGroup, base: &str) -> String {
 }
 
 /// Edit ▸ Paste with effects on the clipboard: adds copies to every target layer, after the
-/// layer's selected effect when it has one, else at the end of its stack.
+/// layer's selected effect when it has one, else at the end of its stack. The earliest copied
+/// key lands at the destination comp's CTI; all other keys keep their comp-time offsets.
 fn paste(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "effect.paste";
     let clip = s.state.effect_clipboard.clone();
     if clip.is_empty() {
         return Err(bad("effect.paste", "no effects on the clipboard"));
@@ -330,6 +550,7 @@ fn paste(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad("effect.paste", "select a layer to paste effects onto"));
     }
     let sel = selected_effects(s);
+    let cti = s.time_of(cid);
     let label = if clip.len() == 1 { format!("Paste {}", clip[0].name) } else { "Paste Effects".to_string() };
     let uids = s.edit(&label, None, |proj, st| {
         let mut out = vec![];
@@ -337,6 +558,13 @@ fn paste(s: &mut Session, p: &Value) -> Result<Value> {
         let mut new_sel = vec![];
         for lid in &ids {
             let l = layer_mut(proj, cid, *lid)?;
+            let mut groups = clip.clone();
+            for group in &mut groups {
+                retime_effect(group, 100.0 / l.stretch, CMD, |offset| {
+                    let t = Tick(cti.0.checked_add(offset.0).ok_or_else(|| effect_time_error(CMD))?);
+                    effect_time(l, t, false, CMD)
+                })?;
+            }
             let Some(fx) = l.props.sub_mut("effects") else { continue };
             let at = sel
                 .iter()
@@ -345,8 +573,7 @@ fn paste(s: &mut Session, p: &Value) -> Result<Value> {
                 .max()
                 .map(|i| i + 1)
                 .unwrap_or(fx.children.len());
-            for (k, g) in clip.iter().enumerate() {
-                let mut g = g.clone();
+            for (k, mut g) in groups.into_iter().enumerate() {
                 g.reassign_uids(&mut next);
                 g.name = unique_name(fx, &g.name);
                 out.push(g.uid);
@@ -368,8 +595,7 @@ fn reset(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, lid, uid) = find_fx(s, p, "effect.reset")?;
     let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
     let layer = comp.layer(lid).ok_or(EngineError::NoComp)?;
-    let (w, h) = effectcraft_render::source_size(&s.project, layer);
-    let size = if w == 0 { [comp.width as f64, comp.height as f64] } else { [w as f64, h as f64] };
+    let size = effectcraft_render::effect_bounds(&s.project, comp, layer).0;
     let lt = layer.layer_time(s.time());
     let g = layer.effects().and_then(|fx| fx.groups().find(|g| g.uid == uid)).ok_or_else(|| bad("effect.reset", "gone"))?;
     let spec = match &g.kind {
@@ -381,13 +607,43 @@ fn reset(s: &mut Session, p: &Value) -> Result<Value> {
     s.edit(&format!("Reset {name}"), None, |proj, _| {
         let g = layer_mut(proj, cid, lid)?.props.find_group_mut(uid).ok_or_else(|| bad("effect.reset", "gone"))?;
         for ps in &spec.params {
-            if let Some(pr) = g.get_mut(ps.id) {
+            // (`group/param` ids live in twirl-down groups.)
+            if let Some(pr) = g.prop_mut(ps.id) {
                 pr.set_value_at(lt, effectcraft_effects::default_value(ps, size));
             }
         }
         Ok(())
     })?;
     Ok(Value::Null)
+}
+
+/// Tint's Swap Colors button edits both swatches at the CTI in one undo step. Like Reset,
+/// it keys animated parameters without moving their existing keys or replacing expressions.
+fn swap_tint_colors(s: &mut Session, p: &Value) -> Result<Value> {
+    let cmd = "effect.swapTintColors";
+    if !p.is_object() || p.get("effect").is_some_and(|v| !v.is_string() && v.as_u64().is_none_or(|n| n == 0)) {
+        return Err(bad(cmd, "effect must be a positive index, uid or name"));
+    }
+    let (cid, lid, uid) = find_fx(s, p, cmd)?;
+    let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
+    let layer = comp.layer(lid).ok_or(EngineError::NoComp)?;
+    let g = layer.props.find_group(uid).filter(|g| g.match_id == "ec.color.tint").ok_or_else(|| bad(cmd, "not a Tint effect"))?;
+    let lt = layer.layer_time(s.time_of(cid));
+    let color = |id| {
+        g.prop(id)
+            .map(|pr| pr.value_at(lt))
+            .filter(|v| matches!(v, effectcraft_keyframe::Value::Color(_)))
+            .ok_or_else(|| bad(cmd, "Tint is missing a colour parameter"))
+    };
+    let (black, white) = (color("black")?, color("white")?);
+    s.edit("Swap Tint Colors", None, |proj, _| {
+        let g = layer_mut(proj, cid, lid)?.props.find_group_mut(uid).ok_or_else(|| bad(cmd, "effect gone"))?;
+        for (id, value) in [("black", white), ("white", black)] {
+            g.prop_mut(id).ok_or_else(|| bad(cmd, "Tint is missing a colour parameter"))?.set_value_at(lt, value);
+        }
+        Ok(())
+    })?;
+    Ok(json!({"effect": uid}))
 }
 
 fn last(s: &mut Session, p: &Value) -> Result<Value> {
@@ -409,34 +665,114 @@ fn list(_: &mut Session, p: &Value) -> Result<Value> {
             filter.as_ref().is_none_or(|f| effectcraft_effects::name_matches(e, f) || e.id.contains(f.as_str()) || e.category.to_ascii_lowercase().contains(f))
         })
         .map(|e| {
-            json!({"id": e.id, "name": e.name, "category": e.category, "gpu": e.gpu, "float": e.float, "params": e.params.iter().map(|p| json!({"id": p.id, "name": p.name, "default": p.default.to_json()})).collect::<Vec<_>>()})
+            json!({"id": e.id, "name": e.name, "category": e.category, "gpu": e.gpu, "float": e.float, "params": e.params.iter().map(|p| {
+                let mut out = json!({"id": p.id, "name": p.name, "type": p.default.kind_name(), "default": p.default.to_json()});
+                match &p.ui {
+                    effectcraft_project::ParamUi::Popup { options } => {
+                        // Engine/MCP popup values are zero-based; JSX exposes one-based values.
+                        out["options"] = json!(options.iter().enumerate().map(|(value, label)| json!({"value": value, "label": label})).collect::<Vec<_>>());
+                    }
+                    effectcraft_project::ParamUi::Slider { min, max, slider_min, slider_max, decimals } => {
+                        out["min"] = json!(min);
+                        out["max"] = json!(max);
+                        out["sliderMin"] = json!(slider_min);
+                        out["sliderMax"] = json!(slider_max);
+                        out["decimals"] = json!(decimals);
+                    }
+                    _ => {}
+                }
+                out
+            }).collect::<Vec<_>>()})
         })
         .collect();
     Ok(json!(v))
 }
 
+impl Session {
+    /// The named channels of layer `lid` in the active comp at the current time: its
+    /// multi-layer OpenEXR footage's layers and channels (`diffuse.R`, `depth.Z`, …), which
+    /// EXtractoR and the 3D Channel effects read. `None` for other layers.
+    pub fn layer_channels(&self, lid: LayerId) -> Option<std::sync::Arc<effectcraft_raster::AuxChannels>> {
+        let layer = self.active_comp()?.layer(lid)?;
+        let effectcraft_project::LayerSource::Footage { item } = layer.source else { return None };
+        let effectcraft_project::ItemKind::Footage(f) = &self.project.item(item)?.kind else { return None };
+        self.footage.aux(item, f, layer.layer_time(self.time()))
+    }
+}
+
+/// `layer.channels`: the layers and channels of a layer's multi-layer OpenEXR footage, and
+/// what each layer shows in red, green, blue and alpha (EXtractoR's popups).
+fn channels(s: &mut Session, p: &Value) -> Result<Value> {
+    let (_, lid) = super::layer_p(s, p, "layer.channels")?;
+    let Some(aux) = s.layer_channels(lid) else { return Ok(json!({"channels": [], "layers": []})) };
+    let layers: Vec<Value> = aux.layers().into_iter().map(|l| json!({"name": l, "rgba": aux.layer_rgba(l)})).collect();
+    Ok(json!({"channels": aux.names(), "layers": layers}))
+}
+
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!("effect.apply", "Apply Effect", [], None, "{effect: id|name (e.g. Gaussian Blur), layers?}", has_layers, apply),
+        crate::query!(
+            "layer.channels",
+            "Layer Channels",
+            "{layer?} → {channels: [name], layers: [{name, rgba: [r, g, b, a channel]}]} — a multi-layer OpenEXR layer's channels (EXtractoR's red / green / blue / alpha take these names)",
+            channels
+        ),
         cmd!(
             "effect.pickColor",
             "Pick Effect Colour",
             [],
             None,
-            "{layer?, effect?: index|uid|name, param: id (e.g. screenColour) | prop: uid, x, y (layer px), average?: bool (5×5), time?} — the colour of the effect's input there",
+            "{layer?, effect?: index|uid|name, param: id (e.g. screenColour) | prop: uid, x, y (effect space), average?: bool (5×5), time?} — the colour of the effect's input there",
             has_layers,
             pick_color
+        ),
+        cmd!(
+            "effect.pickCryptomatte",
+            "Pick Cryptomatte",
+            [],
+            None,
+            "{layer?, effect?: index|uid|name, x, y (effect space), mode?: replace|add|remove (default replace), scale? (preview resolution, default 1), time?} → {name, hash, layer, selection, changed, selected} — edits the Cryptomatte effect's Selection with the ID under the point",
+            has_layers,
+            pick_crypto
+        ),
+        crate::query!(
+            "effect.cryptomatteAt",
+            "Cryptomatte At",
+            "{layer?, effect?: index|uid|name, x, y (effect space), scale?, time?} → {name, hash, layer, selected} | null — the Cryptomatte ID under the point",
+            crypto_at
         ),
         cmd!("effect.applyLast", "Last Effect", ["Effect"], Some("Cmd+Alt+Shift+E"), "{layers?}", has_layers, last),
         cmd!("effect.removeAll", "Remove All", ["Effect"], Some("Cmd+Shift+E"), "{layers?}", has_layers, remove_all),
         cmd!("effect.remove", "Remove Effect", [], None, "{layer?, effect: index|uid|name}", has_layers, remove),
         cmd!("effect.toggle", "Toggle Effect", [], None, "{layer?, effect, value?}", has_layers, toggle),
+        cmd!("effect.setLabel", "Effect Label", [], None, "{layer?, effect, label: name|index 0-16 (None clears)}", has_layers, set_label),
         cmd!("effect.reorder", "Reorder Effect", [], None, "{layer?, effect, index}", has_layers, reorder),
         cmd!("effect.duplicate", "Duplicate Effect", [], None, "{layer?, effect}", has_layers, duplicate),
         cmd!("effect.copy", "Copy Effects", [], None, "{layer?, effect? | effects?: [uid|name|index]} (default: the selected effects)", has_layers, copy),
         cmd!("effect.paste", "Paste Effects", [], None, "{layers?} — adds the copied effects to the layers", has_layers, paste),
         cmd!("effect.reset", "Reset Effect", [], None, "{layer?, effect}", has_layers, reset),
-        crate::query!("effect.list", "List Effects", "{filter?}", list),
+        cmd!(
+            "effect.swapTintColors",
+            "Swap Tint Colors",
+            [],
+            None,
+            "{comp?, layer?, effect?: index|uid|name} — swaps Tint's Map Black To and Map White To at the current layer time in one undo step",
+            has_layers,
+            swap_tint_colors
+        ),
+        crate::query!(
+            "effect.list",
+            "List Effects",
+            "{filter?} → [{params: [{id, name, type, default, options?, min?, max?, sliderMin?, sliderMax?, decimals?}]}]; popup indices are zero-based (JSX uses one-based values)",
+            list
+        ),
+        crate::query!(
+            "effect.warning",
+            "Effect Warning",
+            "{layer?, effect?: index|uid|name (default: the selected effect), time?} → {effect, warning: string|null} — what Effect Controls warns about (an OCIO config it can't read, transforms it passes through)",
+            warning
+        ),
         crate::query!(
             "effect.plugins.list",
             "List Effect Plug-ins",
@@ -453,4 +789,37 @@ pub fn specs() -> Vec<CommandSpec> {
             plugins_load
         ),
     ]
+}
+
+#[cfg(test)]
+mod list_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn effect_list_exposes_popup_labels_and_numeric_slider_limits() {
+        let mut s = Session::default();
+        let menus = s.execute("effect.list", json!({"filter": "ec.control.dropdown"})).unwrap();
+        assert_eq!(menus.as_array().map(Vec::len), Some(1));
+        let menu = &menus[0]["params"][0];
+        assert_eq!(menu["type"], "enum");
+        assert_eq!(menu["default"], 0);
+        assert_eq!(
+            menu["options"],
+            json!([
+                {"value": 0, "label": "Item 1"},
+                {"value": 1, "label": "Item 2"},
+                {"value": 2, "label": "Item 3"}
+            ])
+        );
+        let sliders = s.execute("effect.list", json!({"filter": "ec.control.slider"})).unwrap();
+        assert_eq!(sliders.as_array().map(Vec::len), Some(1));
+        let slider = &sliders[0]["params"][0];
+        assert_eq!(slider["type"], "scalar");
+        assert_eq!(slider["min"], -1_000_000.0);
+        assert_eq!(slider["max"], 1_000_000.0);
+        assert_eq!(slider["sliderMin"], 0.0);
+        assert_eq!(slider["sliderMax"], 100.0);
+        assert_eq!(slider["decimals"], 2);
+        assert!(slider["options"].is_null());
+    }
 }

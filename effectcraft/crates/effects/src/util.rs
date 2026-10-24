@@ -424,16 +424,24 @@ pub fn remap(src: &Image, clamp: bool, f: impl Fn(f64, f64) -> Option<(f64, f64)
 
 /// Layer rectangle in buffer pixels: (x0, y0, width, height).
 pub fn layer_rect(ctx: &crate::EffectCtx, b: &crate::Buf) -> (f64, f64, f64, f64) {
-    (b.offset[0], b.offset[1], ctx.layer_size[0] * b.scale, ctx.layer_size[1] * b.scale)
+    layer_rect_at(ctx, b.offset, b.scale)
 }
 
-/// The layer bounds edge pinning holds in place, in the pixels of a buffer with `offset` and
-/// `scale` (see [`crate::Buf`]): (x0, y0, width, height). Unlike [`layer_rect`] it starts at
-/// [`crate::EffectEnv::bounds_origin`], so a shape layer's content around its origin lies
-/// inside it.
-pub fn pin_rect(ctx: &crate::EffectCtx, offset: [f64; 2], scale: f64) -> (f64, f64, f64, f64) {
-    let o = ctx.env.bounds_origin;
-    (offset[0] + o[0] * scale, offset[1] + o[1] * scale, ctx.layer_size[0] * scale, ctx.layer_size[1] * scale)
+/// [`layer_rect`] in the pixels of a buffer with `offset` and `scale` (see [`crate::Buf`];
+/// GPU buffers): the layer bounds start at effect-space (0, 0).
+pub fn layer_rect_at(ctx: &crate::EffectCtx, offset: [f64; 2], scale: f64) -> (f64, f64, f64, f64) {
+    (offset[0], offset[1], ctx.layer_size[0] * scale, ctx.layer_size[1] * scale)
+}
+
+/// Transparent pixels to add on every side ([`crate::Buf::pad`]) of a buffer `size` pixels big,
+/// with `offset` and `scale`, so it covers the whole layer rectangle (at most 4096). A text or
+/// shape layer's buffer only surrounds its content, but its layer bounds are comp-sized (see
+/// the renderer's `effect_bounds`): an effect that fills the layer, such as CC Tiler, fills
+/// those as in After Effects (#659).
+pub fn layer_cover_pad(ctx: &crate::EffectCtx, size: [u32; 2], offset: [f64; 2], scale: f64) -> u32 {
+    let (x0, y0, w, h) = layer_rect_at(ctx, offset, scale);
+    let need = [-x0, -y0, x0 + w - f64::from(size[0]), y0 + h - f64::from(size[1])].into_iter().fold(0.0, f64::max);
+    need.ceil().min(4096.0) as u32
 }
 
 /// Resample another layer (a layer parameter) into `b`'s pixel grid. With `stretch` the other
@@ -453,6 +461,17 @@ pub fn fit_layer(ctx: &crate::EffectCtx, b: &crate::Buf, other: &crate::LayerPix
     })
 }
 
+/// Resample a buffer into another buffer's pixel grid without stretching its layer space.
+/// Used to composite the pre-effect image after earlier effects expand or shift the bounds.
+pub fn fit_buffer(source: &crate::Buf, width: u32, height: u32, offset: [f64; 2], scale: f64) -> Image {
+    let inv = 1.0 / scale.max(1e-9);
+    gen_image(width, height, |x, y| {
+        let sx = (x as f64 + 0.5 - offset[0]) * inv * source.scale + source.offset[0];
+        let sy = (y as f64 + 0.5 - offset[1]) * inv * source.scale + source.offset[1];
+        source.img.sample_bilinear(sx, sy)
+    })
+}
+
 /// The layer chosen in layer parameter `id` fitted to `b` (see [`fit_layer`]), or a copy of
 /// `b`'s own pixels when none is chosen / available (After Effects' "self" behaviour).
 pub fn layer_or_self(ctx: &crate::EffectCtx, b: &crate::Buf, id: &str, masks_and_effects: bool, stretch: bool) -> Image {
@@ -465,9 +484,15 @@ pub fn layer_or_self(ctx: &crate::EffectCtx, b: &crate::Buf, id: &str, masks_and
 /// A stable hash of an effect instance's evaluated parameters, seed, layer size and buffer
 /// scale (cache key for simulations).
 pub fn params_key(ctx: &crate::EffectCtx, b: &crate::Buf, salt: u64) -> u64 {
+    params_key_except(ctx, b, salt, &[])
+}
+
+/// [`params_key`] without the parameters whose ids start with one of `skip` (ones that only
+/// change how the simulation is viewed, so animating them doesn't restart it).
+pub fn params_key_except(ctx: &crate::EffectCtx, b: &crate::Buf, salt: u64, skip: &[&str]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    let mut keys: Vec<&String> = ctx.params.values.keys().collect();
+    let mut keys: Vec<&String> = ctx.params.values.keys().filter(|k| !skip.iter().any(|s| k.starts_with(s))).collect();
     keys.sort();
     for k in keys {
         k.hash(&mut h);

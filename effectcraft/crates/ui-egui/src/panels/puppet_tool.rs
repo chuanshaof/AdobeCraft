@@ -12,7 +12,7 @@ use effectcraft_engine::render::EvalCtx;
 use effectcraft_engine::time::Tick;
 use egui::{Color32, Pos2, Stroke};
 
-use super::viewer::{ViewerMap, l2c};
+use super::viewer::{ViewerMap, fx2c};
 use crate::EffectcraftApp;
 
 /// Deformed meshes of a layer's Puppet effect: (mesh uid, mesh, deformed vertices, pins).
@@ -82,6 +82,20 @@ pub fn overlay(app: &EffectcraftApp, ctx: &egui::Context, cid: ItemId, layer: &L
     Some(overlay)
 }
 
+/// The layer a Puppet tool press at comp point `cpt` works on, of the selected `layers` with a
+/// Puppet effect (stack order): the one whose mesh, as deformed now, is under it (pins go on the
+/// deformed shape, also where it reaches past the layer's own bounds), else the one whose art is
+/// (a new mesh there). Never a layer without a Puppet effect: the tools stay on the layers being
+/// rigged, as in After Effects (#284).
+pub fn target(ectx: &EvalCtx, layers: &[(&Layer, Overlay)], cpt: [f64; 2], on_art: impl Fn(&Layer) -> bool) -> Option<LayerId> {
+    let on_mesh = |l: &Layer, ov: &Overlay| {
+        let Some(inv) = fx2c(ectx, l).inverse() else { return false };
+        let p = inv.apply(gv2(cpt[0], cpt[1]));
+        ov.iter().any(|(_, mesh, def, _)| puppet::contains(mesh, def, [p.x, p.y]))
+    };
+    layers.iter().find(|(l, ov)| on_mesh(l, ov)).or_else(|| layers.iter().find(|(l, _)| on_art(l))).map(|(l, _)| l.id)
+}
+
 /// Keep a pin's keyframed Position in view in the Timeline after placing, moving or recording the
 /// pin in the viewer (#273).
 pub fn reveal_pin(app: &mut EffectcraftApp, layer: LayerId, pin: u64) {
@@ -92,7 +106,7 @@ pub fn reveal_pin(app: &mut EffectcraftApp, layer: LayerId, pin: u64) {
     }
 }
 
-/// Where a pin sits now (layer space): its Position, or (Bend / Starch / Overlap pins) its rest
+/// Where a pin sits now (effect space): its Position, or (Bend / Starch / Overlap pins) its rest
 /// point carried along by the deformation.
 pub fn pin_position(mesh: &Mesh, def: &[[f64; 2]], p: &Pin) -> [f64; 2] {
     if p.kind.moves() {
@@ -134,7 +148,7 @@ pub fn draw(
     selected: &[u64],
     hover: Option<Pos2>,
 ) -> Vec<PinHit> {
-    let (m, _) = l2c(ectx, layer);
+    let m = fx2c(ectx, layer);
     let scr = |q: [f64; 2]| {
         let c = m.apply(gv2(q[0], q[1]));
         map.to_screen([c.x, c.y])

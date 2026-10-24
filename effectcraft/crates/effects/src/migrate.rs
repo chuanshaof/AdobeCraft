@@ -236,6 +236,11 @@ fn refresh(pr: &mut Property, ps: &ParamSpec, spec: &EffectSpec) {
         }
         // A parameter that became internal (superseded by a new one) is hidden.
         (_, ParamUi::Hidden) => pr.ui = ParamUi::Hidden,
+        // A path typed as text, or set only by commands, that got a Choose… button (Apply Color
+        // LUT's LUT, the OCIO files, #514).
+        (ParamUi::Hidden | ParamUi::Text, ParamUi::File { .. }) => pr.ui = ps.ui.clone(),
+        // An internal point that became a control (Liquify's Distortion Mesh Offset, #1194).
+        (ParamUi::Hidden, ParamUi::Point) => pr.ui = ParamUi::Point,
         // Same kind of value: take the spec's hints (units, ranges).
         (a, b) if std::mem::discriminant(a) == std::mem::discriminant(b) || is_numeric_ui(a) && is_numeric_ui(b) => pr.ui = ps.ui.clone(),
         _ => {}
@@ -339,6 +344,120 @@ pub fn upgrade_instance(spec: &EffectSpec, g: &mut PropGroup, ids: &mut Ids, lay
     *g != before
 }
 
+/// Bring an effect instance saved before project schema 2 into effect space (#227).
+///
+/// Layers without a source rectangle (shape, text) have comp-sized effect bounds centred on
+/// their origin. Effects used to measure positions from the origin, so the default "layer
+/// centre" sat at the comp's bottom-right corner; they now measure from the bounds' top-left,
+/// as After Effects does. `d` is the bounds' half size: positions the instance holds move by it
+/// so they keep their place in the comp (point parameters with their keyframes, Paint stroke
+/// paths and clone positions, Puppet mesh seeds and pin rest points, Liquify and Roto Brush
+/// strokes). A point parameter still at its default (`layer_size`) and not animated stays: it
+/// meant the layer centre and now is. Expression controls keep their values (what they mean is
+/// up to the expressions reading them), and expressions are not rewritten.
+///
+/// `clone_d(source)`: the shift of a Paint clone stroke's source layer (`None` = this layer),
+/// whose effect space its Clone Position is in.
+pub fn to_effect_space(spec: &EffectSpec, g: &mut PropGroup, layer_size: [f64; 2], d: [f64; 2], clone_d: &dyn Fn(Option<u64>) -> [f64; 2]) {
+    if spec.id.starts_with("ec.control.") {
+        return;
+    }
+    let defaults: Vec<u64> = spec
+        .params
+        .iter()
+        .filter(|ps| matches!(ps.ui, ParamUi::Point | ParamUi::Point3))
+        .filter_map(|ps| g.prop(ps.id).filter(|pr| pr.keys.is_empty() && same_point(&pr.value, &default_value(ps, layer_size))).map(|pr| pr.uid))
+        .collect();
+    let at = Shift { d, clone_d, defaults: &defaults, effect: spec.id };
+    at.group(g);
+}
+
+/// What [`to_effect_space`] moves, and by how much.
+struct Shift<'a> {
+    d: [f64; 2],
+    clone_d: &'a dyn Fn(Option<u64>) -> [f64; 2],
+    /// Point parameters left at their defaults.
+    defaults: &'a [u64],
+    effect: &'a str,
+}
+
+impl Shift<'_> {
+    fn group(&self, g: &mut PropGroup) {
+        // A Paint clone stroke's Clone Position is in its source layer's effect space.
+        let clone_d = g.get("clone_source").map(|s| (self.clone_d)(s.value.as_layer())).unwrap_or(self.d);
+        for n in &mut g.children {
+            match n {
+                Node::Group(sg) => self.group(sg),
+                Node::Prop(pr) => {
+                    let d = if pr.match_id == "clone_position" { clone_d } else { self.d };
+                    let kind = match (&pr.ui, pr.match_id.as_str()) {
+                        (ParamUi::Point | ParamUi::Point3, _) if !self.defaults.contains(&pr.uid) => Some(Data::Point),
+                        (ParamUi::Path, _) => Some(Data::Point),
+                        (ParamUi::Hidden, "seed" | "rest") if self.effect == crate::puppet::ID => Some(Data::Point),
+                        (ParamUi::Hidden, "distortionMesh") if self.effect == "ec.distort.liquify" => Some(Data::Liquify),
+                        (ParamUi::Hidden, crate::roto::STROKES) if self.effect == crate::roto::ID => Some(Data::Roto),
+                        _ => None,
+                    };
+                    if let Some(kind) = kind.filter(|_| d != [0.0; 2]) {
+                        shift_value(&mut pr.value, kind, d);
+                        for k in &mut pr.keys {
+                            shift_value(&mut k.value, kind, d);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// How a value holds positions.
+#[derive(Clone, Copy)]
+enum Data {
+    /// A point (2D or 3D: x and y move) or a path (its vertices; tangents are relative).
+    Point,
+    /// Liquify's Distortion Mesh text (`distort4::LiquifyStroke` lines).
+    Liquify,
+    /// Roto Brush's Strokes JSON ([`effectcraft_track::roto::RotoData`]).
+    Roto,
+}
+
+fn shift_value(v: &mut Value, kind: Data, d: [f64; 2]) {
+    let add = |p: &mut [f64; 2]| *p = [p[0] + d[0], p[1] + d[1]];
+    match (kind, v) {
+        (Data::Point, Value::Vec2(p)) => add(p),
+        (Data::Point, Value::Vec3(p)) => *p = [p[0] + d[0], p[1] + d[1], p[2]],
+        (Data::Point, Value::Path(sp)) => sp.vertices.iter_mut().for_each(add),
+        (Data::Liquify, Value::Str(s)) => {
+            // Lines that don't read as strokes are kept as they are.
+            let lines: Vec<String> = s
+                .lines()
+                .map(|l| match crate::distort4::LiquifyStroke::parse(l) {
+                    Some(mut st) => {
+                        st.points.iter_mut().for_each(add);
+                        st.to_line()
+                    }
+                    None => l.to_string(),
+                })
+                .collect();
+            *s = lines.join("\n");
+        }
+        (Data::Roto, Value::Str(s)) => {
+            // Unreadable data is kept as it is.
+            if let Ok(mut r) = serde_json::from_str::<effectcraft_track::roto::RotoData>(s) {
+                r.strokes.iter_mut().flat_map(|st| st.points.iter_mut()).for_each(add);
+                *s = r.to_json();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Two point values equal up to float noise.
+fn same_point(a: &Value, b: &Value) -> bool {
+    let (a, b) = (a.components(), b.components());
+    a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| (x - y).abs() < 1e-6)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +497,52 @@ mod tests {
         assert_eq!(pr.name, popup.name);
         assert_eq!(pr.value, Value::Enum(options.len() as u32 - 1));
         assert_eq!(pr.ui, popup.ui);
+    }
+
+    /// #1797: Shift Channels' menu put Half On before Full Off; a project saved then keeps the
+    /// option it chose, by label.
+    #[test]
+    fn shift_channels_half_on_and_full_off_are_remapped_by_label() {
+        const OLD: [&str; 11] = ["Alpha", "Red", "Green", "Blue", "Luminance", "Hue", "Lightness", "Saturation", "Full On", "Half On", "Full Off"];
+        for (saved, want) in [(9u32, 10u32), (10, 9), (1, 1)] {
+            let mut next = 1;
+            let (spec, mut g) = instance("ec.channel.shiftchannels", &mut next);
+            let pr = g.get_mut("takeGreenFrom").unwrap();
+            pr.ui = ParamUi::Popup { options: OLD.iter().map(|s| s.to_string()).collect() };
+            pr.value = Value::Enum(saved);
+            upgrade_instance(spec, &mut g, &mut Ids(&mut next), SIZE);
+            assert_eq!(g.get("takeGreenFrom").unwrap().value, Value::Enum(want), "saved {saved}");
+        }
+    }
+
+    /// #514: Apply Color LUT's LUT was hidden (set only by commands) and the OCIO files were
+    /// plain text; old projects get the Choose… file parameter, keeping the path.
+    #[test]
+    fn hidden_and_text_paths_become_file_parameters() {
+        for (fx, pid, old) in [("ec.utility.applylut", "lut", ParamUi::Hidden), ("ec.color.ociofile", "file", ParamUi::Text)] {
+            let mut next = 1;
+            let (spec, mut g) = instance(fx, &mut next);
+            let pr = g.get_mut(pid).unwrap();
+            pr.ui = old;
+            pr.value = Value::Str("/luts/look.cube".into());
+            assert!(upgrade_instance(spec, &mut g, &mut Ids(&mut next), [100.0, 100.0]), "{fx}");
+            let pr = g.get(pid).unwrap();
+            assert!(matches!(&pr.ui, ParamUi::File { filters } if filters.iter().any(|f| f == "cube")), "{fx}: {:?}", pr.ui);
+            assert_eq!(pr.value, Value::Str("/luts/look.cube".into()));
+        }
+    }
+
+    /// #1194: Liquify's Distortion Mesh Offset was hidden; old projects show it, keeping its value.
+    #[test]
+    fn a_hidden_point_that_became_a_control_is_shown() {
+        let mut next = 1;
+        let (spec, mut g) = instance("ec.distort.liquify", &mut next);
+        let pr = g.get_mut("distortionMeshOffset").unwrap();
+        pr.ui = ParamUi::Hidden;
+        pr.value = Value::Vec2([20.0, -5.0]);
+        assert!(upgrade_instance(spec, &mut g, &mut Ids(&mut next), [100.0, 100.0]));
+        let pr = g.get("distortionMeshOffset").unwrap();
+        assert_eq!((&pr.ui, &pr.value), (&ParamUi::Point, &Value::Vec2([20.0, -5.0])));
     }
 
     #[test]
@@ -466,5 +631,123 @@ mod tests {
         pr.value = Value::Enum(0);
         assert!(upgrade_instance(spec, &mut g, &mut Ids(&mut next), [100.0, 50.0]));
         assert_eq!(g.get("viewingMode").unwrap().value, Value::Enum(4), "Final Output");
+    }
+
+    /// The shift a 200 × 100 shape layer's effect positions get (#227): half its bounds.
+    const D: [f64; 2] = [100.0, 50.0];
+    const SIZE: [f64; 2] = [200.0, 100.0];
+
+    fn instance(id: &str, next: &mut u64) -> (&'static EffectSpec, PropGroup) {
+        let spec = find(id).unwrap();
+        (spec, instantiate(spec, &mut Ids(next), spec.name, SIZE))
+    }
+
+    fn own(_: Option<u64>) -> [f64; 2] {
+        D
+    }
+
+    #[test]
+    fn effect_points_move_into_effect_space_unless_left_at_their_default() {
+        let mut next = 1;
+        // Twirl: a set centre (with keyframes) moves; Bulge's default centre stays.
+        let (spec, mut twirl) = instance("ec.distort.twirl", &mut next);
+        let c = twirl.get_mut("center").unwrap();
+        c.value = Value::Vec2([-30.0, -10.0]);
+        let key = |t: i64, v: Value| {
+            let mut k = effectcraft_keyframe::Keyframe::new(Default::default(), v);
+            k.time.0 = t;
+            k
+        };
+        c.keys = vec![key(0, Value::Vec2([0.0, 0.0])), key(1000, Value::Vec2([5.0, -5.0]))];
+        to_effect_space(spec, &mut twirl, SIZE, D, &own);
+        let c = twirl.get("center").unwrap();
+        assert_eq!(c.value, Value::Vec2([70.0, 40.0]));
+        assert_eq!(c.keys.iter().map(|k| k.value.clone()).collect::<Vec<_>>(), vec![Value::Vec2([100.0, 50.0]), Value::Vec2([105.0, 45.0])]);
+        let (spec, mut bulge) = instance("ec.distort.bulge", &mut next);
+        let before = bulge.clone();
+        to_effect_space(spec, &mut bulge, SIZE, D, &own);
+        assert_eq!(bulge, before, "the default centre now means the layer centre");
+        // Expression controls keep their values.
+        let (spec, mut ctl) = instance("ec.control.point", &mut next);
+        let pr = ctl.props().find(|p| p.ui == ParamUi::Point).unwrap().uid;
+        ctl.find_mut(pr).unwrap().value = Value::Vec2([5.0, 5.0]);
+        to_effect_space(spec, &mut ctl, SIZE, D, &own);
+        assert_eq!(ctl.find(pr).unwrap().value, Value::Vec2([5.0, 5.0]));
+    }
+
+    #[test]
+    fn puppet_paint_liquify_and_roto_data_move_into_effect_space() {
+        let mut next = 1;
+        // Puppet: mesh seed, pin rest and Position.
+        let (spec, mut puppet) = instance(crate::puppet::ID, &mut next);
+        let mut mesh = crate::puppet::mesh_group(&mut Ids(&mut next), "Mesh 1", [1.0, 2.0], &crate::puppet::MeshOpts::default());
+        let pin = crate::puppet::pin_group(&mut Ids(&mut next), "Puppet Pin 1", crate::puppet::PinKind::Position, [3.0, 4.0]);
+        mesh.sub_mut("deform").unwrap().children.push(pin.into());
+        puppet.children.push(mesh.into());
+        to_effect_space(spec, &mut puppet, SIZE, D, &own);
+        let mesh = puppet.sub("mesh").unwrap();
+        assert_eq!(mesh.get("seed").unwrap().value, Value::Vec2([101.0, 52.0]));
+        let pin = mesh.sub("deform").unwrap().sub("pin").unwrap();
+        assert_eq!(pin.get("rest").unwrap().value, Value::Vec2([103.0, 54.0]));
+        assert_eq!(pin.get("position").unwrap().value, Value::Vec2([103.0, 54.0]));
+
+        // Paint: the stroke path, its transform, and a clone position in its source layer's space.
+        let (spec, mut paint) = instance(crate::paint::ID, &mut next);
+        let s = crate::paint::StrokeSpec {
+            kind: crate::paint::StrokeKind::Clone,
+            points: vec![[0.0, 0.0], [10.0, 0.0]],
+            clone_source: Some(7),
+            clone_position: [20.0, 20.0],
+            ..Default::default()
+        };
+        paint.children.push(crate::paint::stroke_group(&mut Ids(&mut next), "Clone 1", &s).into());
+        to_effect_space(spec, &mut paint, SIZE, D, &|src| if src == Some(7) { [0.0; 2] } else { D });
+        let st = paint.sub("clone").unwrap();
+        let Value::Path(path) = &st.get("path").unwrap().value else { panic!("no path") };
+        assert_eq!(path.vertices, vec![[100.0, 50.0], [110.0, 50.0]]);
+        assert_eq!(st.sub("transform").unwrap().get("position").unwrap().value, Value::Vec2([100.0, 50.0]));
+        assert_eq!(st.sub("stroke_options").unwrap().get("clone_position").unwrap().value, Value::Vec2([20.0, 20.0]), "a footage source");
+
+        // Liquify: stroke points move, the clone offset (relative) doesn't; unknown lines stay.
+        let (spec, mut liquify) = instance("ec.distort.liquify", &mut next);
+        let line =
+            crate::distort4::LiquifyStroke { tool: 0, size: 64.0, pressure: 50.0, jitter: 0.0, clone_offset: [3.0, 3.0], points: vec![[1.0, 1.0]] }.to_line();
+        liquify.get_mut("distortionMesh").unwrap().value = Value::Str(format!(
+            "{line}
+not a stroke"
+        ));
+        to_effect_space(spec, &mut liquify, SIZE, D, &own);
+        let Value::Str(text) = &liquify.get("distortionMesh").unwrap().value else { panic!("no mesh") };
+        let moved = crate::distort4::LiquifyStroke { points: vec![[101.0, 51.0]], ..crate::distort4::LiquifyStroke::parse(&line).unwrap() };
+        assert_eq!(
+            text,
+            &format!(
+                "{}
+not a stroke",
+                moved.to_line()
+            )
+        );
+
+        // Roto Brush strokes.
+        let (spec, mut roto) = instance(crate::roto::ID, &mut next);
+        let data = effectcraft_track::roto::RotoData {
+            base: Some(0),
+            span: [0, 10],
+            strokes: vec![effectcraft_track::roto::Stroke { kind: effectcraft_track::roto::StrokeKind::Fg, frame: 0, radius: 5.0, points: vec![[2.0, 2.0]] }],
+        };
+        roto.get_mut(crate::roto::STROKES).unwrap().value = Value::Str(data.to_json());
+        to_effect_space(spec, &mut roto, SIZE, D, &own);
+        let Value::Str(text) = &roto.get(crate::roto::STROKES).unwrap().value else { panic!("no strokes") };
+        assert_eq!(effectcraft_track::roto::RotoData::from_json(text).strokes[0].points, vec![[102.0, 52.0]]);
+    }
+
+    #[test]
+    fn layers_with_a_source_rectangle_keep_their_effect_positions() {
+        let mut next = 1;
+        let (spec, mut twirl) = instance("ec.distort.twirl", &mut next);
+        twirl.get_mut("center").unwrap().value = Value::Vec2([3.0, 4.0]);
+        let before = twirl.clone();
+        to_effect_space(spec, &mut twirl, SIZE, [0.0; 2], &|_| [0.0; 2]);
+        assert_eq!(twirl, before);
     }
 }

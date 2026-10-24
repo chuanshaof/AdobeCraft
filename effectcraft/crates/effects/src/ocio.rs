@@ -17,9 +17,12 @@
 //! * CDL maths follows the ASC CDL v1.2 specification (slope, offset, power, then saturation with
 //!   Rec. 709 luma weights); the "No Clamp" style mirrors power around zero;
 //! * File Transform reads `.cube` (Adobe/Resolve), `.3dl` (Autodesk Lustre/Flame integer
-//!   lattices), `.csp` (cineSpace, with its per-channel pre-LUT shaper) and ASC `.cc` / `.ccc` /
-//!   `.cdl` XML, with nearest, trilinear or tetrahedral interpolation and an inverse direction
-//!   (exact for 1D/CDL, iterative for 3D lattices).
+//!   lattices), `.csp` (cineSpace, with its per-channel pre-LUT shaper), Sony Imageworks
+//!   `.spi1d` / `.spi3d` / `.spimtx` and ASC `.cc` / `.ccc` / `.cdl` XML, with nearest, trilinear
+//!   or tetrahedral interpolation and an inverse direction (exact for 1D/CDL/matrices, iterative
+//!   for 3D lattices);
+//! * Configuration ▸ Custom reads a `.ocio` file instead ([`crate::ocio_config`]); what it can't
+//!   apply is reported by [`warning`].
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -36,13 +39,13 @@ use crate::{Buf, EffectCtx, EffectSpec, num, p, popup, slider};
 
 type M3 = [[f64; 3]; 3];
 
-const D65: [f64; 2] = [0.3127, 0.3290];
+pub(crate) const D65: [f64; 2] = [0.3127, 0.3290];
 const ACES_WHITE: [f64; 2] = [0.32168, 0.33767];
 const AP0: [[f64; 2]; 3] = [[0.7347, 0.2653], [0.0, 1.0], [0.0001, -0.0770]];
 const AP1: [[f64; 2]; 3] = [[0.713, 0.293], [0.165, 0.830], [0.128, 0.044]];
-const REC709: [[f64; 2]; 3] = [[0.640, 0.330], [0.300, 0.600], [0.150, 0.060]];
-const REC2020: [[f64; 2]; 3] = [[0.708, 0.292], [0.170, 0.797], [0.131, 0.046]];
-const P3: [[f64; 2]; 3] = [[0.680, 0.320], [0.265, 0.690], [0.150, 0.060]];
+pub(crate) const REC709: [[f64; 2]; 3] = [[0.640, 0.330], [0.300, 0.600], [0.150, 0.060]];
+pub(crate) const REC2020: [[f64; 2]; 3] = [[0.708, 0.292], [0.170, 0.797], [0.131, 0.046]];
+pub(crate) const P3: [[f64; 2]; 3] = [[0.680, 0.320], [0.265, 0.690], [0.150, 0.060]];
 const IDENTITY: M3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
 /// Transfer functions (encoded ↔ linear).
@@ -52,9 +55,15 @@ pub enum Tf {
     Srgb,
     Gamma(f64),
     AcesCct,
+    /// ACEScc (Academy S-2014-003), the pure-log grading encoding.
+    AcesCc,
     /// SMPTE ST 2084 with 1.0 = 100 cd/m².
     Pq,
 }
+
+/// ACEScc: the lowest code value (linear 0 and below) and the end of its toe (linear 2⁻¹⁵).
+const ACESCC_MIN: f64 = (-16.0 + 9.72) / 17.52;
+const ACESCC_TOE: f64 = (-15.0 + 9.72) / 17.52;
 
 impl Tf {
     pub fn decode(self, v: f64) -> f64 {
@@ -69,6 +78,15 @@ impl Tf {
             Tf::AcesCct => {
                 if v <= 0.155_251_141_552_511 {
                     (v - 0.072_905_534_195_835_5) / 10.540_237_741_654_5
+                } else if v < (65504f64.log2() + 9.72) / 17.52 {
+                    2f64.powf(v * 17.52 - 9.72)
+                } else {
+                    65504.0
+                }
+            }
+            Tf::AcesCc => {
+                if v < ACESCC_TOE {
+                    (2f64.powf(v * 17.52 - 9.72) - 2f64.powi(-16)) * 2.0
                 } else if v < (65504f64.log2() + 9.72) / 17.52 {
                     2f64.powf(v * 17.52 - 9.72)
                 } else {
@@ -99,6 +117,15 @@ impl Tf {
                     (v.log2() + 9.72) / 17.52
                 }
             }
+            Tf::AcesCc => {
+                if v <= 0.0 {
+                    ACESCC_MIN
+                } else if v < 2f64.powi(-15) {
+                    ((2f64.powi(-16) + v * 0.5).log2() + 9.72) / 17.52
+                } else {
+                    (v.log2() + 9.72) / 17.52
+                }
+            }
             Tf::Pq => {
                 let (m1, m2, c1, c2, c3) = pq_consts();
                 let y = (v / 100.0).max(0.0).powf(m1);
@@ -123,13 +150,13 @@ pub struct Space {
     pub raw: bool,
 }
 
-const fn sp(name: &'static str, prims: [[f64; 2]; 3], white: [f64; 2], tf: Tf) -> Space {
+pub(crate) const fn sp(name: &'static str, prims: [[f64; 2]; 3], white: [f64; 2], tf: Tf) -> Space {
     Space { name, prims: Some((prims, white)), tf, raw: false }
 }
 
 /// The built-in configuration's colour spaces, in popup order.
-const ACES2065_1: Space = sp("ACES2065-1", AP0, ACES_WHITE, Tf::Linear);
-const ACES_CG: Space = sp("ACEScg", AP1, ACES_WHITE, Tf::Linear);
+pub(crate) const ACES2065_1: Space = sp("ACES2065-1", AP0, ACES_WHITE, Tf::Linear);
+pub(crate) const ACES_CG: Space = sp("ACEScg", AP1, ACES_WHITE, Tf::Linear);
 const ACES_CCT: Space = sp("ACEScct", AP1, ACES_WHITE, Tf::AcesCct);
 
 pub const SPACES: &[Space] = &[
@@ -332,6 +359,92 @@ pub enum FileXform {
     Lut { lut: Lut, shaper: Option<[Vec<(f32, f32)>; 3]> },
     /// CDL corrections by id (in file order).
     Cdl(Vec<(String, Cdl)>),
+    /// A matrix with offset (Sony Imageworks `.spimtx`), as a MatrixTransform's.
+    Matrix { m: [f64; 16], offset: [f64; 4] },
+}
+
+/// Parse a Sony Imageworks `.spimtx` matrix: three rows of four numbers, three matrix columns
+/// and an offset in 16-bit code values (÷ 65535).
+pub fn parse_spimtx(text: &str) -> Option<FileXform> {
+    let v: Vec<f64> = text.split_whitespace().map(|t| t.parse().ok()).collect::<Option<_>>()?;
+    if v.len() != 12 || v.iter().any(|x| !x.is_finite()) {
+        return None;
+    }
+    let mut m = [0.0; 16];
+    let mut offset = [0.0; 4];
+    for (r, row) in v.as_chunks::<4>().0.iter().enumerate() {
+        m[r * 4..r * 4 + 3].copy_from_slice(&row[..3]);
+        offset[r] = row[3] / 65535.0;
+    }
+    m[15] = 1.0;
+    Some(FileXform::Matrix { m, offset })
+}
+
+/// Parse a Sony Imageworks `.spi1d` 1D LUT: `From <min> <max>`, `Length <n>`, `Components
+/// <1 | 3>`, then `{` the values `}`.
+pub fn parse_spi1d(text: &str) -> Option<Lut> {
+    let (mut from, mut len, mut comps) = ([0.0f32, 1.0], 0usize, 1usize);
+    let mut values: Vec<f32> = vec![];
+    let mut body = false;
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if body {
+            if line.starts_with('}') {
+                break;
+            }
+            for t in line.split_whitespace() {
+                values.push(t.parse().ok()?);
+            }
+            continue;
+        }
+        let mut t = line.split_whitespace();
+        match t.next()? {
+            "{" => body = true,
+            "From" => from = [t.next()?.parse().ok()?, t.next()?.parse().ok()?],
+            "Length" => len = t.next()?.parse().ok()?,
+            "Components" => comps = t.next()?.parse().ok()?,
+            _ => {}
+        }
+    }
+    // A 1D table is interpolated by index, so cap it like the lattices (2²⁴ entries).
+    if !(2..=1 << 24).contains(&len)
+        || !matches!(comps, 1 | 3)
+        || values.len() != len.checked_mul(comps)?
+        || from[1] <= from[0]
+        || from.iter().any(|v| !v.is_finite())
+    {
+        return None;
+    }
+    let d1 = values.chunks_exact(comps).map(|c| if comps == 3 { [c[0], c[1], c[2]] } else { [c[0]; 3] }).collect();
+    Some(Lut { n1: len, d1, n3: 0, d3: vec![], dmin: [from[0]; 3], dmax: [from[1]; 3] })
+}
+
+/// Parse a Sony Imageworks `.spi3d` lattice: `SPILUT 1.0`, `3 3`, the sizes, then one
+/// `r g b  R G B` line per lattice point (indices, then the colour).
+pub fn parse_spi3d(text: &str) -> Option<Lut> {
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    if !lines.next()?.starts_with("SPILUT") {
+        return None;
+    }
+    lines.next()?;
+    let size: Vec<usize> = lines.next()?.split_whitespace().map(|t| t.parse().ok()).collect::<Option<_>>()?;
+    let n = *size.first()?;
+    if size.len() != 3 || size.iter().any(|s| *s != n) || !(2..=129).contains(&n) {
+        return None;
+    }
+    let mut d3 = vec![[0.0f32; 3]; n * n * n];
+    let mut seen = 0usize;
+    for line in lines {
+        let v: Vec<&str> = line.split_whitespace().collect();
+        let [r, g, b, cr, cg, cb] = v.as_slice() else { return None };
+        let (r, g, b): (usize, usize, usize) = (r.parse().ok()?, g.parse().ok()?, b.parse().ok()?);
+        if r >= n || g >= n || b >= n {
+            return None;
+        }
+        // Our lattice is red fastest.
+        *d3.get_mut(r + g * n + b * n * n)? = [cr.parse().ok()?, cg.parse().ok()?, cb.parse().ok()?];
+        seen += 1;
+    }
+    (seen == n * n * n).then_some(Lut { n1: 0, d1: vec![], n3: n, d3, dmin: [0.0; 3], dmax: [1.0; 3] })
 }
 
 /// Parse an Autodesk `.3dl` lattice (integers, blue fastest; an optional input-mesh line).
@@ -470,6 +583,15 @@ pub fn parse_file(text: &str, ext: &str) -> Option<FileXform> {
     if ext == "csp" || text.trim_start().starts_with("CSPLUTV100") {
         return parse_csp(text).map(|(lut, s)| FileXform::Lut { lut, shaper: Some(s) });
     }
+    if ext == "spimtx" {
+        return parse_spimtx(text);
+    }
+    if ext == "spi1d" || text.trim_start().starts_with("Version") {
+        return parse_spi1d(text).map(|lut| FileXform::Lut { lut, shaper: None });
+    }
+    if ext == "spi3d" || text.trim_start().starts_with("SPILUT") {
+        return parse_spi3d(text).map(|lut| FileXform::Lut { lut, shaper: None });
+    }
     if ext == "cube" || text.contains("LUT_3D_SIZE") || text.contains("LUT_1D_SIZE") {
         return parse_cube(text).map(|lut| FileXform::Lut { lut, shaper: None });
     }
@@ -514,6 +636,7 @@ impl FileXform {
                 let o = if inverse { cdl.invert(c64, true) } else { cdl.apply(c64, true) };
                 o.map(|v| v as f32)
             }
+            FileXform::Matrix { m, offset } => crate::ocio_config::matrix_apply(m, offset, c.map(|v| v as f64), inverse).map(|v| v as f32),
             FileXform::Lut { lut, shaper } => {
                 let fwd = |c: [f32; 3]| {
                     let c = match shaper {
@@ -656,33 +779,86 @@ fn space_at(i: u32) -> &'static Space {
     &SPACES[(i as usize).min(SPACES.len() - 1)]
 }
 
-/// The custom config chosen by an effect (Configuration ▸ Custom with a readable file).
-fn custom_config(ctx: &EffectCtx) -> Option<std::sync::Arc<crate::ocio_config::Config>> {
-    if ctx.params.e("config") != 1 {
-        return None;
+/// The effects that take Configuration ▸ Custom (a `.ocio` file).
+pub(crate) const CUSTOM_CONFIG_FX: [&str; 2] = ["ec.color.ociocolorspace", "ec.color.ociodisplay"];
+
+/// Effect `id`'s transform under Configuration ▸ Custom: the config's conversion from the source
+/// space to the destination space (Color Space Transform) or through a display's view (Display
+/// Transform), see [`crate::ocio_config`]. `Ok(None)` with the built-in configuration; an error
+/// (the pixels pass through) when the config can't be read or has no such colour space.
+fn custom_xf(id: &str, pr: &crate::Params) -> Result<Option<crate::ocio_config::Xf>, String> {
+    use crate::ocio_config::Xf;
+    if !CUSTOM_CONFIG_FX.contains(&id) || pr.e("config") != 1 {
+        return Ok(None);
     }
-    crate::ocio_config::load_config(ctx.params.s("configFile"))
+    let cfg = crate::ocio_config::load_config(pr.s("configFile")).map_err(|e| format!("Can't read the OCIO config: {e}"))?;
+    // A space by its typed name, else by the built-in popup's name.
+    let space = |name: &str, popup: u32| {
+        let name = if name.trim().is_empty() { space_at(popup).name } else { name.trim() };
+        cfg.space(name).ok_or_else(|| format!("The OCIO config has no color space `{name}`"))
+    };
+    let a = space(pr.s("sourceName"), pr.e("source"))?;
+    let inverse = pr.e("direction") == 1;
+    if id == "ec.color.ociodisplay" {
+        let (dn, vn) = display_view_names(pr);
+        let xf = cfg.display_path(a, dn, vn);
+        return Ok(Some(if inverse { Xf::Inverse(Box::new(xf)) } else { xf }));
+    }
+    let z = space(pr.s("destinationName"), pr.e("destination"))?;
+    // Inverse: the conversion the other way (OCIO's inverse ColorSpaceTransform).
+    Ok(Some(if inverse { cfg.path(z, a) } else { cfg.path(a, z) }))
 }
 
-/// A space of a custom config by its typed name, else by the built-in popup's name.
-fn custom_space<'c>(cfg: &'c crate::ocio_config::Config, name: &str, popup: u32) -> Option<&'c crate::ocio_config::ConfigSpace> {
-    cfg.space(name).or_else(|| cfg.space(space_at(popup).name))
+/// The display and view a Display Transform names: the typed names, else the popups'.
+fn display_view_names(pr: &crate::Params) -> (&str, &str) {
+    let display = DISPLAYS.get(pr.e("display") as usize).map_or("", |d| d.0);
+    let view = VIEWS.get(pr.e("view") as usize).copied().unwrap_or("");
+    let typed = |k: &str, popup| if pr.s(k).trim().is_empty() { popup } else { pr.s(k).trim() };
+    (typed("displayName", display), typed("viewName", view))
+}
+
+/// Effect Controls' warning for effect `id`: a custom OCIO configuration that can't be read, has
+/// no such colour space, display or view, or uses transforms EffectCraft can't apply (colours
+/// pass through those steps, #410). `None` when the effect renders as asked.
+pub fn warning(id: &str, pr: &crate::Params) -> Option<String> {
+    let xf = match custom_xf(id, pr) {
+        Ok(x) => x?,
+        Err(e) => return Some(format!("{e}: the colors pass through.")),
+    };
+    let mut notes = vec![];
+    if id == "ec.color.ociodisplay"
+        && let Ok(cfg) = crate::ocio_config::load_config(pr.s("configFile"))
+    {
+        let (dn, vn) = display_view_names(pr);
+        if let Some((d, v)) = cfg.view(dn, vn)
+            && (!d.eq_ignore_ascii_case(dn) || !v.name.eq_ignore_ascii_case(vn))
+        {
+            notes.push(format!("The OCIO config has no display `{dn}` with a view `{vn}`: showing {d} / {}.", v.name));
+        }
+    }
+    let missing = xf.unsupported_list();
+    if !missing.is_empty() {
+        notes.push(format!("Not supported, the colors pass through: {}.", missing.join(", ")));
+    }
+    (!notes.is_empty()).then(|| notes.join(" "))
+}
+
+/// Configuration ▸ Custom: render through the config's transform. `false` with the built-in
+/// configuration (the caller renders it).
+fn custom_render(id: &str, ctx: &EffectCtx, b: &mut Buf) -> bool {
+    match custom_xf(id, ctx.params) {
+        Ok(None) => false,
+        Ok(Some(xf)) => {
+            map_px(b, |c| xf.apply(c.map(|v| v as f64), false).map(|v| v as f32));
+            true
+        }
+        // A config that can't be read, or an unknown space: the pixels pass through.
+        Err(_) => true,
+    }
 }
 
 fn ocio_cst(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    // Custom configuration that can't be read: pixels pass through.
-    if ctx.params.e("config") == 1 && custom_config(ctx).is_none() {
-        return b;
-    }
-    if let Some(cfg) = custom_config(ctx) {
-        let (Some(a), Some(z)) = (
-            custom_space(&cfg, ctx.params.s("sourceName"), ctx.params.e("source")),
-            custom_space(&cfg, ctx.params.s("destinationName"), ctx.params.e("destination")),
-        ) else {
-            return b;
-        };
-        let (a, z) = if ctx.params.e("direction") == 1 { (z, a) } else { (a, z) };
-        map_px(&mut b, |c| cfg.convert(a, z, c.map(|v| v as f64)).map(|v| v as f32));
+    if custom_render("ec.color.ociocolorspace", ctx, &mut b) {
         return b;
     }
     let (a, z) = (space_at(ctx.params.e("source")), space_at(ctx.params.e("destination")));
@@ -720,19 +896,7 @@ fn ocio_cdl(ctx: &EffectCtx, mut b: Buf) -> Buf {
 }
 
 fn ocio_display(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    // Custom configuration that can't be read: pixels pass through.
-    if ctx.params.e("config") == 1 && custom_config(ctx).is_none() {
-        return b;
-    }
-    if let Some(cfg) = custom_config(ctx) {
-        // The display's view names a colour space of the config.
-        let display = DISPLAYS.get(ctx.params.e("display") as usize).map_or("", |d| d.0);
-        let view = VIEWS.get(ctx.params.e("view") as usize).copied().unwrap_or("");
-        let dn = if ctx.params.s("displayName").is_empty() { display } else { ctx.params.s("displayName") };
-        let vn = if ctx.params.s("viewName").is_empty() { view } else { ctx.params.s("viewName") };
-        let (Some(a), Some(z)) = (custom_space(&cfg, ctx.params.s("sourceName"), ctx.params.e("source")), cfg.view_space(dn, vn)) else { return b };
-        let (a, z) = if ctx.params.e("direction") == 1 { (z, a) } else { (a, z) };
-        map_px(&mut b, |c| cfg.convert(a, z, c.map(|v| v as f64)).map(|v| v as f32));
+    if custom_render("ec.color.ociodisplay", ctx, &mut b) {
         return b;
     }
     let input = space_at(ctx.params.e("source"));
@@ -899,9 +1063,26 @@ pub enum ColorOp {
     Pow([f32; 3]),
     /// LogTransform / LogAffineTransform, forward or inverse (as `ocio_config::Xf::apply`).
     LogAffine { base: f32, log_slope: [f32; 3], log_offset: [f32; 3], lin_slope: [f32; 3], lin_offset: [f32; 3], inverse: bool },
+    /// ExponentWithLinearTransform, forward (decode) or inverse (as
+    /// [`crate::ocio_config::moncurve`]).
+    MonCurve { gamma: [f32; 3], offset: [f32; 3], inverse: bool, mirror: bool },
+    /// Clamp each channel to `lo..=hi` (a clamping RangeTransform; ±`f32::MAX` = unbounded).
+    Clamp { lo: [f32; 3], hi: [f32; 3] },
 }
 
-/// The ops of a LUT / CDL file transform (as [`FileXform::apply`]).
+/// The ops of a matrix-and-offset transform (MatrixTransform, `.spimtx`), forward or inverse
+/// (as [`crate::ocio_config::matrix_apply`]).
+fn matrix_ops(m: &[f64; 16], offset: &[f64; 4], inverse: bool, ops: &mut Vec<ColorOp>) {
+    if !inverse {
+        let m = [0, 1, 2].map(|r| [m[r * 4] as f32, m[r * 4 + 1] as f32, m[r * 4 + 2] as f32]);
+        ops.push(ColorOp::Affine { m, pre: [0.0; 3], post: [offset[0] as f32, offset[1] as f32, offset[2] as f32] });
+    } else if let Some(inv) = crate::ocio_config::mat3_inverse(m) {
+        let m = inv.map(|r| r.map(|v| v as f32));
+        ops.push(ColorOp::Affine { m, pre: [-offset[0] as f32, -offset[1] as f32, -offset[2] as f32], post: [0.0; 3] });
+    }
+}
+
+/// The ops of a LUT / CDL / matrix file transform (as [`FileXform::apply`]).
 fn file_ops(x: &FileXform, interp: u32, inverse: bool, ccc_id: &str, ops: &mut Vec<ColorOp>) {
     match x {
         FileXform::Cdl(list) => {
@@ -911,6 +1092,7 @@ fn file_ops(x: &FileXform, interp: u32, inverse: bool, ccc_id: &str, ops: &mut V
         FileXform::Lut { lut, shaper } => {
             ops.push(ColorOp::Lut { lut: Arc::new(lut.clone()), shaper: shaper.clone().map(Arc::new), interp, inverse });
         }
+        FileXform::Matrix { m, offset } => matrix_ops(m, offset, inverse, ops),
     }
 }
 
@@ -920,16 +1102,12 @@ fn config_xf_ops(x: &crate::ocio_config::Xf, inverse: bool, ops: &mut Vec<ColorO
     let f3 = |v: &[f64; 3]| v.map(|x| x as f32);
     match x {
         Xf::Inverse(x) => config_xf_ops(x, !inverse, ops),
-        Xf::Matrix { m, offset } => {
-            if !inverse {
-                let m = [0, 1, 2].map(|r| [m[r * 4] as f32, m[r * 4 + 1] as f32, m[r * 4 + 2] as f32]);
-                ops.push(ColorOp::Affine { m, pre: [0.0; 3], post: [offset[0] as f32, offset[1] as f32, offset[2] as f32] });
-            } else if let Some(inv) = crate::ocio_config::mat3_inverse(m) {
-                let m = inv.map(|r| r.map(|v| v as f32));
-                ops.push(ColorOp::Affine { m, pre: [-offset[0] as f32, -offset[1] as f32, -offset[2] as f32], post: [0.0; 3] });
-            }
-        }
+        Xf::Matrix { m, offset } => matrix_ops(m, offset, inverse, ops),
         Xf::File { xf: Some(x), interp, ccc, .. } => file_ops(x, *interp, inverse, ccc, ops),
+        Xf::ExponentLinear { gamma, offset, mirror } => ops.push(ColorOp::MonCurve { gamma: f3(gamma), offset: f3(offset), inverse, mirror: *mirror }),
+        // A BuiltinTransform's curve: forward decodes.
+        Xf::Curve(tf) => ops.push(if inverse { ColorOp::Encode(*tf) } else { ColorOp::Decode(*tf) }),
+        Xf::Named(_) => {}
         Xf::File { xf: None, .. } | Xf::Unsupported(_) => {}
         Xf::Exponent(e) => ops.push(ColorOp::Pow([0, 1, 2].map(|k| (if inverse { 1.0 / e[k].max(1e-9) } else { e[k] }) as f32))),
         Xf::Log { base } => {
@@ -944,11 +1122,14 @@ fn config_xf_ops(x: &crate::ocio_config::Xf, inverse: bool, ops: &mut Vec<ColorO
             inverse,
         }),
         Xf::Cdl(cdl) => ops.push(ColorOp::Cdl { cdl: *cdl, clamp: true, inverse }),
-        Xf::Range { min_in, max_in, min_out, max_out } => {
-            let (a0, a1, b0, b1) = if inverse { (*min_out, *max_out, *min_in, *max_in) } else { (*min_in, *max_in, *min_out, *max_out) };
-            let k = if (a1 - a0).abs() > 1e-12 { (b1 - b0) / (a1 - a0) } else { 0.0 };
+        Xf::Range(r) => {
+            let (k, off, lo, hi) = r.parts(inverse);
             let k = k as f32;
-            ops.push(ColorOp::Affine { m: [[k, 0.0, 0.0], [0.0, k, 0.0], [0.0, 0.0, k]], pre: [-a0 as f32; 3], post: [b0 as f32; 3] });
+            ops.push(ColorOp::Affine { m: [[k, 0.0, 0.0], [0.0, k, 0.0], [0.0, 0.0, k]], pre: [0.0; 3], post: [off as f32; 3] });
+            if lo.is_finite() || hi.is_finite() {
+                let bound = |v: f64| (v as f32).clamp(-f32::MAX, f32::MAX);
+                ops.push(ColorOp::Clamp { lo: [bound(lo); 3], hi: [bound(hi); 3] });
+            }
         }
         Xf::Group(list) => {
             if inverse {
@@ -957,23 +1138,6 @@ fn config_xf_ops(x: &crate::ocio_config::Xf, inverse: bool, ops: &mut Vec<ColorO
                 list.iter().for_each(|x| config_xf_ops(x, false, ops));
             }
         }
-    }
-}
-
-/// The ops of a custom config's conversion from space `a` to space `z` (as `Config::convert`).
-fn config_ops(a: &crate::ocio_config::ConfigSpace, z: &crate::ocio_config::ConfigSpace, ops: &mut Vec<ColorOp>) {
-    if a.is_data || z.is_data || a.name == z.name {
-        return;
-    }
-    match (&a.to_ref, &a.from_ref) {
-        (Some(x), _) => config_xf_ops(x, false, ops),
-        (None, Some(x)) => config_xf_ops(x, true, ops),
-        _ => {}
-    }
-    match (&z.from_ref, &z.to_ref) {
-        (Some(x), _) => config_xf_ops(x, false, ops),
-        (None, Some(x)) => config_xf_ops(x, true, ops),
-        _ => {}
     }
 }
 
@@ -1004,6 +1168,16 @@ fn xform_ops(x: &Xform, ops: &mut Vec<ColorOp>) {
 pub fn color_program(id: &str, ctx: &EffectCtx) -> Option<(Vec<ColorOp>, Straight)> {
     let pr = ctx.params;
     let mut ops = vec![];
+    // Configuration ▸ Custom compiles the config's transforms (a config that can't be read, or
+    // names unknown spaces, passes the pixels through).
+    match custom_xf(id, pr) {
+        Ok(None) => {}
+        Ok(Some(xf)) => {
+            config_xf_ops(&xf, false, &mut ops);
+            return Some((ops, Straight::Unpremul));
+        }
+        Err(_) => return Some((ops, Straight::Unpremul)),
+    }
     match id {
         "ec.utility.applylut" => {
             if let Some(lut) = crate::utility::load_lut(pr.s("lut")) {
@@ -1012,18 +1186,6 @@ pub fn color_program(id: &str, ctx: &EffectCtx) -> Option<(Vec<ColorOp>, Straigh
             return Some((ops, Straight::Divide));
         }
         "ec.color.ociocolorspace" => {
-            if pr.e("config") == 1 {
-                // A custom config (one that can't be read, or names unknown spaces: the pixels
-                // pass through).
-                if let Some(cfg) = custom_config(ctx)
-                    && let (Some(a), Some(z)) =
-                        (custom_space(&cfg, pr.s("sourceName"), pr.e("source")), custom_space(&cfg, pr.s("destinationName"), pr.e("destination")))
-                {
-                    let (a, z) = if pr.e("direction") == 1 { (z, a) } else { (a, z) };
-                    config_ops(a, z, &mut ops);
-                }
-                return Some((ops, Straight::Unpremul));
-            }
             let (a, z) = (space_at(pr.e("source")), space_at(pr.e("destination")));
             let (a, z) = if pr.e("direction") == 1 { (z, a) } else { (a, z) };
             if a.name != z.name {
@@ -1037,19 +1199,6 @@ pub fn color_program(id: &str, ctx: &EffectCtx) -> Option<(Vec<ColorOp>, Straigh
             }
         }
         "ec.color.ociodisplay" => {
-            if pr.e("config") == 1 {
-                if let Some(cfg) = custom_config(ctx) {
-                    let display = DISPLAYS.get(pr.e("display") as usize).map_or("", |d| d.0);
-                    let view = VIEWS.get(pr.e("view") as usize).copied().unwrap_or("");
-                    let dn = if pr.s("displayName").is_empty() { display } else { pr.s("displayName") };
-                    let vn = if pr.s("viewName").is_empty() { view } else { pr.s("viewName") };
-                    if let (Some(a), Some(z)) = (custom_space(&cfg, pr.s("sourceName"), pr.e("source")), cfg.view_space(dn, vn)) {
-                        let (a, z) = if pr.e("direction") == 1 { (z, a) } else { (a, z) };
-                        config_ops(a, z, &mut ops);
-                    }
-                }
-                return Some((ops, Straight::Unpremul));
-            }
             let input = space_at(pr.e("source"));
             let (display, view, inverse) = (pr.e("display") as usize, pr.e("view") as usize, pr.e("direction") == 1);
             let (_, prims, tf) = DISPLAYS[display.min(DISPLAYS.len() - 1)];
@@ -1278,7 +1427,7 @@ pub fn specs() -> Vec<EffectSpec> {
             cc,
             vec![
                 p("config", "Configuration", Value::Enum(0), popup(CONFIGS)),
-                p("configFile", "Config File (.ocio)", Value::Str(String::new()), ParamUi::Text),
+                p("configFile", "Config File (.ocio)", Value::Str(String::new()), crate::file_ui(&["ocio"])),
                 space_param("source", "Source", lin709),
                 p("sourceName", "Source (config name)", Value::Str(String::new()), ParamUi::Text),
                 space_param("destination", "Destination", srgb),
@@ -1293,7 +1442,7 @@ pub fn specs() -> Vec<EffectSpec> {
             cc,
             vec![
                 p("config", "Configuration", Value::Enum(0), popup(CONFIGS)),
-                p("configFile", "Config File (.ocio)", Value::Str(String::new()), ParamUi::Text),
+                p("configFile", "Config File (.ocio)", Value::Str(String::new()), crate::file_ui(&["ocio"])),
                 space_param("source", "Input Color Space", lin709),
                 p("sourceName", "Source (config name)", Value::Str(String::new()), ParamUi::Text),
                 p("display", "Display Device", Value::Enum(0), popup(&DISPLAYS.iter().map(|d| d.0).collect::<Vec<_>>())),
@@ -1310,7 +1459,7 @@ pub fn specs() -> Vec<EffectSpec> {
             "OCIO File Transform",
             cc,
             vec![
-                p("file", "File", Value::Str(String::new()), ParamUi::Text),
+                p("file", "File", Value::Str(String::new()), crate::file_ui(&["cube", "3dl", "csp", "cc", "ccc", "cdl", "spi1d", "spi3d", "spimtx"])),
                 p("cccId", "CCC ID", Value::Str(String::new()), ParamUi::Text),
                 p("interpolation", "Interpolation", Value::Enum(3), popup(&["Nearest", "Linear", "Tetrahedral", "Best"])),
                 direction(),
@@ -1472,6 +1621,44 @@ mod tests {
             }
         }
         v
+    }
+
+    /// Sony Imageworks `.spi1d`, `.spi3d` and `.spimtx` (Blender's configs use them, #410), and
+    /// malformed ones rejected without panicking.
+    #[test]
+    fn spi_files_parse() {
+        let spi1d = "Version 1\nFrom 0.0 2.0\nLength 3\nComponents 1\n{\n0.0\n0.25\n1.0\n}\n";
+        let x = parse_file(spi1d, "spi1d").unwrap();
+        let o = x.apply([1.0, 0.5, 2.0], 1, false, "");
+        assert!((o[0] - 0.25).abs() < 1e-6 && (o[1] - 0.125).abs() < 1e-6 && (o[2] - 1.0).abs() < 1e-6, "{o:?}");
+        let back = x.apply(o, 1, true, "");
+        assert!((back[0] - 1.0).abs() < 1e-5 && (back[2] - 2.0).abs() < 1e-5, "{back:?}");
+        let three = parse_spi1d("Version 1\nFrom 0 1\nLength 2\nComponents 3\n{\n0 0 0\n1 0.5 2\n}\n").unwrap();
+        assert_eq!(three.d1, vec![[0.0; 3], [1.0, 0.5, 2.0]]);
+        let mut spi3d = String::from("SPILUT 1.0\n3 3\n2 2 2\n");
+        for (r, g, b) in (0..8).map(|i| (i & 1, (i >> 1) & 1, i >> 2)) {
+            spi3d += &format!("{r} {g} {b} {} {} {}\n", r as f32 * 0.5, g, b);
+        }
+        let x = parse_file(&spi3d, "spi3d").unwrap();
+        let o = x.apply([1.0, 0.5, 0.25], 1, false, "");
+        assert!((o[0] - 0.5).abs() < 1e-6 && (o[1] - 0.5).abs() < 1e-6 && (o[2] - 0.25).abs() < 1e-6, "{o:?}");
+        let m = parse_file("2 0 0 6553.5\n0 1 0 0\n0 0 1 0\n", "spimtx").unwrap();
+        let o = m.apply([0.25, 0.5, 1.0], 1, false, "");
+        assert!((o[0] - 0.6).abs() < 1e-6 && o[1] == 0.5 && o[2] == 1.0, "{o:?}");
+        assert!((m.apply(o, 1, true, "")[0] - 0.25).abs() < 1e-6);
+        for bad in [
+            "Version 1\nFrom 0 1\nLength 99999999999\nComponents 1\n{\n0\n}\n",
+            "Version 1\nFrom 1 0\nLength 2\nComponents 1\n{\n0\n1\n}\n",
+            "Version 1\nFrom 0 1\nLength 3\nComponents 1\n{\n0\n1\n}\n",
+            "Version 1\nFrom 0 1\nLength 2\nComponents 2\n{\n0 0\n1 1\n}\n",
+        ] {
+            assert!(parse_spi1d(bad).is_none(), "{bad}");
+        }
+        assert!(parse_spi3d("SPILUT 1.0\n3 3\n4000 4000 4000\n").is_none());
+        assert!(parse_spi3d("SPILUT 1.0\n3 3\n2 2 2\n9 0 0 1 1 1\n").is_none());
+        assert!(parse_spi3d("SPILUT 1.0\n3 3\n2 2 2\n0 0 0 1 1 1\n").is_none(), "incomplete lattice");
+        assert!(parse_spimtx("1 0 0\n0 1 0\n").is_none());
+        assert!(parse_spimtx("NaN 0 0 0 0 1 0 0 0 0 1 0").is_none());
     }
 
     #[test]

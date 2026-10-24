@@ -12,7 +12,7 @@ use effectcraft_svg::{
 };
 use kurbo::{Point, Shape as _};
 
-use crate::build::Builder;
+use crate::build::{Builder, MAX_PATH};
 use crate::color::{Cs, Func, color_space, text_string};
 use crate::font::Font;
 use crate::object::{Dict, File, Lexer, Obj, decode_stream};
@@ -281,7 +281,12 @@ impl<'a> Interp<'a> {
                         self.ext_gstate(&g, res, depth);
                     }
                 }
-                // Path construction.
+                // Path construction. Each operator adds at most five elements (`re`), so when fewer
+                // than five more fit within `MAX_PATH`, the operator stops the stream.
+                "m" | "l" | "c" | "v" | "y" | "h" | "re" if self.path.elements().len() > MAX_PATH - 5 => {
+                    self.b.skip("content (path limit)");
+                    return;
+                }
                 "m" => {
                     let p = Point::new(n(0), n(1));
                     self.path.move_to(p);
@@ -313,11 +318,9 @@ impl<'a> Interp<'a> {
                     self.path.curve_to(Point::new(n(0), n(1)), p, p);
                     self.cur = Some(p);
                 }
-                "h" => {
-                    if self.cur.is_some() {
-                        self.path.close_path();
-                        self.cur = self.start;
-                    }
+                "h" if self.cur.is_some() => {
+                    self.path.close_path();
+                    self.cur = self.start;
                 }
                 "re" => {
                     let (x, y, w, h) = (n(0), n(1), n(2), n(3));
@@ -517,7 +520,7 @@ impl<'a> Interp<'a> {
                 && (p + 2 == data.len() || crate::object::is_white(data[p + 2]))
         };
         let end = match crate::image::inline_len(self.file, &d, Some(res)) {
-            Some(len) => (start + len).min(data.len()),
+            Some(len) => start.saturating_add(len).min(data.len()),
             None => {
                 let mut p = start;
                 while p + 1 < data.len() && !is_ei(p) {

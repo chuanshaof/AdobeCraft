@@ -95,6 +95,21 @@ fn strokes_segment_the_base_frame() {
     assert!(bytes.len() < seg.w * seg.h / 4, "{} bytes", bytes.len());
     assert!(FrameSeg::from_bytes(&bytes[..bytes.len() - 1]).is_none());
     assert!(FrameSeg::from_bytes(b"nope").is_none());
+
+    // Untrusted plane dimensions and run lengths are rejected before allocation/resize.
+    let mut hostile = b"ECSG".to_vec();
+    hostile.extend_from_slice(&u32::MAX.to_le_bytes());
+    hostile.extend_from_slice(&u32::MAX.to_le_bytes());
+    hostile.extend_from_slice(&0u32.to_le_bytes());
+    assert!(FrameSeg::from_bytes(&hostile).is_none());
+    let mut overrun = bytes.clone();
+    let plane_at = 16 + u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    overrun[plane_at..plane_at + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+    assert!(FrameSeg::from_bytes(&overrun).is_none());
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert!(FrameSeg::from_bytes(&trailing).is_none());
+    assert_eq!(FrameSeg::empty(usize::MAX, 2), FrameSeg::default());
 }
 
 #[test]
@@ -427,4 +442,26 @@ fn mobilesam_segments_and_propagates_the_disk() {
     }
     eprintln!("MobileSAM: base IoU {jb:.4}, worst propagated {worst:.4} (classic {cworst:.4}), {:.0} ms/frame", t.elapsed().as_secs_f64() * 1000.0 / 20.0);
     assert!(jb > 0.95 && worst > 0.93 && worst >= cworst - 0.01, "base {jb}, worst {worst} vs classic {cworst}");
+}
+
+/// A box stroke becomes the model's box prompt (scaled, corners in any order); the graph cut
+/// ignores it; a prior's box does not replace it.
+#[test]
+fn box_stroke_is_the_model_box_prompt() {
+    let fg = Stroke { kind: StrokeKind::Fg, frame: 0, radius: 2.0, points: vec![[50.0, 40.0]] };
+    let bx = Stroke { kind: StrokeKind::Box, frame: 0, radius: 0.0, points: vec![[80.0, 60.0], [20.0, 10.0]] };
+    let p = stroke_prompt(&[&fg, &bx], 0.5);
+    assert_eq!(p.bbox, Some([10.0, 5.0, 40.0, 30.0]));
+    assert_eq!(p.points, vec![([25.0, 20.0], true)]);
+    // Degenerate or non-finite boxes are no prompt.
+    for pts in [vec![[20.0, 10.0]], vec![[20.0, 10.0], [20.0, 50.0]], vec![[f64::NAN, 10.0], [80.0, 60.0]]] {
+        let b = Stroke { points: pts, ..bx.clone() };
+        assert_eq!(stroke_prompt(&[&fg, &b], 1.0).bbox, None);
+    }
+    assert!(!StrokeKind::Box.is_segmentation());
+    assert!(rasterize(&[&bx], &[StrokeKind::Fg, StrokeKind::Bg], 1.0, 100, 80).iter().all(|v| !v));
+    let mut q = stroke_prompt(&[&fg, &bx], 1.0);
+    let soft: Vec<f32> = (0..100 * 80).map(|i| ((i % 100) < 10) as u8 as f32).collect();
+    assert!(add_prior_prompt(&mut q, &soft, 100, 80));
+    assert_eq!(q.bbox, Some([20.0, 10.0, 80.0, 60.0]));
 }

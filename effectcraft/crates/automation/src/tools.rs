@@ -31,10 +31,62 @@ impl ToolDef {
     pub fn input_schema(&self) -> Value {
         (self.schema)()
     }
-    /// The MCP `Tool` object.
+    /// The MCP `Tool` object, with a title and annotations (docs/mcp.md).
     pub fn descriptor(&self) -> Value {
-        json!({"name": self.name, "description": self.description, "inputSchema": self.input_schema()})
+        let title = title_of(self.name);
+        let read_only = READ_ONLY.contains(&self.name);
+        let files = WRITES_FILES.contains(&self.name);
+        json!({
+            "name": self.name,
+            "title": title,
+            "description": self.description,
+            "inputSchema": self.input_schema(),
+            "annotations": {
+                "title": title,
+                "readOnlyHint": read_only,
+                "destructiveHint": !read_only && !files,
+                "idempotentHint": read_only || files,
+                "openWorldHint": false,
+            },
+        })
     }
+
+    /// The first argument this tool doesn't take, as a message naming the accepted ones.
+    pub fn unknown_arg(&self, args: &Value) -> Option<String> {
+        let Some(m) = args.as_object() else { return Some("arguments must be an object".into()) };
+        let schema = self.input_schema();
+        let props = schema.get("properties")?.as_object()?;
+        let bad = m.keys().find(|k| !props.contains_key(*k))?;
+        let accepted: Vec<&str> = props.keys().map(String::as_str).collect();
+        Some(format!("unknown argument \"{bad}\" for {}; expected: {}", self.name, accepted.join(", ")))
+    }
+}
+
+/// Tools that only read.
+const READ_ONLY: &[&str] = &[
+    "command_list",
+    "list_commands",
+    "describe_command",
+    "doc_inspect",
+    "render_preview",
+    "get_project",
+    "get_comp",
+    "get_layer",
+    "get_property",
+    "list_effects",
+    "list_fonts",
+    "get_state",
+    "ui_inspect",
+    "ui_elements",
+];
+/// Tools that write files without changing the project.
+const WRITES_FILES: &[&str] = &["save_project", "render_frame", "screenshot"];
+
+/// `get_project` → "Get project".
+fn title_of(name: &str) -> String {
+    let s = name.replace('_', " ");
+    let mut c = s.chars();
+    c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
 }
 
 /// All tools (headless + bridge-only).
@@ -51,11 +103,18 @@ pub fn available(bridge: bool) -> impl Iterator<Item = &'static ToolDef> {
     TOOLS.iter().filter(move |t| bridge || !t.bridge_only)
 }
 
+/// Tools refused while file access is confined: they drive the live app like a person (menus,
+/// shortcuts, Open Recent…) or call control-channel methods directly, past the command checks.
+const UNCONFINED_ONLY: &[&str] = &["control", "ui_click", "ui_drag", "ui_key", "ui_type", "ui_set", "script_ui"];
+
 /// Run a tool by name.
 pub fn run(b: &mut Backend, name: &str, args: &Value) -> Result<Reply> {
     let t = find(name).ok_or_else(|| Error::BadArgs(format!("unknown tool `{name}`")))?;
     if t.bridge_only && !b.is_bridge() {
         return Err(Error::BadArgs(NEED_BRIDGE.into()));
+    }
+    if b.confinement().is_some() && UNCONFINED_ONLY.contains(&name) {
+        return Err(Error::BadArgs(format!("`{name}` is not available while file access is confined (--automation-read-root/--automation-write-root)")));
     }
     let empty = json!({});
     (t.run)(b, if args.is_null() { &empty } else { args })
@@ -64,7 +123,7 @@ pub fn run(b: &mut Backend, name: &str, args: &Value) -> Result<Reply> {
 // ------------------------------------------------------------------ schema fragments
 
 fn schema(props: Value, required: &[&str]) -> Value {
-    json!({"type": "object", "properties": props, "required": required})
+    json!({"type": "object", "properties": props, "required": required, "additionalProperties": false})
 }
 fn comp_s() -> Value {
     json!({"type": ["integer", "string"], "description": "Composition item id or name; omit for the active comp."})
@@ -151,7 +210,7 @@ fn list_effects(b: &mut Backend, a: &Value) -> Result<Reply> {
 }
 
 fn list_fonts(b: &mut Backend, a: &Value) -> Result<Reply> {
-    json_reply(b.exec("text.fonts", obj(&[("query", get(a, "query")), ("rescan", get(a, "rescan"))]))?)
+    json_reply(b.exec("text.fonts", obj(&[("query", get(a, "query")), ("variable", get(a, "variable")), ("rescan", get(a, "rescan"))]))?)
 }
 
 /// `effect.apply` on one layer, then set parameters on the new instance by param id: one batch,
@@ -267,6 +326,9 @@ fn set_property(b: &mut Backend, a: &Value) -> Result<Reply> {
         match time {
             Some(t) => {
                 p["time"] = t.clone();
+                if let Some(tb) = get(a, "timeBase") {
+                    p["timeBase"] = tb.clone();
+                }
                 b.exec("prop.addKey", p)?;
             }
             None => {
@@ -299,6 +361,9 @@ fn add_keyframe(b: &mut Backend, a: &Value) -> Result<Reply> {
         if let Some(v) = get(k, "value") {
             p["value"] = v.clone();
         }
+        if let Some(tb) = get(a, "timeBase") {
+            p["timeBase"] = tb.clone();
+        }
         b.exec("prop.addKey", p)?;
     }
     let info = b.exec("prop.get", obj(&base))?;
@@ -308,7 +373,11 @@ fn add_keyframe(b: &mut Backend, a: &Value) -> Result<Reply> {
             b.exec("comp.open", json!({"comp": c}))?;
         }
         let sel: Vec<Value> = keys.iter().map(|k| json!({"layer": info["layer"], "prop": info["uid"], "time": k["time"]})).collect();
-        b.exec("keys.select", json!({"keys": sel}))?;
+        let mut select = json!({"keys": sel});
+        if let Some(tb) = get(a, "timeBase") {
+            select["timeBase"] = tb.clone();
+        }
+        b.exec("keys.select", select)?;
         match interp.to_ascii_lowercase().as_str() {
             "easyease" | "ease" => b.exec("keys.easyEase", json!({}))?,
             "easyeasein" => b.exec("keys.easyEase", json!({"which": "in"}))?,
@@ -327,6 +396,9 @@ fn render_frame(b: &mut Backend, a: &Value) -> Result<Reply> {
     let f = b.render_with(get(a, "comp"), get(a, "time").and_then(Value::as_f64), max_side, transparent)?;
     let mut info = json!({"comp": f.comp, "time": f.time, "width": f.width, "height": f.height});
     if let Some(p) = get(a, "path").and_then(Value::as_str) {
+        if let Some(c) = b.confinement() {
+            c.check(p, crate::confine::Access::Write)?;
+        }
         std::fs::write(p, &f.png).map_err(|e| Error::Other(format!("cannot write {p}: {e}")))?;
         info["path"] = json!(p);
     }
@@ -420,6 +492,9 @@ fn batch_tool(b: &mut Backend, a: &Value) -> Result<Reply> {
 fn screenshot(b: &mut Backend, a: &Value) -> Result<Reply> {
     let max_side = get(a, "max_side").and_then(Value::as_u64).unwrap_or(1600) as u32;
     let keep = get(a, "path").and_then(Value::as_str).map(str::to_string);
+    if let (Some(c), Some(p)) = (b.confinement(), &keep) {
+        c.check(p, crate::confine::Access::Write)?;
+    }
     let path =
         keep.clone().unwrap_or_else(|| std::env::temp_dir().join(format!("effectcraft-mcp-shot-{}.png", std::process::id())).to_string_lossy().into_owned());
     b.control("ui.screenshot", obj(&[("path", Some(&json!(path))), ("panel", get(a, "panel")), ("id", get(a, "id"))]))?;
@@ -485,7 +560,12 @@ static TOOLS: &[ToolDef] = &[
         name: "describe_command",
         description: "One command in full: id, label, menu path, shortcut, the `params` doc, a JSON Schema of its parameters (`schema`: properties, required, additionalProperties) and whether it can run now (`why` if not). Use before execute_command when unsure of the parameters; execute_command rejects unknown keys.",
         bridge_only: false,
-        schema: || schema(json!({"command": {"type": "string", "description": "Command id, e.g. `layer.newText`."}}), &["command"]),
+        schema: || {
+            schema(
+                json!({"command": {"type": "string", "description": "Command id, e.g. `layer.newText`."}, "id": {"type": "string", "description": "Alias of `command`."}}),
+                &[],
+            )
+        },
         run: describe_command,
     },
     ToolDef {
@@ -496,9 +576,10 @@ static TOOLS: &[ToolDef] = &[
             schema(
                 json!({
                     "command": {"type": "string", "description": "Command id, e.g. `comp.new`, `layer.newText`, `effect.apply` (see list_commands)."},
+                    "id": {"type": "string", "description": "Alias of `command`."},
                     "params": {"type": "object", "description": "Command parameters as documented by list_commands.", "additionalProperties": true}
                 }),
-                &["command"],
+                &[],
             )
         },
         run: execute_command,
@@ -534,7 +615,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "get_layer",
-        description: "A layer's property tree (transform, masks, effects, text, shape contents, ...): every node has a `path` usable with get_property/set_property/add_keyframe, plus uid, match id, name, type, value at `time`, keyframes and expression. `flat: true` returns just a list of {path, type, value, keys, expression} (compact).",
+        description: "A layer's property tree (transform, masks, effects, text, shape contents, ...): leaf properties have a `path` usable with get_property/set_property/add_keyframe, plus uid, match id, name, type, value at `time`, keyframes and expression. Groups contain children; inspect them here, then select a leaf path. `flat: true` returns just a list of {path, type, value, keys, expression} (compact).",
         bridge_only: false,
         schema: || {
             schema(
@@ -570,6 +651,7 @@ static TOOLS: &[ToolDef] = &[
                 json!({
                     "layer": layer_s(), "path": path_s(), "value": value_s(), "comp": comp_s(),
                     "time": {"type": "number", "description": "Keyframe time in seconds (layer time; equals comp time unless the layer is offset/stretched)."},
+                    "timeBase": {"type": "string", "enum": ["layer", "comp"], "description": "What `time` counts: layer time (the default) or comp time, as the Timeline shows it."},
                     "expression": {"type": "string", "description": "Expression text; empty string removes the expression."}
                 }),
                 &["layer", "path"],
@@ -586,6 +668,7 @@ static TOOLS: &[ToolDef] = &[
                 json!({
                     "layer": layer_s(), "path": path_s(), "comp": comp_s(),
                     "time": {"type": "number", "description": "Key time in seconds (layer time)."},
+                    "timeBase": {"type": "string", "enum": ["layer", "comp"], "description": "What `time` counts: layer time (the default) or comp time, as the Timeline shows it."},
                     "value": value_s(),
                     "keys": {"type": "array", "items": {"type": "object", "properties": {"time": {"type": "number"}, "value": value_s()}, "required": ["time"]}, "description": "Several keys at once."},
                     "interpolation": {"type": "string", "enum": ["linear", "bezier", "hold", "easyEase", "easyEaseIn", "easyEaseOut"]}
@@ -620,12 +703,13 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "list_fonts",
-        description: "The font families text layers can use, bundled and installed on this machine: family, styles, origin (bundled / system / user) and the name in the font's own language. Narrow with `query`; `rescan` picks up fonts installed since launch. Set one with execute_command `layer.setText {\"layer\", \"font\", \"style\"}`.",
+        description: "The font families text layers can use, bundled and installed on this machine: family, styles, origin (bundled / system / user), whether it is a variable font and the name in the font's own language. Narrow with `query` and `variable`; `rescan` picks up fonts installed since launch. Set one with execute_command `layer.setText {\"layer\", \"font\", \"style\"}`.",
         bridge_only: false,
         schema: || {
             schema(
                 json!({
                     "query": {"type": "string", "description": "Only families whose name (English or own-language) contains this text."},
+                    "variable": {"type": "boolean", "description": "Only variable fonts (families with variation axes)."},
                     "rescan": {"type": "boolean", "description": "Look for fonts installed since launch first."}
                 }),
                 &[],
@@ -825,4 +909,101 @@ static TOOLS: &[ToolDef] = &[
         },
         run: batch_tool,
     },
+    ToolDef {
+        name: "command_list",
+        description: "List engine commands: id, label, menu path, shortcut, `params` doc (e.g. `{name?, width?, height?, frameRate?, duration? (s)}`) and whether it can run now (`why` if not). Every menu item, shortcut and panel gesture maps to one of these ids; run them with execute_command. Narrow with `filter` (e.g. `layer.new`, `keys`, `effect`).",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "filter": {"type": "string", "description": "Only commands whose id or label contains this text (case-insensitive)."},
+                    "enabled_only": {"type": "boolean", "description": "Only commands that can run right now."},
+                    "schemas": {"type": "boolean", "description": "Also return each command's parameter JSON Schema (`schema`)."}
+                }),
+                &[],
+            )
+        },
+        run: list_commands,
+    },
+    ToolDef {
+        name: "command_run",
+        description: "Run any engine command by id with JSON params; edits are undoable. Examples: comp.new {\"name\":\"Main\",\"width\":1920,\"height\":1080,\"frameRate\":30,\"duration\":5}; layer.newText {\"text\":\"Hello\",\"size\":120,\"fill\":\"#ffffff\"} (returns {\"layer\":id}); layer.newSolid {\"color\":\"#3366ff\"}; layer.newShape; effect.apply {\"layer\":3,\"effect\":\"Gaussian Blur\"}; time.set {\"time\":2.5}; layer.select {\"layers\":[3]}. Layers are referenced by id, \"#n\" or name; times are seconds.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "id": {"type": "string", "description": "Command id, e.g. `comp.new`, `layer.newText`, `effect.apply` (see list_commands)."},
+                    "params": {"type": "object", "description": "Command parameters as documented by list_commands.", "additionalProperties": true}
+                }),
+                &["id"],
+            )
+        },
+        run: execute_command,
+    },
+    ToolDef {
+        name: "render_preview",
+        description: "Render a composition frame (default: the active comp at the current time) and return it as a PNG image, longest side `max_side` (default 960, 0 = full size). Use it to check your work.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({
+                    "comp": comp_s(),
+                    "time": {"type": "number", "description": "Comp time in seconds (default: current time)."},
+                    "max_side": {"type": "integer", "description": "Longest side in pixels (default 960; 0 = full comp size)."},
+                    "transparent": {"type": "boolean", "description": "Keep the frame's alpha (RGBA PNG, as an RGB + Alpha render writes it) instead of compositing over the comp's background colour."}
+                }),
+                &[],
+            )
+        },
+        run: render_frame,
+    },
+    ToolDef {
+        name: "command_batch",
+        description: "Run commands in order, returning each result or error. Stop at the first error by default; stop_on_error: false continues. Each edit has its own undo step; use batch for an atomic undo group.",
+        bridge_only: false,
+        schema: || {
+            schema(
+                json!({"steps": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "params": {"type": "object"}}, "required": ["id"], "additionalProperties": false}}, "stop_on_error": {"type": "boolean"}}),
+                &["steps"],
+            )
+        },
+        run: command_batch,
+    },
+    ToolDef {
+        name: "doc_inspect",
+        description: "Inspect the project overview and active composition (null when no composition is active).",
+        bridge_only: false,
+        schema: || schema(json!({}), &[]),
+        run: doc_inspect,
+    },
 ];
+
+fn doc_inspect(b: &mut Backend, _: &Value) -> Result<Reply> {
+    let project = b.exec("project.summary", json!({}))?;
+    let comp = b.exec("comp.info", json!({})).ok();
+    json_reply(json!({"project": project, "activeComp": comp}))
+}
+
+fn command_batch(b: &mut Backend, a: &Value) -> Result<Reply> {
+    let steps = need(a, "steps")?.as_array().ok_or_else(|| Error::BadArgs("steps must be an array".into()))?;
+    let stop = get(a, "stop_on_error").and_then(Value::as_bool).unwrap_or(true);
+    let mut results = Vec::new();
+    let (mut completed, mut failed) = (0, 0);
+    for step in steps {
+        match execute_command(b, step) {
+            Ok(Reply::Json(result)) => {
+                completed += 1;
+                results.push(json!({"ok": true, "result": result}));
+            }
+            Ok(Reply::Image { .. }) => return Err(Error::Other("unexpected command image".into())),
+            Err(e) => {
+                failed += 1;
+                results.push(json!({"ok": false, "error": e.to_string()}));
+                if stop {
+                    break;
+                }
+            }
+        }
+    }
+    json_reply(json!({"completed": completed, "failed": failed, "results": results}))
+}

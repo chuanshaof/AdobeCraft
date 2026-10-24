@@ -96,7 +96,7 @@ fn bulge(e: &mut Enc, ctx: &EffectCtx, b: GBuf) -> Option<GBuf> {
     let h = ctx.params.f("height");
     let taper = 1.0 + ctx.params.f("taperRadius").max(0.0) / 100.0 * 3.0;
     let pin = ctx.params.b("pinAllEdges");
-    let (x0, y0, lw, lh) = util::pin_rect(ctx, b.offset, b.scale);
+    let (x0, y0, lw, lh) = util::layer_rect_at(ctx, b.offset, b.scale);
     let edge = (lw.min(lh) * 0.1).max(1.0);
     let mut p = Params::default();
     p.f[0] = [c.0 as f32, c.1 as f32, rx as f32, ry as f32];
@@ -111,11 +111,14 @@ fn wave_warp(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let dir = ctx.params.f("direction").to_radians();
     let speed = ctx.params.f("speed");
     let phase = ctx.params.f("phase").to_radians() + ctx.time * speed * TAU;
-    let (dx, dy) = (dir.sin(), -dir.cos());
+    // Cardinal directions must not acquire a tiny perpendicular slope: at a square-wave
+    // boundary cos(90°)'s rounding residue can flip a whole column on CPU but not GPU.
+    let axis = |v: f64| if v.abs() < 4.0 * f64::EPSILON { 0.0 } else { v };
+    let (dx, dy) = (axis(dir.sin()), -axis(dir.cos()));
     if !ctx.adjustment {
         b.pad(e, h.abs().ceil() as u32 + 1)?;
     }
-    let (x0, y0, lw, lh) = util::pin_rect(ctx, b.offset, b.scale);
+    let (x0, y0, lw, lh) = util::layer_rect_at(ctx, b.offset, b.scale);
     let rect = [x0 as f32, y0 as f32, lw.max(1.0) as f32, lh.max(1.0) as f32];
     // The wave phase in cycles, (x·dx + y·dy) / width + phase / 2π, is separable: per column
     // and per row (fraction, whole cycles) in f64, so the kernel's sum keeps the fraction exact
@@ -183,7 +186,7 @@ fn turbulent(e: &mut Enc, ctx: &EffectCtx, mut b: GBuf) -> Option<GBuf> {
     let evo = ctx.params.f("evolution") / 360.0;
     let cycle = ctx.params.b("evolutionOptions/cycleEvolution").then(|| ctx.params.f("evolutionOptions/cycle").round().max(1.0));
     let falloff = if (3..=5).contains(&kind) { 0.3 } else { 0.5 };
-    let (x0, y0, lw, lh) = util::pin_rect(ctx, b.offset, b.scale);
+    let (x0, y0, lw, lh) = util::layer_rect_at(ctx, b.offset, b.scale);
     let edge = (lw.min(lh) * 0.1).max(1.0);
     let seed = (ctx.seed ^ 0x7d15).wrapping_add((ctx.params.f("evolutionOptions/randomSeed") as i64 as u32).wrapping_mul(0x9e37_79b9));
     let (z0, z1, t) = match cycle {

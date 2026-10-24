@@ -402,7 +402,9 @@ fn fp2_point(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         // u[0] = (_, composite original, mode, rgb only); f[0].x = opacity.
         default: {
-            let orig = px * P.f[0].x;
+            var source = px;
+            if (P.u[1].x != 0u) { source = textureLoad(aux, p, 0); }
+            let orig = source * P.f[0].x;
             if (P.u[0].y == 1u) {
                 o = blend_pixel(P.u[0].z, orig, px, 0.5);
             } else {
@@ -826,7 +828,7 @@ fn fp2_io_final(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 // ---------------------------------------------------------------- CC Simple Wire Removal (keying2::wire_removal)
-// u[0].x = style; f[0] = (ax, ay, nx, ny); f[1] = (hw thickness, soft width, mirror).
+// u[0].x = style; f[0] = (ax, ay, nx, ny); f[1] = (hw thickness, soft width, mirror, segment length).
 
 fn fp2_wire_pos(base: vec2<f32>, nrm: vec2<f32>, s: f32) -> vec4<f32> {
     return sample_bilinear_clamped(src, base.x + nrm.x * s, base.y + nrm.y * s);
@@ -849,7 +851,9 @@ fn fp2_wire(@builtin(global_invocation_id) gid: vec3<u32>) {
     let q = vec2<f32>(fx - a.x, fy - a.y);
     let d = q.x * nrm.x + q.y * nrm.y;
     let ad = abs(d);
-    if (ad > hw + soft_w) {
+    // The wire is the segment A to B: the tangent is the normal turned back by 90 degrees.
+    let along = q.x * nrm.y - q.y * nrm.x;
+    if (along < 0.0 || along > P.f[1].w || ad > hw + soft_w) {
         textureStore(out, p, px);
         return;
     }

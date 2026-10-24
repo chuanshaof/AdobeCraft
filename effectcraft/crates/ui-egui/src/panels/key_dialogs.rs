@@ -1,6 +1,7 @@
 //! Animation dialogs: Keyframe Velocity, Keyframe Interpolation and Time Stretch. Each one is
 //! pre-filled from the engine (`keys.info`, the layer) and commits through one engine command.
 
+use crate::i18n::tr;
 use egui::{Color32, vec2};
 use serde_json::{Value, json};
 
@@ -114,10 +115,10 @@ fn buttons(ui: &mut egui::Ui, app: &mut EffectcraftApp, t: &Tokens, prefix: &str
     let (mut ok, mut cancel) = (false, false);
     ui.add_space(14.0);
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        let r = ui.add(egui::Button::new(egui::RichText::new("   OK   ").color(Color32::WHITE)).fill(t.accent));
+        let r = ui.add(egui::Button::new(egui::RichText::new(tr("   OK   ")).color(Color32::WHITE)).fill(t.accent));
         app.auto.add(&format!("{prefix}.ok"), r.rect, "OK");
         ok = r.clicked();
-        let r = ui.button("Cancel");
+        let r = ui.button(tr("Cancel"));
         app.auto.add(&format!("{prefix}.cancel"), r.rect, "Cancel");
         cancel = r.clicked();
     });
@@ -125,7 +126,7 @@ fn buttons(ui: &mut egui::Ui, app: &mut EffectcraftApp, t: &Tokens, prefix: &str
 }
 
 fn drag(ui: &mut egui::Ui, app: &mut EffectcraftApp, id: &str, v: &mut f64, speed: f64, range: std::ops::RangeInclusive<f64>, suffix: &str, enabled: bool) {
-    let r = ui.add_enabled(enabled, egui::DragValue::new(v).speed(speed).range(range).max_decimals(2).suffix(suffix));
+    let r = ui.add_enabled(enabled, crate::widgets::drag_value(egui::DragValue::new(v).speed(speed).range(range).max_decimals(2).suffix(suffix)));
     app.auto.add(id, r.rect, id);
 }
 
@@ -144,13 +145,13 @@ pub fn velocity(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
                     ui.label(egui::RichText::new(tag).color(t.text_dim));
                     let side = if out { "out" } else { "in" };
                     ui.horizontal(|ui| {
-                        ui.label("Speed:");
+                        ui.label(tr("Speed:"));
                         let v = if out { &mut d.out_speed[dim] } else { &mut d.in_speed[dim] };
                         drag(ui, app, &format!("dialog.velocity.{side}Speed.{dim}"), v, 1.0, -1e7..=1e7, "", enabled);
                         ui.label(egui::RichText::new(&d.units).color(t.text_dim));
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Influence:");
+                        ui.label(tr("Influence:"));
                         let v = if out { &mut d.out_inf[dim] } else { &mut d.in_inf[dim] };
                         drag(ui, app, &format!("dialog.velocity.{side}Influence.{dim}"), v, 0.2, 0.1..=100.0, " %", enabled);
                     });
@@ -159,7 +160,7 @@ pub fn velocity(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
             });
             ui.add_space(8.0);
         }
-        let r = ui.checkbox(&mut d.continuous, "Continuous (Lock Outgoing to Incoming)");
+        let r = ui.checkbox(&mut d.continuous, tr("Continuous (Lock Outgoing to Incoming)"));
         app.auto.add("dialog.velocity.continuous", r.rect, "Continuous");
         if d.continuous {
             d.out_speed = d.in_speed.clone();
@@ -189,9 +190,10 @@ pub fn velocity(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
 
 fn combo(ui: &mut egui::Ui, app: &mut EffectcraftApp, id: &str, sel: &mut usize, opts: &[&str], enabled: bool) {
     ui.add_enabled_ui(enabled, |ui| {
-        let r = egui::ComboBox::from_id_salt(id).width(200.0).selected_text(opts[*sel]).show_ui(ui, |ui| {
+        // The options are the English source strings; the automation id and label stay English.
+        let r = egui::ComboBox::from_id_salt(id).width(200.0).selected_text(tr(opts[*sel])).show_ui(ui, |ui| {
             for (i, o) in opts.iter().enumerate() {
-                ui.selectable_value(sel, i, *o);
+                ui.selectable_value(sel, i, tr(o));
             }
         });
         app.auto.add(id, r.response.rect, id);
@@ -203,13 +205,13 @@ pub fn interpolation(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) 
     let (mut ok, mut cancel) = (false, false);
     super::dialogs::modal(ctx, "Keyframe Interpolation", vec2(440.0, 250.0), t, |ui| {
         egui::Grid::new("interp-grid").num_columns(2).spacing([14.0, 10.0]).show(ui, |ui| {
-            ui.label("Temporal Interpolation:");
+            ui.label(tr("Temporal Interpolation:"));
             combo(ui, app, "dialog.interpolation.temporal", &mut d.temporal, &TEMPORAL.map(|x| x.0), true);
             ui.end_row();
-            ui.label("Spatial Interpolation:");
+            ui.label(tr("Spatial Interpolation:"));
             combo(ui, app, "dialog.interpolation.spatial", &mut d.spatial, &SPATIAL.map(|x| x.0), d.has_spatial);
             ui.end_row();
-            ui.label("Roving:");
+            ui.label(tr("Roving:"));
             combo(ui, app, "dialog.interpolation.roving", &mut d.roving, &ROVING, d.has_spatial);
             ui.end_row();
         });
@@ -245,19 +247,19 @@ pub fn time_stretch(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let mut d = app.dialog_state.stretch.clone();
     let (mut ok, mut cancel) = (false, false);
     super::dialogs::modal(ctx, "Time Stretch", vec2(420.0, 300.0), t, |ui| {
-        ui.label(egui::RichText::new("Stretch").font(Tokens::medium(12.5)));
+        ui.label(egui::RichText::new(tr("Stretch")).font(Tokens::medium(12.5)));
         egui::Grid::new("stretch-grid").num_columns(2).spacing([14.0, 8.0]).show(ui, |ui| {
-            ui.label("Original Duration:");
+            ui.label(tr("Original Duration:"));
             ui.label(format!("{:.2} s", d.orig_duration));
             ui.end_row();
-            ui.label("Stretch Factor:");
+            ui.label(tr("Stretch Factor:"));
             let before = d.percent;
             drag(ui, app, "dialog.timeStretch.percent", &mut d.percent, 0.5, -10000.0..=10000.0, " %", true);
             if (before - d.percent).abs() > 1e-9 && d.orig_percent.abs() > 1e-9 {
                 d.duration = d.orig_duration * d.percent.abs() / d.orig_percent.abs();
             }
             ui.end_row();
-            ui.label("New Duration:");
+            ui.label(tr("New Duration:"));
             let before = d.duration;
             drag(ui, app, "dialog.timeStretch.duration", &mut d.duration, 0.05, 0.01..=100000.0, " s", true);
             if (before - d.duration).abs() > 1e-9 && d.orig_duration > 1e-9 {
@@ -266,7 +268,7 @@ pub fn time_stretch(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
             ui.end_row();
         });
         ui.add_space(10.0);
-        ui.label(egui::RichText::new("Hold In Place").font(Tokens::medium(12.5)));
+        ui.label(egui::RichText::new(tr("Hold In Place")).font(Tokens::medium(12.5)));
         for (i, l) in ["Layer In-point", "Current Frame", "Layer Out-point"].into_iter().enumerate() {
             let r = ui.radio_value(&mut d.hold, i, l);
             app.auto.add(&format!("dialog.timeStretch.hold.{i}"), r.rect, l);

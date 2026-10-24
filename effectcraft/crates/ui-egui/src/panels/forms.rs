@@ -4,6 +4,7 @@
 //! Keyboard Shortcuts: `shortcut_editor`). Every form runs an engine command with the collected parameters, so whatever a
 //! dialog does an agent can do with one `engine.execute`.
 
+use crate::i18n::{tr, tr_args};
 use egui::{Color32, vec2};
 use serde_json::{Map, Value, json};
 
@@ -126,27 +127,86 @@ fn has(p: &Value, keys: &[&str]) -> bool {
     keys.iter().any(|k| p.get(*k).is_some())
 }
 
-/// If `id` is a dialog command invoked without its parameters, open its form and return true.
+/// The files of an import's parameters (`paths` or `path`).
+fn import_paths(p: &Value) -> Vec<String> {
+    match p.get("paths").or(p.get("path")) {
+        Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+        Some(Value::String(x)) => vec![x.clone()],
+        _ => vec![],
+    }
+}
+
+/// The import includes a file with one of these (lowercase) extensions.
+fn imports_ext(p: &Value, exts: &[&str]) -> bool {
+    import_paths(p).iter().any(|s| s.rsplit('.').next().is_some_and(|e| exts.contains(&e.to_ascii_lowercase().as_str())))
+}
+
 /// The import includes a Photoshop document.
 fn is_layered(p: &Value) -> bool {
-    let psd = |v: &Value| v.as_str().is_some_and(|s| matches!(s.rsplit('.').next().map(str::to_ascii_lowercase).as_deref(), Some("psd" | "psb")));
-    match p.get("paths").or(p.get("path")) {
-        Some(Value::Array(a)) => a.iter().any(psd),
-        Some(v) => psd(v),
-        None => false,
-    }
+    imports_ext(p, &["psd", "psb"])
 }
 
 /// The import includes a PDF or Illustrator file (which may have several pages).
 fn is_pdf(p: &Value) -> bool {
-    let pdf = |v: &Value| v.as_str().is_some_and(|s| matches!(s.rsplit('.').next().map(str::to_ascii_lowercase).as_deref(), Some("pdf" | "ai")));
-    match p.get("paths").or(p.get("path")) {
-        Some(Value::Array(a)) => a.iter().any(pdf),
-        Some(v) => pdf(v),
-        None => false,
-    }
+    imports_ext(p, &["pdf", "ai"])
 }
 
+/// File ▸ Import ▸ File… picked numbered stills that import as image sequences: ask, as After
+/// Effects' "<format> Sequence" checkbox in its Import dialog does (rfd's native dialog can't
+/// carry a checkbox), with Force Alphabetical Order and the frame rate. `p`: the import's
+/// parameters. Returns whether the dialog opened. The checkbox starts off, as in After Effects:
+/// unticked, the picked files import as stills. Dropped files and agents' `file.import` don't
+/// ask (files import as stills, folders' runs as sequences).
+pub fn open_import_sequence(app: &mut EffectcraftApp, p: &Value) -> bool {
+    if has(p, &["sequence", "alphabetical"]) {
+        return false;
+    }
+    let runs = effectcraft_engine::sequence::sequences(app.session.services.as_ref(), &import_paths(p), false);
+    if runs.is_empty() {
+        return false;
+    }
+    let fields = sequence_fields(app, &runs);
+    form(app, "Import Image Sequence", "file.import", p.clone(), fields);
+    true
+}
+
+/// The Import Image Sequence dialog's fields for `runs` (each a sequence's files).
+fn sequence_fields(app: &EffectcraftApp, runs: &[Vec<String>]) -> Vec<Field> {
+    use effectcraft_engine::project::sequence::sequence_name;
+    let first = runs.first().map(Vec::as_slice).unwrap_or_default();
+    let ext = first.first().and_then(|f| f.rsplit_once('.')).map(|(_, e)| e.to_ascii_uppercase()).unwrap_or_default();
+    let what = |files: &[String]| {
+        let name = sequence_name(files).unwrap_or_default();
+        match effectcraft_engine::sequence::missing_report(files) {
+            Some(gaps) => format!("{name}: {} files, {gaps}", files.len()),
+            None => format!("{name}: {} files", files.len()),
+        }
+    };
+    let note = match runs {
+        [one] => format!("{} – numbered stills of one image sequence.", what(one)),
+        _ => format!("{} image sequences: {}.", runs.len(), runs.iter().map(|r| what(r)).collect::<Vec<_>>().join("; ")),
+    };
+    vec![
+        Field::note("note", &note),
+        Field::bool("sequence", &format!("{ext} Sequence"), false),
+        Field::bool("alphabetical", "Force alphabetical order", false),
+        Field::num("frameRate", "Frame rate (fps)", app.session.prefs.import.sequence_fps),
+        Field::note("after", "Change the frame rate, alpha and start frame later with File ▸ Interpret Footage."),
+    ]
+}
+
+/// Fields to type a numeric property value in (`value`, or `value[0]`… per dimension).
+fn value_fields(name: &str, v: &effectcraft_engine::keyframe::Value) -> Option<Vec<Field>> {
+    use effectcraft_engine::keyframe::Value as KV;
+    Some(match v {
+        KV::Scalar(v) => vec![Field::num("value", name, *v)],
+        KV::Vec2(v) => vec![Field::num("value[0]", "X", v[0]), Field::num("value[1]", "Y", v[1])],
+        KV::Vec3(v) => vec![Field::num("value[0]", "X", v[0]), Field::num("value[1]", "Y", v[1]), Field::num("value[2]", "Z", v[2])],
+        _ => return None,
+    })
+}
+
+/// If `id` is a dialog command invoked without its parameters, open its form and return true.
 pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
     let s = &app.session;
     let comp = s.active_comp();
@@ -155,21 +215,29 @@ pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
     let lt = layer.map(|l| l.layer_time(t)).unwrap_or(t);
     let base = p.clone();
     let (title, fields): (String, Vec<Field>) = match id {
-        // Photoshop files: Import Kind (Footage / Composition / – Retain Layer Sizes).
-        "file.import" if !has(p, &["importAs"]) && is_layered(p) => (
-            "Import Photoshop File".into(),
-            vec![Field::choice(
-                "importAs",
-                "Import Kind",
-                &[("Footage", json!("footage")), ("Composition", json!("composition")), ("Composition - Retain Layer Sizes", json!("compositionLayerSizes"))],
-                1,
-            )],
-        ),
+        // Photoshop files: Import Kind (Footage / Composition / – Retain Layer Sizes). Dropped
+        // files start at Settings ▸ Import ▸ Default Drag Import As.
+        "file.import" if !has(p, &["importAs"]) && is_layered(p) => {
+            let kinds =
+                [("Footage", json!("footage")), ("Composition", json!("composition")), ("Composition - Retain Layer Sizes", json!("compositionLayerSizes"))];
+            let drag = p.get("drag").and_then(Value::as_bool).unwrap_or(false);
+            let sel = if drag { kinds.iter().position(|(_, v)| v.as_str() == Some(s.prefs.drag_import_as())).unwrap_or(0) } else { 1 };
+            ("Import Photoshop File".into(), vec![Field::choice("importAs", "Import Kind", &kinds, sel)])
+        }
         // PDF / Illustrator files: Import Kind and the page.
         "file.import" if !has(p, &["importAs", "page"]) && is_pdf(p) => (
             "Import PDF / Illustrator File".into(),
             vec![
-                Field::choice("importAs", "Import Kind", &[("Footage", json!("footage")), ("Composition", json!("composition"))], 0),
+                Field::choice(
+                    "importAs",
+                    "Import Kind",
+                    &[
+                        ("Footage", json!("footage")),
+                        ("Composition", json!("composition")),
+                        ("Composition - Retain Layer Sizes", json!("compositionLayerSizes")),
+                    ],
+                    0,
+                ),
                 Field::num("page", "Page", 1.0),
             ],
         ),
@@ -203,13 +271,14 @@ pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
             let t = p.get("time").and_then(Value::as_f64).map(effectcraft_engine::time::Tick::from_seconds_f64);
             let Some((pr, t)) = pr.zip(t) else { return false };
             let Some(k) = pr.keys.iter().min_by_key(|k| (k.time.0 - t.0).abs()) else { return false };
-            use effectcraft_engine::keyframe::Value as KV;
-            let fields = match &k.value {
-                KV::Scalar(v) => vec![Field::num("value", &pr.name, *v)],
-                KV::Vec2(v) => vec![Field::num("value[0]", "X", v[0]), Field::num("value[1]", "Y", v[1])],
-                KV::Vec3(v) => vec![Field::num("value[0]", "X", v[0]), Field::num("value[1]", "Y", v[1]), Field::num("value[2]", "Z", v[2])],
-                _ => return false,
-            };
+            let Some(fields) = value_fields(&pr.name, &k.value) else { return false };
+            (pr.name.clone(), fields)
+        }
+        // A property's context menu ▸ Edit Value…: its value at the current time.
+        "prop.set" if !has(p, &["value"]) => {
+            let l = p.get("layer").and_then(Value::as_u64).and_then(|l| comp?.layer(effectcraft_engine::project::LayerId(l)));
+            let Some((l, pr)) = l.and_then(|l| Some((l, l.props.find(p.get("prop").and_then(Value::as_u64)?)?))) else { return false };
+            let Some(fields) = value_fields(&pr.name, &pr.value_at(l.layer_time(t))) else { return false };
             (pr.name.clone(), fields)
         }
         "layer.setTransform" if !has(p, &["value"]) => {
@@ -297,6 +366,13 @@ pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
                 ],
             )
         }
+        "view.addPercentGuide" if !has(p, &["position"]) => (
+            "Add Percentage Guide".into(),
+            vec![
+                Field::choice("orientation", "Orientation", &[("Vertical", json!("vertical")), ("Horizontal", json!("horizontal"))], 0),
+                Field::num("position", "Position (percent of the composition)", 50.0),
+            ],
+        ),
         // Several items selected: After Effects' New Composition from Selection dialog.
         "file.newCompFromSelection"
             if s.state.project_selection.len() > 1 && !has(p, &["single", "dimensionsFrom", "duration", "sequence", "addToRenderQueue"]) =>
@@ -346,7 +422,7 @@ pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
             ],
         ),
         "file.interpretFootage" | "file.interpretProxy"
-            if !has(p, &["frameRate", "alpha", "loop", "pixelAspect", "colorProfile", "fields", "invertAlpha", "matteColor", "linearLight"]) =>
+            if !has(p, &["frameRate", "alpha", "loop", "pixelAspect", "colorProfile", "fields", "invertAlpha", "matteColor", "linearLight", "startFrame"]) =>
         {
             let proxy = id == "file.interpretProxy";
             let f = s.state.project_selection.first().and_then(|i| s.project.item(*i)).and_then(|it| match (&it.kind, &it.proxy) {
@@ -356,59 +432,82 @@ pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
             });
             let Some(f) = f else { return false };
             let hex = |c: [f32; 3]| format!("#{:02x}{:02x}{:02x}", (c[0] * 255.0).round() as u8, (c[1] * 255.0).round() as u8, (c[2] * 255.0).round() as u8);
-            (
-                if proxy { "Interpret Footage: Proxy".into() } else { "Interpret Footage".into() },
-                vec![
-                    // Main Options ▸ Alpha.
-                    Field::choice(
-                        "alpha",
-                        "Alpha",
-                        &[
-                            ("Interpret Straight - Unmatted", json!("straight")),
-                            ("Interpret Premultiplied - Matted With Color", json!("premultiplied")),
-                            ("Ignore", json!("ignore")),
-                            ("Guess", json!("guess")),
-                        ],
-                        f.alpha as usize,
-                    ),
-                    Field::text("matteColor", "Matte color (premultiplied)", &hex(f.premul_color)),
-                    Field::bool("invertAlpha", "Invert Alpha", f.invert_alpha),
-                    // Main Options ▸ Frame Rate, Fields and Pulldown, Other Options.
-                    Field::num("frameRate", "Assume this frame rate", f.frame_rate.as_f64()),
-                    Field::choice(
-                        "fields",
-                        "Separate Fields",
-                        &[("Off", json!("off")), ("Upper Field First", json!("upper")), ("Lower Field First", json!("lower"))],
-                        f.fields as usize,
-                    ),
-                    Field::num("pixelAspect", "Pixel Aspect Ratio", f.pixel_aspect),
-                    Field::num("loop", "Loop (times)", f.loop_count as f64),
-                    // Color.
-                    Field::choice(
-                        "colorProfile",
-                        "Assign Profile",
-                        &[
-                            ("Embedded / sRGB", json!("auto")),
-                            ("sRGB IEC61966-2.1", json!("srgb")),
-                            ("HDTV (Rec. 709)", json!("rec709")),
-                            ("Rec. 2020", json!("rec2020")),
-                            ("Display P3", json!("p3")),
-                            ("ACEScg", json!("acescg")),
-                            ("ACES2065-1", json!("aces2065")),
-                            ("Rec. 2100 PQ", json!("rec2100pq")),
-                            ("Rec. 2100 HLG", json!("rec2100hlg")),
-                        ],
-                        f.color_profile.map_or(0, |c| 1 + effectcraft_engine::project::ColorSpace::ALL.iter().position(|x| *x == c).unwrap_or(0)),
-                    ),
-                    Field::bool("linearLight", "Interpret As Linear Light", f.linear_light),
-                ],
-            )
+            let mut fields = vec![
+                // Main Options ▸ Alpha.
+                Field::choice(
+                    "alpha",
+                    "Alpha",
+                    &[
+                        ("Interpret Straight - Unmatted", json!("straight")),
+                        ("Interpret Premultiplied - Matted With Color", json!("premultiplied")),
+                        ("Ignore", json!("ignore")),
+                        ("Guess", json!("guess")),
+                    ],
+                    f.alpha as usize,
+                ),
+                Field::text("matteColor", "Matte color (premultiplied)", &hex(f.premul_color)),
+                Field::bool("invertAlpha", "Invert Alpha", f.invert_alpha),
+                // Main Options ▸ Frame Rate, Fields and Pulldown, Other Options.
+                Field::num("frameRate", "Assume this frame rate", f.frame_rate.as_f64()),
+                Field::choice(
+                    "fields",
+                    "Separate Fields",
+                    &[("Off", json!("off")), ("Upper Field First", json!("upper")), ("Lower Field First", json!("lower"))],
+                    f.fields as usize,
+                ),
+                Field::num("pixelAspect", "Pixel Aspect Ratio", f.pixel_aspect),
+                Field::num("loop", "Loop (times)", f.loop_count as f64),
+                // Color.
+                Field::choice(
+                    "colorProfile",
+                    "Assign Profile",
+                    &[
+                        ("Embedded / sRGB", json!("auto")),
+                        ("sRGB IEC61966-2.1", json!("srgb")),
+                        ("HDTV (Rec. 709)", json!("rec709")),
+                        ("Rec. 2020", json!("rec2020")),
+                        ("Display P3", json!("p3")),
+                        ("ACEScg", json!("acescg")),
+                        ("ACES2065-1", json!("aces2065")),
+                        ("Rec. 2100 PQ", json!("rec2100pq")),
+                        ("Rec. 2100 HLG", json!("rec2100hlg")),
+                    ],
+                    f.color_profile.map_or(0, |c| 1 + effectcraft_engine::project::ColorSpace::ALL.iter().position(|x| *x == c).unwrap_or(0)),
+                ),
+                Field::bool("preserveRgb", "Preserve RGB", f.preserve_rgb),
+                Field::bool("linearLight", "Interpret As Linear Light", f.linear_light),
+            ];
+            // After Frame Rate: an image sequence's frames (missing ones show colour bars, as in
+            // After Effects), then Start Timecode.
+            let mut timing = Vec::new();
+            if f.kind == effectcraft_engine::project::FootageKind::Sequence {
+                let gaps = match effectcraft_engine::sequence::missing_report(&f.sequence) {
+                    _ if f.alphabetical => "files in alphabetical order".into(),
+                    Some(gaps) => format!("{gaps} shown as color bars"),
+                    None => "no missing frames".into(),
+                };
+                timing.push(Field::note("sequenceInfo", &format!("Image sequence: {} files, {} frames; {gaps}.", f.sequence.len(), f.sequence_frames())));
+            }
+            if f.kind != effectcraft_engine::project::FootageKind::Still {
+                timing.push(Field::choice(
+                    "overrideStart",
+                    "Start Timecode",
+                    &[("Use Source File Timecode", json!(false)), ("Override Start", json!(true))],
+                    usize::from(f.start_timecode.is_some()),
+                ));
+                timing.push(Field::text("startTimecode", "Override Start", &f.timecode(0)));
+            }
+            let at = fields.iter().position(|x| x.key == "frameRate").map_or(fields.len(), |i| i + 1);
+            fields.splice(at..at, timing);
+            (if proxy { "Interpret Footage: Proxy".into() } else { "Interpret Footage".into() }, fields)
         }
         "file.projectSettings" if p.as_object().is_none_or(|m| m.is_empty()) => {
             let st = &s.project.settings;
+            // The catalogue row is `Mercury GPU Acceleration ({})`, so the value goes through
+            // tr_args: wrapping the assembled string in tr() would look up the backend's name.
             let gpu_label = match &s.accel {
-                Some(a) => format!("Mercury GPU Acceleration ({})", a.name()),
-                None => "Mercury GPU Acceleration (no GPU: software)".to_string(),
+                Some(a) => tr_args("Mercury GPU Acceleration ({})", &[&a.name()]),
+                None => tr("Mercury GPU Acceleration (no GPU: software)").to_string(),
             };
             let depth = match st.bit_depth.label() {
                 l if l.starts_with("16") => 1,
@@ -443,6 +542,8 @@ pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
                             }
                         },
                     ),
+                    // Time Display Style ▸ Frames ▸ Frame Count (also numbers Feet + Frames).
+                    Field::choice("frameStart", "Frame count", &[("Start at 0", json!(0)), ("Start at 1", json!(1))], usize::from(st.frame_start == 1)),
                     Field::choice(
                         "colorEngine",
                         "Color engine",
@@ -463,6 +564,8 @@ pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
                         ],
                         st.working_space.map_or(0, |c| 1 + effectcraft_engine::project::ColorSpace::WORKING.iter().position(|x| *x == c).unwrap_or(0)),
                     ),
+                    // With Working Space None (After Effects' Working Gamma, 2.2 or 2.4).
+                    Field::choice("workingGamma", "Working gamma", &[("2.2", json!(2.2)), ("2.4", json!(2.4))], usize::from(st.working_gamma_24())),
                     Field::bool("linearize", "Linearize working space", st.linearize),
                     Field::bool("blendLinear", "Blend colors using 1.0 gamma", st.blend_linear),
                     Field::choice(
@@ -665,74 +768,119 @@ pub fn open_form(app: &mut EffectcraftApp, id: &str, p: &Value) -> bool {
     true
 }
 
+/// The label and control rows of a form: the part of [`show_form`] that scrolls.
+fn form_grid(ui: &mut egui::Ui, f: &mut Form, regs: &mut Vec<(String, egui::Rect, String)>, browse: &mut Option<usize>, focused: &mut bool) {
+    egui::Grid::new("form-grid").num_columns(2).spacing([14.0, 10.0]).show(ui, |ui| {
+        for (i, fl) in f.fields.iter_mut().enumerate() {
+            ui.label(tr(&fl.label));
+            let r = match &mut fl.kind {
+                FieldKind::Number { value, speed } => {
+                    let dec = if *speed < 0.01 { 5 } else { 3 };
+                    let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(value).speed(*speed).max_decimals(dec)));
+                    // The first field takes the keyboard when the form opens. (A number edits
+                    // as text once focused; the selection is clamped to what it shows.)
+                    if !std::mem::replace(focused, true) {
+                        crate::widgets::focus_on_open(ui.ctx(), &r, &" ".repeat(64));
+                    }
+                    r.rect
+                }
+                FieldKind::Text(s) => {
+                    let r = ui.add(egui::TextEdit::singleline(s).desired_width(220.0));
+                    if !std::mem::replace(focused, true) {
+                        crate::widgets::focus_on_open(ui.ctx(), &r, s);
+                    }
+                    r.rect
+                }
+                FieldKind::Path { value, .. } => {
+                    ui.horizontal(|ui| {
+                        let r = ui.add(egui::TextEdit::singleline(value).desired_width(150.0)).rect;
+                        let b = ui.button(tr("Browse…"));
+                        regs.push((format!("form.field.{}.browse", fl.key), b.rect, "Browse…".into()));
+                        if b.clicked() {
+                            *browse = Some(i);
+                        }
+                        r
+                    })
+                    .inner
+                }
+                FieldKind::SavePath(value) => {
+                    ui.horizontal(|ui| {
+                        let r = ui.add(egui::TextEdit::singleline(value).desired_width(150.0)).rect;
+                        let b = ui.button(tr("Browse…"));
+                        regs.push((format!("form.field.{}.browse", fl.key), b.rect, "Browse…".into()));
+                        if b.clicked() {
+                            *browse = Some(i);
+                        }
+                        r
+                    })
+                    .inner
+                }
+                // A fixed width: in the grid's value column a wrapping label would otherwise
+                // shrink to a word per line.
+                FieldKind::Note(text) => {
+                    ui.scope(|ui| {
+                        ui.set_width(220.0);
+                        ui.add(egui::Label::new(egui::RichText::new(tr(text.as_str())).small()).wrap())
+                    })
+                    .inner
+                    .rect
+                }
+                FieldKind::Bool(b) => ui.checkbox(b, "").rect,
+                FieldKind::Choice { options, sel } => {
+                    let cur = options.get(*sel).map(|o| o.0.clone()).unwrap_or_default();
+                    // The column keeps its width: a long choice (a GPU adapter's name) ends in an
+                    // ellipsis instead of widening the form past the dialog (#978).
+                    egui::ComboBox::from_id_salt(("form", fl.key.as_str()))
+                        .selected_text(tr(&cur))
+                        .width(240.0)
+                        .truncate()
+                        .show_ui(ui, |ui| {
+                            for (i, (l, _)) in options.iter().enumerate() {
+                                ui.selectable_value(sel, i, tr(l));
+                            }
+                        })
+                        .response
+                        .rect
+                }
+            };
+            regs.push((format!("form.field.{}", fl.key), r, fl.label.clone()));
+            ui.end_row();
+        }
+    });
+}
+
 pub fn show_form(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let mut f = app.dialog_state.form.clone();
     let (mut ok, mut close) = (false, false);
-    let h = 120.0 + f.fields.len() as f32 * 30.0;
+    // Rows are 30 px; a note wraps at about 40 characters a line, so OK and Cancel stay in view.
+    let rows: f32 = f
+        .fields
+        .iter()
+        .map(|fl| match &fl.kind {
+            FieldKind::Note(text) => 10.0 + 15.0 * (text.chars().count() as f32 / 40.0).ceil().max(1.0),
+            _ => 30.0,
+        })
+        .sum();
+    let h = 120.0 + rows;
     let mut regs: Vec<(String, egui::Rect, String)> = vec![];
     let mut browse: Option<usize> = None;
-    super::dialogs::modal(ctx, &f.title.clone(), vec2(440.0, h), t, |ui| {
-        egui::Grid::new("form-grid").num_columns(2).spacing([14.0, 10.0]).show(ui, |ui| {
-            for (i, fl) in f.fields.iter_mut().enumerate() {
-                ui.label(&fl.label);
-                let r = match &mut fl.kind {
-                    FieldKind::Number { value, speed } => {
-                        let dec = if *speed < 0.01 { 5 } else { 3 };
-                        ui.add(egui::DragValue::new(value).speed(*speed).max_decimals(dec)).rect
-                    }
-                    FieldKind::Text(s) => ui.add(egui::TextEdit::singleline(s).desired_width(220.0)).rect,
-                    FieldKind::Path { value, .. } => {
-                        ui.horizontal(|ui| {
-                            let r = ui.add(egui::TextEdit::singleline(value).desired_width(150.0)).rect;
-                            let b = ui.button("Browse…");
-                            regs.push((format!("form.field.{}.browse", fl.key), b.rect, "Browse…".into()));
-                            if b.clicked() {
-                                browse = Some(i);
-                            }
-                            r
-                        })
-                        .inner
-                    }
-                    FieldKind::SavePath(value) => {
-                        ui.horizontal(|ui| {
-                            let r = ui.add(egui::TextEdit::singleline(value).desired_width(150.0)).rect;
-                            let b = ui.button("Browse…");
-                            regs.push((format!("form.field.{}.browse", fl.key), b.rect, "Browse…".into()));
-                            if b.clicked() {
-                                browse = Some(i);
-                            }
-                            r
-                        })
-                        .inner
-                    }
-                    FieldKind::Note(text) => ui.add(egui::Label::new(egui::RichText::new(text.as_str()).small()).wrap()).rect,
-                    FieldKind::Bool(b) => ui.checkbox(b, "").rect,
-                    FieldKind::Choice { options, sel } => {
-                        let cur = options.get(*sel).map(|o| o.0.clone()).unwrap_or_default();
-                        egui::ComboBox::from_id_salt(("form", fl.key.as_str()))
-                            .selected_text(cur)
-                            .width(240.0)
-                            .show_ui(ui, |ui| {
-                                for (i, (l, _)) in options.iter().enumerate() {
-                                    ui.selectable_value(sel, i, l);
-                                }
-                            })
-                            .response
-                            .rect
-                    }
-                };
-                regs.push((format!("form.field.{}", fl.key), r, fl.label.clone()));
-                ui.end_row();
-            }
+    let mut focused = false;
+    // Wide enough for a label column and a 240 px popup. Only the fields scroll, and only
+    // vertically: OK and Cancel sit under the scroll area, so they are always in view (#978).
+    super::dialogs::modal_fit(ctx, &f.title.clone(), vec2(480.0, h), t, |ui, _| {
+        let footer = 14.0 + ui.spacing().interact_size.y + 2.0 * ui.spacing().item_spacing.y;
+        let max_height = (super::dialogs::modal_space(ctx).y - 84.0 - footer).max(40.0);
+        egui::ScrollArea::vertical().max_height(max_height).auto_shrink([false, true]).show(ui, |ui| {
+            form_grid(ui, &mut f, &mut regs, &mut browse, &mut focused);
         });
         ui.add_space(14.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let b = ui.add(egui::Button::new(egui::RichText::new("   OK   ").color(Color32::WHITE)).fill(t.accent));
+            let b = ui.add(egui::Button::new(egui::RichText::new(tr("   OK   ")).color(Color32::WHITE)).fill(t.accent));
             regs.push(("form.ok".into(), b.rect, "OK".into()));
             if b.clicked() {
                 ok = true;
             }
-            let c = ui.button("Cancel");
+            let c = ui.button(tr("Cancel"));
             regs.push(("form.cancel".into(), c.rect, "Cancel".into()));
             if c.clicked() {
                 close = true;
@@ -758,13 +906,9 @@ pub fn show_form(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     if let Some(i) = browse
         && let Some(FieldKind::SavePath(value)) = f.fields.get_mut(i).map(|f| &mut f.kind)
     {
-        let default = std::path::Path::new(value.as_str()).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        match app.hooks.pick_save.as_ref() {
-            Some(pick) => {
-                if let Some(path) = pick(&default) {
-                    *value = path;
-                }
-            }
+        match app.hooks.save_dialog(value) {
+            Some(Some(path)) => *value = path,
+            Some(None) => {}
             None => app.ui.status = "no file dialog available: type the path".into(),
         }
     }
@@ -783,20 +927,27 @@ pub fn show_form(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     }
 }
 
+/// Close the information dialog without abandoning a pending Settings transaction.
+pub(crate) fn close_info(app: &mut EffectcraftApp) {
+    app.dialog = app.dialog_state.prefs_snapshot.is_some().then_some(Dialog::Settings);
+}
+
 pub fn show_info(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let (title, body) = app.dialog_state.info.clone();
-    let mut close = false;
-    super::dialogs::modal(ctx, &title, vec2(440.0, 160.0), t, |ui| {
-        ui.label(body);
+    // Enter presses OK, the default (and only) button.
+    let mut close = !ctx.egui_wants_keyboard_input() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+    // The text wraps within this small dialog; avoid a horizontal scrollbar changing its height.
+    super::dialogs::modal_vertical(ctx, &title, vec2(440.0, 160.0), t, |ui| {
+        ui.label(tr(&body));
         ui.add_space(16.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.add(egui::Button::new(egui::RichText::new("   OK   ").color(Color32::WHITE)).fill(t.accent)).clicked() {
+            if ui.add(egui::Button::new(egui::RichText::new(tr("   OK   ")).color(Color32::WHITE)).fill(t.accent)).clicked() {
                 close = true;
             }
         });
     });
     if close {
-        app.dialog = None;
+        close_info(app);
     }
 }
 
@@ -804,16 +955,16 @@ pub fn show_view_options(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Toke
     let mut close = false;
     super::dialogs::modal(ctx, "View Options", vec2(360.0, 330.0), t, |ui| {
         let v = &mut app.ui.viewer;
-        ui.checkbox(&mut v.show_layer_controls, "Layer controls");
-        ui.checkbox(&mut v.show_masks, "Masks");
-        ui.checkbox(&mut v.rulers, "Rulers");
-        ui.checkbox(&mut v.guides, "Guides");
-        ui.checkbox(&mut v.grid, "Grid");
-        ui.checkbox(&mut v.safe_margins, "Title/action safe");
-        ui.checkbox(&mut v.transparency_grid, "Transparency grid");
+        ui.checkbox(&mut v.show_layer_controls, tr("Layer controls"));
+        ui.checkbox(&mut v.show_masks, tr("Masks"));
+        ui.checkbox(&mut v.rulers, tr("Rulers"));
+        ui.checkbox(&mut v.guides, tr("Guides"));
+        ui.checkbox(&mut v.grid, tr("Grid"));
+        ui.checkbox(&mut v.safe_margins, tr("Title/action safe"));
+        ui.checkbox(&mut v.transparency_grid, tr("Transparency grid"));
         ui.add_space(12.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.add(egui::Button::new(egui::RichText::new("   OK   ").color(Color32::WHITE)).fill(t.accent)).clicked() {
+            if ui.add(egui::Button::new(egui::RichText::new(tr("   OK   ")).color(Color32::WHITE)).fill(t.accent)).clicked() {
                 close = true;
             }
         });
@@ -842,13 +993,44 @@ mod tests {
         assert_eq!(f.params(), json!({"prop": "position", "value": [10.0, 20.0], "mode": "b"}));
     }
 
+    /// A numeric form (Layer ▸ Transform ▸ Position…) opens with its first number being edited
+    /// and selected: typing replaces it, and one Enter confirms.
+    #[test]
+    fn a_numeric_form_opens_with_its_first_number_selected() {
+        let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx, &app.tokens, crate::i18n::language(&app));
+        app.dialog_state.form = Form {
+            title: "Position".into(),
+            command: "layer.setTransform".into(),
+            base: json!({"prop": "position"}),
+            fields: vec![Field::num("value[0]", "X", 960.0), Field::num("value[1]", "Y", 540.0)],
+        };
+        app.dialog = Some(Dialog::Form);
+        let frame = |app: &mut EffectcraftApp, events: Vec<egui::Event>| {
+            let raw = egui::RawInput { events, ..Default::default() };
+            ctx.run_ui(raw, |ui| {
+                app.auto.begin_frame();
+                crate::panels::dialogs::show(app, ui.ctx());
+            })
+            .textures_delta
+            .clear();
+        };
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![egui::Event::Text("42".into())]);
+        assert_eq!(app.dialog_state.form.params()["value"], json!([42.0, 540.0]));
+        frame(&mut app, vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }]);
+        assert!(app.dialog.is_none(), "one Enter confirms");
+    }
+
     /// File ▸ Export ▸ Adobe Premiere Pro Project… opens a form that says it writes Final Cut Pro
     /// XML; its fields register automation ids and OK runs `file.exportTimeline`.
     #[test]
     fn premiere_export_dialog() {
         let mut app = EffectcraftApp::new(effectcraft_engine::Session::default());
         let ctx = egui::Context::default();
-        crate::theme::install(&ctx, &app.tokens);
+        crate::theme::install(&ctx, &app.tokens, crate::i18n::language(&app));
         app.session.execute("comp.new", json!({"name": "Spot", "width": 64, "height": 36, "frameRate": 25, "duration": 1})).unwrap();
         app.session.execute("layer.newSolid", json!({"color": "#ff0000"})).unwrap();
         crate::menus::invoke(&mut app, &ctx, "file.exportTimeline", json!({})).unwrap();

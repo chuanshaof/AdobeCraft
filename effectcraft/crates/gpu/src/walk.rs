@@ -26,9 +26,7 @@ pub(crate) fn render<'g>(e: &mut Enc<'g>, r: &Renderer, comp_id: ItemId, t: Tick
         return None;
     }
     let ctx = r.eval_ctx(comp_id, t)?;
-    let s = r.opts.scale;
-    let w = ((ctx.comp.width as f64 * s).round() as u32).max(1);
-    let h = ((ctx.comp.height as f64 * s).round() as u32).max(1);
+    let (w, h) = effectcraft_render::frame_size(ctx.comp.width, ctx.comp.height, r.opts.scale);
     if r.depth() > 16 || !e.g.fits(w, h) {
         return None;
     }
@@ -73,6 +71,9 @@ fn draw_comp<'a>(e: &mut Enc, r: &Renderer<'a>, ctx: &EvalCtx<'a>, canvas: &mut 
     let levels = r.pipe().levels;
     let mut i = 0;
     while i < visible.len() {
+        // A device that ran out of memory (or was lost) on an earlier layer fails every later
+        // one: give the frame back to the CPU now instead of drawing the rest of the comp.
+        e.g.check_health().ok()?;
         if visible[i].is_3d() {
             let mut j = i;
             while j < visible.len() && visible[j].is_3d() {
@@ -214,6 +215,12 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
     if opacity <= 0.0 {
         return Some(());
     }
+    if let Some(done) = draw_precomp(e, r, ctx, layer, canvas, opacity) {
+        return done;
+    }
+    if let Some(done) = draw_resident_fx(e, r, ctx, layer, canvas, opacity) {
+        return done;
+    }
     let Some(st) = r.styled_layer(ctx, layer) else { return Some(()) };
     if st.plain {
         return composite_layer(e, r, ctx, layer, &st.body, canvas, opacity);
@@ -243,14 +250,103 @@ fn draw_layer(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &
     Some(())
 }
 
+/// A plain layer with effects, its effect stack run on the GPU: the source (+ masks, from the
+/// layer cache) uploads once while unchanged, the effects stay resident and the result is
+/// placed directly; the CPU path instead runs each GPU-capable effect run through an
+/// upload → kernels → readback, then uploads the result again to place it. `None`: not this
+/// kind of layer (draw it the usual way); `Some(None)`: the GPU failed.
+fn draw_resident_fx(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage, opacity: f32) -> Option<Option<()>> {
+    if !layer.switches.effects
+        || layer.effects().is_none_or(|f| f.children.is_empty())
+        || styles::active(ctx, layer)
+        || layer.preserve_transparency
+        || r.track_matte(ctx, layer).is_some()
+        // Unchanged since the last frame: the cached result uploads once (the usual path).
+        || r.layer_is_static(ctx, layer)
+    {
+        return None;
+    }
+    let input = r.layer_input(ctx, layer, 0)?;
+    if input.img.is_empty() {
+        return Some(Some(()));
+    }
+    let Some(src) = e.g.upload_buf(&input) else { return Some(None) };
+    let pipe = r.pipe();
+    // `layer_input` is in effect space: run the stack there, then back to layer space.
+    let mut fx = crate::effects::GpuFx::new(e, src, input.offset, input.scale, pipe.levels);
+    let origin = r.run_layer_effects_on(ctx, layer, &mut fx);
+    let Some((mut img, mut offset, scale)) = fx.finish() else { return Some(None) };
+    offset = [offset[0] - origin[0] * scale, offset[1] - origin[1] * scale];
+    if img.width == 0 || img.height == 0 {
+        return Some(Some(()));
+    }
+    if let Some(c) = pipe.to_blend() {
+        img = ops::convert(e, &img, &c);
+    }
+    // The placement only reads the buffer's size, offset and scale.
+    let shape = Buf { img: Image { width: img.width, height: img.height, data: Vec::new() }, offset, scale };
+    Some(place_src(e, r, ctx, layer, &shape, img, canvas, layer.blend_mode, opacity, pipe.levels).map(|c| *canvas = c))
+}
+
+/// A 2D precomp layer, its nested comp rendered resident on the GPU (`walk::render` one level
+/// down) instead of by the CPU compositor and uploaded every frame (`Renderer::layer_source`
+/// renders nested comps on the CPU: depth > 0). Then the layer's effects (resident), its
+/// placement, track matte / Preserve Transparency and blend, as for any layer. `None`: not this
+/// kind of layer, or the nested comp needs the CPU path (masks, layer styles, proxies,
+/// overrides, frame blending, nested motion-blur sampling; see `Renderer::precomp_source`);
+/// `Some(None)`: the GPU failed.
+fn draw_precomp(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage, opacity: f32) -> Option<Option<()>> {
+    if layer.masks().is_some_and(|m| !m.children.is_empty()) || styles::active(ctx, layer) {
+        return None;
+    }
+    let (sub, item, lt, bs) = r.precomp_source(ctx, layer)?;
+    // A nested comp the GPU can't take (nested too deep, over the texture limit, content it
+    // declines) goes back to the CPU path for this layer only; only a device failure fails the
+    // frame.
+    let Some(mut src) = render(e, &sub, item, lt) else {
+        return if e.g.check_health().is_ok() { None } else { Some(None) };
+    };
+    let pipe = r.pipe();
+    // `masked_source` quantises a non-solid source to the project's depth.
+    if let Some(l) = pipe.levels {
+        src = ops::quantize(e, &src, l);
+    }
+    let (mut img, offset, scale) = if layer.switches.effects && layer.effects().is_some_and(|f| !f.children.is_empty()) {
+        // Effects run in effect space (0.7.0): from the layer bounds' corner.
+        let o = ctx.effect_bounds(layer).1;
+        let mut fx = crate::effects::GpuFx::new(e, src, [o[0] * bs, o[1] * bs], bs, pipe.levels);
+        r.run_layer_effects_on(ctx, layer, &mut fx);
+        let Some((img, off, sc)) = fx.finish() else { return Some(None) };
+        (img, [off[0] - o[0] * sc, off[1] - o[1] * sc], sc)
+    } else {
+        (src, [0.0; 2], bs)
+    };
+    if img.width == 0 || img.height == 0 {
+        return Some(Some(()));
+    }
+    if let Some(c) = pipe.to_blend() {
+        img = ops::convert(e, &img, &c);
+    }
+    let shape = Buf { img: Image { width: img.width, height: img.height, data: Vec::new() }, offset, scale };
+    if r.track_matte(ctx, layer).is_some() || layer.preserve_transparency {
+        let Some(iso) = place_src(e, r, ctx, layer, &shape, img, &e.zeros(canvas.width, canvas.height), BlendMode::Normal, 1.0, None) else {
+            return Some(None);
+        };
+        return Some(composite_iso(e, r, ctx, layer, iso, canvas, opacity));
+    }
+    Some(place_src(e, r, ctx, layer, &shape, img, canvas, layer.blend_mode, opacity, pipe.levels).map(|c| *canvas = c))
+}
+
 /// Adjustment layer (`Renderer::draw_adjustment`): the effect stack runs on the comp below,
 /// resident on the GPU (non-GPU effects read back, run on the CPU and upload), and the result
-/// replaces the canvas inside the layer's footprint × opacity. `None` = draw it on the CPU.
+/// replaces the canvas inside the layer's footprint × track matte × opacity. `None` = draw it
+/// on the CPU.
 fn draw_adjustment(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canvas: &mut GpuImage) -> Option<()> {
     let opacity = r.layer_opacity(ctx, layer);
     let Some(foot) = r.adjustment_footprint(ctx, layer) else { return Some(()) };
     let (w, h) = (canvas.width, canvas.height);
     let matte = place(e, r, ctx, layer, &foot, &e.zeros(w, h), BlendMode::Normal, 1.0, None)?;
+    let matte = track_matte(e, r, ctx, layer, matte, None)?;
     let pipe = r.pipe();
     // Effects run in the working space, not the linear blending space.
     let below = match pipe.from_blend() {
@@ -259,7 +355,11 @@ fn draw_adjustment(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, canv
     };
     let mut fx = crate::effects::GpuFx::new(e, below, [0.0; 2], r.opts.scale, pipe.levels);
     r.run_effects_on(ctx, layer, true, &mut fx);
-    let (mut adjusted, _, _) = fx.finish()?;
+    let (mut adjusted, offset, _) = fx.finish()?;
+    // An effect that changed the frame (Motion Tile's Output size): back onto the canvas.
+    if let Some((dx, dy)) = effectcraft_effects::adjustment_crop(offset, [0.0; 2], (adjusted.width, adjusted.height), (w, h)) {
+        adjusted = e.crop(&adjusted, dx, dy, w, h);
+    }
     if adjusted.width != w || adjusted.height != h {
         return Some(());
     }
@@ -301,27 +401,32 @@ fn composite_iso_with(
     matte_img: Option<GpuImage>,
     levels: Option<f32>,
 ) -> Option<()> {
-    if let Some((m, kind)) = r.track_matte(ctx, layer) {
-        let mimg = match matte_img.filter(|i| (i.width, i.height) == (canvas.width, canvas.height)) {
-            Some(i) => i,
-            None => {
-                let mut mimg = e.zeros(canvas.width, canvas.height);
-                if m.is_active_at(ctx.time)
-                    && let Some(mb) = r.layer_buf(ctx, m)
-                {
-                    let mo = ctx.opacity(m) as f32;
-                    mimg = place(e, r, ctx, m, &mb, &mimg, BlendMode::Normal, mo, None)?;
-                }
-                mimg
-            }
-        };
-        iso = ops::matte(e, &iso, &mimg, kind);
-    }
+    iso = track_matte(e, r, ctx, layer, iso, matte_img)?;
     if layer.preserve_transparency {
         iso = ops::preserve(e, &iso, canvas);
     }
     *canvas = ops::blend_full(e, canvas, &iso, layer.blend_mode, opacity, layer.id.0 as u32, levels);
     Some(())
+}
+
+/// `Renderer::apply_track_matte`: `img` (comp-sized) times the layer's track matte, if it has
+/// one; `matte_img` as in [`composite_iso_with`].
+fn track_matte(e: &mut Enc, r: &Renderer, ctx: &EvalCtx, layer: &Layer, img: GpuImage, matte_img: Option<GpuImage>) -> Option<GpuImage> {
+    let Some((m, kind)) = r.track_matte(ctx, layer) else { return Some(img) };
+    let mimg = match matte_img.filter(|i| (i.width, i.height) == (img.width, img.height)) {
+        Some(i) => i,
+        None => {
+            let mut mimg = e.zeros(img.width, img.height);
+            if m.is_active_at(ctx.time)
+                && let Some(mb) = r.layer_buf(ctx, m)
+            {
+                let mo = ctx.opacity(m) as f32;
+                mimg = place(e, r, ctx, m, &mb, &mimg, BlendMode::Normal, mo, None)?;
+            }
+            mimg
+        }
+    };
+    Some(ops::matte(e, &img, &mimg, kind))
 }
 
 /// Draw a processed layer buffer onto `target` (transform, motion blur sub-samples), quantising
@@ -342,6 +447,23 @@ fn place(
         return Some(target.clone());
     }
     let src = e.g.upload_buf(buf)?;
+    place_src(e, r, ctx, layer, buf, src, target, mode, opacity, levels)
+}
+
+/// [`place`] of a GPU image `src` shaped like `buf`.
+#[allow(clippy::too_many_arguments)]
+fn place_src(
+    e: &mut Enc,
+    r: &Renderer,
+    ctx: &EvalCtx,
+    layer: &Layer,
+    buf: &Buf,
+    src: GpuImage,
+    target: &GpuImage,
+    mode: BlendMode,
+    opacity: f32,
+    levels: Option<f32>,
+) -> Option<GpuImage> {
     let pl = r.placement(ctx, layer, buf);
     if let [m] = pl.matrices.as_slice() {
         return Some(ops::warp_q(e, target, &src, m, pl.sampling, mode, opacity, pl.seed, None, levels));

@@ -15,8 +15,9 @@ pub mod camera_track;
 pub mod commands;
 pub mod config;
 pub mod demo;
-pub mod ease_presets;
+pub mod doc_path;
 pub mod footage_check;
+pub mod footage_reload;
 pub mod guard;
 pub mod history;
 pub mod jobs;
@@ -37,6 +38,7 @@ pub mod remote;
 pub mod render_queue;
 pub mod roto;
 pub mod scriptui;
+pub mod sequence;
 mod session_settings;
 pub mod shortcuts;
 pub mod storage;
@@ -101,6 +103,13 @@ pub trait Services: Send + Sync {
     fn exists(&self, path: &str) -> bool {
         std::path::Path::new(path).exists()
     }
+    /// A file's size and modification time (nanoseconds since 1970), to notice that it changed
+    /// on disk (Settings ▸ Import ▸ Reload Footage Changed on Disk); `None` when it can't be read.
+    fn stamp(&self, path: &str) -> Option<(u64, u128)> {
+        let meta = std::fs::metadata(path).ok()?;
+        let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+        Some((meta.len(), modified.as_nanos()))
+    }
     /// Keep a file the app made for itself (footage extracted from a template): like
     /// [`Services::write_file`], creating its folder, but never offered as a download (web: it
     /// goes to browser storage only).
@@ -109,6 +118,19 @@ pub trait Services: Send + Sync {
             let _ = std::fs::create_dir_all(d);
         }
         self.write_file(path, data)
+    }
+    /// The files in folder `dir` (full paths; no folders, no hidden files), for image-sequence
+    /// detection on import. Empty when it can't be read.
+    fn list_dir(&self, dir: &str) -> Vec<String> {
+        let Ok(rd) = std::fs::read_dir(if dir.is_empty() { "." } else { dir }) else { return vec![] };
+        rd.filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()) && !e.file_name().to_string_lossy().starts_with('.'))
+            .map(|e| e.path().to_string_lossy().to_string())
+            .collect()
+    }
+    /// Whether `path` is a folder (dropped or picked folders import their files).
+    fn is_dir(&self, path: &str) -> bool {
+        std::path::Path::new(path).is_dir()
     }
 }
 
@@ -125,11 +147,15 @@ impl Services for FsServices {
 
 /// Imports media files into the project (implemented by the media layer).
 pub trait Importer: Send + Sync {
-    /// Probe a file and return footage metadata.
+    /// Probe one file and return footage metadata. Image sequences are the engine's
+    /// ([`sequence`]): it groups numbered stills and probes their first file here.
     fn probe(&self, path: &str) -> std::result::Result<effectcraft_project::Footage, String>;
     /// A footage file's bytes are now at `path` (extracted from a template): hosts whose media
     /// layer reads from memory (the browser) register them; file-based ones need nothing.
     fn register(&self, _path: &str, _data: &[u8]) {}
+    /// An image sequence's other frames (its first was probed) are footage now: hosts whose
+    /// media layer reads from memory (the browser) register them; file-based ones need nothing.
+    fn add_frames(&self, _paths: &[String]) {}
 }
 
 /// A keyframe reference: layer, property uid, key time (layer time).
@@ -169,15 +195,38 @@ pub struct VertexRef {
     pub index: usize,
 }
 
+/// One composition's selection. The active comp's copy lives in [`EditorState::selected_layers`]
+/// (and the property, key, and vertex lists); every other comp keeps its own here (#1001).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CompSelection {
+    pub layers: Vec<LayerId>,
+    pub props: Vec<(LayerId, Uid)>,
+    pub keys: Vec<KeyRef>,
+    pub vertices: Vec<VertexRef>,
+}
+
+impl CompSelection {
+    fn is_empty(&self) -> bool {
+        self.layers.is_empty() && self.props.is_empty() && self.keys.is_empty() && self.vertices.is_empty()
+    }
+}
+
 /// Editing state that commands depend on (headless-relevant, serde for agents).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct EditorState {
     pub active_comp: Option<ItemId>,
     /// Open compositions (viewer/timeline tabs), in tab order.
     pub open_comps: Vec<ItemId>,
+    /// Compositions that were active before the current one, most recent first (Shift+Esc).
+    #[serde(default)]
+    pub recent_comps: Vec<ItemId>,
     /// Current time per comp (the CTI).
     pub times: std::collections::BTreeMap<ItemId, Tick>,
+    /// Layer selection of the active comp. Other comps' selections are in [`Self::comp_selections`].
     pub selected_layers: Vec<LayerId>,
+    /// Selections of comps that are not active, keyed by comp id (#1001).
+    #[serde(default)]
+    pub comp_selections: std::collections::BTreeMap<ItemId, CompSelection>,
     /// Selected properties / groups (by uid) of selected layers.
     pub selected_props: Vec<(LayerId, Uid)>,
     pub selected_keys: Vec<KeyRef>,
@@ -191,8 +240,12 @@ pub struct EditorState {
     /// The last copy was keyframes (Paste pastes keys at the CTI).
     #[serde(skip)]
     pub clip_is_keys: bool,
-    /// Copied effect instances (Edit ▸ Copy with effects selected); Paste adds them to the
-    /// selected layers.
+    /// Values of selected unanimated properties (match path, value), copied with Edit ▸ Copy;
+    /// Paste sets the same properties of the selected layers.
+    #[serde(skip)]
+    pub value_clipboard: Vec<(String, effectcraft_keyframe::Value)>,
+    /// Copied effect instances, with comp-time key offsets from the earliest copied key.
+    /// Paste adds them to the selected layers at the destination comp's CTI.
     #[serde(skip)]
     pub effect_clipboard: Vec<effectcraft_project::PropGroup>,
     /// Copied shape items (Edit ▸ Copy with groups, paths, paints or path operations selected in
@@ -292,6 +345,11 @@ fn one_view() -> u8 {
     1
 }
 
+/// `t` as a current time of `comp`: a frame within its duration.
+fn comp_frame_at(comp: &Comp, t: Tick) -> Tick {
+    comp.frame_rate.snap_nearest(t.min(comp.duration - comp.frame_duration()).max(Tick::ZERO))
+}
+
 /// What Copy with Property Links / Copy Expression Only put on the clipboard.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LinkClip {
@@ -321,6 +379,15 @@ pub enum Event {
     },
     /// Drop cached frames / renders (Edit ▸ Purge).
     PurgeCaches,
+    /// Put an image on the system clipboard (Composition ▸ Copy Frame to Clipboard): `rgba` is
+    /// `width` × `height` straight-alpha RGBA8 rows. Headless sessions ignore it; the pixels are
+    /// not serialized.
+    CopyImage {
+        width: u32,
+        height: u32,
+        #[serde(skip)]
+        rgba: Vec<u8>,
+    },
 }
 
 pub struct Session {
@@ -343,6 +410,9 @@ pub struct Session {
     /// Why there is no [`Session::accel`] (`render.backend`'s `why`): the host's reason, e.g. a
     /// headless start without `--gpu` or the compositor's setup error.
     pub accel_note: Option<String>,
+    /// The graphics adapter and backend the window draws with (`NVIDIA GeForce RTX 4070
+    /// (Vulkan)`), as the host reports it: the System Compatibility Report shows it.
+    pub window_adapter: Option<String>,
     /// Expression syntax checker (set by the host that links the expression engine).
     pub expr_check: Option<fn(&str) -> std::result::Result<(), String>>,
     pub importer: Option<Arc<dyn Importer>>,
@@ -388,8 +458,9 @@ pub struct Session {
     pub config: Option<Arc<dyn config::ConfigStore>>,
     /// Keyboard shortcut presets.
     pub keymaps: shortcuts::Keymaps,
-    /// User ease presets (Window ▸ Ease Presets; the built-in ones are in [`ease_presets`]).
-    pub ease_presets: Vec<ease_presets::EasePreset>,
+    /// Scripts' `app.settings`, kept in the settings store (see
+    /// [`commands::scripts::SCRIPT_SETTINGS_FILE`]).
+    pub script_settings: commands::scripts::ScriptSettings,
     /// Frontend-only commands offered for binding.
     pub ui_commands: Vec<shortcuts::UiCommand>,
     /// Cache of the resolved active preset (read it with [`Session::shortcuts`]).
@@ -430,6 +501,8 @@ pub struct Session {
     /// Offloaded jobs that ended, newest last (kind, error): how a caller waiting for one
     /// (`wait: true` over the control channel in the browser) learns its outcome.
     pub offload_log: Vec<(offload::JobKind, Option<String>)>,
+    /// Number of older completion entries evicted from the bounded offload log.
+    pub offload_log_start: usize,
     /// Generic background tasks (Content-Aware Fill, Scene Edit Detection), see [`jobs`].
     pub tasks: Vec<jobs::Task>,
     /// Finished tasks, newest last (Progress panel, `jobs.list`).
@@ -441,7 +514,24 @@ pub struct Session {
     /// event loop (the desktop app) turn this on; headless sessions run `footage.check` when
     /// they want it.
     pub check_footage_on_open: bool,
+    /// Footage paths that came from a document, with that document ([`doc_path`]).
+    pub stored_paths: doc_path::StoredPaths,
+    /// Each footage file's size and modification time when last seen (Settings ▸ Import ▸
+    /// Reload Footage Changed on Disk, [`footage_reload`]).
+    pub footage_stamps: std::collections::HashMap<String, footage_reload::Stamp>,
+    /// The stamps being taken on a worker thread ([`footage_reload::start_scan`]).
+    pub footage_scan: Option<footage_reload::Scan>,
+    /// The disk cache's footage salt and the footage it was taken for ([`Session::refresh_disk_salt`]).
+    pub disk_salt: Option<(u64, u64)>,
+    /// How many script-issued commands are running ([`Session::execute_for_script`]): while one
+    /// is, settings that guard what scripts may do can't change (see
+    /// [`prefs::Scripting::same_permissions`]).
+    pub script_calls: ScriptCalls,
 }
+
+/// The count behind [`Session::running_for_script`]; only the engine changes it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScriptCalls(u32);
 
 /// A thumbnail render ([`Session::thumbnail_job`]): (width, height, RGBA8).
 pub type ThumbnailJob = Box<dyn FnOnce() -> Option<(u32, u32, Vec<u8>)> + Send>;
@@ -480,6 +570,7 @@ impl Default for Session {
             expr: None,
             accel: None,
             accel_note: None,
+            window_adapter: None,
             expr_check: None,
             importer: None,
             exporter: None,
@@ -503,7 +594,7 @@ impl Default for Session {
             prefs_revision: 0,
             config: None,
             keymaps: shortcuts::Keymaps::default(),
-            ease_presets: vec![],
+            script_settings: Default::default(),
             ui_commands: vec![],
             shortcut_table: std::sync::OnceLock::new(),
             autosave: autosave::AutoSaveState::default(),
@@ -519,6 +610,7 @@ impl Default for Session {
             offload: None,
             offloaded: vec![],
             offload_log: vec![],
+            offload_log_start: 0,
             browser: None,
             storage: None,
             tasks: vec![],
@@ -526,6 +618,11 @@ impl Default for Session {
             next_task_id: 1,
             learn: None,
             check_footage_on_open: false,
+            stored_paths: Default::default(),
+            footage_stamps: Default::default(),
+            disk_salt: None,
+            footage_scan: None,
+            script_calls: ScriptCalls::default(),
         }
     }
 }
@@ -566,6 +663,22 @@ impl Session {
         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         commands::check_params(spec, &params)?;
         self.execute(id, params)
+    }
+
+    /// [`Session::execute`] for a command a script asked for (the JavaScript engine's
+    /// `app.run`, ScriptUI callbacks…). The command and everything it runs count as the script's:
+    /// it may not change the settings that limit scripts (Settings ▸ Scripting & Expressions ▸
+    /// Application Scripting), which only the user can, from the UI, CLI or control channel.
+    pub fn execute_for_script(&mut self, id: &str, params: Value) -> Result<Value> {
+        self.script_calls.0 = self.script_calls.0.saturating_add(1);
+        let r = self.execute(id, params);
+        self.script_calls.0 = self.script_calls.0.saturating_sub(1);
+        r
+    }
+
+    /// Whether the command running was issued by a script ([`Session::execute_for_script`]).
+    pub fn running_for_script(&self) -> bool {
+        self.script_calls.0 > 0
     }
 
     pub fn is_enabled(&self, id: &str) -> bool {
@@ -626,15 +739,74 @@ impl Session {
         if Arc::ptr_eq(&self.project, &self.saved_project) {
             self.saved_revision = self.revision;
         }
-        if self.disk_cache.is_some() {
-            self.layer_cache.set_disk_salt(effectcraft_render::disk_cache::footage_salt(&self.project));
-        }
+        self.refresh_disk_salt(false);
         self.events.push(Event::ProjectChanged { revision: self.revision });
+    }
+
+    /// Salt the disk cache's layer keys with the project's footage files
+    /// ([`effectcraft_render::disk_cache::footage_salt`]). Taking it reads the size and time of
+    /// every file, every frame of an image sequence included, so it is taken again only when the
+    /// footage items changed, or with `force` (a project opened, footage reloaded, the disk cache
+    /// attached), not at every edit: with a few large sequences that cost each keystroke in a
+    /// text field over half a second (#1926).
+    pub fn refresh_disk_salt(&mut self, force: bool) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        if self.disk_cache.is_none() {
+            self.disk_salt = None;
+            return None;
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for (id, it) in &self.project.items {
+            if let effectcraft_project::ItemKind::Footage(f) = &it.kind {
+                id.hash(&mut h);
+                format!("{f:?}").hash(&mut h);
+            }
+        }
+        let footage = h.finish();
+        if let Some((seen, salt)) = self.disk_salt
+            && seen == footage
+            && !force
+        {
+            return Some(salt);
+        }
+        let salt = effectcraft_render::disk_cache::footage_salt(&self.project);
+        self.disk_salt = Some((footage, salt));
+        self.layer_cache.set_disk_salt(salt);
+        Some(salt)
+    }
+
+    /// Set a comp's Resolution. As in After Effects it is saved with the project (which becomes
+    /// modified) but is no undo step, and it changes no pixels: the comp's cached frames stay
+    /// valid ([`effectcraft_project::Comp::same_pixels`]).
+    pub fn set_resolution(&mut self, comp: ItemId, r: effectcraft_project::Resolution) -> Result<()> {
+        if self.project.comp(comp).ok_or(EngineError::NoComp)?.resolution == r {
+            return Ok(());
+        }
+        Arc::make_mut(&mut self.project).comp_mut(comp).ok_or(EngineError::NoComp)?.resolution = r;
+        self.bump();
+        Ok(())
+    }
+
+    /// Keep what lives outside the undo history (each comp's Resolution) as it is in `from`, the
+    /// project before undo, redo or a history jump restored another state.
+    pub(crate) fn keep_view_settings(&mut self, from: &Project) {
+        let keep: Vec<(ItemId, effectcraft_project::Resolution)> =
+            self.project.comps().filter_map(|(id, c)| from.comp(*id).map(|f| (*id, f.resolution)).filter(|(_, r)| *r != c.resolution)).collect();
+        if keep.is_empty() {
+            return;
+        }
+        let p = Arc::make_mut(&mut self.project);
+        for (id, r) in keep {
+            if let Some(c) = p.comp_mut(id) {
+                c.resolution = r;
+            }
+        }
     }
 
     pub fn undo(&mut self) -> bool {
         let Some((label, p)) = self.history.undo.pop() else { return false };
         let cur = std::mem::replace(&mut self.project, p);
+        self.keep_view_settings(&cur);
         self.history.redo.push((label, cur));
         self.history.merge_key = None;
         self.sanitize_state();
@@ -645,6 +817,7 @@ impl Session {
     pub fn redo(&mut self) -> bool {
         let Some((label, p)) = self.history.redo.pop() else { return false };
         let cur = std::mem::replace(&mut self.project, p);
+        self.keep_view_settings(&cur);
         self.history.undo.push((label, cur));
         self.history.merge_key = None;
         self.sanitize_state();
@@ -652,12 +825,26 @@ impl Session {
         true
     }
 
-    /// Drop selections that no longer exist.
+    /// Drop selections that no longer exist. Each comp keeps its own selection (#1001); a layer id
+    /// counts only inside the comp that owns it, so the active comp never sees another comp's layers.
     pub fn sanitize_state(&mut self) {
         let p = self.project.clone();
         self.state.open_comps.retain(|c| p.comp(*c).is_some());
+        self.state.comp_selections.retain(|cid, sel| {
+            let Some(c) = p.comp(*cid) else { return false };
+            let ids: Vec<LayerId> = c.layers.iter().map(|l| l.id).collect();
+            sel.layers.retain(|l| ids.contains(l));
+            sel.props.retain(|(l, _)| ids.contains(l));
+            sel.keys.retain(|k| ids.contains(&k.layer));
+            sel.vertices.retain(|v| ids.contains(&v.layer));
+            !sel.is_empty()
+        });
         if self.state.active_comp.is_some_and(|c| p.comp(c).is_none()) {
+            self.clear_live_selection();
             self.state.active_comp = self.state.open_comps.first().copied();
+            if let Some(id) = self.state.active_comp {
+                self.recall_selection(id);
+            }
         }
         if let Some(c) = self.active_comp() {
             let ids: Vec<LayerId> = c.layers.iter().map(|l| l.id).collect();
@@ -715,11 +902,7 @@ impl Session {
 
     pub fn set_time(&mut self, t: Tick) {
         if let Some(c) = self.state.active_comp {
-            let comp = self.project.comp(c);
-            let t = match comp {
-                Some(comp) => comp.frame_rate.snap_nearest(t.clamp(Tick::ZERO, comp.duration - comp.frame_duration())),
-                None => t,
-            };
+            let t = self.project.comp(c).map_or(t, |comp| comp_frame_at(comp, t));
             self.state.times.insert(c, t);
             if self.prefs.general.sync_time_related_items {
                 self.sync_related_times(c, t);
@@ -765,6 +948,59 @@ impl Session {
         }
     }
 
+    /// Make `id` the active comp, parking the previous comp's selection and restoring this one's.
+    pub fn activate_comp(&mut self, id: ItemId) {
+        if self.project.comp(id).is_none() || self.state.active_comp == Some(id) {
+            return;
+        }
+        self.remember_selection();
+        self.state.active_comp = Some(id);
+        self.recall_selection(id);
+        self.state.current_track = None;
+    }
+
+    /// Leave no comp active, keeping the one that was active in [`EditorState::comp_selections`].
+    pub fn activate_comp_none(&mut self) {
+        self.remember_selection();
+        self.state.active_comp = None;
+        self.clear_live_selection();
+        self.state.current_track = None;
+    }
+
+    fn remember_selection(&mut self) {
+        let Some(id) = self.state.active_comp else { return };
+        let sel = CompSelection {
+            layers: self.state.selected_layers.clone(),
+            props: self.state.selected_props.clone(),
+            keys: self.state.selected_keys.clone(),
+            vertices: self.state.selected_vertices.clone(),
+        };
+        if sel.is_empty() {
+            self.state.comp_selections.remove(&id);
+        } else {
+            self.state.comp_selections.insert(id, sel);
+        }
+    }
+
+    fn recall_selection(&mut self, id: ItemId) {
+        match self.state.comp_selections.remove(&id) {
+            Some(sel) => {
+                self.state.selected_layers = sel.layers;
+                self.state.selected_props = sel.props;
+                self.state.selected_keys = sel.keys;
+                self.state.selected_vertices = sel.vertices;
+            }
+            None => self.clear_live_selection(),
+        }
+    }
+
+    fn clear_live_selection(&mut self) {
+        self.state.selected_layers.clear();
+        self.state.selected_props.clear();
+        self.state.selected_keys.clear();
+        self.state.selected_vertices.clear();
+    }
+
     /// Open a comp in the viewer/timeline and make it active.
     pub fn open_comp(&mut self, id: ItemId) {
         if self.project.comp(id).is_none() {
@@ -774,14 +1010,44 @@ impl Session {
             self.state.open_comps.push(id);
         }
         if self.state.active_comp != Some(id) {
-            self.state.active_comp = Some(id);
-            self.state.selected_layers.clear();
-            self.state.selected_props.clear();
-            self.state.selected_keys.clear();
-            self.state.selected_vertices.clear();
-            self.state.current_track = None;
+            let previous = self.state.active_comp;
+            self.state.recent_comps.retain(|c| *c != id && Some(*c) != previous);
+            if let Some(previous) = previous {
+                self.state.recent_comps.insert(0, previous);
+                self.state.recent_comps.truncate(32);
+            }
         }
+        self.activate_comp(id);
         self.events.push(Event::OpenComp(id));
+    }
+
+    /// The open compositions and their current times, as a project file records them
+    /// ([`effectcraft_project::SavedView`]).
+    pub fn saved_view(&self) -> effectcraft_project::SavedView {
+        let comp_times = self.state.times.iter().filter(|(id, _)| self.project.comp(**id).is_some()).map(|(id, t)| (*id, *t)).collect();
+        effectcraft_project::SavedView { active_comp: self.state.active_comp, open_comps: self.state.open_comps.clone(), comp_times }
+    }
+
+    /// Reopen the compositions a project file was saved with (#748), each at its saved current
+    /// time (#1714). Ids that no longer name a comp are skipped; with none left the project stays
+    /// on the comp [`Session::replace_project`] opened (its first), as files from before the view
+    /// was saved do.
+    pub fn restore_view(&mut self, view: &effectcraft_project::SavedView) {
+        for (id, t) in &view.comp_times {
+            if let Some(comp) = self.project.comp(*id) {
+                let t = comp_frame_at(comp, *t);
+                self.state.times.insert(*id, t);
+            }
+        }
+        let mut open: Vec<ItemId> = Vec::new();
+        for id in view.open_comps.iter().copied().filter(|id| self.project.comp(*id).is_some()) {
+            if !open.contains(&id) {
+                open.push(id);
+            }
+        }
+        let Some(active) = view.active_comp.filter(|id| self.project.comp(*id).is_some()).or_else(|| open.first().copied()) else { return };
+        self.state.open_comps = open;
+        self.open_comp(active);
     }
 
     pub fn toast(&mut self, msg: impl Into<String>) {
@@ -803,12 +1069,18 @@ impl Session {
 
     /// Render a comp frame with the session's footage + expression hosts.
     pub fn render(&self, comp: ItemId, t: Tick, opts: RenderOpts) -> Image {
+        self.renderer(opts).comp_frame(comp, t)
+    }
+
+    /// The renderer [`Session::render`] uses: the session's footage, expressions, layer cache and
+    /// accelerator, and the render prefs (nested switches, draft shadows) over `opts`.
+    pub fn renderer(&self, opts: RenderOpts) -> Renderer<'_> {
         let opts = RenderOpts { nested_switches: self.prefs.general.switches_affect_nested_comps, draft_shadows: self.prefs.three_d.realtime_shadows, ..opts };
         let mut r = Renderer::new(&self.project, self.footage.as_ref(), opts);
         r.expr = self.expr.as_deref();
         r.cache = Some(&self.layer_cache);
         r.accel = self.accel.as_deref();
-        r.comp_frame(comp, t)
+        r
     }
 
     /// Resolve a comp reference (item id number or name; `None`/null = the active comp).
@@ -891,6 +1163,15 @@ impl Session {
         Ok((img.width, img.height, img.to_rgba8()))
     }
 
+    /// Make the media layer and the layer cache let go of what they decoded from `footage`'s
+    /// files (it keys frames by path, so an overwritten file would keep showing its old pixels).
+    pub(crate) fn forget_decoded(&self, footage: &effectcraft_project::Footage) {
+        for p in std::iter::once(&footage.path).chain(&footage.sequence) {
+            self.footage.forget(p);
+        }
+        self.layer_cache.clear();
+    }
+
     /// Replace the whole project (open/new), resetting history and state.
     pub fn replace_project(&mut self, mut p: Project, path: Option<String>) {
         if self.stop_render()
@@ -900,6 +1181,7 @@ impl Session {
             job.wait();
         }
         self.render_job = None;
+        self.stored_paths = Default::default();
         self.stop_track();
         self.track_job = None;
         self.stop_mask_track();
@@ -914,9 +1196,20 @@ impl Session {
         self.roto_job = None;
         self.roto_pending.clear();
         self.drop_tasks();
+        self.script_ui.project_epoch = self.script_ui.project_epoch.wrapping_add(1);
         p.fix_next_id();
         upgrade_effects(&mut p);
+        // The media layer keys decoded frames by path: files of the new project may have changed
+        // since an earlier project decoded them (#1070).
+        for it in p.items.values() {
+            if let effectcraft_project::ItemKind::Footage(f) = &it.kind {
+                self.forget_decoded(f);
+            }
+        }
+        self.layer_cache.clear();
         self.project = Arc::new(p);
+        // Its files may have changed since they were last stamped.
+        self.disk_salt = None;
         self.history = History::default();
         self.state = EditorState { snapping: true, view_layout: 1, ..Default::default() };
         self.path = path;
@@ -931,31 +1224,46 @@ impl Session {
 
 /// Bring effect instances saved by earlier versions up to date with the effect registry
 /// (renamed / regrouped / added parameters, reordered popups; see
-/// [`effectcraft_effects::migrate`]).
+/// [`effectcraft_effects::migrate`]), and a project from before
+/// [`effectcraft_project::SCHEMA_EFFECT_SPACE`] into effect space
+/// ([`effectcraft_effects::migrate::to_effect_space`]). Stamps the current schema.
 pub fn upgrade_effects(p: &mut Project) {
-    let mut sizes = std::collections::HashMap::new();
+    let to_effect_space = p.schema < effectcraft_project::SCHEMA_EFFECT_SPACE;
+    // Effect bounds per layer: (size, top-left in layer coordinates).
+    let mut bounds = std::collections::HashMap::new();
     for (cid, c) in p.comps() {
         for l in &c.layers {
-            let (w, h) = effectcraft_render::source_size(p, l);
-            sizes.insert((*cid, l.id), if w == 0 { [c.width as f64, c.height as f64] } else { [w as f64, h as f64] });
+            bounds.insert((*cid, l.id), effectcraft_render::effect_bounds(p, c, l));
         }
     }
     let mut next = p.next_id;
     for (cid, it) in p.items.iter_mut() {
         let effectcraft_project::ItemKind::Comp(c) = &mut it.kind else { continue };
         for l in &mut std::sync::Arc::make_mut(c).layers {
-            let size = sizes.get(&(*cid, l.id)).copied().unwrap_or([100.0, 100.0]);
+            let (size, origin) = bounds.get(&(*cid, l.id)).copied().unwrap_or(([100.0, 100.0], [0.0; 2]));
+            // Effect space starts at the bounds' top-left: positions move by minus that corner.
+            // Adjustment layers run their effects on the comp below as it is: nothing moves.
+            let shift = |o: [f64; 2]| [-o[0], -o[1]];
+            let d = if l.switches.adjustment { [0.0; 2] } else { shift(origin) };
+            let clone_d = |src: Option<u64>| match src {
+                Some(id) => bounds.get(&(*cid, effectcraft_project::LayerId(id))).map_or([0.0; 2], |b| shift(b.1)),
+                None => d,
+            };
             let Some(fx) = l.props.sub_mut("effects") else { continue };
             for n in &mut fx.children {
                 let effectcraft_project::Node::Group(g) = n else { continue };
                 let effectcraft_project::GroupKind::Effect { effect } = &g.kind else { continue };
                 if let Some(spec) = effectcraft_effects::find(effect) {
                     effectcraft_effects::migrate::upgrade_instance(spec, g, &mut effectcraft_project::build::Ids(&mut next), size);
+                    if to_effect_space {
+                        effectcraft_effects::migrate::to_effect_space(spec, g, size, d, &clone_d);
+                    }
                 }
             }
         }
     }
     p.next_id = next;
+    p.schema = effectcraft_project::SCHEMA_VERSION;
 }
 
 #[cfg(test)]
@@ -965,6 +1273,8 @@ mod tests;
 #[cfg(test)]
 mod tests_3d;
 #[cfg(test)]
+mod tests_anim_presets;
+#[cfg(test)]
 mod tests_anim_tools;
 #[cfg(test)]
 mod tests_camera_track;
@@ -973,9 +1283,11 @@ mod tests_codec_options;
 #[cfg(test)]
 mod tests_color_view;
 #[cfg(test)]
-mod tests_disk_cache;
+mod tests_crypto_pick;
 #[cfg(test)]
-mod tests_ease_presets;
+mod tests_delete_keys;
+#[cfg(test)]
+mod tests_disk_cache;
 #[cfg(test)]
 mod tests_effects;
 #[cfg(test)]
@@ -989,7 +1301,15 @@ mod tests_fidelity;
 #[cfg(test)]
 mod tests_frame_export;
 #[cfg(test)]
+mod tests_fuzz_open;
+#[cfg(test)]
+mod tests_import_project;
+#[cfg(test)]
+mod tests_key_metadata_order;
+#[cfg(test)]
 mod tests_keylight;
+#[cfg(test)]
+mod tests_limits;
 #[cfg(test)]
 mod tests_lottie;
 #[cfg(test)]
@@ -1011,9 +1331,17 @@ mod tests_project_items;
 #[cfg(test)]
 mod tests_proxy;
 #[cfg(test)]
+mod tests_quick_offset;
+#[cfg(test)]
+mod tests_replace_source;
+#[cfg(test)]
 mod tests_rig3d;
 #[cfg(test)]
+mod tests_sequence;
+#[cfg(test)]
 mod tests_settings;
+#[cfg(test)]
+mod tests_shortcut_cmds;
 #[cfg(test)]
 mod tests_stubs;
 #[cfg(test)]
@@ -1039,6 +1367,11 @@ mod tests_viewer;
 /// Text animation presets: (id, name), for menus.
 pub fn text_presets() -> Vec<(String, String)> {
     commands::text_preset_list()
+}
+
+/// Built-in animation presets (Effects & Presets ▸ * Animation Presets): (id, name, category).
+pub fn animation_presets() -> Vec<(String, String, String)> {
+    commands::builtin_preset_list()
 }
 
 pub fn text_families() -> Vec<String> {
@@ -1070,6 +1403,8 @@ pub struct FontRow {
     /// Settings ▸ Type ▸ Show Font Names in English is off.
     pub display: String,
     pub recent: bool,
+    /// A variable font (the menu's Variable Fonts filter keeps only these).
+    pub variable: bool,
 }
 
 /// Outline polylines of "Sample" set in `family` at `size` px (baseline at y = 0, y down), for
@@ -1110,14 +1445,21 @@ pub fn font_preview(family: &str, size: f64) -> Vec<Vec<[f32; 2]>> {
 }
 
 /// The Character panel's font menu: the recent fonts (Settings ▸ Type ▸ Number of Recent Fonts
-/// to Display), a separator, then every family.
+/// to Display), a separator, then every family. Each row says whether the family is variable,
+/// for the menu's Variable Fonts filter.
 pub fn font_menu(prefs: &prefs::Prefs) -> Vec<FontRow> {
     let all = text_families();
     let native = if prefs.type_.font_names_in_english { Default::default() } else { effectcraft_text::fonts::native_families() };
-    let row = |f: &String, recent: bool| FontRow { family: f.clone(), display: native.get(f).cloned().unwrap_or_else(|| f.clone()), recent };
+    let variable = effectcraft_text::fonts::variable_families();
+    let row = |f: &String, recent: bool| FontRow {
+        family: f.clone(),
+        display: native.get(f).cloned().unwrap_or_else(|| f.clone()),
+        recent,
+        variable: variable.contains(f),
+    };
     let mut out: Vec<FontRow> = prefs.recent_fonts_shown().iter().filter(|f| all.contains(f)).map(|f| row(f, true)).collect();
     if !out.is_empty() {
-        out.push(FontRow { family: String::new(), display: "-".into(), recent: false });
+        out.push(FontRow { family: String::new(), display: "-".into(), recent: false, variable: false });
     }
     out.extend(all.iter().map(|f| row(f, false)));
     out
@@ -1132,3 +1474,6 @@ mod tests_paint;
 mod tests_panels;
 #[cfg(test)]
 mod tests_roto;
+
+#[cfg(test)]
+mod tests_key_time;

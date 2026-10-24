@@ -548,8 +548,8 @@ pub fn apply(p: &mut Project, cid: ItemId, src: LayerId, tracker: Uid, dims: Dim
             }
             TrackKind::Affine | TrackKind::Perspective => {
                 let (ms, _) = ctx.layer_to_comp(&source);
-                let (mt, _) = ctx.layer_to_comp(&target);
-                let inv = mt.inverse().ok_or("the target layer's transform is not invertible")?;
+                // Corner Pin's corners are effect points: in the target's effect space.
+                let inv = ctx.effect_to_comp(&target).inverse().ok_or("the target layer's transform is not invertible")?;
                 let n = pts.len();
                 if n < 3 {
                     return Err("corner pin tracks need 3 or 4 track points".into());
@@ -564,13 +564,11 @@ pub fn apply(p: &mut Project, cid: ItemId, src: LayerId, tracker: Uid, dims: Dim
         }
     }
     let n = track.len();
-    let tsize = effectcraft_render::source_size(p, &target);
+    let size = effectcraft_render::effect_bounds(p, &comp, &target).0;
     let mut ids_next = p.next_id;
     let layer = p.comp_mut(cid).and_then(|c| c.layer_mut(target_id)).ok_or("no target layer")?;
     if !corner_keys.is_empty() {
         let spec = effectcraft_effects::find("ec.distort.cornerpin").ok_or("Corner Pin is not available")?;
-        let size = tsize;
-        let size = if size.0 == 0 { [comp.width as f64, comp.height as f64] } else { [size.0 as f64, size.1 as f64] };
         let fx = layer.props.sub_mut("effects").ok_or("the target layer can't have effects")?;
         let same = fx.groups().filter(|g| g.match_id == spec.id).count();
         let name = if same == 0 { spec.name.to_string() } else { format!("{} {}", spec.name, same + 1) };

@@ -460,18 +460,41 @@ fn noisy(a: f32, noise: f32, x: usize, y: usize, seed: u32) -> f32 {
     if noise <= 0.0 { a } else { a * (1.0 - noise * hash_noise(x as u32, y as u32, seed)) }
 }
 
+/// `dst` with the straight colour `c` at coverage `a` blended onto it at pixel (`x`, `y`).
+#[inline]
+fn blend_style(mode: BlendMode, seed: u32, x: usize, y: usize, dst: [f32; 4], c: [f32; 3], a: f32) -> [f32; 4] {
+    let n = if mode == BlendMode::Dissolve { hash_noise(x as u32, y as u32, seed) } else { 0.5 };
+    blend_pixel(mode, dst, [c[0] * a, c[1] * a, c[2] * a, a], n)
+}
+
 /// Blend a straight colour with coverage `a` onto every pixel of `img` (`f(x, y)` → (colour, a)).
 fn blend_into(img: &mut Image, mode: BlendMode, seed: u32, f: impl Fn(usize, usize) -> ([f32; 3], f32) + Sync) {
     let w = img.width as usize;
     img.data.par_chunks_mut(w.max(1)).enumerate().for_each(|(y, row)| {
         for (x, d) in row.iter_mut().enumerate() {
             let (c, a) = f(x, y);
-            if a <= 0.0 {
-                continue;
+            if a > 0.0 {
+                *d = blend_style(mode, seed, x, y, *d, c, a);
             }
-            let src = [c[0] * a, c[1] * a, c[2] * a, a];
-            let n = if mode == BlendMode::Dissolve { hash_noise(x as u32, y as u32, seed) } else { 0.5 };
-            *d = blend_pixel(mode, *d, src, n);
+        }
+    });
+}
+
+/// Blend an interior style clipped to the content: `f(x, y)` → (straight colour, opacity) is
+/// blended onto the layer *inside* its shape, whose coverage is `clip`, so the body keeps its
+/// alpha and an anti-aliased edge pixel mixes the style with the layer's colour in the
+/// proportion the style covers it, instead of letting the layer's own colour show through
+/// around a blended edge (#416).
+fn blend_clipped(img: &mut Image, clip: &Plane, mode: BlendMode, seed: u32, f: impl Fn(usize, usize) -> ([f32; 3], f32) + Sync) {
+    let w = img.width as usize;
+    img.data.par_chunks_mut(w.max(1)).zip(clip.data.par_chunks(w.max(1))).enumerate().for_each(|(y, (row, cov))| {
+        for (x, (d, &k)) in row.iter_mut().zip(cov).enumerate() {
+            if k > 0.0
+                && let (c, a) = f(x, y)
+                && a > 0.0
+            {
+                *d = blend_style(mode, seed, x, y, d.map(|v| v / k), c, a).map(|v| v * k);
+            }
         }
     });
 }
@@ -568,13 +591,12 @@ pub fn render(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size: [f64; 2])
     if !bl.interior_group && bl.fill < 1.0 {
         body.scale_alpha(bl.fill);
     }
-    let cov = |i: usize| alpha.data[i];
     if let Some(go) = &styles.gradient {
         let (cx, cy, hw, hh) = gradient_frame(go, &buf, &alpha, layer_size);
         let (ux, uy) = (go.angle.to_radians().cos(), -go.angle.to_radians().sin());
         let ext = ((hw * ux).abs() + (hh * uy).abs()).max(1e-3) * go.scale;
         let radius = hw.max(hh).max(1e-3) * go.scale;
-        blend_into(&mut body, go.mode, seed, |x, y| {
+        blend_clipped(&mut body, &alpha, go.mode, seed, |x, y| {
             let (px, py) = (x as f64 + 0.5 - cx, y as f64 + 0.5 - cy);
             let along = px * ux + py * uy;
             let across = -px * uy + py * ux;
@@ -592,35 +614,35 @@ pub fn render(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size: [f64; 2])
                 t = 1.0 - t;
             }
             let c = go.gradient.sample(t.clamp(0.0, 1.0));
-            ([c[0], c[1], c[2]], c[3] * go.opacity * cov(y * w + x))
+            ([c[0], c[1], c[2]], c[3] * go.opacity)
         });
     }
     if let Some(co) = &styles.color {
-        blend_into(&mut body, co.mode, seed, |x, y| (co.color, co.opacity * cov(y * w + x)));
+        blend_clipped(&mut body, &alpha, co.mode, seed, |_, _| (co.color, co.opacity));
     }
     if let Some(sa) = &styles.satin {
         let b = gauss_plane(&alpha, sa.size * s / 2.0, sa.size * s / 2.0);
         let off = [sa.offset[0] * s, sa.offset[1] * s];
-        blend_into(&mut body, sa.mode, seed, |x, y| {
+        blend_clipped(&mut body, &alpha, sa.mode, seed, |x, y| {
             let v = (shifted(&b, x, y, off) - shifted(&b, x, y, [-off[0], -off[1]])).abs().min(1.0);
             let v = if sa.invert { 1.0 - v } else { v };
-            (sa.color, v * sa.opacity * cov(y * w + x))
+            (sa.color, v * sa.opacity)
         });
     }
     if let Some(gl) = &styles.inner_glow {
         let v = glow_intensity(&alpha, &d, gl, s, true);
-        blend_into(&mut body, gl.mode, seed, |x, y| {
+        blend_clipped(&mut body, &alpha, gl.mode, seed, |x, y| {
             let i = y * w + x;
             let e = if gl.center { 1.0 - v.data[i] } else { v.data[i] };
             let (c, a) = glow_color(gl, e, x, y);
-            (c, noisy(a * gl.opacity * cov(i), gl.noise, x, y, seed ^ 0x3c3c))
+            (c, noisy(a * gl.opacity, gl.noise, x, y, seed ^ 0x3c3c))
         });
     }
     if let Some(is) = &styles.inner_shadow {
         let shape = soft_shape(&alpha, &d, is.size * s, is.spread, true);
         let off = [is.offset[0] * s, is.offset[1] * s];
-        blend_into(&mut body, is.mode, seed, |x, y| {
-            let a = shifted(&shape, x, y, off).min(1.0) * is.opacity * cov(y * w + x);
+        blend_clipped(&mut body, &alpha, is.mode, seed, |x, y| {
+            let a = shifted(&shape, x, y, off).min(1.0) * is.opacity;
             (is.color, noisy(a, is.noise, x, y, seed ^ 0x1234))
         });
     }
@@ -635,11 +657,13 @@ pub fn render(ctx: &EvalCtx, layer: &Layer, content: &Buf, layer_size: [f64; 2])
             2 => (size / 2.0, size / 2.0),
             _ => (size, 0.0),
         };
-        // Inside part: blended over the body within the content.
+        // Inside part: blended over the body within the content, over the share of each
+        // pixel's coverage the ring takes.
         if r_in > 0.0 {
-            blend_into(&mut body, sk.mode, seed, |x, y| {
+            blend_clipped(&mut body, &alpha, sk.mode, seed, |x, y| {
                 let i = y * w + x;
-                let ring = (alpha.data[i] - grown(sd.data[i], -r_in)).max(0.0);
+                let a = alpha.data[i];
+                let ring = ((a - grown(sd.data[i], -r_in)) / a.max(1e-6)).clamp(0.0, 1.0);
                 (sk.color, ring * sk.opacity)
             });
         }

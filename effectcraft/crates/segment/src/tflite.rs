@@ -5,6 +5,13 @@
 //! and `DEQUANTIZE` of float16 weights (folded at load). Weights are re-laid out once at load for
 //! the [`nn`](crate::nn) kernels. Anything else (other operators, quantised tensors, dilation) is a
 //! load error, never a panic: models are pinned by SHA-256, so what loads once always loads.
+//!
+//! A model is also refused at load when running it would take more than a fixed budget: memory
+//! (each tensor, all tensors alive at once, one operator's working space, the weights), work
+//! (multiply-adds, values written) or kernel size. Every one is worked out from the static
+//! shapes with checked arithmetic, so a small hostile file can neither exhaust memory nor keep
+//! [`Model::run`] busy for minutes. The budgets leave wide headroom over the official
+//! MediaPipe face models.
 
 use crate::nn::{Conv, Depthwise, Linear};
 use crate::pt::half_to_f32;
@@ -111,6 +118,20 @@ mod op {
 
 /// The most values a tensor may hold.
 const MAX_TENSOR: usize = 1 << 28;
+/// The widest convolution or pooling window side.
+const MAX_KERNEL: usize = 32;
+/// The most floats one operator may use as working space (a convolution's patch matrix for one
+/// output row: `ow·kh·kw·cin`).
+const MAX_SCRATCH: u64 = 1 << 22;
+/// The most multiply-adds (convolutions) and window comparisons (pooling) in one run.
+const MAX_MACS: u64 = 1 << 33;
+/// The most values all operators together may write in one run.
+const MAX_VALUES: u64 = 1 << 30;
+/// The most floats alive at once while the model runs.
+const MAX_LIVE: u64 = 1 << 29;
+/// The most constant values decoded and laid out at load (a weight shared by several tensors or
+/// operators counts once per use).
+const MAX_CONSTS: usize = 1 << 27;
 
 /// Tensor types (`TensorType`).
 const FLOAT32: u8 = 0;
@@ -234,9 +255,12 @@ impl Model {
         let n = tensors.len();
         let mut shapes = Vec::with_capacity(n);
         let mut names = Vec::with_capacity(n);
-        // Constant data: float tensors as f32, int tensors (pads, shapes) as i32.
+        // Constant data: float tensors as f32, int tensors (pads, shapes) as i32, decoded once
+        // their total is known to fit the budget.
         let mut floats: Vec<Option<Vec<f32>>> = vec![None; n];
         let mut ints: Vec<Option<Vec<i32>>> = vec![None; n];
+        let mut data: Vec<(usize, u8, usize, &[u8])> = vec![];
+        let mut consts = 0usize;
         for (i, t) in tensors.iter().enumerate() {
             let shape: Vec<usize> = fb
                 .ints(*t, 0)?
@@ -246,8 +270,12 @@ impl Model {
             let ty = fb.byte(*t, 1, FLOAT32)?;
             let buf = fb.int(*t, 2, 0)? as u32 as usize;
             names.push(fb.string(*t, 3)?);
-            // Every size computed from shapes later stays in range.
-            let count = shape.iter().try_fold(1usize, |a, &d| a.checked_mul(d)).filter(|&c| c <= MAX_TENSOR).ok_or("a tensor is too large")?;
+            // Every size computed from shapes later stays in range, even a product of some of the
+            // dimensions (a zero dimension does not let the others grow without bound).
+            let count = shape.iter().try_fold(1usize, |a, &d| a.checked_mul(d)).ok_or("a tensor is too large")?;
+            if shape.iter().try_fold(1usize, |a, &d| a.checked_mul(d.max(1))).is_none_or(|c| c > MAX_TENSOR) {
+                return Err("a tensor is too large".into());
+            }
             if fb.field(*t, 4)?.is_some() && fb.table(*t, 4)?.is_some_and(|q| fb.vector(q, 2).is_ok_and(|v| v.1 > 0)) {
                 return Err(format!("{}: quantised tensors are not supported", names[i]));
             }
@@ -260,23 +288,33 @@ impl Model {
                     (at, len) = (o as usize, s as usize);
                 }
                 if len > 0 {
-                    let data = bytes.get(at..at.checked_add(len).ok_or("bad buffer")?).ok_or("truncated model")?;
-                    match ty {
-                        FLOAT32 if data.len() == 4 * count => {
-                            floats[i] = Some(data.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
-                        }
-                        FLOAT16 if data.len() == 2 * count => {
-                            floats[i] = Some(data.as_chunks::<2>().0.iter().map(|c| half_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect())
-                        }
-                        INT32 if data.len() == 4 * count => {
-                            ints[i] = Some(data.as_chunks::<4>().0.iter().map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
-                        }
-                        _ => return Err(format!("{}: unsupported tensor data", names[i])),
-                    }
+                    data.push((i, ty, count, bytes.get(at..at.checked_add(len).ok_or("bad buffer")?).ok_or("truncated model")?));
+                    // Several tensors may share one buffer: each is decoded on its own.
+                    consts = consts.checked_add(count).filter(|&c| c <= MAX_CONSTS).ok_or("the model's weights are too large")?;
                 }
             }
             shapes.push(shape);
         }
+        for (i, ty, count, data) in data {
+            match ty {
+                FLOAT32 if data.len() == 4 * count => {
+                    floats[i] = Some(data.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+                }
+                FLOAT16 if data.len() == 2 * count => {
+                    floats[i] = Some(data.as_chunks::<2>().0.iter().map(|c| half_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect())
+                }
+                INT32 if data.len() == 4 * count => {
+                    ints[i] = Some(data.as_chunks::<4>().0.iter().map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+                }
+                _ => return Err(format!("{}: unsupported tensor data", names[i])),
+            }
+        }
+        // Copies of constants made below (folded DEQUANTIZEs, weights laid out for the kernels).
+        let consts = std::cell::Cell::new(consts);
+        let spend = |values: usize| -> Result<()> {
+            consts.set(consts.get().checked_add(values).filter(|&c| c <= MAX_CONSTS).ok_or("the model's weights are too large")?);
+            Ok(())
+        };
         let inputs = fb.ints(g, 1)?.into_iter().map(|i| index(i, n)).collect::<Result<Vec<_>>>()?;
         let outputs = fb.ints(g, 2)?.into_iter().map(|i| index(i, n)).collect::<Result<Vec<_>>>()?;
         let mut steps = vec![];
@@ -288,9 +326,11 @@ impl Model {
             let output = index(*outs.first().ok_or("an operator has no output")?, n)?;
             // Float16 weights: fold their DEQUANTIZE.
             if code == op::DEQUANTIZE
-                && let Some(f) = ins.first().copied().flatten().and_then(|i| floats[i].clone())
+                && let Some(i) = ins.first().copied().flatten()
+                && let Some(len) = floats[i].as_ref().map(Vec::len)
             {
-                floats[output] = Some(f);
+                spend(len)?;
+                floats[output] = floats[i].clone();
                 continue;
             }
             let opts = fb.table(o, 4)?;
@@ -299,9 +339,12 @@ impl Model {
             let input = |k: usize| ins.get(k).copied().flatten().ok_or_else(|| format!("{}: missing input {k}", names[output]));
             let weights = |k: usize| -> Result<Vec<f32>> {
                 let id = input(k)?;
-                floats[id].clone().ok_or_else(|| format!("{}: input {k} is not constant", names[output]))
+                let w = floats[id].as_ref().ok_or_else(|| format!("{}: input {k} is not constant", names[output]))?;
+                spend(w.len())?;
+                Ok(w.clone())
             };
             let bias = |count: usize| -> Result<Vec<f32>> {
+                spend(count)?;
                 match ins.get(2).copied().flatten() {
                     Some(id) => floats[id].clone().filter(|b| b.len() == count).ok_or_else(|| format!("{}: bad bias", names[output])),
                     None => Ok(vec![0.0; count]),
@@ -335,6 +378,9 @@ impl Model {
                     if kh != kw || s[0] != s[1] {
                         return Err(format!("{}: only square kernels and strides are supported", names[output]));
                     }
+                    if kh > MAX_KERNEL {
+                        return Err(format!("{}: the convolution kernel is too large", names[output]));
+                    }
                     let (ey, py) = window(padding, h, kh, s[0])?;
                     let (ex, px) = window(padding, w, kw, s[1])?;
                     if (ey, ex) != (oh, ow) {
@@ -353,6 +399,7 @@ impl Model {
                         }
                         // OHWI → [(ky·ks + kx)·inp + ci] × out.
                         let kk = kh * kw * cin;
+                        spend(kk * cout)?;
                         let mut t = vec![0.0f32; kk * cout];
                         for o in 0..cout {
                             for p in 0..kk {
@@ -373,8 +420,14 @@ impl Model {
                         return Err("bad pool size".into());
                     }
                     let k = k.map(|v| v as usize);
+                    if k.iter().any(|&v| v > MAX_KERNEL) {
+                        return Err(format!("{}: the pooling window is too large", names[output]));
+                    }
                     let x = in_shape(0)?;
-                    let (&[1, h, w, _], &[1, oh, ow, _]) = (&x[..], &out_shape[..]) else { return Err("unexpected pool shapes".into()) };
+                    let (&[1, h, w, c], &[1, oh, ow, oc]) = (&x[..], &out_shape[..]) else { return Err("unexpected pool shapes".into()) };
+                    if c != oc {
+                        return Err(format!("{}: pooling changes the channels", names[output]));
+                    }
                     let (ey, py) = window(padding, h, k[0], s[0])?;
                     let (ex, px) = window(padding, w, k[1], s[1])?;
                     if (ey, ex) != (oh, ow) {
@@ -394,14 +447,34 @@ impl Model {
                         .iter()
                         .map(|c| Ok([usize::try_from(c[0]).map_err(|_| "bad pad")?, usize::try_from(c[1]).map_err(|_| "bad pad")?]))
                         .collect::<Result<Vec<_>>>()?;
+                    // The padded shape is the declared one (so it is as bounded as any tensor).
+                    let x = in_shape(0)?;
+                    let padded = x.iter().zip(&pads).map(|(d, p)| d.checked_add(p[0])?.checked_add(p[1])).collect::<Option<Vec<_>>>();
+                    if pads.len() != x.len() || padded.as_ref() != Some(&out_shape) {
+                        return Err(format!("{}: the padding disagrees with the output shape", names[output]));
+                    }
                     Op::Pad(pads)
                 }
                 op::CONCATENATION => {
                     runtime = (0..ins.len()).map(input).collect::<Result<_>>()?;
                     let rank = out_shape.len() as i32;
                     let a = opt_int(0, 0)?;
-                    let axis = if a < 0 { a + rank } else { a };
-                    Op::Concat { axis: index(axis, out_shape.len())?, act: Act::from(opt_byte(1, 0)?)? }
+                    let axis = index(if a < 0 { a.saturating_add(rank) } else { a }, out_shape.len())?;
+                    // The parts fit the output: same rank, same sizes but along `axis`, where they add up.
+                    let mut along = 0usize;
+                    for &id in &runtime {
+                        let p = &shapes[id];
+                        let fits = p.len() == out_shape.len() && p.iter().zip(&out_shape).enumerate().all(|(d, (a, b))| d == axis || a == b);
+                        along = p
+                            .get(axis)
+                            .filter(|_| fits)
+                            .and_then(|&d| along.checked_add(d))
+                            .ok_or_else(|| format!("{}: the parts disagree with the output shape", names[output]))?;
+                    }
+                    if out_shape.get(axis) != Some(&along) {
+                        return Err(format!("{}: the parts disagree with the output shape", names[output]));
+                    }
+                    Op::Concat { axis, act: Act::from(opt_byte(1, 0)?)? }
                 }
                 op::RESHAPE => Op::Reshape,
                 op::RELU => Op::Act(Act::Relu),
@@ -428,7 +501,84 @@ impl Model {
         for &o in &outputs {
             last_use[o] = usize::MAX;
         }
-        Ok(Model { shapes, names, consts: floats, steps, inputs, outputs, last_use })
+        let model = Model { shapes, names, consts: floats, steps, inputs, outputs, last_use };
+        let c = model.cost().ok_or("the model is too expensive to run")?;
+        let over = [
+            (c.kernel > MAX_KERNEL as u64, "a kernel is too large"),
+            (c.scratch > MAX_SCRATCH, "an operator's working space is too large"),
+            (c.macs > MAX_MACS, "the model needs too many multiply-adds"),
+            (c.values > MAX_VALUES, "the model does too much work"),
+            (c.live > MAX_LIVE, "the model needs too much memory"),
+        ];
+        if let Some((_, why)) = over.iter().find(|o| o.0) {
+            return Err((*why).to_string());
+        }
+        Ok(model)
+    }
+
+    /// What one run takes, from the static shapes (`None` if a count overflows).
+    fn cost(&self) -> Option<Cost> {
+        let size = |i: usize| -> Option<u64> { self.shapes.get(i)?.iter().try_fold(1u64, |a, &d| a.checked_mul(d as u64)) };
+        let mut c = Cost::default();
+        // Floats alive per tensor, as `run` keeps them: inputs are copied in, and every step's
+        // output stays until its last use (for good when nothing uses it).
+        let mut alive = vec![0u64; self.shapes.len()];
+        let mut total = 0u64;
+        for &i in &self.inputs {
+            total = total.checked_sub(*alive.get(i)?)?.checked_add(size(i)?)?;
+            *alive.get_mut(i)? = size(i)?;
+        }
+        c.live = total;
+        for (k, s) in self.steps.iter().enumerate() {
+            let &x = s.inputs.first()?;
+            let (xs, ys) = (self.shapes.get(x)?, self.shapes.get(s.output)?);
+            let dim = |sh: &[usize], d: usize| sh.get(d).copied().unwrap_or(1) as u64;
+            let (h, w, oh, ow) = (dim(xs, 1), dim(xs, 2), dim(ys, 1), dim(ys, 2));
+            let out = size(s.output)?;
+            let mut scratch = 0u64;
+            let macs = match &s.op {
+                Op::Pointwise(l, _) => h.checked_mul(w)?.checked_mul(l.inp as u64)?.checked_mul(l.out as u64)?,
+                Op::Conv(cv, ..) => {
+                    let ks = cv.ks as u64;
+                    c.kernel = c.kernel.max(ks);
+                    let kk = ks.checked_mul(ks)?.checked_mul(cv.inp as u64)?;
+                    scratch = ow.checked_mul(kk)?;
+                    oh.checked_mul(ow)?.checked_mul(cv.out as u64)?.checked_mul(kk)?
+                }
+                Op::Depthwise(d, ..) => {
+                    let ks = d.ks as u64;
+                    c.kernel = c.kernel.max(ks);
+                    oh.checked_mul(ow)?.checked_mul(d.c as u64)?.checked_mul(ks)?.checked_mul(ks)?
+                }
+                Op::MaxPool { k, .. } => {
+                    c.kernel = c.kernel.max(k[0].max(k[1]) as u64);
+                    out.checked_mul(k[0] as u64)?.checked_mul(k[1] as u64)?
+                }
+                _ => 0,
+            };
+            c.macs = c.macs.checked_add(macs)?;
+            c.values = c.values.checked_add(out)?;
+            c.scratch = c.scratch.max(scratch);
+            // The output and the scratch are allocated while the inputs (and any earlier value of
+            // the output) are still alive.
+            c.live = c.live.max(total.checked_add(out)?.checked_add(scratch)?);
+            total = total.checked_sub(*alive.get(s.output)?)?.checked_add(out)?;
+            *alive.get_mut(s.output)? = out;
+            for &i in &s.inputs {
+                if self.last_use.get(i) == Some(&k) {
+                    total = total.checked_sub(*alive.get(i)?)?;
+                    *alive.get_mut(i)? = 0;
+                }
+            }
+        }
+        // Outputs that are constants are copied out.
+        for &o in &self.outputs {
+            if *alive.get(o)? == 0 {
+                total = total.checked_add(size(o)?)?;
+            }
+        }
+        c.live = c.live.max(total);
+        Some(c)
     }
 
     /// The shape of input `k`.
@@ -528,6 +678,21 @@ impl Model {
         }
         self.outputs.iter().map(|&o| vals[o].take().or_else(|| self.consts[o].clone()).ok_or_else(|| "an output was not computed".to_string())).collect()
     }
+}
+
+/// What running a model takes, worked out at load from its static shapes.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Cost {
+    /// Multiply-adds (convolutions) and window comparisons (pooling).
+    macs: u64,
+    /// Values all operators write.
+    values: u64,
+    /// The most floats alive at once.
+    live: u64,
+    /// The largest working space one operator allocates, in floats.
+    scratch: u64,
+    /// The widest window side.
+    kernel: u64,
 }
 
 /// Max pooling over `k` windows; window cells outside the input are ignored.
@@ -657,6 +822,302 @@ mod tests {
         for i in 0..fb.len() {
             fb[i] ^= 0x5a;
             let _ = Model::read(&fb);
+        }
+    }
+
+    /// A FlatBuffer value, to build small models in tests.
+    enum V {
+        Int(i32),
+        Byte(u8),
+        Table(Vec<(usize, V)>),
+        Ints(Vec<i32>),
+        Bytes(Vec<u8>),
+        Tables(Vec<V>),
+    }
+
+    fn put_u32(b: &mut [u8], at: usize, v: usize) {
+        b[at..at + 4].copy_from_slice(&(v as u32).to_le_bytes());
+    }
+
+    /// Append `v` (children after their parent, so every offset points forward); where it starts.
+    fn put(b: &mut Vec<u8>, v: &V) -> usize {
+        match v {
+            V::Table(fields) => {
+                let slots = fields.iter().map(|f| f.0 + 1).max().unwrap_or(0);
+                let vt = b.len();
+                let vt_len = 4 + 2 * slots;
+                b.resize(vt + vt_len, 0);
+                let t = b.len();
+                // Every field gets 8 bytes (the reader does not need alignment).
+                let t_len = 4 + 8 * fields.len();
+                b.resize(t + t_len, 0);
+                b[vt..vt + 2].copy_from_slice(&(vt_len as u16).to_le_bytes());
+                b[vt + 2..vt + 4].copy_from_slice(&(t_len as u16).to_le_bytes());
+                b[t..t + 4].copy_from_slice(&((t - vt) as i32).to_le_bytes());
+                for (k, (id, f)) in fields.iter().enumerate() {
+                    let at = t + 4 + 8 * k;
+                    b[vt + 4 + 2 * id..vt + 6 + 2 * id].copy_from_slice(&((at - t) as u16).to_le_bytes());
+                    match f {
+                        V::Int(i) => b[at..at + 4].copy_from_slice(&i.to_le_bytes()),
+                        V::Byte(x) => b[at] = *x,
+                        _ => {
+                            let child = put(b, f);
+                            put_u32(b, at, child - at);
+                        }
+                    }
+                }
+                t
+            }
+            V::Ints(xs) => {
+                let p = b.len();
+                b.extend((xs.len() as u32).to_le_bytes());
+                xs.iter().for_each(|x| b.extend(x.to_le_bytes()));
+                p
+            }
+            V::Bytes(xs) => {
+                let p = b.len();
+                b.extend((xs.len() as u32).to_le_bytes());
+                b.extend(xs);
+                p
+            }
+            V::Tables(ts) => {
+                let p = b.len();
+                b.extend((ts.len() as u32).to_le_bytes());
+                let slots = b.len();
+                b.resize(slots + 4 * ts.len(), 0);
+                for (i, t) in ts.iter().enumerate() {
+                    let child = put(b, t);
+                    put_u32(b, slots + 4 * i, child - (slots + 4 * i));
+                }
+                p
+            }
+            V::Int(_) | V::Byte(_) => b.len(),
+        }
+    }
+
+    /// A tensor: shape, type and its constant data (`Some(k)`: buffer `k` of the model's).
+    type T = (Vec<i32>, u8, Option<usize>);
+    /// An operator: code, inputs, outputs and its options' fields.
+    type O = (i32, Vec<i32>, Vec<i32>, Vec<(usize, V)>);
+
+    /// A `.tflite` file with one graph.
+    fn model(bufs: Vec<Vec<u8>>, tensors: Vec<T>, ops: Vec<O>, inputs: Vec<i32>, outputs: Vec<i32>) -> Vec<u8> {
+        let ts = tensors
+            .into_iter()
+            .enumerate()
+            .map(|(i, (shape, ty, buf))| {
+                let mut f = vec![(0, V::Ints(shape)), (1, V::Byte(ty)), (3, V::Bytes(format!("t{i}").into_bytes()))];
+                if let Some(k) = buf {
+                    f.push((2, V::Int(k as i32 + 1)));
+                }
+                V::Table(f)
+            })
+            .collect();
+        let mut codes = vec![];
+        let os = ops
+            .into_iter()
+            .map(|(code, ins, outs, opts)| {
+                let idx = codes.iter().position(|&c| c == code).unwrap_or_else(|| {
+                    codes.push(code);
+                    codes.len() - 1
+                });
+                V::Table(vec![(0, V::Int(idx as i32)), (1, V::Ints(ins)), (2, V::Ints(outs)), (4, V::Table(opts))])
+            })
+            .collect();
+        let g = V::Table(vec![(0, V::Tables(ts)), (1, V::Ints(inputs)), (2, V::Ints(outputs)), (3, V::Tables(os))]);
+        let buffers = std::iter::once(V::Table(vec![])).chain(bufs.into_iter().map(|d| V::Table(vec![(0, V::Bytes(d))]))).collect();
+        let codes = codes.into_iter().map(|c| V::Table(vec![(3, V::Int(c))])).collect();
+        let root = V::Table(vec![(1, V::Tables(codes)), (2, V::Tables(vec![g])), (4, V::Tables(buffers))]);
+        let mut b = vec![0u8; 4];
+        let r = put(&mut b, &root);
+        put_u32(&mut b, 0, r);
+        b
+    }
+
+    fn f32s(xs: &[f32]) -> Vec<u8> {
+        xs.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    /// Conv2DOptions / Pool2DOptions: padding (0 same, 1 valid) and stride.
+    fn window_opts(padding: u8, stride: i32) -> Vec<(usize, V)> {
+        vec![(0, V::Byte(padding)), (1, V::Int(stride)), (2, V::Int(stride))]
+    }
+
+    fn refused(bytes: &[u8], why: &str) {
+        let e = Model::read(bytes).err().unwrap_or_default();
+        assert!(e.contains(why), "refused for `{e}`, expected `{why}`");
+    }
+
+    #[test]
+    fn built_models_load_and_run() {
+        // A 3×3 stride-2 "same" conv on 4×4, then a RELU: as `asymmetric_conv_padding`.
+        let m = model(
+            vec![f32s(&[1.0; 9])],
+            vec![(vec![1, 4, 4, 1], FLOAT32, None), (vec![1, 3, 3, 1], FLOAT32, Some(0)), (vec![1, 2, 2, 1], FLOAT32, None), (vec![1, 2, 2, 1], FLOAT32, None)],
+            vec![(op::CONV_2D, vec![0, 1, -1], vec![2], window_opts(0, 2)), (op::RELU, vec![2], vec![3], vec![])],
+            vec![0],
+            vec![3],
+        );
+        let m = Model::read(&m).unwrap();
+        let c = m.cost().unwrap();
+        assert_eq!((c.macs, c.values, c.scratch, c.kernel), (2 * 2 * 9, 8, 2 * 9, 3));
+        // The input, the conv's output and its patch row, alive together.
+        assert_eq!(c.live, 16 + 4 + 2 * 9);
+        let x: Vec<f32> = (0..16).map(|v| v as f32).collect();
+        assert_eq!(m.run(&[&x]).unwrap(), vec![vec![45.0, 39.0, 66.0, 50.0]]);
+    }
+
+    /// #368: an 8 KB model whose CONV_2D needed a 512 GB scratch buffer aborted `run`.
+    #[test]
+    fn convolution_scratch_is_bounded() {
+        let w = 1 << 25;
+        let bomb = model(
+            vec![vec![0; 2 * 64 * 64]],
+            vec![(vec![1, 1, w, 1], FLOAT32, None), (vec![1, 64, 64, 1], FLOAT16, Some(0)), (vec![1, 1, w, 1], FLOAT32, None)],
+            vec![(op::CONV_2D, vec![0, 1, -1], vec![2], window_opts(0, 1))],
+            vec![0],
+            vec![2],
+        );
+        refused(&bomb, "kernel is too large");
+        // A small kernel over many channels: the patch row is `ow·3·3·cin`.
+        let (w, cin) = (1 << 20, 256);
+        let wide = model(
+            vec![vec![0; 2 * 9 * 256]],
+            vec![(vec![1, 1, w, cin], FLOAT32, None), (vec![1, 3, 3, cin], FLOAT16, Some(0)), (vec![1, 1, w, 1], FLOAT32, None)],
+            vec![(op::CONV_2D, vec![0, 1, -1], vec![2], window_opts(0, 1))],
+            vec![0],
+            vec![2],
+        );
+        refused(&wide, "working space is too large");
+    }
+
+    #[test]
+    fn kernel_sides_are_bounded() {
+        let k = MAX_KERNEL as i32 + 1;
+        let conv = model(
+            vec![vec![0; 2 * (k * k) as usize]],
+            vec![(vec![1, 40, 40, 1], FLOAT32, None), (vec![1, k, k, 1], FLOAT16, Some(0)), (vec![1, 40, 40, 1], FLOAT32, None)],
+            vec![(op::CONV_2D, vec![0, 1, -1], vec![2], window_opts(0, 1))],
+            vec![0],
+            vec![2],
+        );
+        refused(&conv, "kernel is too large");
+        let depthwise = model(
+            vec![vec![0; 2 * (k * k) as usize]],
+            vec![(vec![1, 40, 40, 1], FLOAT32, None), (vec![1, k, k, 1], FLOAT16, Some(0)), (vec![1, 40, 40, 1], FLOAT32, None)],
+            vec![(op::DEPTHWISE_CONV_2D, vec![0, 1, -1], vec![2], window_opts(0, 1))],
+            vec![0],
+            vec![2],
+        );
+        refused(&depthwise, "kernel is too large");
+        // A "same" pool takes any window: a huge one looped for billions of steps per output.
+        let mut opts = window_opts(0, 1);
+        opts.extend([(3, V::Int(i32::MAX)), (4, V::Int(i32::MAX))]);
+        let pool = model(
+            vec![],
+            vec![(vec![1, 8, 8, 1], FLOAT32, None), (vec![1, 8, 8, 1], FLOAT32, None)],
+            vec![(op::MAX_POOL_2D, vec![0], vec![1], opts)],
+            vec![0],
+            vec![1],
+        );
+        refused(&pool, "pooling window is too large");
+    }
+
+    #[test]
+    fn multiply_adds_are_bounded() {
+        // Three 16 → 16 pointwise convolutions over 4096×4096: 3·2³² multiply-adds.
+        let s = vec![1, 4096, 4096, 16];
+        let t = |buf| (s.clone(), FLOAT32, buf);
+        let m = model(
+            vec![vec![0; 2 * 16 * 16]],
+            vec![t(None), (vec![16, 1, 1, 16], FLOAT16, Some(0)), t(None), t(None), t(None)],
+            (0..3).map(|i| (op::CONV_2D, vec![if i == 0 { 0 } else { i + 1 }, 1, -1], vec![i + 2], window_opts(0, 1))).collect(),
+            vec![0],
+            vec![4],
+        );
+        refused(&m, "too many multiply-adds");
+    }
+
+    /// #368: 2000 RELUs over 2²⁵ values loaded fine, and one run took minutes.
+    #[test]
+    fn elementwise_work_is_bounded() {
+        let n = 2000;
+        let m = model(
+            vec![],
+            (0..=n).map(|_| (vec![1, 1 << 25], FLOAT32, None)).collect(),
+            (0..n).map(|i| (op::RELU, vec![i], vec![i + 1], vec![])).collect(),
+            vec![0],
+            vec![n],
+        );
+        refused(&m, "too much work");
+    }
+
+    #[test]
+    fn memory_alive_at_once_is_bounded() {
+        // Five outputs of 2²⁷ values each, all kept, besides the input.
+        let m = model(
+            vec![],
+            (0..6).map(|_| (vec![1, 1 << 27], FLOAT32, None)).collect(),
+            (1..6).map(|i| (op::RELU, vec![0], vec![i], vec![])).collect(),
+            vec![0],
+            (1..6).collect(),
+        );
+        refused(&m, "too much memory");
+    }
+
+    #[test]
+    fn shapes_computed_at_run_time_must_match_the_declared_ones() {
+        // PAD to 2³⁰ × 2³⁰ while declaring a 1×1 output.
+        let pads = vec![0, 1 << 30, 0, 1 << 30].into_iter().flat_map(i32::to_le_bytes).collect();
+        let pad = model(
+            vec![pads],
+            vec![(vec![1, 1], FLOAT32, None), (vec![2, 2], INT32, Some(0)), (vec![1, 1], FLOAT32, None)],
+            vec![(op::PAD, vec![0, 1], vec![2], vec![])],
+            vec![0],
+            vec![2],
+        );
+        refused(&pad, "padding disagrees");
+        // Many large parts concatenated into a small declared output.
+        let concat = model(
+            vec![],
+            vec![(vec![1, 1 << 27], FLOAT32, None), (vec![1, 2], FLOAT32, None)],
+            vec![(op::CONCATENATION, vec![0; 64], vec![1], vec![(0, V::Int(1))])],
+            vec![0],
+            vec![1],
+        );
+        refused(&concat, "parts disagree");
+        // A pool whose output claims more channels than its input has.
+        let pool = model(
+            vec![],
+            vec![(vec![1, 2, 2, 1], FLOAT32, None), (vec![1, 1, 1, 1 << 20], FLOAT32, None)],
+            vec![(op::MAX_POOL_2D, vec![0], vec![1], window_opts(1, 2).into_iter().chain([(3, V::Int(2)), (4, V::Int(2))]).collect())],
+            vec![0],
+            vec![1],
+        );
+        refused(&pool, "changes the channels");
+        // Dimensions may not hide behind a zero.
+        let zero = model(vec![], vec![(vec![0, 1 << 30, 1 << 30], FLOAT32, None)], vec![], vec![0], vec![0]);
+        refused(&zero, "tensor is too large");
+    }
+
+    #[test]
+    fn shared_weights_count_once_per_use() {
+        // One 128 KB buffer decoded for 2100 tensors would be 2100 copies of 2¹⁶ floats.
+        let m = model(vec![vec![0; 2 << 16]], (0..2100).map(|_| (vec![1, 1 << 16], FLOAT16, Some(0))).collect(), vec![], vec![], vec![]);
+        refused(&m, "weights are too large");
+    }
+
+    /// The official face models (`EFFECTCRAFT_FACE_LANDMARKER` = path to `face_landmarker.task`)
+    /// fit every budget with wide headroom.
+    #[test]
+    fn official_face_models_fit_the_budgets() {
+        let Some(path) = std::env::var_os("EFFECTCRAFT_FACE_LANDMARKER") else { return };
+        let bytes = std::fs::read(path).unwrap();
+        for name in [crate::mediapipe::DETECTOR, crate::mediapipe::MESH] {
+            let c = Model::read(&crate::pt::zip_file(&bytes, name).unwrap()).unwrap().cost().unwrap();
+            println!("{name}: {c:?}");
+            assert!(c.macs <= MAX_MACS / 8 && c.values <= MAX_VALUES / 8 && c.live <= MAX_LIVE / 8 && c.scratch <= MAX_SCRATCH / 8, "{name}: {c:?}");
+            assert!(c.kernel <= MAX_KERNEL as u64 / 4, "{name}: {c:?}");
         }
     }
 }

@@ -1,5 +1,7 @@
 # Architecture
 
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-10 · **Change:** minor (crate table checked against `crates/`: effect count 306, VP9 inter frames) · **Target:** Adobe After Effects 2026
+
 EffectCraft is a stack of small Rust crates. The engine knows nothing about the user interface;
 the egui frontend, the command-line tool and the MCP server all sit on top of the same `Session`
 and drive it through the same command registry.
@@ -16,7 +18,7 @@ cpal or muda. Everything in L0 to L4, the egui UI and the web app also build for
 | L0 | `time` | `Tick` (254 016 000 000 per second), rational frame rates incl. NTSC, SMPTE and drop-frame timecode |
 | L0 | `geom` | Vectors, matrices, quaternions, the layer transform (anchor, position, scale, orientation, rotation) |
 | L0 | `color` | sRGB and linear, HSL/HSV, luminance, the 38 blend modes, label colors |
-| L0 | `vp9enc` | VP9 intra-frame encoder (profile 0, 8-bit 4:2:0; lossless at quality 100) for WebM export, from the VP9 bitstream specification |
+| L0 | `vp9enc` | VP9 encoder (profile 0, 8-bit 4:2:0, key and inter frames with motion search, loop filter and rate control; lossless at quality 100) for WebM export, from the VP9 bitstream specification |
 | L0 | `opusenc` | Opus encoder: RFC 6716 SILK (NB/MB/WB), hybrid (SWB/FB) and CELT (FB) modes chosen by bitrate and application (audio / voice), 48 kHz 20 ms packets, mono/stereo, and the RFC 7845 `OpusHead`, for WebM export audio |
 | L0 | `hevcenc` | HEVC (H.265) encoder from ITU-T H.265: Main / Main 10 4:2:0, IDR + P slices (quarter-pel motion, merge/AMVP), CABAC, deblocking, bitrate or constant-QP rate control, for MP4 (`hvc1`) export |
 | L0 | `av1enc` | AV1 encoder from the AV1 bitstream specification: Main profile 8/10-bit 4:2:0, key + inter frames (quarter-pel motion), deblocking, for MP4 (`av01`) and WebM export |
@@ -27,7 +29,7 @@ cpal or muda. Everything in L0 to L4, the egui UI and the web app also build for
 | L1 | `path` | Bezier paths, path operators (trim, offset, round corners, zig zag, twist, merge…), stroking, coverage masks |
 | L2 | `project` | The document: items, compositions, layers, the property tree, render queue model, `.ecproj` serde |
 | L2 | `text` | Fonts, shaping, layout, per-glyph geometry, text animators and selectors |
-| L2 | `effects` | The effect registry (241 effects) and their CPU implementations |
+| L2 | `effects` | The effect registry (306 effects) and their CPU implementations |
 | L2 | `svg` | SVG import (W3C SVG 1.1/2 static subset: shapes, paths, transforms, `use`, CSS, gradients) and rasterisation at any scale |
 | L2 | `pdf` | PDF, PDF-compatible Illustrator (`.ai`) and EPS (PostScript subset) vector footage into the `svg` render tree: paths, fills, strokes, shadings, tiling patterns, clipping, text (embedded TrueType / CFF / Type 1 / Type 3 fonts; the bundled `text` fonts for the standard 14), images, blend modes, soft masks, optional-content layers |
 | L2 | `model` | 3D models for Advanced 3D: glTF 2.0 (`.gltf`/`.glb`) and OBJ/MTL import (meshes, PBR metallic-roughness materials and textures, node hierarchy, skins, animations), parametric primitives, extruded/bevelled outline meshes and polygon triangulation |
@@ -51,13 +53,28 @@ Allowed same-layer edges: `path → keyframe, raster`, `text → path`, `pdf →
 `media / expr / export / gpu → render`, `export → media`, `lottie → format`, `host → engine, script`,
 `script → engine`.
 
+The frontend uses `craft-ui::docking` for atomic layout transactions and pointer drop targets,
+and `craft-ui::layout` for bounded split geometry and resize interactions. A small adapter
+preserves EffectCraft's saved dock tree, stacked entries, floating rectangles and dynamic
+viewer/ScriptUI identities. Tab moves, edge splits, reordering, float/redock, activation and
+close operations use the shared model. The app retains composition-tab behavior, accordion
+height allocation and ScriptUI close callbacks. Lower layers cannot depend on `craft-ui`.
+
+Viewer controls retain their native widgets inside a horizontal scroll area, so narrow panels
+keep dropdowns, exposure dragging and snapshot holds reachable. Keyboard focus scrolls the
+focused control into view. Active composition breadcrumbs use the selected-row theme color.
+The `viewer_geometry` tests inspect actual painted contrast, scroll geometry and pointer/keyboard
+reachability across the three themes.
+
 ## 2. Time
 
 All time is an integer `Tick`, 254 016 000 000 per second, the least common multiple of every
 broadcast frame rate (×1001) and audio sample rate, so frame and sample positions are exact.
 Keyframe times are in **layer time**; `layer_time = (comp_time - start_time) / stretch`, and a
 Time Remap property overrides the source time. Commands snap layer times, keyframe times and
-comp durations to whole frames, as After Effects does. Timecode is only a display.
+comp durations to whole frames, as After Effects does, except Quick Offset (`layer.quickOffset`,
+`keys.quickOffset`), which staggers layers and keys onto subframes, as After Effects 25.4 does.
+Timecode is only a display.
 
 ## 3. Document model
 
@@ -80,7 +97,29 @@ XML). Saving goes through `Project::to_file_json`, which checks that the text re
 anything is written (JSON can't hold NaN or infinity), and files are written atomically. Opening
 a file that a newer EffectCraft saved shows a warning: fields this version doesn't know are
 dropped if it saves the project. Save, Save As, Save a Copy and Increment and Save keep the
-file's format (`.ecprojx` stays XML).
+file's format (`.ecprojx` stays XML). Next to `savedBy` the file records the active comp and the
+open comp tabs (`activeComp`, `openComps`), which opening restores; they are editor state, not
+part of `Project`, so older files (and ids that no longer name a comp) open on the first comp and
+older versions ignore them.
+
+`schema` changes when a saved value changes meaning; a project from an older schema is converted
+when it is opened (`effectcraft_engine::upgrade_effects`, which also refreshes effect instances
+from the registry) and saved with the current one, which older versions refuse to open rather than
+render wrongly. Schema 2 put effect positions on shape and text layers in effect space (§4,
+#227). Opening a schema 1 project moves what an effect on a shape or text layer (not an adjustment
+layer, whose effects see the comp below as before) holds as a position by half the comp size,
+so points that were set keep their place in the comp: point parameters with their keyframes, Paint
+stroke paths and clone positions, Puppet mesh seeds, pin rest points and positions, and Liquify
+and Roto Brush strokes. A point parameter still at its default and not animated is left alone:
+the old default sat at the comp's bottom-right corner, where most effects did nothing, and the
+same value is now the layer centre, as in After Effects. Expression controls (Point Control…)
+keep their values, because their meaning is up to the expressions that read them, and expressions
+are not rewritten, so an expression that computes an effect point on a shape or text layer from
+other values may need `+ [thisComp.width / 2, thisComp.height / 2]`. Effects that use the layer
+bounds (edge pinning, wipes, Offset, generators) now cover the whole comp-sized bounds instead of
+their bottom-right quarter. Tracking data of effects that analyse footage (Warp Stabilizer, 3D
+Camera Tracker, Mocha shape) is left as it is: footage has a source rectangle, whose effect space
+did not change.
 
 ## 4. Rendering
 
@@ -88,7 +127,21 @@ file's format (`.ecprojx` stays XML).
 the **source** (solid, footage frame, text, shape contents, or a nested comp), applies **masks**,
 then **effects** in order, then **layer styles**, then the **transform** into comp space (with motion blur sub-samples
 when enabled), the **track matte**, and finally **blends** into the accumulator. Adjustment layers
-apply their effects to the accumulator. Runs of 3D layers are composited per pixel through the
+apply their effects to the accumulator.
+
+Effects run in **effect space** (`effectcraft_render::effect_bounds`): layer pixels measured from
+the top-left of the layer's effect bounds, which are the source rectangle, or for layers without
+one (shape, text) a comp-sized rectangle centred on the layer's origin that their content
+surrounds. A shape layer's default effect point (the bounds' centre) is therefore its content's
+origin, as in After Effects. The renderer moves the layer buffer into effect space for the whole
+stack (`Buf::rebase`, on the CPU and the GPU alike) and hands effects everything else in it too:
+masks, other layers' pixels for layer parameters (each in its own effect space), the layer's own
+frames at other times (`Renderer::layer_input`, also what Puppet, Roto Brush and the Layer panel
+read) and the comp camera. Effect point handles, Puppet pins and the Layer panel map effect space
+to the comp with `EvalCtx::effect_to_comp`. Adjustment layers run their effects on the comp below
+as it is.
+
+Runs of 3D layers are composited per pixel through the
 active camera, with lights, shadows and depth of field (Classic 3D), or rasterised as meshes by
 the Advanced 3D renderer (below).
 
@@ -128,15 +181,28 @@ collapsed 3D precomps (drawn flattened), morph targets, extruded strokes.
 
 A **layer cache** keeps each layer's finished pixels (source, masks and effects) keyed by a hash of
 its evaluated inputs, excluding the transform. Static and transform-only layers render once;
-editing one layer re-renders only that layer. Effects that read the clock directly are declared in
+editing one layer re-renders only that layer. Each Render Queue job keeps its own layer cache
+for its frames. Effects that read the clock directly are declared in
 `effects::TIME_DEPENDENT`, and a test checks every registered effect against that list.
 
-The viewer's **RAM preview** (`ui-egui/src/frames.rs`) keeps finished frames keyed by project
-revision, comp, frame, scale, 3D view / region of interest and a hash of the other render
-options (Draft / Fast Previews, shadows, nested switches), so frames rendered under other
-options are never shown. When the budget (Settings ▸ Memory & CPU) is full the least recently
-shown frames go first, and frames of an older revision are dropped as soon as the project
-changes. The timeline's green bar counts the frames of exactly what the viewer shows.
+The viewer's **RAM preview** (`ui-egui/src/frames.rs`) keeps finished frames keyed by comp
+content, frame, scale, 3D view / region of interest and a hash of the other render options
+(Draft / Fast Previews, shadows, nested switches). Edits preserve unaffected comps' frames,
+and undo can reuse earlier content. During rapid edits at the same time and view, the viewer
+shows the newest completed revision while the exact requested revision renders; out-of-order
+completions cannot move it backwards. This avoids freezing until a slider or layer drag stops.
+Frames at other times or with other render options are never substituted. Obsolete queued jobs
+are dropped; running jobs finish into the cache. When the budget (Settings ▸ Memory & CPU) is
+full the least recently shown frames go first. The timeline's green bar counts cached frames
+of the current content and viewer settings.
+Resolution Auto renders the pixels the magnification needs, as in After Effects (Full above
+50 %, Half down to 33.3 %, Third down to 25 %, then Quarter). The Resolution is the comp's
+(`Comp::resolution`, saved with the project): setting it is no undo step (undo, redo and history
+jumps carry the current values over) and, like the Shy switches, it is outside
+`Comp::same_pixels`, so cached frames stay valid. Below 100 % the viewer averages
+instead of skipping pixels (Viewer Zoom Quality More Accurate): GPU frames carry a mip chain
+sampled trilinearly, CPU frames go up averaged down by the whole factor that leaves about one
+texel per screen pixel.
 
 A persistent **disk cache** (`render::disk_cache`, Settings ▸ Media & Disk Cache) backs both
 the layer cache and the viewer's RAM preview: layer buffers that were slow to render and every
@@ -173,8 +239,9 @@ switches that don't change pixels (Audio, Lock, Shy, Hide Shy Layers: `Switches:
 **Layer styles** (Layer ▸ Layer Styles; `crates/render/src/styles.rs`) render in layer space and
 may grow the layer's bounds. Drop Shadow and Outer Glow become separate passes composited below the
 layer with their own blend modes; the interior styles, Stroke and Bevel and Emboss are baked into
-the layer body. Layer opacity fades the whole stack; Knockout and the R/G/B channel switches apply
-at composite time. Styled pixels are cached separately from the layer content, so editing a style
+the layer body. Interior styles are clipped to the layer: they blend onto its colour inside its
+shape and keep its alpha, so an anti-aliased edge mixes the style and the background only. Layer
+opacity fades the whole stack; Knockout and the R/G/B channel switches apply at composite time. Styled pixels are cached separately from the layer content, so editing a style
 reuses the cached source/masks/effects. Global Light is one setting per comp, mirrored into every
 layer's Blending Options and kept in step after each edit.
 
@@ -190,7 +257,11 @@ Nulls / Nulls Follow Points take pins as well as paths, and `puppet.follow` give
 Position expression that trails the leader by a delay. The renderer flattens nested effect
 groups into `Params` keys (`effects::flatten_params`). Commands: `paint.*`, `puppet.*`.
 
-Half, Third and Quarter resolution render proportionally fewer pixels end to end.
+Half, Third and Quarter resolution render proportionally fewer pixels end to end. Footage
+starts at the render's size where the source can make it more cheaply than the full frame
+(`FootageSource::frame_at_size`): movies in opaque 4:2:0 Y'CbCr are box-filtered to half size
+before conversion (a quarter of the conversions; the result differs from converting first only
+in blocks where colours clip) and resampled from there, as other frames are from full size.
 
 **GPU compositor** (`crates/gpu`; Project Settings ▸ Video Rendering and Effects ▸ Mercury GPU
 Acceleration, the default, or Mercury Software Only; `render.backend`). The CPU renderer is the
@@ -202,6 +273,8 @@ whichever compositor measured faster for it (`render::auto::AutoPick`, kept by t
 per comp, output scale and path (readback or viewer display) it averages CPU and GPU frame times
 (warm-up on both sides, the fastest warm-up frame starting the average, single stalls capped),
 picks the GPU unless the CPU is clearly faster, and re-measures the other side every 48 frames.
+Render Queue jobs don't use Auto: every frame of a job renders on the project's renderer (the
+GPU compositor with Mercury GPU Acceleration), so runs of a render don't differ by timing.
 Light comps (a few small layers, which the CPU composites only within their bounds) then stay on
 the CPU instead of paying for full-frame passes and a readback. A GPU frame walks the comp like
 `draw_comp`: cached layer buffers are uploaded once per buffer, then transformed with the CPU's
@@ -319,10 +392,13 @@ its nested layers straight into the parent with concatenated transforms (one res
 nested blend modes and adjustment layers act on the parent's layers; nested 3D layers use the
 parent's camera and lights and, when the precomp layer is 3D, are depth-sorted with the parent's
 3D run. Masks, effects or styles force a flattened render. Text layers are always rasterised at
-their on-screen scale; on shape layers and vector footage the switch is Continuously Rasterize and
-does the same. Quality: Draft samples
+their on-screen scale, as text is vector in After Effects; on shape layers and vector footage the
+switch is Continuously Rasterize and does the same. Quality: Draft samples
 nearest-neighbour, Wireframe draws the layer bounds. Slip edit (`layer.slip`, Alt+PageUp/Down,
 dragging the source bar in the timeline) moves the source under fixed in/out points.
+Dragging a layer bar's in or out edge with several layers selected trims every selected layer by
+the same amount from its own in/out point (`layer.timing {inDelta | outDelta}`), clamped to the
+comp and to one frame of layer, as one undo step.
 
 **Nested comps** show nothing before they start or after they end (`Comp::covers`), even when
 the precomp layer is trimmed or remapped past them. A comp with **Preserve frame rate when nested
@@ -475,9 +551,23 @@ text, disables the expression and shows a warning, like After Effects. `sampleIm
 sampled layer through the evaluating renderer's footage source (`EvalCtx::footage`), cached per
 thread and frame; `footage(name)` reads data footage (JSON, CSV, TSV imported with File ▸ Import,
 text kept in the project) through `sourceData`, `sourceText` and `dataValue`. `expr.errors`
-lists failing expressions for the viewer's error bar. Each thread keeps one boa context; boa
+lists failing expressions on demand. The viewer's error bar uses the same checks against an
+immutable project snapshot, after 150 ms without editing, pointer interaction or playback.
+Native builds run these automatic checks on one persistent worker; layout and paint only read
+completed results. Requests are coalesced per comp, cancelled between properties when obsolete,
+and bounded to eight comp entries. Results must match the current project, revision and time.
+Disabling Show Expression Error Banner cancels automatic checks. Non-solo layers still receive
+diagnostics, including disabled expressions with syntax errors. The single-threaded web build
+shares the cache and debounce but evaluates one scan on the UI thread after interaction stops.
+Each thread keeps one boa context; boa
 leaves values on its stack whenever an exception unwinds through call frames (every pending
 host request does), so a run that hits the stack limit gets a fresh context and is retried once.
+
+Snapping memoizes expression values while collecting one immutable set of targets. Bounds,
+vertices and transforms share those values; the cache is discarded before the next query, so
+time changes and edits always use current geometry. Native timeline disk-cache indicators also
+request missing content hashes in the background, coalescing edits per comp. Their blue bars
+appear after the key is ready instead of serializing composition content during painting.
 
 ## 5a. Scripting
 
@@ -625,3 +715,11 @@ The before frame times were dominated by an O(layers²) menu build per visible t
 by every panel deep-cloning the active comp each frame. Left for later: per-layer structural
 sharing (so a one-layer edit doesn't copy its comp), a binary or compact project format (pretty
 JSON parsing is now the bulk of open), and rendering 5,000-layer comps faster.
+
+## Revision history
+
+| Date | Change | Summary |
+|---|---|---|
+| 2026-10-10 | minor | Status line added; crate table checked against `crates/` (every crate listed); effect count and VP9 encoder description corrected |
+
+PDF document structure uses the `craft-pdf` read feature through an app-owned bounded object adapter. EffectCraft retains its drawing tree, fonts, content/image filters and EPS interpreter; ordinary object/xref limits remain 256 MiB on 64-bit and 64 MiB on 32-bit/WASM, including repair.

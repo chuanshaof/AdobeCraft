@@ -81,6 +81,45 @@ fn mask_cuts_layer() {
 }
 
 #[test]
+fn first_intersect_and_darken_keep_their_rectangle() {
+    let render = |modes: &[MaskMode], centers: &[[f64; 2]]| {
+        let (mut p, cid, comp) = setup();
+        let mut l = solid(&mut p, &comp, [1.0, 1.0, 1.0], 200, 100);
+        for (i, (mode, center)) in modes.iter().zip(centers).enumerate() {
+            let mut next = p.next_id;
+            let m = build::mask(&mut Ids(&mut next), &format!("Mask {}", i + 1), ShapePath::rect(*center, 40.0, 40.0), *mode, [255, 255, 0]);
+            p.next_id = next;
+            l.props.sub_mut("masks").unwrap().children.push(m.into());
+        }
+        p.comp_mut(cid).unwrap().layers.push(l);
+        render_frame(&p, cid, Tick::ZERO, 1.0)
+    };
+    // A first Intersect or Darken has nothing to combine with, so it covers like Add.
+    // Lighten and Difference already do; Subtract still starts from the whole layer.
+    for mode in [MaskMode::Intersect, MaskMode::Darken, MaskMode::Add, MaskMode::Lighten, MaskMode::Difference] {
+        let img = render(&[mode], &[[50.0, 50.0]]);
+        assert!(img.get(50, 50)[3] > 0.99, "{mode:?} keeps the rectangle");
+        assert!(img.get(150, 50)[3] < 0.01, "{mode:?} stays outside it");
+    }
+    let hole = render(&[MaskMode::Subtract], &[[50.0, 50.0]]);
+    assert!(hole.get(50, 50)[3] < 0.01, "subtract still cuts its rectangle");
+    assert!(hole.get(150, 50)[3] > 0.99, "subtract leaves the rest of the layer");
+
+    // Add, then Intersect with a shifted rectangle: only the overlap remains.
+    let overlap = render(&[MaskMode::Add, MaskMode::Intersect], &[[50.0, 50.0], [70.0, 50.0]]);
+    assert!(overlap.get(50, 50)[3] > 0.99, "overlap stays");
+    assert!(overlap.get(35, 50)[3] < 0.01, "the first rectangle's exclusive side is cut");
+    assert!(overlap.get(85, 50)[3] < 0.01, "the second rectangle's exclusive side is cut");
+    let darkened = render(&[MaskMode::Add, MaskMode::Darken], &[[50.0, 50.0], [70.0, 50.0]]);
+    assert!(darkened.get(50, 50)[3] > 0.99 && darkened.get(35, 50)[3] < 0.01 && darkened.get(85, 50)[3] < 0.01);
+
+    // A later disjoint Add still contributes after a first Intersect.
+    let both = render(&[MaskMode::Intersect, MaskMode::Add], &[[50.0, 50.0], [150.0, 50.0]]);
+    assert!(both.get(50, 50)[3] > 0.99 && both.get(150, 50)[3] > 0.99);
+    assert!(both.get(100, 50)[3] < 0.01);
+}
+
+#[test]
 fn track_matte_alpha() {
     let (mut p, cid, comp) = setup();
     let mut matte = solid(&mut p, &comp, [1.0, 1.0, 1.0], 50, 50);
@@ -94,6 +133,58 @@ fn track_matte_alpha() {
     let img = render_frame(&p, cid, Tick::ZERO, 1.0);
     assert!(img.get(50, 50)[2] > 0.99);
     assert!(img.get(150, 50)[3] < 0.01);
+}
+
+/// Every matte kind with an opaque white 50×50 matte at the left of a 200×100 comp: the plain
+/// kinds keep the fill only inside the matte, the inverted kinds only outside it (#864).
+#[test]
+fn track_matte_kinds_keep_and_invert() {
+    for (kind, inside) in [(MatteKind::Alpha, true), (MatteKind::AlphaInverted, false), (MatteKind::Luma, true), (MatteKind::LumaInverted, false)] {
+        let (mut p, cid, comp) = setup();
+        let mut matte = solid(&mut p, &comp, [1.0, 1.0, 1.0], 50, 50);
+        matte.props.prop_mut("transform/position").unwrap().value = Value::Vec3([50.0, 50.0, 0.0]);
+        matte.switches.video = false;
+        let mut fill = solid(&mut p, &comp, [0.0, 0.0, 1.0], 200, 100);
+        fill.track_matte = Some(TrackMatte { layer: matte.id, kind });
+        let c = p.comp_mut(cid).unwrap();
+        c.layers.push(matte);
+        c.layers.push(fill);
+        let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+        let (a_in, a_out) = (img.get(50, 50)[3], img.get(150, 50)[3]);
+        if inside {
+            assert!(a_in > 0.99 && a_out < 0.01, "{kind:?}: {a_in} inside, {a_out} outside");
+            assert!(img.get(50, 50)[2] > 0.99, "{kind:?} keeps the fill's colour");
+        } else {
+            assert!(a_in < 0.01 && a_out > 0.99, "{kind:?}: {a_in} inside, {a_out} outside");
+            assert!(img.get(150, 50)[2] > 0.99, "{kind:?} keeps the fill's colour");
+        }
+    }
+}
+
+/// An adjustment layer with a track matte applies its effects only where the matte allows: an
+/// Invert over a 0.25 grey with an opaque white 50×50 matte at the left of the comp (#1201).
+#[test]
+fn track_matte_limits_an_adjustment_layer() {
+    for (kind, inside) in [(MatteKind::Alpha, true), (MatteKind::AlphaInverted, false), (MatteKind::Luma, true), (MatteKind::LumaInverted, false)] {
+        let (mut p, cid, comp) = setup();
+        let mut matte = solid(&mut p, &comp, [1.0, 1.0, 1.0], 50, 50);
+        matte.props.prop_mut("transform/position").unwrap().value = Value::Vec3([50.0, 50.0, 0.0]);
+        matte.switches.video = false;
+        let mut adj = solid(&mut p, &comp, [1.0, 1.0, 1.0], 200, 100);
+        adj.switches.adjustment = true;
+        add_effect_200(&mut p, &mut adj, "ec.channel.invert", &[]);
+        adj.track_matte = Some(TrackMatte { layer: matte.id, kind });
+        let bg = solid(&mut p, &comp, [0.25, 0.25, 0.25], 200, 100);
+        let c = p.comp_mut(cid).unwrap();
+        c.layers.push(matte);
+        c.layers.push(adj);
+        c.layers.push(bg);
+        let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+        let (g_in, g_out) = (img.get(50, 50)[0], img.get(150, 50)[0]);
+        let (want_in, want_out) = if inside { (0.75, 0.25) } else { (0.25, 0.75) };
+        assert!((g_in - want_in).abs() < 1e-4 && (g_out - want_out).abs() < 1e-4, "{kind:?}: {g_in} inside, {g_out} outside");
+        assert_eq!(img.get(150, 50)[3], 1.0, "{kind:?} keeps the comp opaque");
+    }
 }
 
 #[test]
@@ -163,6 +254,22 @@ fn effects_run_in_pipeline() {
     assert!(c[1] > 0.99 && c[0] < 0.01, "{c:?}");
 }
 
+/// After Effects 2026, sRGB working space (not linearised), Tint at its defaults on full-frame
+/// solids: the effect sees the encoded solid colour and weights it Rec. 601.
+#[test]
+fn tint_in_an_srgb_working_space_matches_after_effects_greys() {
+    for (col, want) in [([1.0, 0.0, 0.0], 76.0), ([0.0, 1.0, 0.0], 150.0), ([0.0, 0.0, 1.0], 29.0), ([0.5, 0.5, 0.5], 128.0)] {
+        let (mut p, cid, comp) = setup();
+        p.settings.working_space = Some(effectcraft_color::ColorSpace::Srgb);
+        let mut l = solid(&mut p, &comp, col, 200, 100);
+        add_effect(&mut p, &mut l, "ec.color.tint", [200.0, 100.0], &[]);
+        p.comp_mut(cid).unwrap().layers.push(l);
+        let o = render_frame(&p, cid, Tick::ZERO, 1.0).get(100, 50);
+        let want = want / 255.0;
+        assert!(o[..3].iter().all(|v| (v - want).abs() <= 1.0 / 255.0), "{col:?}: {o:?} vs {want}");
+    }
+}
+
 /// Card Dance's Comp Camera through the default comp camera reproduces a 2D layer in place.
 #[test]
 fn card_dance_comp_camera_matches_the_default_view() {
@@ -176,12 +283,74 @@ fn card_dance_comp_camera_matches_the_default_view() {
     assert!(img.get(10, 50)[3] < 0.01);
 }
 
+/// A black 2D solid with CC Particle World, under a camera layer panned right by `pan` px.
+fn particle_world_scene(pan: f64) -> (Project, ItemId) {
+    let (mut p, cid, comp) = setup();
+    let mut l = solid(&mut p, &comp, [0.0, 0.0, 0.0], 200, 100);
+    let vals = [("birthRate", Value::Scalar(2.0)), ("particle/particleType", Value::Enum(2)), ("particle/birthSize", Value::Scalar(0.1))];
+    add_effect(&mut p, &mut l, "ec.sim.ccparticleworld", [200.0, 100.0], &vals);
+    let mut cam = build::layer(&mut p, &comp, "Camera", LayerSource::Camera, (200, 100), None);
+    for path in ["transform/position", "transform/poi"] {
+        let pr = cam.props.prop_mut(path).unwrap();
+        let Value::Vec3(v) = pr.value else { panic!("{path}: {:?}", pr.value) };
+        pr.value = Value::Vec3([v[0] + pan, v[1], v[2]]);
+    }
+    p.comp_mut(cid).unwrap().layers = vec![cam, l];
+    (p, cid)
+}
+
+/// The red-weighted centre of the particles (x).
+fn particles_x(img: &crate::Image) -> f32 {
+    let (mut m, mut sx) = (0.0, 0.0);
+    for y in 0..img.height {
+        for x in 0..img.width {
+            let r = img.get(x as i64, y as i64)[0];
+            m += r;
+            sx += r * x as f32;
+        }
+    }
+    assert!(m > 1.0, "particles drawn");
+    sx / m
+}
+
+/// #397: CC Particle World on a 2D layer is seen through the comp's camera layer, and the layer
+/// cache notices the camera moving.
+#[test]
+fn particle_world_follows_the_comp_camera() {
+    let t = Tick::from_seconds_f64(1.0);
+    let (p, cid) = particle_world_scene(0.0);
+    let (q, _) = particle_world_scene(40.0);
+    let cache = crate::LayerCache::default();
+    let here = render_cached(&p, cid, t, Some(&cache));
+    let panned = render_cached(&q, cid, t, Some(&cache));
+    assert_same(&panned, &render_cached(&q, cid, t, None), "cached render after the camera moved");
+    let (a, b) = (particles_x(&here), particles_x(&panned));
+    assert!(b < a - 20.0, "panning the camera right moves the particles left: {a} -> {b}");
+}
+
 // ------------------------------------------------------------------------------ layer cache
 
 fn render_cached(p: &Project, cid: ItemId, t: Tick, cache: Option<&crate::LayerCache>) -> crate::Image {
     let mut r = crate::Renderer::new(p, &crate::NoFootage, crate::RenderOpts::default());
     r.cache = cache;
     r.comp_frame(cid, t)
+}
+
+/// #329: a render whose footage reads were called off keeps nothing in the layer cache: a layer
+/// made from a frame that came back empty (an effect's layer parameter) would be reused by the
+/// next render of that time.
+#[test]
+fn a_called_off_render_keeps_nothing_in_the_layer_cache() {
+    let (p, cid) = cache_scene();
+    let t = Tick::from_seconds_f64(0.5);
+    let cache = crate::LayerCache::default();
+    let off = crate::CancellableFootage { inner: &crate::NoFootage, cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)) };
+    let mut r = crate::Renderer::new(&p, &off, crate::RenderOpts::default());
+    r.cache = Some(&cache);
+    r.comp_frame(cid, t);
+    assert_eq!(cache.stats().entries, 0, "a called-off render kept layers");
+    render_cached(&p, cid, t, Some(&cache));
+    assert!(cache.stats().entries > 0, "a render that runs to the end keeps its layers");
 }
 
 /// [`add_effect`] for a 200×100 layer.
@@ -368,6 +537,26 @@ fn effects_see_layer_masks() {
     assert!(img.get(150, 50)[3] > 0.99, "mode None mask does not cut the layer");
 }
 
+/// An open mask (the Pen still drawing it) leaves the layer whole; closed, it masks (#290).
+#[test]
+fn open_masks_make_no_transparency() {
+    let render = |closed: bool| {
+        let (mut p, cid, comp) = setup();
+        let mut l = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+        let path = ShapePath { closed, ..ShapePath::rect([50.0, 50.0], 40.0, 40.0) };
+        let mut next = p.next_id;
+        let m = build::mask(&mut Ids(&mut next), "Mask 1", path, MaskMode::Add, [255, 255, 0]);
+        p.next_id = next;
+        l.props.sub_mut("masks").unwrap().children.push(m.into());
+        p.comp_mut(cid).unwrap().layers.push(l);
+        render_frame(&p, cid, Tick::ZERO, 1.0)
+    };
+    let open = render(false);
+    assert!(open.get(50, 50)[3] > 0.99 && open.get(150, 50)[3] > 0.99, "the open mask cut the layer");
+    let closed = render(true);
+    assert!(closed.get(50, 50)[3] > 0.99 && closed.get(150, 50)[3] < 0.01, "the closed mask masks");
+}
+
 #[test]
 fn effects_read_layer_params() {
     let (mut p, cid, comp) = setup();
@@ -455,4 +644,414 @@ fn edge_pinning_displaces_all_of_a_centred_shape_layer() {
         }
         assert!(q.iter().all(|&d| d > 20.0), "{id}: per-quadrant change {q:?}");
     }
+}
+
+/// Effect points on a shape layer are measured from the top-left of its comp-sized bounds
+/// (#227), so the default "layer centre" is where the content's origin is. Measured from the
+/// origin they sat at the comp's bottom-right corner: Twirl changed nothing and Bulge only
+/// the bottom-right quadrant.
+#[test]
+fn default_effect_points_sit_at_the_centre_of_a_shape_layer() {
+    let cases: [(&str, Vec<(&str, Value)>); 2] =
+        [("ec.distort.twirl", vec![("angle", Value::Scalar(90.0))]), ("ec.distort.bulge", vec![("height", Value::Scalar(2.0))])];
+    for (id, vals) in cases {
+        let (mut p, cid, comp) = setup();
+        let mut l = build::layer(&mut p, &comp, "Shape Layer 1", LayerSource::Shape, (200, 100), None);
+        let mut next = p.next_id;
+        let mut ids = Ids(&mut next);
+        let rect = build::shape_rect(&mut ids, [180.0, 80.0], [0.0, 0.0], 0.0);
+        let fill = build::shape_fill(&mut ids, [1.0, 0.0, 0.0, 1.0]);
+        let g = build::shape_group(&mut ids, "Rectangle 1", vec![rect, fill]);
+        p.next_id = next;
+        l.props.sub_mut("contents").unwrap().children.push(g.into());
+        p.comp_mut(cid).unwrap().layers.push(l.clone());
+        let plain = render_frame(&p, cid, Tick::ZERO, 1.0);
+        add_effect_200(&mut p, &mut l, id, &vals);
+        p.comp_mut(cid).unwrap().layers = vec![l];
+        let warped = render_frame(&p, cid, Tick::ZERO, 1.0);
+        // Alpha change per comp quadrant (TL, TR, BL, BR): the top and bottom edges move in each.
+        let mut q = [0.0f32; 4];
+        for y in 0..100 {
+            for x in 0..200 {
+                q[(x >= 100) as usize + 2 * (y >= 50) as usize] += (plain.get(x, y)[3] - warped.get(x, y)[3]).abs();
+            }
+        }
+        assert!(q.iter().all(|&d| d > 5.0), "{id}: per-quadrant change {q:?}");
+        // Symmetric about the centre: opposite quadrants change alike.
+        assert!((q[0] - q[3]).abs() < 0.05 * q[0].max(q[3]) && (q[1] - q[2]).abs() < 0.05 * q[1].max(q[2]), "{id}: {q:?}");
+    }
+}
+
+/// #659: a tiling effect on a text layer tiles across the layer's whole region. The glyphs
+/// were cut off at their own bounding box: the effect computed over the comp-sized layer rect
+/// but wrote into the painted (glyph-bounds) buffer alone. Tiling shrinks each copy, so the
+/// probe is the x-span of the painted pixels, not their count.
+#[test]
+fn effects_on_text_reach_past_the_text_bounds() {
+    let (mut p, cid, comp) = setup();
+    let mut l = build::layer(&mut p, &comp, "Text", LayerSource::Text, (200, 100), None);
+    l.props.prop_mut("text/sourceText").unwrap().value = Value::Text(Box::new(TextDoc { text: "HI".into(), size: 24.0, ..Default::default() }));
+    l.props.prop_mut("transform/position").unwrap().value = Value::Vec3([50.0, 60.0, 0.0]);
+    p.comp_mut(cid).unwrap().layers.push(l.clone());
+    let plain = render_frame(&p, cid, Tick::ZERO, 1.0);
+    let painted = plain.data.iter().filter(|px| px[3] > 0.5).count();
+    add_effect_200(&mut p, &mut l, "ec.distort.cctiler", &[("scale", Value::Scalar(25.0))]);
+    p.comp_mut(cid).unwrap().layers = vec![l];
+    let tiled = render_frame(&p, cid, Tick::ZERO, 1.0);
+    let (mut lo, mut hi) = (u32::MAX, 0u32);
+    for y in 0..100 {
+        for x in 0..200 {
+            if tiled.get(x as i64, y as i64)[3] > 0.5 {
+                lo = lo.min(x);
+                hi = hi.max(x);
+            }
+        }
+    }
+    assert!(
+        painted > 50 && hi.saturating_sub(lo) > 100,
+        "CC Tiler tiles the glyphs across the layer region, not just its text bounds: {painted} painted, x-span {lo}..{hi}"
+    );
+}
+
+/// #658: CC Smear drags text glyphs beyond the text layer's own bounds. Pixels smeared past
+/// the painted rectangle used to fall off its edge, so the liquid trail never appeared.
+#[test]
+fn cc_smear_trails_text_past_its_bounds() {
+    let (mut p, cid, comp) = setup();
+    let mut l = build::layer(&mut p, &comp, "Text", LayerSource::Text, (200, 100), None);
+    l.props.prop_mut("text/sourceText").unwrap().value = Value::Text(Box::new(TextDoc { text: "HI".into(), size: 24.0, ..Default::default() }));
+    l.props.prop_mut("transform/position").unwrap().value = Value::Vec3([60.0, 60.0, 0.0]);
+    p.comp_mut(cid).unwrap().layers.push(l.clone());
+    let right = |img: &effectcraft_raster::Image| (0..100).map(|y| (0..200).filter(|x| img.get(*x, y)[3] > 0.5).max().unwrap_or(0)).max().unwrap_or(0);
+    let plain = right(&render_frame(&p, cid, Tick::ZERO, 1.0));
+    add_effect_200(
+        &mut p,
+        &mut l,
+        "ec.distort.ccsmear",
+        &[("from", Value::Vec2([110.0, 45.0])), ("to", Value::Vec2([185.0, 45.0])), ("reach", Value::Scalar(100.0)), ("radius", Value::Scalar(40.0))],
+    );
+    p.comp_mut(cid).unwrap().layers = vec![l];
+    let smeared = right(&render_frame(&p, cid, Tick::ZERO, 1.0));
+    assert!(plain > 40 && smeared > plain + 25, "CC Smear trails the glyphs past the text bounds: right edge {plain} → {smeared}");
+}
+
+/// A layer parameter pointing at a shape layer sees all of it (in its effect space), and the
+/// effect's own masks are in effect space too: Set Matte with a centred shape layer as the
+/// matte keeps the centre of a full-comp solid (#227).
+#[test]
+fn layer_parameters_see_a_whole_shape_layer() {
+    let (mut p, cid, comp) = setup();
+    let mut shape = build::layer(&mut p, &comp, "Matte", LayerSource::Shape, (200, 100), None);
+    let mut next = p.next_id;
+    let mut ids = Ids(&mut next);
+    let rect = build::shape_rect(&mut ids, [100.0, 50.0], [0.0, 0.0], 0.0);
+    let fill = build::shape_fill(&mut ids, [1.0, 1.0, 1.0, 1.0]);
+    let g = build::shape_group(&mut ids, "Rectangle 1", vec![rect, fill]);
+    p.next_id = next;
+    shape.props.sub_mut("contents").unwrap().children.push(g.into());
+    shape.switches.video = false;
+    let matte_id = shape.id;
+    let mut s = solid(&mut p, &comp, [0.0, 0.0, 1.0], 200, 100);
+    add_effect_200(&mut p, &mut s, "ec.channel.setmatte", &[("takeMatteFromLayer", Value::Layer(Some(matte_id.0)))]);
+    p.comp_mut(cid).unwrap().layers = vec![s, shape];
+    let f = render_frame(&p, cid, Tick::ZERO, 1.0);
+    // The matte covers x 50..150, y 25..75: kept inside (all four quadrants), gone outside.
+    for (x, y) in [(60, 30), (140, 30), (60, 70), (140, 70)] {
+        assert!(f.get(x, y)[3] > 0.99, "inside at ({x}, {y}): {:?}", f.get(x, y));
+    }
+    for (x, y) in [(20, 10), (180, 90), (190, 50)] {
+        assert!(f.get(x, y)[3] < 0.01, "outside at ({x}, {y}): {:?}", f.get(x, y));
+    }
+}
+
+#[test]
+fn set_matte_self_source_and_masks_precede_effects() {
+    for source in [0, 1] {
+        let (mut p, cid, comp) = setup();
+        let mut l = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+        let mut next = p.next_id;
+        let mask = build::mask(&mut Ids(&mut next), "Left", ShapePath::rect([50.0, 50.0], 80.0, 80.0), MaskMode::Add, [255, 255, 0]);
+        p.next_id = next;
+        l.props.sub_mut("masks").unwrap().children.push(mask.into());
+        let id = l.id.0;
+        add_effect_200(&mut p, &mut l, "ec.channel.invert", &[("channel", Value::Enum(effectcraft_effects::INVERT_ALPHA))]);
+        add_effect_200(
+            &mut p,
+            &mut l,
+            "ec.channel.setmatte",
+            &[
+                ("takeMatteFromLayer", Value::Layer(Some(id))),
+                ("takeMatteFromLayerSource", Value::Enum(source)),
+                ("compositeMatteWithOriginal", Value::Bool(false)),
+            ],
+        );
+        p.comp_mut(cid).unwrap().layers.push(l);
+        let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+        assert!(img.get(50, 50)[3] > 0.99, "original alpha must survive preceding alpha inversion");
+        assert!((img.get(150, 50)[3] - if source == 0 { 1.0 } else { 0.0 }).abs() < 0.01, "Source and Masks must remain distinct");
+    }
+}
+
+#[test]
+fn cc_composite_restores_stack_input_on_layers_and_adjustments() {
+    for adjustment in [false, true] {
+        for mode in [0, 1] {
+            let (mut p, cid, comp) = setup();
+            let mut l = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+            l.switches.adjustment = adjustment;
+            add_effect_200(&mut p, &mut l, "ec.channel.invert", &[]);
+            add_effect_200(&mut p, &mut l, "ec.channel.cccomposite", &[("compositeOriginal", Value::Enum(mode))]);
+            p.comp_mut(cid).unwrap().layers.push(l);
+            if adjustment {
+                let bg = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+                p.comp_mut(cid).unwrap().layers.push(bg);
+            }
+            let img = render_frame(&p, cid, Tick::ZERO, 1.0);
+            let want = if mode == 0 { [1.0, 0.0, 0.0, 1.0] } else { [0.0, 1.0, 1.0, 1.0] };
+            assert_eq!(img.get(50, 50), want, "adjustment={adjustment} mode={mode}");
+        }
+    }
+}
+
+#[test]
+fn self_inputs_share_source_semantics_across_effects_and_times() {
+    use crate::{EffectHost, FxHost, NoFootage, RenderOpts, Renderer};
+    let (mut p, cid, comp) = setup();
+    let mut l = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+    let mut next = p.next_id;
+    let mask = build::mask(&mut Ids(&mut next), "Left", ShapePath::rect([50.0, 50.0], 80.0, 80.0), MaskMode::Add, [255, 255, 0]);
+    p.next_id = next;
+    l.props.sub_mut("masks").unwrap().children.push(mask.into());
+    p.comp_mut(cid).unwrap().layers.push(l.clone());
+    let c = p.comp(cid).unwrap();
+    let ctx = crate::eval::EvalCtx::new(&p, cid, c, Tick::ZERO);
+    let renderer = Renderer::new(&p, &NoFootage, RenderOpts::default());
+    let host = FxHost { r: &renderer, ctx: &ctx, layer: &l, origin: [0.0; 2], index: Default::default(), original: None };
+    assert_eq!(host.layer(l.id.0, false).unwrap().buf.img.get(150, 50)[3], 1.0);
+    assert_eq!(host.layer_masks(l.id.0).unwrap().buf.img.get(150, 50)[3], 0.0);
+    assert_eq!(host.layer_at(l.id.0, 0.5, false).unwrap().buf.img.get(150, 50)[3], 1.0);
+    assert!(host.layer(l.id.0, true).is_none(), "full-stack self references must not recurse");
+    assert!(host.layer_at(l.id.0, 0.5, true).is_none());
+    assert!(host.layer_at(l.id.0, f64::NAN, false).is_none());
+    // A second built-in using the shared selector: Invert(red) then Blend(original red).
+    l.props.sub_mut("masks").unwrap().children.clear();
+    add_effect_200(&mut p, &mut l, "ec.channel.invert", &[]);
+    let id = l.id.0;
+    add_effect_200(
+        &mut p,
+        &mut l,
+        "ec.channel.blend",
+        &[("blendWithLayer", Value::Layer(Some(id))), ("blendWithLayerSource", Value::Enum(0)), ("blendWithOriginal", Value::Scalar(0.0))],
+    );
+    p.comp_mut(cid).unwrap().layers = vec![l];
+    let c = p.comp(cid).unwrap();
+    let ctx = crate::eval::EvalCtx::new(&p, cid, c, Tick::ZERO);
+    assert!(crate::cache::input_key(&ctx, &c.layers[0], 1.0, false, false, 1).is_some());
+    assert!(crate::cache::input_key(&ctx, &c.layers[0], 1.0, false, false, 2).is_some());
+    assert_eq!(render_frame(&p, cid, Tick::ZERO, 1.0).get(50, 50), [1.0, 0.0, 0.0, 1.0]);
+}
+
+#[test]
+fn timed_source_reads_preserve_other_layer_masks() {
+    use effectcraft_effects::EffectHost;
+    let (mut p, cid, comp) = setup();
+    let owner = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+    let mut other = solid(&mut p, &comp, [0.0, 1.0, 0.0], 200, 100);
+    let mut next = p.next_id;
+    let mask = build::mask(&mut Ids(&mut next), "Left", ShapePath::rect([50.0, 50.0], 80.0, 80.0), MaskMode::Add, [255, 255, 0]);
+    p.next_id = next;
+    other.props.sub_mut("masks").unwrap().children.push(mask.into());
+    p.comp_mut(cid).unwrap().layers = vec![owner.clone(), other.clone()];
+    let ctx = crate::EvalCtx::new(&p, cid, p.comp(cid).unwrap(), Tick::ZERO);
+    let renderer = crate::Renderer::new(&p, &crate::NoFootage, crate::RenderOpts::default());
+    let host = crate::FxHost { r: &renderer, ctx: &ctx, layer: &owner, origin: [0.0; 2], index: Default::default(), original: None };
+    // Current Source and timed Source had different contracts before this fix. Keep
+    // the existing timed read (used by Clone/Time effects) masked for other layers.
+    assert_eq!(host.layer(other.id.0, false).unwrap().buf.img.get(150, 50)[3], 1.0);
+    let timed = host.layer_at(other.id.0, 0.5, false).unwrap();
+    assert_eq!(timed.buf.img.get(50, 50)[3], 1.0);
+    assert_eq!(timed.buf.img.get(150, 50)[3], 0.0);
+}
+
+#[test]
+fn layer_dependencies_remain_cacheable_and_invalidate_only_related_edits() {
+    let (mut p, cid, comp) = setup();
+    let mut owner = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+    let mut source = solid(&mut p, &comp, [0.0, 1.0, 0.0], 200, 100);
+    let third = solid(&mut p, &comp, [0.0, 0.0, 1.0], 200, 100);
+    let unrelated = solid(&mut p, &comp, [0.2, 0.3, 0.4], 200, 100);
+    add_effect_200(&mut p, &mut source, "ec.channel.blend", &[("blendWithLayer", Value::Layer(Some(third.id.0))), ("blendWithOriginal", Value::Scalar(0.0))]);
+    add_effect_200(&mut p, &mut owner, "ec.channel.blend", &[("blendWithLayer", Value::Layer(Some(source.id.0))), ("blendWithOriginal", Value::Scalar(0.0))]);
+    p.comp_mut(cid).unwrap().layers = vec![owner, source, third, unrelated];
+    let key = |p: &Project, time: f64, limit| {
+        let comp = p.comp(cid).unwrap();
+        let ctx = crate::EvalCtx::new(p, cid, comp, Tick::from_seconds_f64(time));
+        crate::cache::input_key(&ctx, &comp.layers[0], 1.0, false, false, limit).unwrap()
+    };
+    let initial = key(&p, 0.0, 1);
+    let input = key(&p, 0.0, 0);
+    assert_eq!(initial, key(&p, 0.5, 1), "static dependencies reuse across frames");
+    let cache = crate::LayerCache::default();
+    let before = render_cached(&p, cid, Tick::ZERO, Some(&cache));
+    render_cached(&p, cid, Tick::ZERO, Some(&cache));
+    assert!(cache.stats().hits > 0, "layer parameters must not disable caching");
+    let LayerSource::Solid { item: unrelated } = p.comp(cid).unwrap().layers[3].source else { panic!() };
+    let ItemKind::Solid(s) = &mut p.item_mut(unrelated).unwrap().kind else { panic!() };
+    s.color = [0.9, 0.8, 0.7];
+    assert_eq!(initial, key(&p, 0.0, 1), "unrelated edits preserve the owner key");
+    let LayerSource::Solid { item: third } = p.comp(cid).unwrap().layers[2].source else { panic!() };
+    let ItemKind::Solid(s) = &mut p.item_mut(third).unwrap().kind else { panic!() };
+    s.color = [1.0, 0.0, 1.0];
+    assert_ne!(initial, key(&p, 0.0, 1), "transitive source edits invalidate the owner");
+    assert_eq!(input, key(&p, 0.0, 0), "effects after an input prefix do not affect its key");
+    let cached = render_cached(&p, cid, Tick::ZERO, Some(&cache));
+    let fresh = render_cached(&p, cid, Tick::ZERO, None);
+    assert_same(&cached, &fresh, "transitive dependency edit");
+    assert_ne!(before.get(50, 50), fresh.get(50, 50));
+    let owner_id = p.comp(cid).unwrap().layers[0].id;
+    p.comp_mut(cid).unwrap().layers[1].props.prop_mut("effects/#1/blendWithLayer").unwrap().value = Value::Layer(Some(owner_id.0));
+    let comp = p.comp(cid).unwrap();
+    let ctx = crate::EvalCtx::new(&p, cid, comp, Tick::ZERO);
+    assert!(crate::cache::layer_key(&ctx, &comp.layers[0], 1.0, false, false).is_none(), "cycles decline caching without recursion");
+}
+
+#[test]
+fn precomp_dependencies_hash_nested_sources_and_evaluated_animation() {
+    let (mut p, cid, comp) = setup();
+    let mut child = solid(&mut p, &comp, [0.0, 0.0, 1.0], 200, 100);
+    let LayerSource::Solid { item: source } = child.source else { panic!() };
+    child.props.prop_mut("transform/opacity").unwrap().keys =
+        vec![Keyframe::new(Tick::ZERO, Value::Scalar(100.0)), Keyframe::new(Tick::from_seconds_f64(1.0), Value::Scalar(50.0))];
+    let mut nested = comp.clone();
+    nested.layers = vec![child];
+    let nested_id = p.add_item("Nested", Label::Sandstone, None, ItemKind::Comp(nested.into()));
+    let pre = build::layer(&mut p, &comp, "Precomp", LayerSource::Comp { item: nested_id }, (200, 100), None);
+    let mut owner = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+    add_effect_200(&mut p, &mut owner, "ec.channel.blend", &[("blendWithLayer", Value::Layer(Some(pre.id.0))), ("blendWithOriginal", Value::Scalar(0.0))]);
+    p.comp_mut(cid).unwrap().layers = vec![owner, pre];
+    let key = |p: &Project, time| {
+        let c = p.comp(cid).unwrap();
+        crate::cache::layer_key(&crate::EvalCtx::new(p, cid, c, time), &c.layers[0], 1.0, false, false).unwrap()
+    };
+    let cache = crate::LayerCache::default();
+    let before = render_cached(&p, cid, Tick::ZERO, Some(&cache));
+    let initial = key(&p, Tick::ZERO);
+    let later = Tick::from_seconds_f64(0.5);
+    assert_ne!(initial, key(&p, later));
+    assert_same(&render_cached(&p, cid, later, Some(&cache)), &render_cached(&p, cid, later, None), "animated precomp dependency");
+    let ItemKind::Solid(s) = &mut p.item_mut(source).unwrap().kind else { panic!() };
+    s.color = [0.0, 1.0, 0.0];
+    assert_ne!(initial, key(&p, Tick::ZERO), "items used inside the precomp invalidate the owner");
+    let fresh = render_cached(&p, cid, Tick::ZERO, None);
+    assert_same(&render_cached(&p, cid, Tick::ZERO, Some(&cache)), &fresh, "precomp source edit");
+    assert_ne!(before.get(50, 50), fresh.get(50, 50));
+}
+
+/// #352: a shape layer's bounds (snapping, Align) are its visual edges: a 100×100 rectangle is
+/// exactly ±50, and a 10 px stroke adds half its width, with no anti-aliasing padding.
+#[test]
+fn shape_content_bounds_are_the_visual_edges() {
+    for (stroke, half) in [(None, 50.0), (Some(10.0), 55.0)] {
+        let (mut p, cid, comp) = setup();
+        let mut l = build::layer(&mut p, &comp, "Shape Layer 1", LayerSource::Shape, (200, 100), None);
+        let mut next = p.next_id;
+        let mut ids = Ids(&mut next);
+        let mut items = vec![build::shape_rect(&mut ids, [100.0, 100.0], [0.0, 0.0], 0.0), build::shape_fill(&mut ids, [1.0, 0.0, 0.0, 1.0])];
+        if let Some(w) = stroke {
+            items.push(build::shape_stroke(&mut ids, [1.0, 1.0, 1.0, 1.0], w));
+        }
+        let g = build::shape_group(&mut ids, "Rectangle 1", items);
+        p.next_id = next;
+        l.props.sub_mut("contents").unwrap().children.push(g.into());
+        p.comp_mut(cid).unwrap().layers.push(l.clone());
+        let ctx = crate::EvalCtx::new(&p, cid, p.comp(cid).unwrap(), Tick::ZERO);
+        let b = crate::content_bounds(&ctx, &l).unwrap();
+        assert!(b.iter().zip([-half, -half, half, half]).all(|(a, e)| (a - e).abs() < 1e-6), "{stroke:?}: {b:?}");
+    }
+}
+
+/// Solo is not time-dependent (as in After Effects): while any layer is soloed, the others stay
+/// excluded even when the playhead is outside the soloed layer's in-out range.
+#[test]
+fn solo_excludes_other_layers_outside_the_soloed_layers_range() {
+    let (mut p, cid, comp) = setup();
+    let a = solid(&mut p, &comp, [1.0, 0.0, 0.0], 200, 100);
+    let mut b = solid(&mut p, &comp, [0.0, 0.0, 1.0], 200, 100);
+    b.in_point = Tick::from_seconds_f64(1.0);
+    b.switches.solo = true;
+    let c = p.comp_mut(cid).unwrap();
+    c.layers.push(b);
+    c.layers.push(a);
+    let first = render_frame(&p, cid, Tick::from_seconds_f64(0.5), 1.0);
+    assert_eq!(first.get(100, 50), [0.0, 0.0, 0.0, 0.0], "neither A nor B before B's in point");
+    let second = render_frame(&p, cid, Tick::from_seconds_f64(1.5), 1.0);
+    assert_eq!(second.get(100, 50), [0.0, 0.0, 1.0, 1.0], "only B inside its range");
+}
+
+/// #1252: a layer blended with a CC Particle World layer, under a camera panned by `pan` px.
+fn scene_reader_dependency(pan: f64) -> (Project, ItemId) {
+    let (mut p, cid, comp) = setup();
+    let mut source = solid(&mut p, &comp, [0.0, 0.0, 0.0], 200, 100);
+    let vals = [("birthRate", Value::Scalar(2.0)), ("particle/particleType", Value::Enum(2)), ("particle/birthSize", Value::Scalar(0.1))];
+    add_effect(&mut p, &mut source, "ec.sim.ccparticleworld", [200.0, 100.0], &vals);
+    source.switches.video = false;
+    let mut owner = solid(&mut p, &comp, [0.0, 0.0, 0.0], 200, 100);
+    add_effect_200(&mut p, &mut owner, "ec.channel.blend", &[("blendWithLayer", Value::Layer(Some(source.id.0))), ("blendWithOriginal", Value::Scalar(0.0))]);
+    let mut cam = build::layer(&mut p, &comp, "Camera", LayerSource::Camera, (200, 100), None);
+    for path in ["transform/position", "transform/poi"] {
+        let pr = cam.props.prop_mut(path).unwrap();
+        let Value::Vec3(v) = pr.value else { panic!("{path}: {:?}", pr.value) };
+        pr.value = Value::Vec3([v[0] + pan, v[1], v[2]]);
+    }
+    p.comp_mut(cid).unwrap().layers = vec![cam, owner, source];
+    (p, cid)
+}
+
+/// #1252: the owner's cache key covers the comp camera and lights that a layer it selects reads,
+/// though the owner itself runs no scene-reading effect.
+#[test]
+fn a_selected_layer_reading_the_comp_scene_invalidates_its_owner() {
+    let t = Tick::from_seconds_f64(1.0);
+    let (p, cid) = scene_reader_dependency(0.0);
+    let (q, _) = scene_reader_dependency(40.0);
+    let key = |p: &Project| {
+        let c = p.comp(cid).unwrap();
+        crate::cache::layer_key(&crate::EvalCtx::new(p, cid, c, t), &c.layers[1], 1.0, false, false).unwrap()
+    };
+    assert_ne!(key(&p), key(&q), "moving the camera changes the owner's key");
+    let cache = crate::LayerCache::default();
+    let here = render_cached(&p, cid, t, Some(&cache));
+    let panned = render_cached(&q, cid, t, Some(&cache));
+    assert_same(&panned, &render_cached(&q, cid, t, None), "cached render after the camera moved");
+    let (a, b) = (particles_x(&here), particles_x(&panned));
+    assert!(b < a - 20.0, "the blended particles follow the camera: {a} -> {b}");
+}
+
+/// #1812: preview workers that render a layer at once end up with one buffer (the one kept
+/// first), so the GPU compositor uploads and packs it once, not once per worker.
+#[test]
+fn workers_rendering_a_layer_at_once_share_one_buffer() {
+    let (mut p, cid, comp) = setup();
+    let mut l = solid(&mut p, &comp, [0.2, 0.5, 0.8], 1600, 1200);
+    add_effect(&mut p, &mut l, "ec.blur.gaussian", [1600.0, 1200.0], &[("blurriness", Value::Scalar(60.0))]);
+    p.comp_mut(cid).unwrap().layers.push(l);
+    let cache = crate::LayerCache::default();
+    let start = std::sync::Barrier::new(8);
+    let bufs: Vec<_> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..8)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut r = crate::Renderer::new(&p, &crate::NoFootage, crate::RenderOpts::default());
+                    r.cache = Some(&cache);
+                    let c = p.comp(cid).unwrap();
+                    let ctx = r.eval_ctx(cid, Tick::ZERO).unwrap();
+                    start.wait();
+                    r.layer_buf(&ctx, &c.layers[0]).unwrap()
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert!(bufs.iter().all(|b| std::sync::Arc::ptr_eq(b, &bufs[0])), "one shared buffer");
+    assert_eq!(cache.stats().entries, 1);
 }

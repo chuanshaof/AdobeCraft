@@ -47,7 +47,7 @@ fn stroke(s: &mut Session, p: &Value) -> Result<Value> {
         .iter()
         .position(|t| t.eq_ignore_ascii_case(tool_name))
         .ok_or_else(|| bad(cmd, format!("unknown tool `{tool_name}` ({})", LIQUIFY_TOOLS.join(" | "))))?;
-    let raw = p.get("points").and_then(Value::as_array).ok_or_else(|| bad(cmd, "missing `points` [[x, y], …] (layer space)"))?;
+    let raw = p.get("points").and_then(Value::as_array).ok_or_else(|| bad(cmd, "missing `points` [[x, y], …] (effect space)"))?;
     let mut points = vec![];
     for q in raw {
         let a = q.as_array().ok_or_else(|| bad(cmd, "each point is [x, y]"))?;
@@ -66,8 +66,7 @@ fn stroke(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(bad(cmd, "Liquify works on footage, solid, text, shape and precomp layers"));
     }
     let lt = layer.layer_time(t);
-    let (w, h) = effectcraft_render::source_size(&s.project, layer);
-    let size = if w == 0 { [comp.width as f64, comp.height as f64] } else { [w as f64, h as f64] };
+    let size = effectcraft_render::effect_bounds(&s.project, comp, layer).0;
     let want = p.get("effect").and_then(Value::as_u64);
     let (fx_uid, count) = s.edit("Liquify Stroke", None, |proj, _st| {
         let mut next = proj.next_id;
@@ -147,7 +146,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Liquify Stroke",
             [],
             None,
-            "{layer?, effect?: uid, tool?: warp|turbulence|twirlClockwise|twirlCounterclockwise|pucker|bloat|shiftPixels|reflection|clone|reconstruction|freeze|thaw, points: [[x,y],…] (layer space), size?, pressure? (1-100), jitter? (1-100), cloneOffset?: [dx,dy], time? (s) | frame?}",
+            "{layer?, effect?: uid, tool?: warp|turbulence|twirlClockwise|twirlCounterclockwise|pucker|bloat|shiftPixels|reflection|clone|reconstruction|freeze|thaw, points: [[x,y],…] (effect space), size?, pressure? (1-100), jitter? (1-100), cloneOffset?: [dx,dy], time? (s) | frame?}",
             has_comp,
             stroke
         ),

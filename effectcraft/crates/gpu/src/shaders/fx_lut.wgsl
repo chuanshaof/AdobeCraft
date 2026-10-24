@@ -266,6 +266,16 @@ fn fxl_decode(tf: u32, g: f32, v: f32) -> f32 {
             let l = powz(max(e - FXL_PQ_C1, 0.0) / (FXL_PQ_C2 - FXL_PQ_C3 * e), 1.0 / FXL_PQ_M1);
             return l * 100.0;
         }
+        case 5u: {
+            // ACEScc.
+            if (v < (-15.0 + 9.72) / 17.52) {
+                return (exp2(v * 17.52 - 9.72) - exp2(-16.0)) * 2.0;
+            }
+            if (v < (log2(65504.0) + 9.72) / 17.52) {
+                return exp2(v * 17.52 - 9.72);
+            }
+            return 65504.0;
+        }
         default: {
             return v;
         }
@@ -296,6 +306,16 @@ fn fxl_encode(tf: u32, g: f32, v: f32) -> f32 {
         case 4u: {
             let y = powz(max(v / 100.0, 0.0), FXL_PQ_M1);
             return powz((FXL_PQ_C1 + FXL_PQ_C2 * y) / (1.0 + FXL_PQ_C3 * y), FXL_PQ_M2);
+        }
+        case 5u: {
+            // ACEScc.
+            if (v <= 0.0) {
+                return (-16.0 + 9.72) / 17.52;
+            }
+            if (v < exp2(-15.0)) {
+                return (log2(exp2(-16.0) + v * 0.5) + 9.72) / 17.52;
+            }
+            return (log2(v) + 9.72) / 17.52;
         }
         default: {
             return v;
@@ -381,6 +401,37 @@ fn fxl_tonemap(v: f32, inverse: bool) -> f32 {
     let b = 1.0 - v;
     let c = -v;
     return (-b + sqrt(b * b - 4.0 * a * c)) / (2.0 * a);
+}
+
+// ExponentWithLinearTransform (ocio_config::moncurve): forward decodes; a gamma of at most 1 or
+// a non-positive offset is a plain power curve.
+fn fxl_moncurve(v0: f32, g: f32, o: f32, inv: bool, mirror: bool) -> f32 {
+    var v = v0;
+    var sign = 1.0;
+    if (mirror && v < 0.0) {
+        v = -v;
+        sign = -1.0;
+    }
+    if (g <= 1.0 || o <= 0.0) {
+        var p = g;
+        if (inv) {
+            p = 1.0 / max(g, 1e-9);
+        }
+        return sign * powz(max(v, 0.0), p);
+    }
+    let xb = o / (g - 1.0);
+    let yb = powz((xb + o) / (1.0 + o), g);
+    let slope = yb / xb;
+    if (!inv) {
+        if (v >= xb) {
+            return sign * powz((v + o) / (1.0 + o), g);
+        }
+        return sign * v * slope;
+    }
+    if (v >= yb) {
+        return sign * ((1.0 + o) * powz(v, 1.0 / g) - o);
+    }
+    return sign * v / slope;
 }
 
 // Run the colour program at data[0..] on a straight colour.
@@ -484,6 +535,22 @@ fn fxl_run(c0: vec3<f32>) -> vec3<f32> {
                     }
                 }
                 pc += 16u;
+            }
+            case 12u: {
+                // ExponentWithLinearTransform: gamma (3), offset (3), inverse, mirror.
+                let g = fxl_d3(pc + 1u);
+                let o = fxl_d3(pc + 4u);
+                let inv = data[pc + 7u] != 0.0;
+                let mirror = data[pc + 8u] != 0.0;
+                for (var i = 0u; i < 3u; i++) {
+                    c[i] = fxl_moncurve(c[i], g[i], o[i], inv, mirror);
+                }
+                pc += 9u;
+            }
+            case 13u: {
+                // Clamp (a clamping RangeTransform): low (3), high (3).
+                c = min(max(c, fxl_d3(pc + 1u)), fxl_d3(pc + 4u));
+                pc += 7u;
             }
             default: {
                 return c;

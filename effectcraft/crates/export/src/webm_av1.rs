@@ -51,7 +51,7 @@ pub(crate) async fn webm_av1(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut
     let duration_ms = frame_ms(total) as f64;
 
     let path = job.place(job.path, 1);
-    let mut file = crate::out::create(job.sink, &path)?;
+    let mut file = job.create(&path)?;
     let mut head = vec![];
     let mut eb = vec![];
     el_uint(&mut eb, 0x4286, 1);

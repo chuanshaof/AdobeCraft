@@ -6,7 +6,7 @@ use effectcraft_time::{TICKS_PER_SECOND, Tick};
 use serde_json::{Value, json};
 
 use super::prop::prop_ref;
-use super::{CommandSpec, b_p, bad, has_layers, layer_mut, layer_p};
+use super::{CommandSpec, b_p, bad, has_layers, layer_mut, layer_p, str_p};
 use crate::{EngineError, Result, Session, cmd};
 
 const AXES: [(&str, &str); 3] = [("positionX", "X Position"), ("positionY", "Y Position"), ("positionZ", "Z Position")];
@@ -164,6 +164,29 @@ fn pick_whip(s: &mut Session, p: &Value) -> Result<Value> {
     let r = reference(comp, from, target, tu, s.prefs.general.expression_pick_whip_compact).ok_or_else(|| bad("prop.pickWhip", "no such target property"))?;
     let (me, them) = (from.props.find(uid).ok_or(EngineError::NoComp)?, target.props.find(tu).ok_or(EngineError::NoComp)?);
     let (dm, dt) = (dims(from, me), dims(target, them));
+    // Dropped on one of the target's values: that dimension (`position[0]`), as in After Effects.
+    let (r, dt) = match t.get("dimension").and_then(Value::as_u64) {
+        Some(d) if d < dt as u64 => (format!("{r}[{d}]"), 1),
+        Some(d) => return Err(bad("prop.pickWhip", format!("the target has {dt} dimension(s), no dimension {d}"))),
+        None => (r, dt),
+    };
+    // While the expression is being edited the reference goes in at the cursor, replacing the
+    // selected text (After Effects): `expression` is the text being edited, `range` the
+    // selection [start, end] in characters.
+    if let Some(base) = str_p(p, "expression") {
+        let range: Option<Vec<u64>> = p.get("range").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).collect());
+        let n = base.chars().count() as u64;
+        let (a, b) = match range.as_deref() {
+            Some(&[a, b]) => (a.min(b).min(n), a.max(b).min(n)),
+            None => (n, n),
+            Some(_) => return Err(bad("prop.pickWhip", "`range` must be [start, end] (characters)")),
+        };
+        let head: String = base.chars().take(a as usize).collect();
+        let tail: String = base.chars().skip(b as usize).collect();
+        let text = format!("{head}{r}{tail}");
+        s.execute("prop.setExpression", json!({"layer": lid.0, "prop": uid, "expression": text}))?;
+        return Ok(json!(text));
+    }
     let text = if dt == 1 && dm > 1 {
         format!("temp = {r};\n[{}]", vec!["temp"; dm].join(", "))
     } else if dt > 1 && dm == 1 {
@@ -183,7 +206,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Pick Whip (Link Property)",
             [],
             None,
-            "{layer?, path|prop, target: {layer, path|prop}} → sets an AE reference expression",
+            "{layer?, path|prop, target: {layer, path|prop, dimension?}, expression?, range?: [start, end]} → sets an AE reference expression (`dimension`: one of the target's values, `position[0]`; with `expression`: inserts it there, replacing the characters in `range`, default the end)",
             has_layers,
             pick_whip
         ),

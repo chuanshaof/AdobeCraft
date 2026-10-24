@@ -3,7 +3,7 @@
 use effectcraft_effects::Buf;
 use effectcraft_geom::{Mat3, vec2};
 use effectcraft_keyframe::Value;
-use effectcraft_path::{FillRule, StrokeStyle};
+use effectcraft_path::{FillRule, Join};
 use effectcraft_project::{FeatherFalloff, GroupKind, Layer, MaskMode, MaskMotionBlur};
 use effectcraft_raster::{Mask, box_blur, gaussian_blur};
 use rayon::prelude::*;
@@ -72,21 +72,15 @@ fn coverage_at(ctx: &EvalCtx, layer: &Layer, g: &effectcraft_project::PropGroup,
     let variable = !sp.feather.is_empty();
     let mut cov = if variable {
         effectcraft_path::feather::variable_feather_coverage(&sp, &m, w, h, exp, linear)
+    } else if exp.abs() > 0.01 {
+        // Expansion offsets the outline itself (round joins). Offset Paths' geometry stays right
+        // when the expansion exceeds a curvature radius, where a fill + stroke blend leaves a
+        // ring around an uncovered middle (growing) or islands (shrinking).
+        let grown = effectcraft_path::offset::offset_path(&path, exp, Join::Round, 4.0);
+        effectcraft_path::fill_coverage(std::slice::from_ref(&grown), &m, w, h, FillRule::NonZero)
     } else {
         effectcraft_path::fill_coverage(std::slice::from_ref(&path), &m, w, h, FillRule::NonZero)
     };
-    if exp.abs() > 0.01 && !variable {
-        let ring = effectcraft_path::stroke_coverage(
-            std::slice::from_ref(&path),
-            &StrokeStyle { width: exp.abs() * 2.0, join: effectcraft_path::Join::Round, ..Default::default() },
-            &m,
-            w,
-            h,
-        );
-        cov.data.par_iter_mut().zip(ring.data.par_iter()).for_each(|(c, r)| {
-            *c = if exp > 0.0 { (*c + r - *c * r).min(1.0) } else { (*c * (1.0 - r)).max(0.0) };
-        });
-    }
     let feather = ctx.v2(layer, g, "feather", [0.0; 2]);
     if feather[0] > 0.0 || feather[1] > 0.0 {
         let img = cov.to_image();
@@ -114,10 +108,8 @@ pub fn shapes(ctx: &EvalCtx, layer: &Layer) -> Vec<effectcraft_effects::MaskShap
         let mut pts: Vec<[f64; 2]> = Vec::new();
         let mut closed = false;
         kurbo::flatten(path.iter(), 0.25, |el| match el {
-            effectcraft_path::PathEl::MoveTo(p) | effectcraft_path::PathEl::LineTo(p) => {
-                if pts.last() != Some(&[p.x, p.y]) {
-                    pts.push([p.x, p.y]);
-                }
+            effectcraft_path::PathEl::MoveTo(p) | effectcraft_path::PathEl::LineTo(p) if pts.last() != Some(&[p.x, p.y]) => {
+                pts.push([p.x, p.y]);
             }
             effectcraft_path::PathEl::ClosePath => closed = true,
             _ => {}
@@ -134,7 +126,10 @@ pub fn shapes(ctx: &EvalCtx, layer: &Layer) -> Vec<effectcraft_effects::MaskShap
 /// Returns whether any mask was applied.
 pub fn apply(ctx: &EvalCtx, layer: &Layer, buf: &mut Buf, blur: MaskBlur) -> bool {
     let Some(masks) = layer.masks() else { return false };
-    let list: Vec<_> = masks.groups().filter(|g| g.enabled && matches!(g.kind, GroupKind::Mask { mode, .. } if mode != MaskMode::None)).collect();
+    // An open mask (a path the Pen is still drawing) makes no transparency: the layer shows
+    // whole until the path is closed (After Effects; effects still use it as a path).
+    let closed = |g: &effectcraft_project::PropGroup| matches!(ctx.group_value(layer, g, "path"), Some(Value::Path(sp)) if sp.closed);
+    let list: Vec<_> = masks.groups().filter(|g| g.enabled && matches!(g.kind, GroupKind::Mask { mode, .. } if mode != MaskMode::None) && closed(g)).collect();
     if list.is_empty() {
         return false;
     }
@@ -142,9 +137,16 @@ pub fn apply(ctx: &EvalCtx, layer: &Layer, buf: &mut Buf, blur: MaskBlur) -> boo
     let n = (buf.img.width * buf.img.height) as usize;
     let first_sub = matches!(list[0].kind, GroupKind::Mask { mode: MaskMode::Subtract, .. });
     let mut acc = vec![if first_sub { 1.0f32 } else { 0.0 }; n];
+    // The first mask has nothing to combine with. Intersect and Darken would multiply or
+    // minimise against that empty coverage and hide the layer; they cover like Add instead.
+    // Lighten and Difference already do. Filling the accumulator first would make Add show
+    // the whole layer.
+    let mut first = true;
     for g in list {
         let GroupKind::Mask { mode, inverted, .. } = g.kind else { continue };
         let Some(mut cov) = coverage(ctx, layer, g, buf, blur) else { continue };
+        let mode = if first && matches!(mode, MaskMode::Intersect | MaskMode::Darken) { MaskMode::Add } else { mode };
+        first = false;
         let op = (ctx.f(layer, g, "opacity", 100.0) / 100.0) as f32;
         cov.data.par_iter_mut().for_each(|c| {
             if inverted {

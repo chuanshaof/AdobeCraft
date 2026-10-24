@@ -8,7 +8,7 @@
 use effectcraft_project::render_queue::{
     AlphaMode, AudioFormat, AudioOutput, Channels, ColorDepth, CurrentOrOff, DEFAULT_SEQUENCE_TEMPLATE, DEFAULT_TEMPLATE, EffectsMode, FieldRender,
     OutputFormat, OutputModule, PostRenderAction, ProResProfile, Pulldown, RESIZE_PRESETS, RenderLog, RenderQuality, RenderQueueItem, RenderSettings,
-    RenderStatus, ResizeQuality, SwitchOverride, TimeSpan, post_render_parse,
+    RenderStatus, ResizeQuality, SwitchOverride, TimeSpan, post_render_parse, without_project_extension,
 };
 use effectcraft_project::render_templates::{RenderTemplates, TemplateKind, TemplateSlot};
 use effectcraft_time::{FrameRate, Tick};
@@ -203,7 +203,7 @@ fn apply_om_template(om: &mut OutputModule, t: &OutputModule) {
 }
 
 /// The `format` parameter's values.
-const FORMATS: &str = "format: h264|hevc|av1|prores|webm|png|jpeg|tiff|exr|gif|wav|aiff";
+const FORMATS: &str = "format: h264|hevc|av1|prores|uncompressed|webm|png|jpeg|tiff|exr|gif|wav|aiff";
 
 /// Apply Output Module parameters (`template` first). `roi`: the viewer's region of interest
 /// (captured by `crop.useRoi`).
@@ -364,7 +364,8 @@ fn apply_output(om: &mut OutputModule, templates: &RenderTemplates, roi: Option<
     if let Some(l) = b_p(p, "includeProjectLink") {
         om.include_project_link = l;
     }
-    if let Some(o) = str_p(p, "output").or(str_p(p, "path")) {
+    // (Without the `.ecproj` a save dialog filtered to projects appended, #293.)
+    if let Some(o) = str_p(p, "output").or(str_p(p, "path")).map(without_project_extension) {
         om.output = o.to_string();
         // Only an extension the format doesn't write changes it: `.mp4` is H.264's, HEVC's and AV1's.
         if let Some(f) = OutputFormat::from_path(o).filter(|f| f.extension() != om.format.extension() && !o.contains("[fileExtension]")) {
@@ -379,6 +380,8 @@ fn apply_output(om: &mut OutputModule, templates: &RenderTemplates, roi: Option<
                 om.output = keep;
             }
         }
+        // The format's extension exactly once (`Comp 2.mov.mov` → `Comp 2.mov`).
+        om.output = om.format.with_extension(&om.output);
     }
     if *om != before {
         // Output To alone doesn't make the module custom.
@@ -523,7 +526,12 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     apply_settings(&mut it.settings, &templates, p, "renderQueue.add")?;
-    apply_output(&mut it.output, &templates, s.state.region_of_interest, p, "renderQueue.add")?;
+    // "template" belongs to Render Settings on add, not Output Module.
+    let mut output_params = p.clone();
+    if let Some(object) = output_params.as_object_mut() {
+        object.remove("template");
+    }
+    apply_output(&mut it.output, &templates, s.state.region_of_interest, &output_params, "renderQueue.add")?;
     if let Some(l) = enum_p(p, "log", "renderQueue.add", RenderLog::parse, "errorsOnly|plusSettings|plusPerFrameInfo")? {
         it.log = l;
     }
@@ -580,6 +588,22 @@ fn set_output_module(s: &mut Session, p: &Value) -> Result<Value> {
     let m = module_p(s, i, p, "renderQueue.setOutputModule")?;
     let mut om = module_ref(&s.project.render_queue[i], m).clone();
     let changed = apply_output(&mut om, &s.project.render_templates, s.state.region_of_interest, p, "renderQueue.setOutputModule")?;
+
+    // When aspect is locked, an explicit height-only edit must drive the size.
+    // frame_size() derives height from width; calculate the matching width from the
+    // cropped render bounds before storing the updated module.
+    let width_given =
+        p.get("resizeWidth").is_some() || p.get("resize").and_then(Value::as_object).is_some_and(|r| r.contains_key("width") || r.contains_key("preset"));
+    let height_given = p.get("resizeHeight").is_some() || p.get("resize").and_then(Value::as_object).is_some_and(|r| r.contains_key("height"));
+    if om.resize.enabled && om.resize.lock_aspect && height_given && !width_given {
+        let item = &s.project.render_queue[i];
+        let comp = s.project.comp(item.comp).ok_or(EngineError::NoComp)?;
+        let (w, h) = item.settings.output_size(comp);
+        let mut crop_only = om.clone();
+        crop_only.resize.enabled = false;
+        let (cw, ch) = crop_only.frame_size(w, h, item.settings.resolution.clamp(0.01, 4.0));
+        om.resize.width = ((om.resize.height as f64 * cw as f64 / ch as f64).round() as u32).clamp(1, 30_000);
+    }
     let post = match str_p(p, "postRenderAction") {
         Some(a) => Some(post_render_parse(a).ok_or_else(|| bad("renderQueue.setOutputModule", "postRenderAction: none|import|importAndReplace|setProxy"))?),
         None => None,
@@ -974,8 +998,8 @@ pub fn specs() -> Vec<CommandSpec> {
             "renderQueue.add",
             "Add to Render Queue",
             ["Composition"],
-            Some("Cmd+M"),
-            "{comp?: id|name, template?: Render Settings template, format?: h264|hevc|av1|prores|webm|png|jpeg|tiff|exr|gif|wav|aiff, output?: path|template, log?: errorsOnly|plusSettings|plusPerFrameInfo, quality?: best|draft|1-100 (jpeg, webm), resolution?: full|half|third|quarter|scale, proxyUse?, effects?, solo?, guideLayers?, colorDepth?, frameBlending?, fieldRender?, pulldown?, motionBlur?, timeSpan?: workArea|comp|custom, start?: s, end?: s, duration?: s, frameRate?: fps|null, skipExisting?: bool, storageOverflow?: bool, channels?: rgb|rgba|alpha, color?, bitrate?: kbps, webmBitrate?, keyframeInterval?, proresProfile?, profile?, level?, rateControl?, webmCodec?, audioBitrate?, opusApplication?, crop?, resize?, includeProjectLink?, audio?: auto|on|off, sampleRate?, audioChannels?, audioFormat?, loop?: bool (values as in setRenderSettings / setOutputModule)}",
+            ["Cmd+M", "Cmd+Shift+/"],
+            "{comp?: id|name, template?: Render Settings template, format?: h264|hevc|av1|prores|uncompressed|webm|png|jpeg|tiff|exr|gif|wav|aiff, output?: path|template, log?: errorsOnly|plusSettings|plusPerFrameInfo, quality?: best|draft|1-100 (jpeg, webm), resolution?: full|half|third|quarter|scale, proxyUse?, effects?, solo?, guideLayers?, colorDepth?, frameBlending?, fieldRender?, pulldown?, motionBlur?, timeSpan?: workArea|comp|custom, start?: s, end?: s, duration?: s, frameRate?: fps|null, skipExisting?: bool, storageOverflow?: bool, channels?: rgb|rgba|alpha, color?, bitrate?: kbps, webmBitrate?, keyframeInterval?, proresProfile?, profile?, level?, rateControl?, webmCodec?, audioBitrate?, opusApplication?, crop?, resize?, includeProjectLink?, audio?: auto|on|off, sampleRate?, audioChannels?, audioFormat?, loop?: bool (values as in setRenderSettings / setOutputModule)}",
             can_add,
             add
         ),
@@ -995,7 +1019,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Output Module Settings...",
             [],
             None,
-            "{item?|index?, module?: n (1 = first), template?: name, format?: h264|hevc|av1|prores|webm|png|jpeg|tiff|exr|gif|wav|aiff, channels?: rgb|rgba|alpha, color?: straight|premultiplied, quality?: 1-100, bitrate?: kbps, webmBitrate?: bool, keyframeInterval?: frames (0 = auto), proresProfile?: proxy|lt|standard|hq|4444|4444xq, profile?: main|main10 (HEVC/AV1), level?: auto|4.1, rateControl?: bitrate|quality, webmCodec?: vp9|av1, audioBitrate?: Opus kbps, opusApplication?: audio|voice, crop?: bool|{useRoi?, roi?, top?, left?, bottom?, right?}, cropTop?, cropLeft?, cropBottom?, cropRight?, resize?: bool|{preset?, width?, height?, lockAspect?, quality?: low|high}, resizeWidth?, resizeHeight?, postRenderAction?: none|import|importAndReplace|setProxy, includeProjectLink?: bool, audio?: auto|on|off, sampleRate?, audioChannels?: mono|stereo, audioFormat?: 16|24|32, loop?: bool, output?}",
+            "{item?|index?, module?: n (1 = first), template?: name, format?: h264|hevc|av1|prores|uncompressed|webm|png|jpeg|tiff|exr|gif|wav|aiff, channels?: rgb|rgba|alpha, color?: straight|premultiplied, quality?: 1-100, bitrate?: kbps, webmBitrate?: bool, keyframeInterval?: frames (0 = auto), proresProfile?: proxy|lt|standard|hq|4444|4444xq, profile?: main|main10 (HEVC/AV1), level?: auto|4.1, rateControl?: bitrate|quality, webmCodec?: vp9|av1, audioBitrate?: Opus kbps, opusApplication?: audio|voice, crop?: bool|{useRoi?, roi?, top?, left?, bottom?, right?}, cropTop?, cropLeft?, cropBottom?, cropRight?, resize?: bool|{preset?, width?, height?, lockAspect?, quality?: low|high}, resizeWidth?, resizeHeight?, postRenderAction?: none|import|importAndReplace|setProxy, includeProjectLink?: bool, audio?: auto|on|off, sampleRate?, audioChannels?: mono|stereo, audioFormat?: 16|24|32, loop?: bool, output?}",
             has_items,
             set_output_module
         ),

@@ -105,6 +105,8 @@ reproduce an image (for example, point lists traced from someone else's icon).
 See `CLAUDE.md`: pure Rust, dependency layering (`cargo xtask layers`), exact `Tick` time, everything is
 a command, everything is agent-drivable, and the quality gates (`cargo xtask ci`) before every commit.
 
+- **Time goes through `chrono`** (workspace dependency). Never hand-roll UTC/calendar conversion (days-to-date algorithms, leap-year math); a crate owns only its output format string. The one exception is range extension: past the years chrono can represent, shift the date by whole 400-year Gregorian cycles (146,097 days, after which the calendar repeats), let chrono compute the month and day, and add the cycles back to the year (splitting seconds into hours, minutes and seconds is plain arithmetic).
+
 Shared real-file test corpora (Photoshop-authored PSDs, etc.) live in
 [`storytold/photocraft-corpus`](https://github.com/storytold/photocraft-corpus), explained in
 [craftrules `standards/test-corpora.md`](https://github.com/storytold/craftrules/blob/main/standards/test-corpora.md).
@@ -114,7 +116,9 @@ as PhotoCraft does with `cargo xtask corpus`.
 
 ## See also
 
-- [docs/gaps.md](docs/gaps.md): where EffectCraft falls short of After Effects and the prioritised workstreams (G1–G9); read it before choosing work
+- [ROADMAP.md](ROADMAP.md): stage, headline numbers and what's next
+- [docs/gaps.md](docs/gaps.md): every known shortfall against After Effects, ranked, and the prioritised workstreams (G1–G9); read it before choosing work
+- [docs/target-app-parity.md](docs/target-app-parity.md): the parity numbers and how they were measured, with the per-area docs it links (UI, file formats, hardware, localization, effects, scripting); progress docs follow [craftrules `standards/progress-docs.md`](https://github.com/storytold/craftrules/blob/main/standards/progress-docs.md)
 - [CONTRIBUTING.md](CONTRIBUTING.md): setup, gates, commits, how to add things
 - [docs/architecture.md](docs/architecture.md): layers, data model, commands, pipeline
 - [docs/testing.md](docs/testing.md): oracle tests, criteria, benchmarks

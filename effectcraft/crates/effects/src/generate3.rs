@@ -15,7 +15,7 @@ use effectcraft_raster::{Image, Px};
 use rayon::prelude::*;
 
 use crate::util::{Plane, gauss_plane, hash1, layer_or_self, morph_frac, poly_length, premul, smoothstep, unpremul};
-use crate::{Buf, EffectCtx, EffectSpec, col, num, p, popup, slider};
+use crate::{Buf, EffectCtx, EffectSpec, Params, col, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
     EffectSpec { id, name, category: "Generate", params, render, gpu: false, float: true }
@@ -503,10 +503,8 @@ fn scan_runs(polys: &[(Vec<[f64; 2]>, bool, bool)], fill: u32, ew: f64, d: [f64;
             let entering = k % 2 == 0;
             let l = ew / sin;
             match mode {
-                0 => {
-                    if entering && k + 1 < xs.len() {
-                        out.push((t, xs[k + 1].0));
-                    }
+                0 if entering && k + 1 < xs.len() => {
+                    out.push((t, xs[k + 1].0));
                 }
                 1 => out.push((t - l * 0.5, t + l * 0.5)),
                 2 => out.push(if entering { (t, t + l) } else { (t - l, t) }),
@@ -1074,23 +1072,66 @@ fn vegas_plan(ctx: &EffectCtx, b: &Buf) -> PaintPlan {
 
 // ---------------------------------------------------------------- Write-on / Glue Gun
 
-/// Brush dab history: only the brush position at the current time is known to an effect
-/// (parameter histories are not passed in), so the stroke is drawn as the dabs laid along
-/// the current position — a single dab when the brush is static. Deterministic.
+/// Write-on draws a stroke along the animated Brush Position, as in After Effects: a dab every
+/// Brush Spacing seconds from the layer's start up to now, each one lasting Stroke Length
+/// seconds (0: for ever). The dabs' positions come from the host's parameters at their times;
+/// with Paint Time Properties ▸ Opacity or Brush Time Properties ▸ Size each dab keeps its own
+/// opacity or size, else the current ones apply to every dab. (Colour and hardness are one per
+/// stroke: the current ones.) Without a host (or dabs) the current dab draws. Deterministic.
 fn write_on(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let plan = write_on_plan(ctx, &b);
     draw_paint(&mut b, &plan);
     b
 }
 
+/// The most dabs one Write-on frame draws; longer strokes lay them further apart, joined.
+const WRITE_ON_MAX_DABS: i64 = 4096;
+
 fn write_on_plan(ctx: &EffectCtx, b: &Buf) -> PaintPlan {
     let pr = ctx.params;
-    let q = b.to_px(pr.v2("brushPosition"));
-    let r = (pr.f("brushSize") * b.scale * 0.5).max(0.05);
+    let own_opacity = pr.e("paintTimeProperties") == 1;
+    let own_size = matches!(pr.e("brushTimeProperties"), 1 | 3);
+    let opacity = |p: &Params| (p.f("brushOpacity") / 100.0).clamp(0.0, 1.0) as f32;
+    let radius = |p: &Params| (p.f("brushSize") * b.scale * 0.5).max(0.05);
+    let dab = |p: &Params| {
+        let q = b.to_px(p.v2("brushPosition"));
+        ([q.0, q.1], radius(if own_size { p } else { pr }), if own_opacity { opacity(p) } else { 1.0 })
+    };
+    let mut segs = vec![];
+    let t = ctx.time;
+    let spacing = pr.f("brushSpacing").max(0.001);
+    let life = pr.f("strokeLength").max(0.0);
+    if let Some(host) = ctx.env.host
+        && t.is_finite()
+        && t >= 0.0
+    {
+        let start = if life > 0.0 { (t - life).max(0.0) } else { 0.0 };
+        let k0 = (start / spacing - 1e-9).ceil().max(0.0) as i64;
+        let k1 = (t / spacing + 1e-9).floor().max(0.0) as i64;
+        let n = k1.saturating_sub(k0).saturating_add(1);
+        let stride = (n / WRITE_ON_MAX_DABS).saturating_add(1).max(1);
+        let mut prev: Option<[f64; 2]> = None;
+        let mut k = k0;
+        while k <= k1 {
+            let tk = k as f64 * spacing;
+            let at = if (tk - t).abs() < 1e-9 { Some(dab(pr)) } else { host.params_at(tk).map(|p| dab(&p)) };
+            if let Some((q, r, v)) = at {
+                // Dabs laid further apart than the brush spacing are joined into a line.
+                let a = if stride > 1 { prev.unwrap_or(q) } else { q };
+                segs.push(Seg { a, b: q, r, v });
+                prev = Some(q);
+            }
+            k = k.saturating_add(stride);
+        }
+    }
+    if segs.is_empty() {
+        let (q, r, v) = dab(pr);
+        segs.push(Seg { a: q, b: q, r, v });
+    }
     PaintPlan {
-        cov: Coverage::Segs { segs: vec![Seg { a: [q.0, q.1], b: [q.0, q.1], r, v: 1.0 }], hardness: pr.f("brushHardness") / 100.0 },
+        cov: Coverage::Segs { segs, hardness: pr.f("brushHardness") / 100.0 },
         color: pr.color("color"),
-        opacity: (pr.f("brushOpacity") / 100.0) as f32,
+        opacity: if own_opacity { 1.0 } else { opacity(pr) },
         style: pr.e("paintStyle"),
     }
 }
@@ -1602,26 +1643,55 @@ fn audio_waveform(ctx: &EffectCtx, mut b: Buf) -> Buf {
     b
 }
 
+fn compute_fft_mags(samples: &[f64]) -> (usize, f64, Vec<f64>) {
+    let m = samples.len();
+    let n = m.next_power_of_two().max(64);
+    let mut re = vec![0.0; n];
+    let mut im = vec![0.0; n];
+    let denom = (m.max(2) - 1) as f64;
+    for (i, s) in samples.iter().enumerate() {
+        let w = 0.5 - 0.5 * (2.0 * PI * i as f64 / denom).cos();
+        if let Some(r) = re.get_mut(i) {
+            *r = s * w;
+        }
+    }
+    fft(&mut re, &mut im);
+    let hz_per_bin = AUDIO_RATE as f64 / n as f64;
+    let scale = 4.0 / m.max(1) as f64;
+    let num_bins = n / 2 + 1;
+    let mut mags = Vec::with_capacity(num_bins);
+    for k in 0..num_bins {
+        let r = re.get(k).copied().unwrap_or(0.0);
+        let im_val = im.get(k).copied().unwrap_or(0.0);
+        let mag = (r * r + im_val * im_val).sqrt() * scale;
+        mags.push(mag);
+    }
+    (n, hz_per_bin, mags)
+}
+
 fn spectrum_plan(ctx: &EffectCtx, b: &Buf) -> Option<MarksPlan> {
     let pr = ctx.params;
     let samples = audio_window(ctx, pr.f("audioDuration"), pr.f("audioOffset"), 0)?;
-    let n = samples.len().next_power_of_two().max(64);
-    let mut re = vec![0.0; n];
-    let mut im = vec![0.0; n];
-    let m = samples.len();
-    for (i, s) in samples.iter().enumerate() {
-        // Hann window.
-        re[i] = s * (0.5 - 0.5 * (2.0 * PI * i as f64 / (m.max(2) - 1) as f64).cos());
-    }
-    fft(&mut re, &mut im);
+    let (_n, hz_per_bin, mags) = compute_fft_mags(&samples);
+
     let bands = pr.f("frequencyBands").round().clamp(1.0, 4096.0) as usize;
-    let f0 = pr.f("startFrequency").max(1.0);
+    let f0 = pr.f("startFrequency").max(0.0);
     let f1 = pr.f("endFrequency").max(f0 + 1.0);
-    let hz_per_bin = AUDIO_RATE as f64 / n as f64;
-    let mag = |f: f64| {
-        let k = ((f / hz_per_bin).round() as usize).min(n / 2);
-        (re[k] * re[k] + im[k] * im[k]).sqrt() * 4.0 / m as f64
+    let max_bin = mags.len().saturating_sub(1);
+
+    let get_band_mag = |fc: f64| -> f64 {
+        if mags.is_empty() || hz_per_bin <= 0.0 {
+            return 0.0;
+        }
+        let k_float = (fc / hz_per_bin).clamp(0.0, max_bin as f64);
+        let k0 = (k_float.floor() as usize).min(max_bin.saturating_sub(1));
+        let k1 = (k0 + 1).min(max_bin);
+        let frac = (k_float - k0 as f64).clamp(0.0, 1.0);
+        let m0 = mags.get(k0).copied().unwrap_or(0.0);
+        let m1 = mags.get(k1).copied().unwrap_or(0.0);
+        m0 * (1.0 - frac) + m1 * frac
     };
+
     let max_h = pr.f("maximumHeight") * b.scale;
     let thick = (pr.f("thickness") * b.scale).max(0.1);
     let soft = pr.f("softness") / 100.0;
@@ -1632,15 +1702,9 @@ fn spectrum_plan(ctx: &EffectCtx, b: &Buf) -> Option<MarksPlan> {
     let mut segs = Vec::new();
     for i in 0..bands {
         let u = if bands > 1 { i as f64 / (bands - 1) as f64 } else { 0.5 };
-        let fa = f0 * (f1 / f0).powf(i as f64 / bands as f64);
-        let fb = f0 * (f1 / f0).powf((i + 1) as f64 / bands as f64);
-        let mut v = 0.0f64;
-        let k = 4;
-        for j in 0..k {
-            v = v.max(mag(fa + (fb - fa) * j as f64 / k as f64));
-        }
-        let db = (20.0 * v.max(1e-9).log10() + 60.0) / 60.0;
-        let hgt = db.clamp(0.0, 1.0) * max_h;
+        let fc = f0 + (f1 - f0) * u;
+        let v = get_band_mag(fc);
+        let hgt = if (v * max_h).is_finite() { (v * max_h).clamp(0.0, max_h.max(0.0)) } else { 0.0 };
         let (q, nrm) = base.at(u);
         let (ua, ub) = match side {
             0 => (0.0, hgt),
@@ -2016,6 +2080,37 @@ mod tests {
     }
 
     #[test]
+    fn audio_spectrum_linear_frequency_and_linear_amplitude() {
+        let host = Tone; // Tone produces 440 Hz
+        let env = EffectEnv { host: Some(&host), comp_time: 1.0, ..Default::default() };
+        let img = Image::new(200, 100);
+        let out = run_env(
+            "ec.generate.audiospectrum",
+            &[
+                ("audioLayer", Value::Layer(Some(1))),
+                ("startPoint", Value::Vec2([0.0, 50.0])),
+                ("endPoint", Value::Vec2([200.0, 50.0])),
+                ("startFrequency", num(20.0)),
+                ("endFrequency", num(2000.0)),
+                ("frequencyBands", num(100.0)),
+                ("maximumHeight", num(40.0)),
+                ("thickness", num(2.0)),
+                ("softness", num(0.0)),
+            ],
+            img,
+            1.0,
+            env,
+        );
+        // Verify 440 Hz tone produces a peak above baseline, while high frequencies have zero bar height
+        let peak_zone = alpha_sum(&out.img, 36, 10, 48, 48);
+        let high_zone = alpha_sum(&out.img, 120, 10, 150, 48);
+        let silent_zone = alpha_sum(&out.img, 170, 10, 195, 48);
+        assert!(peak_zone > 5.0, "peak zone has energy: {peak_zone}");
+        assert!(peak_zone > high_zone * 2.0, "linear peak is distinctly taller than far frequencies: {peak_zone} vs {high_zone}");
+        assert_eq!(silent_zone, 0.0, "silent end has zero height, not boosted by dB scale");
+    }
+
+    #[test]
     fn fractal_deterministic_and_has_inside_set() {
         let img = Image::new(64, 48);
         let a = run("ec.generate.fractal", &[], img.clone());
@@ -2148,6 +2243,75 @@ mod tests {
         assert_eq!(g.img.data, run("ec.generate.ccgluegun", &[], src.clone()).img.data);
         assert_ne!(g.img.get(16, 16), src.get(16, 16));
         assert_eq!(g.img.get(0, 0), src.get(0, 0));
+    }
+
+    /// #536: an animated Brush Position draws a stroke that stays (Stroke Length 0), expires
+    /// after Stroke Length, and lays its dabs Brush Spacing seconds apart.
+    #[test]
+    fn write_on_accumulates_a_stroke_along_the_animated_brush() {
+        // Brush Position from [8, 16] at 0 s to [56, 16] at 1 s; red, hard, 6 px.
+        struct Brush(Vec<(&'static str, Value)>);
+        impl Brush {
+            fn at(&self, t: f64) -> Vec<(&'static str, Value)> {
+                let mut v = self.0.clone();
+                v.push(("brushPosition", Value::Vec2([8.0 + 48.0 * t.clamp(0.0, 1.0), 16.0])));
+                v
+            }
+        }
+        impl EffectHost for Brush {
+            fn layer(&self, _: u64, _: bool) -> Option<LayerPixels> {
+                None
+            }
+            fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+                None
+            }
+            fn params_at(&self, t: f64) -> Option<Params> {
+                let s = crate::find("ec.generate.writeon").unwrap();
+                let mut p = Params { values: s.params.iter().map(|p| (p.id.to_string(), p.default.clone())).collect() };
+                for (k, v) in self.at(t) {
+                    p.values.insert(k.to_string(), v);
+                }
+                Some(p)
+            }
+        }
+        let render = |extra: &[(&'static str, Value)], t: f64| {
+            let mut set = vec![("color", col(1.0, 0.0, 0.0)), ("brushSize", num(6.0)), ("brushHardness", num(100.0)), ("brushSpacing", num(0.05))];
+            set.extend(extra.iter().cloned());
+            let host = Brush(set);
+            let env = EffectEnv { host: Some(&host), ..Default::default() };
+            let at = host.at(t);
+            run_env("ec.generate.writeon", &at, Image::new(64, 32), t, env).img
+        };
+        let on = |img: &Image, x: i64| img.get(x, 16)[3] > 0.9;
+        let half = render(&[], 0.5);
+        assert!(on(&half, 8) && on(&half, 20) && on(&half, 32) && !on(&half, 44) && !on(&half, 56));
+        let end = render(&[], 1.0);
+        assert!([8, 20, 32, 44, 56].iter().all(|x| on(&end, *x)));
+        // Stroke Length 0.25 s: only the last quarter second's trail.
+        let trail = render(&[("strokeLength", num(0.25))], 1.0);
+        assert!(!on(&trail, 8) && !on(&trail, 32) && on(&trail, 48) && on(&trail, 56));
+        // Brush Spacing 0.5 s: three separate marks.
+        let spaced = render(&[("brushSpacing", num(0.5))], 1.0);
+        assert!(on(&spaced, 8) && on(&spaced, 32) && on(&spaced, 56) && !on(&spaced, 20) && !on(&spaced, 44));
+        // Paint Time Properties ▸ Opacity: each dab keeps the opacity it was laid with.
+        struct Fade;
+        impl EffectHost for Fade {
+            fn layer(&self, _: u64, _: bool) -> Option<LayerPixels> {
+                None
+            }
+            fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+                None
+            }
+            fn params_at(&self, t: f64) -> Option<Params> {
+                let mut p = Brush(vec![("brushHardness", num(100.0)), ("brushSpacing", num(0.05)), ("paintTimeProperties", Value::Enum(1))]).params_at(t)?;
+                p.values.insert("brushOpacity".into(), num(if t < 0.5 { 100.0 } else { 20.0 }));
+                Some(p)
+            }
+        }
+        let p1 = Fade.params_at(1.0).unwrap();
+        let set: Vec<(&str, Value)> = p1.values.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+        let faded = run_env("ec.generate.writeon", &set, Image::new(64, 32), 1.0, EffectEnv { host: Some(&Fade), ..Default::default() }).img;
+        assert!(faded.get(8, 16)[3] > 0.9 && (faded.get(56, 16)[3] - 0.2).abs() < 0.05, "{:?} {:?}", faded.get(8, 16), faded.get(56, 16));
     }
 
     #[test]

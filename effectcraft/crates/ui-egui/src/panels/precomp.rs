@@ -2,6 +2,7 @@
 //! composition duration, Open New Composition), the Composition Navigator bar above the viewer
 //! (the flow of nested comps, click to open) and the Composition Mini-Flowchart popup (Tab).
 
+use crate::i18n::{tr, tr_args};
 use effectcraft_engine::project::{ItemId, LayerSource, Project};
 use egui::{Align2, Color32, Rect, Sense, Stroke, pos2, vec2};
 use serde_json::json;
@@ -112,13 +113,14 @@ pub fn dialog(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let (mut ok, mut cancel) = (false, false);
     super::dialogs::modal(ctx, "Pre-compose", vec2(520.0, 360.0), t, |ui| {
         ui.horizontal(|ui| {
-            ui.label("New composition name:");
+            ui.label(tr("New composition name:"));
             let r = ui.add(egui::TextEdit::singleline(&mut d.name).desired_width(260.0));
+            crate::widgets::focus_on_open(ui.ctx(), &r, &d.name);
             app.auto.add("dialog.precompose.name", r.rect, "New composition name");
         });
         ui.add_space(10.0);
         ui.add_enabled_ui(d.can_leave, |ui| {
-            let r = ui.radio_value(&mut d.leave, true, format!("Leave all attributes in \"{}\"", d.layer_name));
+            let r = ui.radio_value(&mut d.leave, true, tr_args("Leave all attributes in \"{}\"", &[&d.layer_name]));
             app.auto.add("dialog.precompose.leave", r.rect, "Leave all attributes");
             ui.label(
                 egui::RichText::new(format!(
@@ -133,24 +135,24 @@ pub fn dialog(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
         let r = ui.radio_value(&mut d.leave, false, "Move all attributes into the new composition");
         app.auto.add("dialog.precompose.move", r.rect, "Move all attributes");
         ui.label(
-            egui::RichText::new("Use this option to place the currently selected layers together into a new intermediate composition.")
+            egui::RichText::new(tr("Use this option to place the currently selected layers together into a new intermediate composition."))
                 .color(t.text_dim)
                 .size(11.0),
         );
         ui.add_space(4.0);
         ui.add_enabled_ui(!d.leave, |ui| {
-            let r = ui.checkbox(&mut d.adjust, "Adjust composition duration to the time span of the selected layers");
+            let r = ui.checkbox(&mut d.adjust, tr("Adjust composition duration to the time span of the selected layers"));
             app.auto.add("dialog.precompose.adjust", r.rect, "Adjust composition duration");
         });
         ui.add_space(8.0);
-        let r = ui.checkbox(&mut d.open, "Open New Composition");
+        let r = ui.checkbox(&mut d.open, tr("Open New Composition"));
         app.auto.add("dialog.precompose.open", r.rect, "Open New Composition");
         ui.add_space(14.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let r = ui.add(egui::Button::new(egui::RichText::new("   OK   ").color(Color32::WHITE)).fill(t.accent));
+            let r = ui.add(egui::Button::new(egui::RichText::new(tr("   OK   ")).color(Color32::WHITE)).fill(t.accent));
             app.auto.add("dialog.precompose.ok", r.rect, "OK");
             ok = r.clicked();
-            let r = ui.button("Cancel");
+            let r = ui.button(tr("Cancel"));
             app.auto.add("dialog.precompose.cancel", r.rect, "Cancel");
             cancel = r.clicked();
         });
@@ -222,7 +224,7 @@ pub fn navigator(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
     let fr = Rect::from_min_size(pos2(rect.max.x - 26.0, rect.min.y + 2.0), vec2(22.0, rect.height() - 4.0));
     if crate::widgets::icon_button(ui, fr, crate::icons::Icon::Flowchart, false, &t, egui::Id::new("comp-nav-flow"))
-        .on_hover_text("Composition Mini-Flowchart")
+        .on_hover_text(tr("Composition Mini-Flowchart"))
         .clicked()
     {
         app.ui.mini_flowchart = Some([fr.min.x, fr.max.y]);
@@ -300,7 +302,7 @@ pub fn mini_flowchart(app: &mut EffectcraftApp, ctx: &egui::Context) {
                 }
             }
             if ups.is_empty() && downs.is_empty() {
-                p.text(pos2(rect.center().x, rect.max.y - 4.0), Align2::CENTER_BOTTOM, "No nested compositions", Tokens::ui(10.5), t.text_faint);
+                p.text(pos2(rect.center().x, rect.max.y - 4.0), Align2::CENTER_BOTTOM, tr("No nested compositions"), Tokens::ui(10.5), t.text_faint);
             }
         });
     });

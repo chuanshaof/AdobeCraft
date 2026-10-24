@@ -2,11 +2,55 @@
 
 use egui::{Align2, Color32, Rect, Response, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 
+use effectcraft_project::ParamUi;
+
 use crate::automation::Registry;
 use crate::icons::{self, Icon};
 use crate::theme::Tokens;
 
-/// "Hot text": a blue number you drag horizontally to scrub, click to type.
+/// The [`egui::UiStackInfo`] tag of a dock panel's `Ui`: Tab moves between the hot-text fields
+/// of one panel.
+pub const PANEL_TAG: &str = "effectcraft.panel";
+
+/// A panel's hot-text fields in drawing order (this pass's and the last one's), and a Tab
+/// pressed while typing in one: (that field, Shift held, the pass).
+#[derive(Clone, Default)]
+struct TabOrder {
+    pass: u64,
+    current: Vec<egui::Id>,
+    last: Vec<egui::Id>,
+    pending: Option<(egui::Id, bool, u64)>,
+}
+
+fn tab_order_id(ui: &Ui) -> egui::Id {
+    let panel = ui.stack().iter().find(|s| s.tags().contains(PANEL_TAG)).map_or(egui::Id::NULL, |s| s.id);
+    egui::Id::new(("hot-tab-order", panel))
+}
+
+/// Puts hot-text field `id` in its panel's Tab order. True when a Tab in the field before it
+/// (Shift+Tab: after it) moves the typing here.
+fn tab_stop(ui: &Ui, id: egui::Id) -> bool {
+    let key = tab_order_id(ui);
+    let pass = ui.ctx().cumulative_pass_nr();
+    ui.data_mut(|d| {
+        let o = d.get_temp_mut_or_default::<TabOrder>(key);
+        if o.pass != pass {
+            o.last = std::mem::take(&mut o.current);
+            o.pass = pass;
+        }
+        o.current.push(id);
+        let Some((from, back, at)) = o.pending else { return false };
+        let i = o.last.iter().position(|f| *f == from);
+        let next = i.and_then(|i| if back { i.checked_sub(1) } else { i.checked_add(1) }).and_then(|i| o.last.get(i)).copied();
+        if next == Some(id) || next.is_none() || pass > at.saturating_add(2) {
+            o.pending = None;
+        }
+        next == Some(id)
+    })
+}
+
+/// "Hot text": a blue number you drag horizontally to scrub, click to type. Tab / Shift+Tab
+/// while typing commits and types in the panel's next / previous one, as in After Effects.
 /// Returns (response, Some(new value) when changed, drag finished).
 pub fn hot_number_at(
     ui: &mut Ui,
@@ -20,16 +64,28 @@ pub fn hot_number_at(
     t: &Tokens,
 ) -> (Rect, Option<f64>, bool) {
     let editing_id = id.with("editing");
-    let editing: Option<String> = ui.data(|d| d.get_temp(editing_id));
+    let mut editing: Option<String> = ui.data(|d| d.get_temp(editing_id));
+    if tab_stop(ui, id) && editing.is_none() {
+        editing = Some(format!("{value:.decimals$}"));
+    }
     let text = format!("{value:.decimals$}{suffix}");
     let galley = ui.painter().layout_no_wrap(text, Tokens::ui(12.0), t.hot_text);
     let rect = Rect::from_min_size(rect_min, galley.size() + vec2(4.0, 4.0));
     if let Some(mut buf) = editing {
         let er = Rect::from_min_size(rect_min - vec2(2.0, 1.0), vec2((galley.size().x + 24.0).max(54.0), 18.0));
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(er));
-        let r = child.add(egui::TextEdit::singleline(&mut buf).desired_width(er.width()).font(Tokens::ui(12.0)).margin(egui::Margin::symmetric(2, 1)));
+        // (Tab stays with the field: it moves to the next hot-text field, not the next widget.)
+        let r = child.add(
+            egui::TextEdit::singleline(&mut buf)
+                .id(id.with("text"))
+                .desired_width(er.width())
+                .font(Tokens::ui(12.0))
+                .margin(egui::Margin::symmetric(2, 1))
+                .lock_focus(true),
+        );
+        let tab = r.has_focus().then(|| ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab).then_some(i.modifiers.shift))).flatten();
         let mut out = None;
-        if r.lost_focus() {
+        if r.lost_focus() || tab.is_some() {
             let txt = buf.trim().trim_end_matches(suffix).trim().replace(',', ".");
             if !ui.input(|i| i.key_pressed(egui::Key::Escape))
                 && let Ok(v) = txt.parse::<f64>()
@@ -38,6 +94,11 @@ pub fn hot_number_at(
                 out = Some(v.clamp(range.0, range.1));
             }
             ui.data_mut(|d| d.remove::<String>(editing_id));
+            if let Some(back) = tab {
+                r.surrender_focus();
+                let (key, pass) = (tab_order_id(ui), ui.ctx().cumulative_pass_nr());
+                ui.data_mut(|d| d.get_temp_mut_or_default::<TabOrder>(key).pending = Some((id, back, pass)));
+            }
         } else {
             keep_focus(ui.ctx(), &r, &buf);
             ui.data_mut(|d| d.insert_temp(editing_id, buf));
@@ -45,6 +106,7 @@ pub fn hot_number_at(
         return (er, out, out.is_some());
     }
     let resp = ui.interact(rect, id, Sense::click_and_drag());
+    crate::pointer_wrap::track(&resp);
     let col = if resp.hovered() || resp.dragged() { t.accent_hover } else { t.hot_text };
     ui.painter().galley_with_override_text_color(rect.min + vec2(2.0, 2.0), galley, col);
     if resp.hovered() || resp.dragged() {
@@ -61,7 +123,7 @@ pub fn hot_number_at(
         let mult = ui.input(|i| {
             if i.modifiers.shift {
                 10.0
-            } else if i.modifiers.command {
+            } else if i.modifiers.command && !proportional_scrub(i.modifiers) {
                 0.1
             } else {
                 1.0
@@ -76,6 +138,23 @@ pub fn hot_number_at(
         ui.data_mut(|d| d.insert_temp(editing_id, format!("{value:.decimals$}")));
     }
     (rect, out, resp.drag_stopped())
+}
+
+/// Ctrl+Alt (Cmd+Opt on macOS) held while scrubbing hot text: After Effects' Proportional
+/// Scrubbing, which spreads the change over the selected layers by selection order. Ctrl alone
+/// still scrubs finely and Shift by tens.
+pub fn proportional_scrub(m: egui::Modifiers) -> bool {
+    m.command && m.alt
+}
+
+/// How far one pointer pixel scrubs a hot-text field: the property's slider (soft) range over
+/// 300 px. The Timeline and Effect Controls share this so they cannot drift; a large hard range
+/// only allows typing big values, it must not make dragging coarse (#2097).
+pub fn slider_scrub_speed(ui: &ParamUi) -> f64 {
+    match ui {
+        ParamUi::Slider { slider_min, slider_max, .. } => ((slider_max - slider_min) / 300.0).clamp(0.001, 50.0),
+        _ => 0.5,
+    }
 }
 
 /// [`hot_number_at`] for a whole number (an angle's revolutions): a drag steps it once every
@@ -95,13 +174,54 @@ pub fn hot_int_at(ui: &mut Ui, rect_min: egui::Pos2, id: egui::Id, value: i64, s
     (rect, (step != 0.0).then(|| value.saturating_add(step as i64)), done)
 }
 
-/// Keep the keyboard on an inline editor that is open until it loses the focus. The frame it
-/// opens (it has no focus yet) its whole `text` is selected, so typing replaces the value.
-pub fn keep_focus(ctx: &egui::Context, field: &Response, text: &str) {
-    if !ctx.memory(|m| m.has_focus(field.id)) {
-        select_all(ctx, field.id, text);
+/// Standard numeric editors use the same continuous native scrubbing as hot text.
+pub fn drag_value(value: egui::DragValue<'_>) -> impl egui::Widget {
+    move |ui: &mut Ui| {
+        let response = ui.add(value);
+        crate::pointer_wrap::track(&response);
+        response
     }
-    field.request_focus();
+}
+
+/// Keep the keyboard on an inline editor that is open until it loses the focus. The frame it
+/// opens its whole `text` is selected, so typing replaces the value; after that the caret is the
+/// user's (arrow keys move it), even if the field is without the focus for a frame (#488).
+/// (The focus is only requested while the field doesn't have it: a request resets what keys the
+/// field keeps for itself, such as Tab with [`egui::TextEdit::lock_focus`].)
+pub fn keep_focus(ctx: &egui::Context, field: &Response, text: &str) {
+    // The editor is open in consecutive passes; a gap means it was closed and opened again.
+    let shown = field.id.with("keep-focus-pass");
+    let pass = ctx.cumulative_pass_nr();
+    let previous = ctx.data_mut(|d| {
+        let previous = d.get_temp::<u64>(shown);
+        d.insert_temp(shown, pass);
+        previous
+    });
+    let opening = previous.is_none_or(|p| p.saturating_add(1) < pass);
+    if !ctx.memory(|m| m.has_focus(field.id)) {
+        if opening {
+            select_all(ctx, field.id, text);
+        }
+        field.request_focus();
+    }
+}
+
+/// Put the keyboard on a dialog's first text field the frame the dialog opens, with its whole
+/// `text` selected, so typing replaces the value without a click. Unlike [`keep_focus`] the
+/// focus is the user's afterwards.
+pub fn focus_on_open(ctx: &egui::Context, field: &Response, text: &str) {
+    // The dialog is open in consecutive passes; a gap means it was closed and opened again.
+    let shown = field.id.with("focus-on-open-pass");
+    let pass = ctx.cumulative_pass_nr();
+    let previous = ctx.data_mut(|d| {
+        let previous = d.get_temp::<u64>(shown);
+        d.insert_temp(shown, pass);
+        previous
+    });
+    if previous.is_none_or(|p| p.saturating_add(1) < pass) {
+        select_all(ctx, field.id, text);
+        field.request_focus();
+    }
 }
 
 /// Select all of the text field `id`'s `text`, so typing replaces it.
@@ -121,17 +241,8 @@ pub fn swatch(ui: &mut Ui, rect: Rect, c: [f32; 4], id: egui::Id, t: &Tokens) ->
     resp
 }
 
-/// A colour button with egui's picker for a colour stored as sRGB components (0–1), as the
-/// project stores colours (`color_edit_button_rgb` reads linear values and shows them lighter).
-/// The value is only rewritten when the user picks a colour.
-pub fn srgb_color_button(ui: &mut Ui, c: &mut [f32; 3]) -> Response {
-    let mut u = c.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
-    let r = ui.color_edit_button_srgb(&mut u);
-    if r.changed() {
-        *c = u.map(|v| v as f32 / 255.0);
-    }
-    r
-}
+// The colour picker and its helpers (every colour input uses them).
+pub use crate::color_picker::{color_popup, hex_rgb, hsv_to_rgb, rgb_to_hsv, srgb_color_button, srgb_hex, srgb32};
 
 /// A twirl-down triangle; returns clicked.
 pub fn twirl(ui: &mut Ui, rect: Rect, open: bool, id: egui::Id, t: &Tokens) -> Response {
@@ -178,7 +289,15 @@ pub fn icon_button(ui: &mut Ui, rect: Rect, icon: Icon, active: bool, t: &Tokens
         t.icon
     };
     icons::paint(ui.painter(), rect.shrink(rect.width() * 0.22), icon, col);
+    focus_outline(ui, &resp, t);
     resp
+}
+
+/// Keep keyboard focus visible on custom-painted controls, including their active state.
+pub fn focus_outline(ui: &Ui, response: &Response, t: &Tokens) {
+    if response.has_focus() {
+        ui.painter().rect_stroke(response.rect.shrink(1.0), 4.0, Stroke::new(2.0, t.text), StrokeKind::Inside);
+    }
 }
 
 /// One line of `text` at `pos` (placed by `align`), cut short with "…" past `max_w` points so it
@@ -216,6 +335,8 @@ fn field(ui: &mut Ui, rect: Rect, text: &mut String, hint: &str, t: &Tokens, sea
             .hint_text(hint)
             .frame(egui::Frame::NONE)
             .desired_width(inner.width())
+            // As tall as the field, so the text and the hint sit on its middle (they sat high, #581).
+            .min_size(inner.size())
             .font(Tokens::ui(12.0))
             .vertical_align(egui::Align::Center),
     )
@@ -223,6 +344,11 @@ fn field(ui: &mut Ui, rect: Rect, text: &mut String, hint: &str, t: &Tokens, sea
 
 /// Dropdown-looking control ("Full ▾").
 pub fn dropdown(ui: &mut Ui, rect: Rect, text: &str, t: &Tokens, id: egui::Id) -> Response {
+    dropdown_tip(ui, rect, text, None, t, id)
+}
+
+/// [`dropdown`] with a tooltip `tip` (shown always; it replaces the elided text's tooltip).
+pub fn dropdown_tip(ui: &mut Ui, rect: Rect, text: &str, tip: Option<&str>, t: &Tokens, id: egui::Id) -> Response {
     let resp = ui.interact(rect, id, Sense::click());
     ui.painter().rect_filled(rect, 3.0, if resp.hovered() { t.hover } else { t.field_bg });
     ui.painter().rect_stroke(rect, 3.0, Stroke::new(1.0, t.field_border), StrokeKind::Inside);
@@ -244,6 +370,9 @@ pub fn dropdown(ui: &mut Ui, rect: Rect, text: &str, t: &Tokens, id: egui::Id) -
     };
     ui.painter().text(pos2(rect.min.x + 7.0, rect.center().y), Align2::LEFT_CENTER, shown, Tokens::ui(11.5), t.text);
     icons::paint(ui.painter(), Rect::from_center_size(pos2(rect.max.x - 9.0, rect.center().y), vec2(8.0, 8.0)), Icon::ChevronDown, t.text_dim);
+    if let Some(tip) = tip {
+        return resp.on_hover_text(tip.to_string());
+    }
     if text.chars().count() > 0 && !fits(text) {
         return resp.on_hover_text(text.to_string());
     }
@@ -365,6 +494,61 @@ pub fn check_label(on: bool, label: &str) -> String {
     if on { format!("✓ {label}") } else { format!("   {label}") }
 }
 
+fn label_swatch_id() -> egui::Id {
+    egui::Id::new("label-swatch")
+}
+
+/// The colour swatch of a Label menu row, as an atom for its button: Label menus show each
+/// label's colour before its name (After Effects), so a label is picked by its colour. Paint it
+/// with [`paint_label_swatch`] once the button is laid out.
+pub fn label_swatch() -> egui::Atom<'static> {
+    egui::Atom::custom(label_swatch_id(), vec2(12.0, 12.0))
+}
+
+/// Paint the [`label_swatch`] of a laid-out button: label `l`'s colour, an empty box for None.
+pub fn paint_label_swatch(ui: &Ui, out: &egui::AtomLayoutResponse, l: effectcraft_engine::color::Label, t: &Tokens) {
+    let Some(r) = out.rect(label_swatch_id()) else { return };
+    let r = Rect::from_center_size(r.center(), vec2(11.0, 11.0));
+    if l == effectcraft_engine::color::Label::None {
+        ui.painter().rect_stroke(r, 2.0, Stroke::new(1.0, t.text_dim), StrokeKind::Inside);
+    } else {
+        ui.painter().rect_filled(r, 2.0, t.label(l));
+    }
+}
+
+/// A Label menu row: label `l`'s swatch then `name`, highlighted when it is the `current` label.
+pub fn label_entry(ui: &mut Ui, l: effectcraft_engine::color::Label, name: &str, current: bool, t: &Tokens) -> Response {
+    let out = egui::Button::selectable(current, (label_swatch(), name)).atom_ui(ui);
+    paint_label_swatch(ui, &out, l, t);
+    out.response
+}
+
+/// The open label menu `id` at `pos` (open it with [`open_popup`]): every label's swatch and its
+/// name from Settings ▸ Labels (`name`). Returns the chosen label.
+pub fn label_popup(
+    ui: &mut Ui,
+    id: egui::Id,
+    pos: egui::Pos2,
+    current: effectcraft_engine::color::Label,
+    name: impl Fn(effectcraft_engine::color::Label) -> String,
+    t: &Tokens,
+) -> Option<effectcraft_engine::color::Label> {
+    if !popup_is_open(ui, id) {
+        return None;
+    }
+    let labels = effectcraft_engine::color::Label::ALL;
+    popup_list(ui, id, pos, Rect::NOTHING, labels.len(), 0, |ui| {
+        ui.set_min_width(160.0);
+        let mut chosen = None;
+        for l in labels {
+            if label_entry(ui, l, &name(l), l == current, t).clicked() {
+                chosen = Some(l);
+            }
+        }
+        chosen
+    })
+}
+
 /// Show a popup menu anchored at `pos` with string options; returns the chosen index.
 pub fn popup_menu(ui: &mut Ui, id: egui::Id, pos: egui::Pos2, options: &[String], current: Option<usize>) -> Option<usize> {
     if !popup_is_open(ui, id) {
@@ -383,6 +567,44 @@ pub fn popup_menu(ui: &mut Ui, id: egui::Id, pos: egui::Pos2, options: &[String]
         }
         chosen
     })
+}
+
+/// The drop-down for a layer-valued property (`ParamUi::Layer`): the current layer shown as
+/// "N. name" (or "None"), and a popup of "None" plus every layer of the comp. Effect Controls
+/// and the Timeline share it so a layer reference (an Environment light's Source, a Displacement
+/// Map's layer) is picked the same way in every panel, and the reference is shown as its layer's
+/// index and name rather than its internal id. Returns `Some(chosen)` when the user picked —
+/// the layer's id, or `None` for "None" — and `None` while nothing is chosen; the caller writes
+/// it as an undoable `prop.set` (id, or null for "None").
+pub fn layer_picker(
+    ui: &mut Ui,
+    rect: Rect,
+    layers: &[effectcraft_engine::project::Layer],
+    current: Option<u64>,
+    t: &Tokens,
+    id: egui::Id,
+) -> Option<Option<u64>> {
+    let index_of = |wanted: u64| layers.iter().position(|l| l.id.0 == wanted);
+    let entry = |i: usize| layers.get(i).map(|l| format!("{}. {}", i + 1, l.name));
+    let current_index = current.and_then(index_of);
+    let label = current_index.and_then(entry).unwrap_or_else(|| crate::i18n::tr("None").to_string());
+    let pop = id.with("pop");
+    if dropdown(ui, rect, &label, t, id).clicked() {
+        open_popup(ui, pop);
+    }
+    if !popup_is_open(ui, pop) {
+        return None;
+    }
+    // Built only while open: a comp can hold hundreds of layers.
+    let mut options: Vec<String> = Vec::with_capacity(layers.len() + 1);
+    options.push(crate::i18n::tr("None").to_string());
+    options.extend((0..layers.len()).filter_map(entry));
+    // The current entry is highlighted (the first option is "None").
+    match popup_menu(ui, pop, rect.left_bottom(), &options, Some(current_index.map_or(0, |i| i + 1))) {
+        Some(0) => Some(None),
+        Some(picked) => layers.get(picked - 1).map(|l| Some(l.id.0)),
+        None => None,
+    }
 }
 
 /// The open popup list `id` at `pos`, drawn by `body` (`rows` entries and `seps` separators,
@@ -404,6 +626,7 @@ pub fn popup_list<R>(ui: &mut Ui, id: egui::Id, pos: egui::Pos2, anchor: Rect, r
             egui::ScrollArea::vertical().max_height(max_h).min_scrolled_height((est - 16.0).min(max_h)).show(ui, |ui| chosen = body(ui));
         });
     });
+    note_open_popup_list(ui.ctx());
     let outside = pressed_outside(ui.ctx(), &area.response) && !ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| anchor.contains(p));
     if chosen.is_some() || outside || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         ui.data_mut(|d| d.insert_temp(id.with("open"), false));
@@ -411,14 +634,122 @@ pub fn popup_list<R>(ui: &mut Ui, id: egui::Id, pos: egui::Pos2, anchor: Rect, r
     chosen
 }
 
+/// Custom popup lists also hold the app's keyboard shortcuts while open.
+pub(crate) fn note_open_popup_list(ctx: &egui::Context) {
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|d| d.insert_temp(popup_list_pass_id(), pass));
+}
+
+/// The pass a [`popup_list`] was last drawn in.
+fn popup_list_pass_id() -> egui::Id {
+    egui::Id::new("popup-list-pass")
+}
+
+/// Whether a menu, context menu or popup list is open, or the menu bar has the keyboard (as of
+/// the last frame): the app's keyboard shortcuts wait until it closes (#279).
+pub fn any_menu_open(ctx: &egui::Context) -> bool {
+    let list_pass: Option<u64> = ctx.data(|d| d.get_temp(popup_list_pass_id()));
+    egui::Popup::is_any_open(ctx) || crate::menu_keys::active(ctx) || list_pass.is_some_and(|p| p + 1 >= ctx.cumulative_pass_nr())
+}
+
 /// A menu's (or submenu's) entries, scrolling with a scroll bar when they are taller than the
 /// window instead of running off it (Edit on a short screen, #269; Blending Mode). Others show
 /// whole: egui sizes a new menu from a default 400 pt area, so without a minimum a longer one
 /// (Window ▸ Workspace) got stuck at that height with its last entries scrolled out of view
 /// (#191).
-pub fn menu_scroll<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+///
+/// While the bar is mid press-and-browse (`browsing`), resting the pointer against the menu's
+/// bottom or top edge scrolls it from there — a crawl at first, then a run, as native menus do —
+/// so a long list can be walked with no wheel. Without the hold the edges do nothing: the wheel
+/// and the scroll bar are how a normally opened menu scrolls.
+pub fn menu_scroll<R>(ui: &mut Ui, browsing: bool, add: impl FnOnce(&mut Ui) -> R) -> R {
     let max_h = ui.ctx().content_rect().height() - 40.0;
-    egui::ScrollArea::vertical().max_height(max_h).min_scrolled_height(max_h).show(ui, add).inner
+    let out = egui::ScrollArea::vertical().max_height(max_h).min_scrolled_height(max_h).show(ui, add);
+    edge_scroll(ui, &out, browsing);
+    out.inner
+}
+
+/// The edge scroll [`menu_scroll`] adds while browsing: with the pointer resting in the bottom
+/// (top) band of an overflowing menu, its content crawls up (down) after a short pause, ramps to
+/// a run and stops at the end — and stops at once when the pointer leaves the band or the hold.
+///
+/// This runs after `ScrollArea::show`, which laid the menu out for the offset it had, so the new
+/// offset goes into the area's state and shows on the next frame: a frame of lag, invisible at
+/// these speeds. egui's own scrolling (wheel, drag, scroll bar) is untouched.
+fn edge_scroll<R>(ui: &Ui, out: &egui::containers::scroll_area::ScrollAreaOutput<R>, browsing: bool) {
+    /// How far from the top / bottom edge the pointer starts the crawl (points).
+    const BAND: f32 = 18.0;
+    /// The pause before the crawl starts: a pointer merely grazing the edge must not jump.
+    const DELAY: f32 = 0.12;
+    /// Points per second: a crawl at first, reaching the run about three quarters of a second in.
+    const CRAWL: f32 = 45.0;
+    const RAMP: f32 = 700.0;
+    const RUN: f32 = 560.0;
+
+    let ctx = ui.ctx();
+    let over = out.content_size.y - out.inner_rect.height();
+    let dir = match (browsing, over > 0.0, ctx.input(|i| i.pointer.latest_pos())) {
+        (true, true, Some(p)) if out.inner_rect.contains(p) => {
+            if p.y >= out.inner_rect.max.y - BAND {
+                1
+            } else if p.y <= out.inner_rect.min.y + BAND {
+                -1
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    };
+    // The clock the pause counts from, kept per menu: entering or leaving an edge band restarts
+    // it, so a later stay there crawls off again instead of jumping straight to the run.
+    let now = ctx.input(|i| i.time);
+    let key = out.id.with("menu-edge-scroll");
+    let (since, prev) = ctx.data(|d| d.get_temp::<(f64, i32)>(key)).unwrap_or((now, 0));
+    let since = if dir == prev {
+        since
+    } else {
+        ctx.data_mut(|d| d.insert_temp(key, (now, dir)));
+        now
+    };
+    if dir == 0 {
+        return;
+    }
+    if now - since < f64::from(DELAY) {
+        // A pointer resting still fires no events: keep the frames coming until the crawl runs.
+        ctx.request_repaint();
+        return;
+    }
+    let speed = (CRAWL + RAMP * ((now - since) as f32 - DELAY)).min(RUN);
+    let crawl = ctx.input(|i| i.unstable_dt).min(0.05) * speed * dir as f32;
+    let new = (out.state.offset.y + crawl).clamp(0.0, over);
+    if new != out.state.offset.y {
+        let mut state = out.state;
+        state.offset.y = new;
+        state.store(ctx, out.id);
+        // At the end of the list the crawl stands still and asks for no more frames.
+        ctx.request_repaint();
+    }
+}
+
+/// egui's menu style with no gap between the rows: the gap the app's item spacing left between
+/// two entries highlighted neither and swallowed a click there. The rows grow by that gap, so a
+/// menu keeps its size.
+pub fn menu_style(style: &mut egui::Style) {
+    egui::containers::menu::menu_style(style);
+    style.spacing.interact_size.y += style.spacing.item_spacing.y;
+    style.spacing.item_spacing.y = 0.0;
+}
+
+/// `resp`'s context menu in the app's [`menu_style`] (its submenus inherit it).
+pub fn context_menu(resp: &Response, add_contents: impl FnOnce(&mut Ui)) -> Option<egui::InnerResponse<()>> {
+    egui::Popup::context_menu(resp).style(menu_style).show(add_contents)
+}
+
+/// A button opening a menu in the app's [`menu_style`], for one outside the menu bar.
+pub fn menu_button<'a, R>(ui: &mut Ui, atoms: impl egui::IntoAtoms<'a>, add_contents: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<Option<R>> {
+    let config = egui::containers::menu::MenuConfig::new().style(menu_style);
+    let (response, inner) = egui::containers::menu::MenuButton::new(atoms).config(config).ui(ui, add_contents);
+    egui::InnerResponse::new(inner.map(|i| i.inner), response)
 }
 
 /// Whether a [`popup_menu`] is open (build its options only then: they can be long).
@@ -428,4 +759,98 @@ pub fn popup_is_open(ui: &Ui, id: egui::Id) -> bool {
 
 pub fn open_popup(ui: &Ui, id: egui::Id) {
     ui.data_mut(|d| d.insert_temp(id.with("open"), true));
+}
+
+/// Linked values after component `d` of `c` became `v`: the others scale by the same ratio
+/// (Constrain Proportions); from 0 the others that are 0 too follow the value.
+pub(crate) fn constrained(c: &[f64], d: usize, v: f64) -> Vec<f64> {
+    let Some(&old) = c.get(d) else { return c.to_vec() };
+    c.iter()
+        .enumerate()
+        .map(|(e, &x)| {
+            if e == d {
+                v
+            } else if old.abs() > 1e-9 {
+                x * v / old
+            } else if x.abs() <= 1e-9 {
+                v
+            } else {
+                x
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #2097: the drag speed comes from the slider range, not a much wider hard range.
+    #[test]
+    fn slider_scrub_speed_uses_the_slider_range() {
+        let slider = |min, max, slider_min, slider_max| ParamUi::Slider { min, max, slider_min, slider_max, decimals: 1 };
+        assert!((slider_scrub_speed(&slider(0.0, 10_000.0, 0.0, 1_000.0)) - 1_000.0 / 300.0).abs() < 1e-9);
+        assert!((slider_scrub_speed(&slider(0.0, 1.0e9, 0.0, 1.0)) - 1.0 / 300.0).abs() < 1e-9);
+        assert_eq!(slider_scrub_speed(&ParamUi::Number), 0.5);
+    }
+
+    /// #488: an inline editor selects its whole text only as it opens. Should it be without the
+    /// keyboard for a frame later (an input method, another handler), it takes the keyboard back
+    /// with the caret where the user put it instead of selecting everything again, which made
+    /// the arrows seem dead and Backspace erase the whole name.
+    #[test]
+    fn inline_editors_select_all_only_as_they_open() {
+        let ctx = egui::Context::default();
+        let mut text = String::from("Comp 1");
+        let mut id = egui::Id::NULL;
+        let frame = |ctx: &egui::Context, text: &mut String, id: &mut egui::Id| {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let r = ui.add(egui::TextEdit::singleline(text));
+                keep_focus(ui.ctx(), &r, text);
+                *id = r.id;
+            });
+            out.textures_delta.clear();
+        };
+        let range = |ctx: &egui::Context, id: egui::Id| egui::TextEdit::load_state(ctx, id).and_then(|s| s.cursor.char_range());
+        let ix = |n: usize| egui::text::CCursor::new(n).index;
+        frame(&ctx, &mut text, &mut id);
+        frame(&ctx, &mut text, &mut id);
+        let all = range(&ctx, id).unwrap();
+        assert_eq!((all.primary.index.min(all.secondary.index), all.primary.index.max(all.secondary.index)), (ix(0), ix(6)), "opened with all selected");
+        // The caret after "Co", then a frame without the keyboard.
+        let mut state = egui::TextEdit::load_state(&ctx, id).unwrap();
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(2))));
+        state.store(&ctx, id);
+        ctx.memory_mut(|m| m.surrender_focus(id));
+        frame(&ctx, &mut text, &mut id);
+        frame(&ctx, &mut text, &mut id);
+        assert!(ctx.memory(|m| m.has_focus(id)), "the editor keeps the keyboard");
+        let r = range(&ctx, id).unwrap();
+        assert_eq!((r.primary.index, r.secondary.index), (ix(2), ix(2)), "the caret stays where it was");
+        // Closed for a frame and opened again: all selected again.
+        ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+        frame(&ctx, &mut text, &mut id);
+        frame(&ctx, &mut text, &mut id);
+        let r = range(&ctx, id).unwrap();
+        assert_eq!((r.primary.index.min(r.secondary.index), r.primary.index.max(r.secondary.index)), (ix(0), ix(6)));
+    }
+
+    /// #581: a field's text edit fills it, so its text and hint sit on the field's middle line
+    /// (it was a row at the top of the field, its text high).
+    #[test]
+    fn field_text_is_vertically_centred() {
+        let ctx = egui::Context::default();
+        let t = Tokens::for_kind(Default::default());
+        for h in [22.0, 26.0, 30.0] {
+            let field = Rect::from_min_size(pos2(20.0, 40.0), vec2(220.0, h));
+            let mut text = String::new();
+            let mut got = None;
+            let mut out = ctx.run_ui(Default::default(), |ui| {
+                got = Some(search_field(ui, field, &mut text, "Filter recent files", &t).rect);
+            });
+            out.textures_delta.clear();
+            let r = got.expect("the field was drawn");
+            assert!((r.center().y - field.center().y).abs() < 0.5 && r.height() >= h - 2.5, "{h}: {r:?} in {field:?}");
+        }
+    }
 }

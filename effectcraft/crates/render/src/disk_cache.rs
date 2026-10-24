@@ -8,7 +8,9 @@
 //!   project therefore never reads stale pixels: its keys simply change.
 //! * Payloads are LZ4-compressed (`lz4_flex`, MIT): frames as 8-bit premultiplied RGBA, layer
 //!   buffers as `f32` RGBA with the bytes shuffled into planes (exact, so cached and fresh
-//!   renders are bit-identical). Every file ends in a checksum; damaged files read as misses and
+//!   renders are bit-identical), Roto Brush / Object Matte segmentations as
+//!   `FrameSeg::to_bytes` (keyed by their content-keyed chain key and scale, so they are
+//!   reused whenever the same frames, settings and prompt come back, also after a restart). Every file ends in a checksum; damaged files read as misses and
 //!   are deleted.
 //! * Size limit with least-recently-used eviction. The in-memory index is rebuilt from the
 //!   folder when the cache opens (file modification times order it), so the cache survives
@@ -37,6 +39,8 @@ const QUEUE_LIMIT: usize = 64;
 pub enum Kind {
     Frame,
     Layer,
+    /// A Roto Brush / Object Matte segmentation.
+    Matte,
 }
 
 impl Kind {
@@ -45,12 +49,14 @@ impl Kind {
         match self {
             Kind::Frame => "frames",
             Kind::Layer => "layers",
+            Kind::Matte => "mattes",
         }
     }
     fn tag(self) -> u8 {
         match self {
             Kind::Frame => 1,
             Kind::Layer => 2,
+            Kind::Matte => 3,
         }
     }
 }
@@ -319,7 +325,7 @@ impl DiskCache {
     /// Rebuild the index from the folder (oldest files first).
     pub fn rescan(&self) {
         let mut found: Vec<(std::time::SystemTime, Kind, u128, u64)> = vec![];
-        for kind in [Kind::Frame, Kind::Layer] {
+        for kind in [Kind::Frame, Kind::Layer, Kind::Matte] {
             let Ok(shards) = std::fs::read_dir(self.dir.join(kind.dir())) else { continue };
             for shard in shards.flatten() {
                 let Ok(files) = std::fs::read_dir(shard.path()) else { continue };
@@ -403,7 +409,7 @@ impl DiskCache {
         if let Ok(mut g) = self.index.lock() {
             g.clear();
         }
-        for kind in [Kind::Frame, Kind::Layer] {
+        for kind in [Kind::Frame, Kind::Layer, Kind::Matte] {
             let _ = std::fs::remove_dir_all(self.dir.join(kind.dir()));
         }
     }
@@ -555,6 +561,22 @@ impl DiskCache {
         self.write_now(Kind::Layer, key, &encode_layer(buf));
     }
 
+    /// A segmentation (chain key, scale) written by [`DiskCache::put_seg`].
+    pub fn get_seg(&self, key: u64, scale: f64) -> Option<effectcraft_effects::roto::FrameSeg> {
+        let p = self.read(Kind::Matte, seg_key(key, scale))?;
+        let raw = lz4_flex::decompress_size_prepended(&p).ok()?;
+        effectcraft_effects::roto::FrameSeg::from_bytes(&raw)
+    }
+
+    /// Queue a segmentation for writing.
+    pub fn put_seg(&self, key: u64, scale: f64, seg: &effectcraft_effects::roto::FrameSeg) {
+        let k = seg_key(key, scale);
+        if self.contains(Kind::Matte, k) {
+            return;
+        }
+        self.enqueue(Kind::Matte, k, lz4_flex::compress_prepend_size(&seg.to_bytes()));
+    }
+
     /// Write a frame synchronously (tests).
     pub fn put_frame_now(&self, key: u128, width: u32, height: u32, rgba: &[u8]) {
         self.write_now(Kind::Frame, key, &encode_frame(width, height, rgba));
@@ -625,6 +647,24 @@ pub fn layer_entry(buf: &Buf) -> Vec<u8> {
 /// A layer buffer from a sealed entry's bytes (`None` when damaged).
 pub fn read_layer_entry(data: &[u8]) -> Option<Buf> {
     decode_layer(verify(data, Kind::Layer)?)
+}
+
+/// The disk key of a segmentation: its chain key and scale.
+fn seg_key(key: u64, scale: f64) -> u128 {
+    let mut h = Hash128::default();
+    h.write(b"segmentation-v1");
+    h.write_u64(key);
+    h.write_u64(scale.to_bits());
+    h.finish()
+}
+
+impl effectcraft_effects::roto::SegStore for DiskCache {
+    fn get_seg(&self, key: u64, scale: f64) -> Option<effectcraft_effects::roto::FrameSeg> {
+        DiskCache::get_seg(self, key, scale)
+    }
+    fn put_seg(&self, key: u64, scale: f64, seg: &effectcraft_effects::roto::FrameSeg) {
+        DiskCache::put_seg(self, key, scale, seg);
+    }
 }
 
 impl crate::cache::LayerStore for DiskCache {
@@ -732,15 +772,19 @@ fn decode_layer(p: &[u8]) -> Option<Buf> {
 // ---------------------------------------------------------------- content keys
 
 /// Bump when rendering changes in a way that makes old disk entries wrong.
-const RENDER_VERSION: &str = "effectcraft-render-1";
+const RENDER_VERSION: &str = "effectcraft-render-2";
 
 fn hash_debug(h: &mut Hash128, v: &impl std::fmt::Debug) {
     h.write(format!("{v:?}").as_bytes());
     h.write(&[0xff]);
 }
 
-/// A file's size and modification time (so edited footage gets new keys).
-fn file_stamp(h: &mut Hash128, path: &str) {
+/// Size and content hash of a path that has no native metadata (the browser file table).
+pub type VirtualFileId<'a> = &'a (dyn Fn(&str) -> Option<(u64, u64)> + Send + Sync);
+
+/// A file's size and modification time (so edited footage gets new keys). When the path has no
+/// native metadata, `virtual_id` supplies a durable size and content hash instead.
+fn file_stamp(h: &mut Hash128, path: &str, virtual_id: Option<VirtualFileId<'_>>) {
     if path.is_empty() {
         return;
     }
@@ -751,26 +795,36 @@ fn file_stamp(h: &mut Hash128, path: &str) {
         {
             h.write_u64(d.as_nanos() as u64);
         }
+        return;
+    }
+    if let Some((len, hash)) = virtual_id.and_then(|id| id(path)) {
+        h.write_u64(len);
+        h.write_u64(hash);
     }
 }
 
-fn footage_stamp(h: &mut Hash128, f: &effectcraft_project::Footage) {
-    file_stamp(h, &f.path);
+fn footage_stamp(h: &mut Hash128, f: &effectcraft_project::Footage, virtual_id: Option<VirtualFileId<'_>>) {
+    file_stamp(h, &f.path, virtual_id);
     for p in &f.sequence {
-        file_stamp(h, p);
+        file_stamp(h, p, virtual_id);
     }
 }
 
 /// Salt for layer cache keys on disk: the renderer version and every footage file's identity
 /// (layer keys name footage items, not file contents).
 pub fn footage_salt(project: &effectcraft_project::Project) -> u64 {
+    footage_salt_with(project, None)
+}
+
+/// [`footage_salt`] with [`VirtualFileId`] for paths `std::fs::metadata` cannot describe.
+pub fn footage_salt_with(project: &effectcraft_project::Project, virtual_id: Option<VirtualFileId<'_>>) -> u64 {
     let mut h = Hash128::default();
     h.write(RENDER_VERSION.as_bytes());
     for (id, it) in &project.items {
         if let effectcraft_project::ItemKind::Footage(f) = &it.kind {
             h.write_u64(id.0);
             hash_debug(&mut h, f);
-            footage_stamp(&mut h, f);
+            footage_stamp(&mut h, f, virtual_id);
         }
     }
     let v = h.finish();
@@ -782,6 +836,11 @@ pub fn footage_salt(project: &effectcraft_project::Project) -> u64 {
 /// files' size and time). With expressions in play (which can read any comp) the whole project
 /// counts. Switches that don't change pixels (Audio, Lock, Shy, Hide Shy Layers) don't count.
 pub fn comp_content_key(project: &effectcraft_project::Project, comp: effectcraft_project::ItemId) -> u128 {
+    comp_content_key_with(project, comp, None)
+}
+
+/// [`comp_content_key`] with [`VirtualFileId`] for paths `std::fs::metadata` cannot describe.
+pub fn comp_content_key_with(project: &effectcraft_project::Project, comp: effectcraft_project::ItemId, virtual_id: Option<VirtualFileId<'_>>) -> u128 {
     use effectcraft_project::{ItemKind, LayerSource};
     let mut h = Hash128::default();
     h.write(RENDER_VERSION.as_bytes());
@@ -815,11 +874,11 @@ pub fn comp_content_key(project: &effectcraft_project::Project, comp: effectcraf
             k => hash_debug(&mut h, k),
         }
         if let ItemKind::Footage(f) = &it.kind {
-            footage_stamp(&mut h, f);
+            footage_stamp(&mut h, f, virtual_id);
         }
         hash_debug(&mut h, &it.proxy);
         if let Some(px) = &it.proxy {
-            footage_stamp(&mut h, &px.footage);
+            footage_stamp(&mut h, &px.footage, virtual_id);
         }
     }
     h.write_u64(comp.0);
@@ -887,6 +946,38 @@ mod tests {
         assert_eq!(parse_entry_name(&entry_name(key)), Some(key));
         assert_eq!(parse_entry_name("abc.ecc"), None);
         assert_eq!(parse_entry_name(&format!("{key:032x}.tmp.1")), None);
+    }
+
+    /// Segmentations round-trip by (chain key, scale), survive a reopen (rescan), are bounded by
+    /// the size limit like every entry, and a damaged file is a miss.
+    #[test]
+    fn segmentations_round_trip_and_reopen() {
+        use effectcraft_effects::roto::FrameSeg;
+        let dir = tmpdir("seg");
+        let dc = DiskCache::open(&dir, 1 << 30).unwrap();
+        let seg = FrameSeg { w: 7, h: 5, matte: (0..35).map(|i| (i % 3 == 0) as u8).collect(), refine: vec![0; 35], ..Default::default() };
+        assert!(dc.get_seg(42, 1.0).is_none());
+        dc.put_seg(42, 1.0, &seg);
+        dc.flush();
+        assert_eq!(dc.get_seg(42, 1.0), Some(seg.clone()));
+        assert!(dc.get_seg(42, 0.5).is_none() && dc.get_seg(43, 1.0).is_none());
+        assert_eq!(dc.keys(Kind::Matte).len(), 1);
+        drop(dc);
+        let dc = DiskCache::open(&dir, 1 << 30).unwrap();
+        assert_eq!(dc.get_seg(42, 1.0), Some(seg.clone()));
+        // Damaged on disk: a miss, and the entry is forgotten.
+        let path = dc.path(Kind::Matte, seg_key(42, 1.0));
+        let mut d = std::fs::read(&path).unwrap();
+        d[18] ^= 0x55;
+        std::fs::write(&path, d).unwrap();
+        assert!(dc.get_seg(42, 1.0).is_none());
+        assert!(!dc.contains(Kind::Matte, seg_key(42, 1.0)));
+        // The size limit evicts segmentations too.
+        dc.put_seg(1, 1.0, &seg);
+        dc.flush();
+        dc.set_max_bytes(1);
+        assert!(dc.keys(Kind::Matte).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1009,5 +1100,30 @@ mod tests {
         for k in 0..5u128 {
             assert_eq!(b.get_layer(k).unwrap().img, buf(k as u32, 16, 16).img);
         }
+    }
+
+    /// A path with no native metadata takes its key from the caller's size and content hash (#1253).
+    #[test]
+    fn virtual_file_bytes_change_content_keys() {
+        use effectcraft_project::build;
+        use effectcraft_project::{Comp, Footage, ItemKind, LayerSource, Project};
+        use effectcraft_time::{FrameRate, Tick};
+
+        let mut p = Project::default();
+        let f = Footage { path: "/virtual.mov".into(), width: 16, height: 9, duration: Tick::from_seconds_f64(1.0), has_video: true, ..Default::default() };
+        let fid = p.add_item("virtual.mov", effectcraft_color::Label::None, None, ItemKind::Footage(f));
+        let mut comp = Comp::new(16, 9, FrameRate::FPS_30, Tick::from_seconds_f64(1.0));
+        comp.layers = vec![build::layer(&mut p, &comp, "clip", LayerSource::Footage { item: fid }, (16, 9), None)];
+        let cid = p.add_item("C", effectcraft_color::Label::None, None, ItemKind::Comp(comp.into()));
+
+        let id = |mark: u64| move |path: &str| (path == "/virtual.mov").then_some((8, mark));
+        let (one, two) = (id(1), id(2));
+        let a = footage_salt_with(&p, Some(&one));
+        let b = footage_salt_with(&p, Some(&two));
+        let ka = comp_content_key_with(&p, cid, Some(&one));
+        let kb = comp_content_key_with(&p, cid, Some(&two));
+        assert_ne!(a, b, "replaced virtual media must not reuse the salt");
+        assert_ne!(ka, kb, "replaced virtual media must not reuse the frame key");
+        assert_eq!(comp_content_key(&p, cid), comp_content_key_with(&p, cid, None));
     }
 }

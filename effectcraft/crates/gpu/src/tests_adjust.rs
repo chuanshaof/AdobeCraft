@@ -3,7 +3,7 @@
 
 use effectcraft_keyframe::{ShapePath, Value};
 use effectcraft_project::build::{self, Ids};
-use effectcraft_project::{BitDepth, ColorSpace, MaskMode};
+use effectcraft_project::{BitDepth, ColorSpace, MaskMode, MatteKind, TrackMatte};
 use effectcraft_render::{Backend, FxStep, FxTarget, RenderOpts, Renderer};
 use effectcraft_time::Tick;
 
@@ -72,6 +72,24 @@ fn mixed_adjustment_chains_fall_back_per_effect() {
     }
 }
 
+/// A track matte limits where the adjustment shows, as on the CPU (#1201).
+#[test]
+fn track_mattes_limit_gpu_adjustments_like_the_cpu() {
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        for kind in [MatteKind::Alpha, MatteKind::AlphaInverted, MatteKind::Luma, MatteKind::LumaInverted] {
+            let mut s = adjustment_scene(depth, &gpu_stack(), false);
+            let mut matte = s.footage(50, 30);
+            matte.switches.video = false;
+            set(&mut matte, "transform/rotation", Value::Scalar(10.0));
+            let mid = s.push(matte);
+            let c = s.p.comp_mut(s.cid).unwrap();
+            let adj = c.layers.iter_mut().find(|l| l.switches.adjustment).unwrap();
+            adj.track_matte = Some(TrackMatte { layer: mid, kind });
+            check(&format!("matted adjustment {kind:?} {depth:?}"), compare_at(&s, opts(), Tick::ZERO), 0.0);
+        }
+    }
+}
+
 /// Counts where each run of the stack goes.
 #[derive(Default)]
 struct Probe {
@@ -102,4 +120,20 @@ fn adjustment_stacks_split_into_gpu_runs_and_cpu_steps() {
     let mut p = Probe::default();
     r.run_effects_on(&ctx, adj, true, &mut p);
     assert_eq!((p.gpu, p.cpu), (3, 1));
+}
+
+#[test]
+fn composite_reads_the_original_adjustment_input_on_gpu() {
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        for mode in [0, 1, 2, 4, 15] {
+            for rgb in [false, true] {
+                let stack = vec![
+                    ("ec.channel.invert", vec![]),
+                    ("ec.channel.cccomposite", vec![("compositeOriginal", Value::Enum(mode)), ("opacity", n(65.0)), ("rgbOnly", Value::Bool(rgb))]),
+                ];
+                let s = adjustment_scene(depth, &stack, true);
+                check(&format!("original adjustment {depth:?} mode {mode} rgb {rgb}"), compare_at(&s, RenderOpts { scale: 0.5, ..opts() }, Tick::ZERO), 0.0);
+            }
+        }
+    }
 }

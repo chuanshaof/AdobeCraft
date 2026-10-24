@@ -10,6 +10,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+craft-ui = { workspace = true }
 effectcraft-time = { workspace = true }
 effectcraft-geom = { workspace = true }
 effectcraft-color = { workspace = true }
@@ -25,6 +26,7 @@ eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
+chrono = { workspace = true }
 rayon = { workspace = true }
 web-time = { workspace = true }
 kurbo = { workspace = true }
@@ -37,6 +39,7 @@ sys-locale = { workspace = true }
 egui_kittest = { workspace = true, features = ["eframe", "wgpu"] }
 pollster = "0.4"
 effectcraft-host = { workspace = true }
+exr = { workspace = true }
 
 [build-dependencies]
 serde_json = { workspace = true }

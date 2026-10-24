@@ -2,6 +2,7 @@
 //! tutorial (engine model in `effectcraft_engine::learn`). The coach highlights the step's target
 //! (an automation id) and moves on when the user performs the step's command; "Show me" runs it.
 
+use crate::i18n::{tr, tr_args};
 use egui::{Align2, Color32, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use serde_json::json;
 
@@ -13,7 +14,7 @@ pub fn home_tab(app: &mut EffectcraftApp, ui: &mut egui::Ui, area: Rect) {
     let t = app.tokens;
     let p = ui.painter().with_clip_rect(area);
     let (x, mut y, w) = (area.min.x, area.min.y, area.width());
-    p.text(pos2(x, y + 6.0), Align2::LEFT_CENTER, "Learn", Tokens::semibold(16.0), Color32::WHITE);
+    p.text(pos2(x, y + 6.0), Align2::LEFT_CENTER, tr("Learn"), Tokens::semibold(16.0), Color32::WHITE);
     p.text(
         pos2(x, y + 26.0),
         Align2::LEFT_CENTER,
@@ -112,11 +113,11 @@ pub fn coach(app: &mut EffectcraftApp, ctx: &egui::Context) {
                 .show(ui, |ui| {
                     ui.set_width(w - 28.0);
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("LEARN").font(Tokens::semibold(10.0)).color(t.accent));
+                        ui.label(egui::RichText::new(tr("LEARN")).font(Tokens::semibold(10.0)).color(t.accent));
                         ui.label(egui::RichText::new(&tut.title).font(Tokens::ui(11.0)).color(t.text_dim));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let (cr, r) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::click());
-                            let r = r.on_hover_text("Close tutorial");
+                            let r = r.on_hover_text(tr("Close tutorial"));
                             crate::icons::paint(ui.painter(), cr, crate::icons::Icon::Close, if r.hovered() { Color32::WHITE } else { t.text_dim });
                             app.auto.add("learn.close", r.rect, "Close tutorial");
                             if r.clicked() {
@@ -140,37 +141,43 @@ pub fn coach(app: &mut EffectcraftApp, ctx: &egui::Context) {
                     ui.add_space(4.0);
                     match &step {
                         Some(st) => {
-                            ui.label(egui::RichText::new(format!("Step {} of {n}: {}", i + 1, st.title)).font(Tokens::semibold(13.0)).color(Color32::WHITE));
+                            ui.label(
+                                egui::RichText::new(tr_args("Step {} of {}: {}", &[&(i + 1), &n, &st.title]))
+                                    .font(Tokens::semibold(13.0))
+                                    .color(Color32::WHITE),
+                            );
                             ui.add_space(2.0);
                             ui.label(egui::RichText::new(&st.text).font(Tokens::ui(12.0)).color(t.text));
                         }
                         None => {
-                            ui.label(egui::RichText::new("Tutorial complete").font(Tokens::semibold(13.0)).color(Color32::WHITE));
+                            ui.label(egui::RichText::new(tr("Tutorial complete")).font(Tokens::semibold(13.0)).color(Color32::WHITE));
                             ui.label(
-                                egui::RichText::new("Nice work. Pick another tutorial on the Home screen's Learn tab.").font(Tokens::ui(12.0)).color(t.text),
+                                egui::RichText::new(tr("Nice work. Pick another tutorial on the Home screen's Learn tab."))
+                                    .font(Tokens::ui(12.0))
+                                    .color(t.text),
                             );
                         }
                     }
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        let back = ui.add_enabled(i > 0, egui::Button::new("Back"));
+                        let back = ui.add_enabled(i > 0, egui::Button::new(tr("Back")));
                         app.auto.add("learn.back", back.rect, "Back");
                         if back.clicked() {
                             action = Some("back");
                         }
                         if step.is_some() {
-                            let show = ui.add(egui::Button::new("Show me"));
+                            let show = ui.add(egui::Button::new(tr("Show me")));
                             app.auto.add("learn.showMe", show.rect, "Show me");
                             if show.clicked() {
                                 action = Some("showMe");
                             }
-                            let next = ui.add(egui::Button::new("Next"));
+                            let next = ui.add(egui::Button::new(tr("Next")));
                             app.auto.add("learn.next", next.rect, "Next");
                             if next.clicked() {
                                 action = Some("next");
                             }
                         } else {
-                            let more = ui.add(egui::Button::new("More tutorials"));
+                            let more = ui.add(egui::Button::new(tr("More tutorials")));
                             app.auto.add("learn.more", more.rect, "More tutorials");
                             if more.clicked() {
                                 action = Some("more");

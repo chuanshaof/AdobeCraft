@@ -306,3 +306,20 @@ fn groups_round_trip_serde() {
     assert_eq!(m[0].pins[1].kind, PinKind::Starch);
     assert_eq!(m[0].pins[0].position, [3.0, 4.0]);
 }
+
+#[test]
+fn single_pin_on_a_traced_solid_does_not_rotate_it() {
+    // #313: an 800×600 solid traced from its alpha, as the Puppet Pin tool builds it. One
+    // pin is not enough to rotate or scale the mesh, so it may only translate it.
+    let (w, h) = (800, 600);
+    let o = outline(&vec![1.0; w * h], w, h, 1.0, [0.0; 2], [400.0, 300.0], 3.0);
+    let m = triangulate(&o, &MeshOpts::default());
+    check_valid(&m);
+    for at in [[40.0, 40.0], [760.0, 30.0], [20.0, 580.0], [790.0, 590.0], [400.0, 300.0], [123.0, 456.0]] {
+        for t in [[0.0, 0.0], [35.0, -20.0]] {
+            let d = solve(&m, &[pin(PinKind::Position, at, [at[0] + t[0], at[1] + t[1]])], 2);
+            let err = d.iter().zip(&m.verts).map(|(a, b)| (a[0] - b[0] - t[0]).hypot(a[1] - b[1] - t[1])).fold(0.0, f64::max);
+            assert!(err < 1e-6, "pin at {at:?} moved by {t:?}: vertices off by up to {err} px");
+        }
+    }
+}

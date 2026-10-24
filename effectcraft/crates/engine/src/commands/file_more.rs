@@ -5,11 +5,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use effectcraft_color::Label;
-use effectcraft_project::{AlphaMode, Comp, Footage, FootageKind, ItemId, ItemKind, LayerSource, Project, Solid};
+use effectcraft_project::{AlphaMode, Comp, Footage, FootageKind, ItemId, ItemKind, LayerSource, Project, Solid, limits};
 use effectcraft_time::{FrameRate, Tick};
 use serde_json::{Value, json};
 
 use super::{CommandSpec, always, b_p, bad, f_p, has_comp, has_project_selection, str_p};
+use crate::sequence::SequenceOptions;
 use crate::{EngineError, Result, Session, cmd};
 
 fn has_footage_selection(s: &Session) -> std::result::Result<(), String> {
@@ -83,12 +84,12 @@ fn save_copy(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn rate_of(p: &Value) -> FrameRate {
-    f_p(p, "frameRate").map(FrameRate::from_f64).unwrap_or(FrameRate::FPS_29_97)
+    f_p(p, "frameRate").map(|f| limits::frame_rate(FrameRate::from_f64(f), FrameRate::FPS_29_97)).unwrap_or(FrameRate::FPS_29_97)
 }
 
 fn placeholder_footage(p: &Value) -> Footage {
-    let w = p.get("width").and_then(Value::as_u64).unwrap_or(1920) as u32;
-    let h = p.get("height").and_then(Value::as_u64).unwrap_or(1080) as u32;
+    let w = p.get("width").and_then(Value::as_u64).map_or(1920, limits::size);
+    let h = p.get("height").and_then(Value::as_u64).map_or(1080, limits::size);
     Footage {
         path: String::new(),
         kind: FootageKind::Video,
@@ -132,8 +133,8 @@ fn solid_from(p: &Value, s: &Session) -> Solid {
     .unwrap_or([0.5, 0.5, 0.5]);
     Solid {
         color,
-        width: p.get("width").and_then(Value::as_u64).map(|v| v as u32).unwrap_or(cw).max(1),
-        height: p.get("height").and_then(Value::as_u64).map(|v| v as u32).unwrap_or(ch).max(1),
+        width: p.get("width").and_then(Value::as_u64).map(limits::size).unwrap_or(cw).max(1),
+        height: p.get("height").and_then(Value::as_u64).map(limits::size).unwrap_or(ch).max(1),
         pixel_aspect: 1.0,
     }
 }
@@ -206,6 +207,10 @@ fn new_comp_from_selection(s: &mut Session, p: &Value) -> Result<Value> {
             let name = lead.name.rsplit_once('.').map(|(a, _)| a.to_string()).unwrap_or(lead.name.clone());
             let c = Comp { pixel_aspect, ..Comp::new(w.max(1), h.max(1), rate, dur) };
             let cid = s.edit("New Comp from Selection", None, |proj, st| {
+                // A name another item already has gets the next free number, as Duplicate gives
+                // ("clip", "clip 2", "clip 3"). The comp's own footage and solid sources don't
+                // count, so an extensionless one still names its first comp; a source comp does.
+                let name = proj.unique_item_name(&name, |i| g.contains(&i.id) && !matches!(i.kind, ItemKind::Comp(_)));
                 let cid = proj.add_item(&name, Label::Sandstone, None, ItemKind::Comp(c.into()));
                 st.project_selection = vec![cid];
                 Ok(cid)
@@ -351,13 +356,12 @@ fn find_missing(s: &mut Session, p: &Value) -> Result<Value> {
             Ok(json!({"effects": found}))
         }
         "fonts" => {
-            let families = crate::text_families();
             let mut found = vec![];
             for (cid, c) in s.project.comps() {
                 for l in &c.layers {
                     if let Some(pr) = l.props.prop("text/sourceText")
                         && let Some(doc) = pr.value.as_text()
-                        && !families.iter().any(|f| f.eq_ignore_ascii_case(&doc.font))
+                        && effectcraft_text::resolve(&doc.font, &doc.style).missing
                     {
                         found.push(json!({"comp": cid.0, "layer": l.id.0, "font": doc.font}));
                     }
@@ -464,6 +468,8 @@ fn run_script(s: &mut Session, p: &Value) -> Result<Value> {
         }
         _ => return Err(bad("file.runScript", "missing `path` (or inline `steps`)")),
     };
+    // A command script read from a file is a script: it can't change what scripts may do.
+    let from_file = p.get("steps").is_none();
     let mut results = vec![];
     for (i, step) in steps.iter().enumerate() {
         let (id, params) = match (step.get("command").or(step.get("id")).and_then(Value::as_str), step.get("method").and_then(Value::as_str)) {
@@ -477,7 +483,8 @@ fn run_script(s: &mut Session, p: &Value) -> Result<Value> {
         if id == "file.runScript" || id == "script.run" {
             return Err(bad("file.runScript", "scripts can't run scripts"));
         }
-        let r = s.execute(&id, params).map_err(|e| EngineError::Other(format!("step {} ({id}): {e}", i + 1)))?;
+        let r = if from_file { s.execute_for_script(&id, params) } else { s.execute(&id, params) };
+        let r = r.map_err(|e| EngineError::Other(format!("step {} ({id}): {e}", i + 1)))?;
         results.push(r);
     }
     Ok(json!({"steps": results.len(), "results": results}))
@@ -552,6 +559,40 @@ pub(crate) struct Interpretation {
     fields: Option<effectcraft_project::FieldOrder>,
     profile: Option<Option<effectcraft_project::ColorSpace>>,
     linear: Option<bool>,
+    /// Color ▸ Preserve RGB.
+    preserve_rgb: Option<bool>,
+    /// Start Timecode.
+    start: Option<StartTimecode>,
+}
+
+/// Interpret Footage ▸ Start Timecode.
+#[derive(Clone, Debug)]
+enum StartTimecode {
+    /// Use Source File Timecode.
+    Source,
+    /// Override Start: a frame number.
+    Frame(i64),
+    /// Override Start: timecode, read at the footage's frame rate.
+    Timecode(String),
+}
+
+impl StartTimecode {
+    /// The highest Override Start, in frames.
+    const MAX: i64 = 1_000_000_000;
+
+    /// The frame (at `rate`) to store, `Some(None)` for Use Source; `None` when the timecode
+    /// doesn't fit at `rate`.
+    fn frame(&self, rate: FrameRate) -> Option<Option<i64>> {
+        match self {
+            StartTimecode::Source => Some(None),
+            StartTimecode::Frame(n) => Some(Some(*n)),
+            StartTimecode::Timecode(t) => Self::read(t, rate).map(Some),
+        }
+    }
+
+    fn read(t: &str, rate: FrameRate) -> Option<i64> {
+        effectcraft_time::parse_timecode(t, rate, false, 0).ok().filter(|n| (0..=Self::MAX).contains(n))
+    }
 }
 
 impl Interpretation {
@@ -582,7 +623,8 @@ impl Interpretation {
             ),
         };
         it.invert_alpha = super::b_p(p, "invertAlpha");
-        it.loops = p.get("loop").and_then(Value::as_u64).map(|v| v.clamp(1, 9999) as u32);
+        // The Interpret Footage form sends numbers as floats (3.0), which `as_u64` rejects.
+        it.loops = f_p(p, "loop").filter(|x| x.is_finite()).map(|v| v.round().clamp(1.0, 9999.0) as u32);
         it.par = f_p(p, "pixelAspect").filter(|x| *x > 0.0);
         it.fields = match str_p(p, "fields") {
             Some(f) => Some(effectcraft_project::FieldOrder::parse(f).ok_or_else(|| bad(cmd, "fields: off|upper|lower"))?),
@@ -598,12 +640,33 @@ impl Interpretation {
             None => None,
         };
         it.linear = super::b_p(p, "linearLight");
+        it.preserve_rgb = super::b_p(p, "preserveRgb");
+        // Start Timecode: Use Source File Timecode (`overrideStart: false`), or Override Start
+        // (timecode or a frame number).
+        let start_err = || bad(cmd, "startTimecode: timecode (0:00:41:20) or a frame number, 0 to 1e9");
+        it.start = match (super::b_p(p, "overrideStart"), p.get("startTimecode")) {
+            (Some(false), _) => Some(StartTimecode::Source),
+            (_, None | Some(Value::Null)) => None,
+            (_, Some(Value::String(t))) => {
+                // Read at 30 fps to check it; it's read again at the footage's rate.
+                StartTimecode::read(t, FrameRate::FPS_30).ok_or_else(start_err)?;
+                Some(StartTimecode::Timecode(t.clone()))
+            }
+            (_, Some(v)) => Some(StartTimecode::Frame(
+                v.as_f64().filter(|x| x.is_finite() && (0.0..=StartTimecode::MAX as f64).contains(x)).map(|x| x.round() as i64).ok_or_else(start_err)?,
+            )),
+        };
         Ok(it)
     }
 
     pub(crate) fn apply(&self, f: &mut Footage, guessed: Option<(AlphaMode, [f32; 3])>) {
         let before = f.frame_rate;
         self.apply_settings(f, guessed);
+        // A sequence's length is its frames.
+        if f.kind == FootageKind::Sequence && !f.sequence.is_empty() {
+            f.sync_sequence_duration();
+            return;
+        }
         // Conforming keeps the frames and changes how long they last (12 frames at 30 fps are
         // 0.4 s; conformed to 12 fps, 1 s). Stills have no frame rate of their own.
         let (old, new) = (before.as_f64(), f.frame_rate.as_f64());
@@ -651,6 +714,13 @@ impl Interpretation {
         }
         if let Some(v) = self.linear {
             f.linear_light = v;
+        }
+        if let Some(v) = self.preserve_rgb {
+            f.preserve_rgb = v;
+        }
+        // After the frame rate: timecode is read at the footage's rate.
+        if let Some(start) = self.start.as_ref().and_then(|t| t.frame(f.frame_rate)) {
+            f.start_timecode = start;
         }
     }
 }
@@ -704,9 +774,9 @@ fn interpret(s: &mut Session, p: &Value) -> Result<Value> {
     s.edit("Interpret Footage", None, |proj, _| {
         for (i, g) in items.iter().zip(&guesses) {
             let Some(ItemKind::Footage(f)) = proj.item_mut(*i).map(|x| &mut x.kind) else { continue };
-            let old = f.duration;
+            let old = f.looped_duration();
             it.apply(f, *g);
-            let new = f.duration;
+            let new = f.looped_duration();
             if new == old {
                 continue;
             }
@@ -728,7 +798,8 @@ fn interpret(s: &mut Session, p: &Value) -> Result<Value> {
             Some(ItemKind::Footage(f)) => Some(json!({
                 "item": i.0, "alpha": format!("{:?}", f.alpha), "matteColor": f.premul_color, "invertAlpha": f.invert_alpha,
                 "fields": f.fields.label(), "pixelAspect": f.pixel_aspect, "loop": f.loop_count, "frameRate": f.frame_rate.as_f64(),
-                "linearLight": f.linear_light,
+                "linearLight": f.linear_light, "preserveRgb": f.preserve_rgb, "startTimecode": f.timecode(0), "overrideStart": f.start_timecode.is_some(),
+                "frames": f.sequence_frames(),
             })),
             _ => None,
         })
@@ -757,6 +828,7 @@ fn apply_interpretation(s: &mut Session, p: &Value) -> Result<Value> {
                 f.fields = src.fields;
                 f.invert_alpha = src.invert_alpha;
                 f.linear_light = src.linear_light;
+                f.preserve_rgb = src.preserve_rgb;
                 f.color_profile = src.color_profile;
                 if src.native_rate.is_some() {
                     if f.native_rate.is_none() {
@@ -775,16 +847,40 @@ fn replace_footage(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").ok_or_else(|| bad("file.replaceFootage", "missing `path`"))?.to_string();
     let item = *items_p(s, p).first().ok_or_else(|| bad("file.replaceFootage", "select footage"))?;
     let importer = s.importer.clone().ok_or_else(|| EngineError::Other("media import is not available in this build".into()))?;
-    let f = importer.probe(&path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
-    let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(path.clone());
+    // A numbered still brings its image sequence, as on import (`sequence: false` for one frame).
+    let opts = SequenceOptions::from_params(p);
+    let src = crate::sequence::source_of(s.services.as_ref(), &path, opts);
+    let f = crate::sequence::probe(importer.as_ref(), &src, s.sequence_rate()).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    let name = src.name();
+    // Replacing a missing file relinks the other missing files that moved with it (as After Effects
+    // does when you locate one).
+    let moved = match s.project.item(item).map(|it| &it.kind) {
+        Some(ItemKind::Footage(previous)) if previous.missing || !s.stored_paths.exists(s.services.as_ref(), &previous.path) => {
+            super::relink_moved::moved_with(s, item, &previous.path, &path)
+        }
+        _ => vec![],
+    };
+    let relinked: Vec<u64> = moved.iter().map(|(id, _)| id.0).collect();
+    for nf in std::iter::once(&f).chain(moved.iter().map(|(_, nf)| nf)) {
+        s.stored_paths.allow(nf);
+    }
     s.edit("Replace Footage", None, |proj, _| {
         let it = proj.item_mut(item).ok_or_else(|| bad("file.replaceFootage", "no such item"))?;
         it.name = name;
         it.kind = ItemKind::Footage(f);
         retarget_layers(proj, item, |_| LayerSource::Footage { item });
+        for (id, nf) in moved {
+            if let Some(it) = proj.item_mut(id) {
+                it.kind = ItemKind::Footage(nf);
+            }
+        }
         Ok(())
     })?;
-    Ok(Value::Null)
+    if relinked.is_empty() {
+        return Ok(Value::Null);
+    }
+    s.toast(format!("Also relinked {} other missing footage item(s)", relinked.len()));
+    Ok(json!({"relinked": relinked}))
 }
 
 /// Point every layer using `item` at a new source kind.
@@ -843,31 +939,7 @@ fn replace_with_solid(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn reload(s: &mut Session, p: &Value) -> Result<Value> {
     let items = items_p(s, p);
-    let Some(importer) = s.importer.clone() else { return Err(EngineError::Other("media import is not available in this build".into())) };
-    let mut updates = vec![];
-    for i in &items {
-        if let Some(ItemKind::Footage(f)) = s.project.item(*i).map(|x| &x.kind) {
-            let mut nf = match importer.probe(&f.path) {
-                Ok(n) => n,
-                Err(_) => Footage { missing: true, ..f.clone() },
-            };
-            // Keep the interpretation.
-            nf.alpha = f.alpha;
-            nf.loop_count = f.loop_count;
-            nf.pixel_aspect = f.pixel_aspect;
-            updates.push((*i, nf));
-        }
-    }
-    let n = updates.len();
-    s.edit("Reload Footage", None, |proj, _| {
-        for (i, f) in updates {
-            if let Some(it) = proj.item_mut(i) {
-                it.kind = ItemKind::Footage(f);
-            }
-        }
-        Ok(())
-    })?;
-    s.events.push(crate::Event::PurgeCaches);
+    let n = crate::footage_reload::reload_items(s, &items)?;
     Ok(json!({"reloaded": n}))
 }
 
@@ -877,7 +949,7 @@ fn reveal_in_finder(s: &mut Session, p: &Value) -> Result<Value> {
         Some(ItemKind::Footage(f)) if !f.path.is_empty() => f.path.clone(),
         _ => return Err(bad("file.revealInFinder", "the item is not a file")),
     };
-    let url = super::layer_menu::folder_url(&path);
+    let url = super::layer_menu::reveal_url(s, &path).map_err(|e| bad("file.revealInFinder", e))?;
     s.events.push(crate::Event::OpenUrl(url.clone()));
     Ok(json!({"url": url}))
 }
@@ -932,6 +1004,15 @@ pub fn specs() -> Vec<CommandSpec> {
             crate::footage_check::command
         ),
         cmd!(
+            "footage.reloadChanged",
+            "Reload Changed Footage",
+            [],
+            None,
+            "{} — reload the footage whose file changed on disk since it was last seen (size or modification time; Settings ▸ Import ▸ Automatically Reload Footage runs this in the background; image sequences only with All Footage); files seen for the first time are only remembered. Returns {files, reloaded}",
+            has_items,
+            crate::footage_reload::command
+        ),
+        cmd!(
             "file.runScript",
             "Run Script File...",
             ["File", "Scripts"],
@@ -954,7 +1035,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Main...",
             ["File", "Interpret Footage"],
             Some("Cmd+Alt+G"),
-            "{items?, frameRate?: fps|\"file\", alpha?: straight|premultiplied|ignore|guess, guessAlpha?, matteColor?, invertAlpha?, loop?, pixelAspect?, fields?: off|upper|lower, colorProfile?: srgb|rec709|rec2020|p3|auto, linearLight?}",
+            "{items?, frameRate?: fps|\"file\", alpha?: straight|premultiplied|ignore|guess, guessAlpha?, matteColor?, invertAlpha?, loop?, pixelAspect?, fields?: off|upper|lower, colorProfile?: srgb|rec709|rec2020|p3|auto, linearLight?, preserveRgb? (the file's values unconverted), overrideStart?: bool (false: Use Source File Timecode), startTimecode?: timecode|frame (Override Start)}",
             has_footage_selection,
             interpret
         ),
@@ -976,7 +1057,15 @@ pub fn specs() -> Vec<CommandSpec> {
             has_interpretation,
             apply_interpretation
         ),
-        cmd!("file.replaceFootage", "File...", ["File", "Replace Footage"], Some("Cmd+H"), "{path, item?}", has_footage_selection, replace_footage),
+        cmd!(
+            "file.replaceFootage",
+            "File...",
+            ["File", "Replace Footage"],
+            Some("Cmd+H"),
+            "{path, item?, sequence?: bool (default true: a numbered still brings its image sequence), alphabetical?: bool}",
+            has_footage_selection,
+            replace_footage
+        ),
         cmd!(
             "file.replaceWithPlaceholder",
             "Placeholder...",

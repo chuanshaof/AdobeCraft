@@ -28,6 +28,11 @@ fn twirl_bulge_ripple_wave_warp() {
     effect_case("ec.distort.wavewarp", &[("waveType", e(2)), ("pinning", e(1)), ("phase", n(400.0)), ("speed", n(-2.0))]);
     effect_case("ec.distort.wavewarp", &[("waveType", e(8)), ("pinning", e(2)), ("height", n(-5.0)), ("direction", n(200.0))]);
     effect_case("ec.distort.wavewarp", &[("waveType", e(4)), ("pinning", e(7)), ("width", n(33.0))]);
+    // #1181: the single-edge pinning paths, with the default vertical displacement direction.
+    effect_case("ec.distort.wavewarp", &[("direction", n(90.0)), ("height", n(7.0)), ("width", n(25.0)), ("pinning", e(4))]);
+    effect_case("ec.distort.wavewarp", &[("direction", n(90.0)), ("height", n(7.0)), ("width", n(19.0)), ("pinning", e(6)), ("waveType", e(1))]);
+    effect_case("ec.distort.wavewarp", &[("direction", n(45.0)), ("height", n(-6.0)), ("pinning", e(4)), ("speed", n(2.0))]);
+    effect_case("ec.distort.wavewarp", &[("direction", n(45.0)), ("height", n(-6.0)), ("pinning", e(6)), ("speed", n(2.0))]);
 }
 
 #[test]
@@ -55,28 +60,47 @@ fn turbulent_displace_and_cc_lens() {
     effect_case("ec.distort.cclens", &[("convergence", n(-70.0))]);
 }
 
-/// Edge pinning on a shape layer, whose comp-sized bounds are centred on its origin (#227).
+/// Effect `id` on a shape layer, whose comp-sized bounds are centred on its origin and whose
+/// effects run in effect space from the bounds' top-left (#227), at full and half resolution
+/// (the 97 × 61 comp puts that corner between pixels).
+fn shape_case(id: &str, vals: &[(&str, Value)]) {
+    let mut s = Scene::new(BitDepth::Bpc32);
+    let mut l = build::layer(&mut s.p, &s.comp, "Shape", LayerSource::Shape, (97, 61), None);
+    let mut next = s.p.next_id;
+    let mut ids = Ids(&mut next);
+    let rect = build::shape_rect(&mut ids, [90.0, 54.0], [0.0, 0.0], 0.0);
+    let fill = build::shape_fill(&mut ids, [0.9, 0.3, 0.1, 1.0]);
+    let g = build::shape_group(&mut ids, "Rectangle 1", vec![rect, fill]);
+    s.p.next_id = next;
+    l.props.sub_mut("contents").unwrap().children.push(g.into());
+    s.effect(&mut l, id, vals);
+    s.push(l);
+    check(&format!("{id} on a shape layer"), compare_at(&s, opts(), Tick::ZERO), 0.0);
+    check(&format!("{id} on a shape layer, half"), compare_at(&s, RenderOpts { scale: 0.5, ..opts() }, Tick::ZERO), 0.0);
+}
+
+/// Edge pinning on a shape layer (#227).
 #[test]
 fn edge_pinning_on_a_shape_layer() {
-    let cases: [(&str, &[(&str, Value)]); 3] = [
-        ("ec.distort.turbulentdisplace", &[("size", n(30.0)), ("amount", n(20.0))]),
-        ("ec.distort.wavewarp", &[("pinning", e(1)), ("height", n(6.0)), ("width", n(25.0))]),
-        ("ec.distort.bulge", &[("pinAllEdges", on()), ("height", n(2.0)), ("hradius", n(40.0)), ("vradius", n(30.0)), ("center", Value::Vec2([-20.0, -10.0]))]),
-    ];
-    for (id, vals) in cases {
-        let mut s = Scene::new(BitDepth::Bpc32);
-        let mut l = build::layer(&mut s.p, &s.comp, "Shape", LayerSource::Shape, (97, 61), None);
-        let mut next = s.p.next_id;
-        let mut ids = Ids(&mut next);
-        let rect = build::shape_rect(&mut ids, [90.0, 54.0], [0.0, 0.0], 0.0);
-        let fill = build::shape_fill(&mut ids, [0.9, 0.3, 0.1, 1.0]);
-        let g = build::shape_group(&mut ids, "Rectangle 1", vec![rect, fill]);
-        s.p.next_id = next;
-        l.props.sub_mut("contents").unwrap().children.push(g.into());
-        s.effect(&mut l, id, vals);
-        s.push(l);
-        check(&format!("{id} on a shape layer"), compare_at(&s, opts(), Tick::ZERO), 0.0);
-    }
+    shape_case("ec.distort.turbulentdisplace", &[("size", n(30.0)), ("amount", n(20.0))]);
+    shape_case("ec.distort.wavewarp", &[("pinning", e(1)), ("height", n(6.0)), ("width", n(25.0))]);
+    // #1181: single-edge pinning over the layer rect, not just All Edges.
+    shape_case("ec.distort.wavewarp", &[("pinning", e(4)), ("direction", n(90.0)), ("height", n(6.0)), ("width", n(25.0))]);
+    shape_case("ec.distort.wavewarp", &[("pinning", e(6)), ("direction", n(90.0)), ("height", n(6.0)), ("width", n(25.0))]);
+    shape_case(
+        "ec.distort.bulge",
+        &[("pinAllEdges", on()), ("height", n(2.0)), ("hradius", n(40.0)), ("vradius", n(30.0)), ("center", Value::Vec2([28.5, 20.5]))],
+    );
+}
+
+/// Effect points on a shape layer at their defaults (the bounds' centre) and set (#227).
+#[test]
+fn effect_points_on_a_shape_layer() {
+    shape_case("ec.distort.twirl", &[("angle", n(120.0))]);
+    shape_case("ec.distort.bulge", &[("hradius", n(30.0)), ("vradius", n(20.0)), ("height", n(1.8))]);
+    shape_case("ec.distort.ripple", &[("radius", n(80.0)), ("waveWidth", n(9.0)), ("waveHeight", n(4.0))]);
+    shape_case("ec.distort.cclens", &[("size", n(45.0)), ("convergence", n(60.0)), ("center", Value::Vec2([30.0, 20.0]))]);
+    shape_case("ec.distort.turbulentdisplace", &[("size", n(25.0)), ("amount", n(30.0)), ("offset", Value::Vec2([10.0, 40.0]))]);
 }
 
 #[test]

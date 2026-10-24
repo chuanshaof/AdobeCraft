@@ -10,8 +10,10 @@
 //! iterative 3D inverse): hardware 3D-texture filtering would round the interpolation weights
 //! and cannot do tetrahedral interpolation. The CPU evaluates transfer functions, CDLs and
 //! Color Profile Converter's matrix in f64; the kernel in f32 (within the 1e-3 tolerance).
-//! Custom `.ocio` configurations compile their colour spaces' transforms (matrix and offset,
-//! exponent, log / log-affine, range, CDL, file LUTs, groups, inverses) to the same program.
+//! Custom `.ocio` configurations compile their conversions (matrix and offset, exponent,
+//! exponent with linear segment, log / log-affine, allocation, range with its clamp, CDL, file
+//! LUTs and matrices, built-in curves, with colour space / look / display-view transforms
+//! resolved) to the same program; one longer than the kernel's 255 ops renders on the CPU.
 
 use effectcraft_effects::{ColorOp, EffectCtx, Lut, Straight, Tf};
 
@@ -57,8 +59,12 @@ fn tf_code(t: Tf) -> [f32; 2] {
         Tf::Gamma(g) => [2.0, g as f32],
         Tf::AcesCct => [3.0, 0.0],
         Tf::Pq => [4.0, 0.0],
+        Tf::AcesCc => [5.0, 0.0],
     }
 }
+
+/// Most ops `fxl_run` interprets (its loop guard); longer programs render on the CPU.
+const MAX_OPS: usize = 255;
 
 /// A LUT in the layout `fxl_lut_*` read at the returned offset: n1, n3, domain min (3), domain
 /// max (3), the 1D table (n1 × RGB), then the lattice (n3³ × RGB, red fastest).
@@ -75,6 +81,9 @@ pub(crate) fn push_lut(d: &mut Vec<f32>, lut: &Lut) -> f32 {
 
 /// Program layout: a stream of (opcode, arguments…) ending in 0, followed by LUT data.
 fn encode(ops: &[ColorOp]) -> Option<Vec<f32>> {
+    if ops.len() > MAX_OPS {
+        return None;
+    }
     let mut prog: Vec<f32> = vec![];
     let mut tables: Vec<Vec<f32>> = vec![];
     // LUT offsets are patched once the program's length is known.
@@ -122,6 +131,15 @@ fn encode(ops: &[ColorOp]) -> Option<Vec<f32>> {
                 prog.extend([11.0, *base]);
                 prog.extend(log_slope.iter().chain(log_offset).chain(lin_slope).chain(lin_offset));
                 prog.extend([*inverse as u32 as f32, f64::MIN_POSITIVE.ln() as f32]);
+            }
+            ColorOp::MonCurve { gamma, offset, inverse, mirror } => {
+                prog.push(12.0);
+                prog.extend(gamma.iter().chain(offset));
+                prog.extend([*inverse as u32 as f32, *mirror as u32 as f32]);
+            }
+            ColorOp::Clamp { lo, hi } => {
+                prog.push(13.0);
+                prog.extend(lo.iter().chain(hi));
             }
             ColorOp::Lut { lut, shaper, interp, inverse } => {
                 prog.extend([8.0, 0.0, *interp as f32, *inverse as u32 as f32, -1.0]);

@@ -6,7 +6,7 @@ use effectcraft_project::ParamUi;
 use effectcraft_raster::Image;
 use rayon::prelude::*;
 
-use crate::util::pin_rect;
+use crate::util::layer_rect;
 use crate::{Buf, EffectCtx, EffectSpec, num, p, popup, slider};
 
 fn spec(id: &'static str, name: &'static str, params: Vec<crate::ParamSpec>, render: crate::RenderFn) -> EffectSpec {
@@ -68,7 +68,7 @@ fn bulge(ctx: &EffectCtx, mut b: Buf) -> Buf {
     // Taper Radius: higher values make the sides of the bulge shallower (a more peaked profile).
     let taper = 1.0 + ctx.params.f("taperRadius").max(0.0) / 100.0 * 3.0;
     let pin = ctx.params.b("pinAllEdges");
-    let (lx, ly, lw, lh) = pin_rect(ctx, b.offset, b.scale);
+    let (lx, ly, lw, lh) = layer_rect(ctx, &b);
     let edge = (lw.min(lh) * 0.1).max(1.0);
     b.img = remap(&b.img, false, |x, y| {
         let (dx, dy) = ((x - c.0) / rx, (y - c.1) / ry);
@@ -164,11 +164,14 @@ fn wave_warp(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let kind = ctx.params.e("waveType");
     let pin = ctx.params.e("pinning");
     let seed = ctx.seed ^ 0x3a7e;
-    let (dx, dy) = (dir.sin(), -dir.cos());
+    // Cardinal directions must not acquire a tiny perpendicular slope: at a square-wave
+    // boundary cos(90°)'s rounding residue can flip a whole column on CPU but not GPU.
+    let axis = |v: f64| if v.abs() < 4.0 * f64::EPSILON { 0.0 } else { v };
+    let (dx, dy) = (axis(dir.sin()), -axis(dir.cos()));
     if !ctx.adjustment {
         b.pad(h.abs().ceil() as u32 + 1);
     }
-    let (x0, y0, lw, lh) = pin_rect(ctx, b.offset, b.scale);
+    let (x0, y0, lw, lh) = layer_rect(ctx, &b);
     let rect = (x0, y0, lw.max(1.0), lh.max(1.0));
     b.img = remap(&b.img, false, |x, y| {
         // Waves travel along `dir`; displacement is perpendicular to it.
@@ -556,8 +559,21 @@ mod tests {
             let (a, b) = (o.img.get(pad, y + pad), im.get(0, y));
             assert!((0..4).all(|i| (a[i] - b[i]).abs() < 0.01), "row {y}: {a:?} vs {b:?}");
         }
-        let free = run("ec.distort.wavewarp", &[("direction", num(0.0)), ("height", num(5.0))], im);
+        let free = run("ec.distort.wavewarp", &[("direction", num(0.0)), ("height", num(5.0))], im.clone());
         assert!(free.img.data.iter().zip(&o.img.data).any(|(a, b)| differs(*a, *b)));
+        // #1181: direction 90° → vertical displacement. Top Edge (4) holds the first row,
+        // Bottom Edge (6) the last, and the rest of the layer still moves.
+        for (pin, edge_row) in [(Value::Enum(4), 0i64), (Value::Enum(6), 29i64)] {
+            let set = [("direction", num(90.0)), ("height", num(5.0)), ("pinning", pin)];
+            let o = run("ec.distort.wavewarp", &set, im.clone());
+            let pad = ((o.img.width - im.width) / 2) as i64;
+            for x in 0..40 {
+                let (a, b) = (o.img.get(x + pad, edge_row + pad), im.get(x, edge_row));
+                assert!((0..4).all(|i| (a[i] - b[i]).abs() < 0.01), "pin {edge_row} col {x}: {a:?} vs {b:?}");
+            }
+            let mid = 15;
+            assert!((0..40).any(|x| differs(o.img.get(x + pad, mid + pad), im.get(x, mid))), "pin {edge_row}: the middle of the layer must still distort");
+        }
     }
 
     #[test]

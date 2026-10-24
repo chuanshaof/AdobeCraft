@@ -3,6 +3,7 @@
 //! Insert Edit — that cut the marked range into the active composition at its current time.
 //! Everything runs `footage.*` commands (state in `EditorState::footage_panel`).
 
+use crate::i18n::{tr, tr_args};
 use effectcraft_engine::project::{FootageKind, ItemKind};
 use effectcraft_engine::time::Tick;
 use egui::{Align2, Color32, Rect, Sense, Stroke, pos2, vec2};
@@ -18,7 +19,12 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let p = ui.painter().with_clip_rect(rect);
     p.rect_filled(rect, 0.0, t.pasteboard);
     let Some(view) = app.session.state.footage_panel.clone() else {
-        p.text(rect.center(), Align2::CENTER_CENTER, "Double-click footage in the Project panel to open it here", Tokens::ui(12.0), t.text_faint);
+        // Wrapped to the panel, so a narrow panel breaks the hint into lines instead of clipping it.
+        let hint = tr("Double-click footage in the Project panel to open it here");
+        let mut job = egui::text::LayoutJob::simple(hint.to_owned(), Tokens::ui(12.0), t.text_faint, (rect.width() - 20.0).max(40.0));
+        job.halign = egui::Align::Center;
+        let galley = p.layout_job(job);
+        p.galley(pos2(rect.center().x, rect.center().y - galley.size().y * 0.5), galley, t.text_faint);
         app.auto.add("footage.empty", rect, "Footage panel (empty)");
         return;
     };
@@ -38,7 +44,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // Title strip.
     let top = Rect::from_min_size(rect.min, vec2(rect.width(), 24.0));
     p.rect_filled(top, 0.0, t.panel_bg);
-    p.text(pos2(top.min.x + 10.0, top.center().y), Align2::LEFT_CENTER, format!("Footage: {}", item.name), Tokens::semibold(12.0), t.text);
+    p.text(pos2(top.min.x + 10.0, top.center().y), Align2::LEFT_CENTER, tr_args("Footage: {}", &[&item.name]), Tokens::semibold(12.0), t.text);
     app.auto.add("footage.title", top, &item.name);
     // Bottom: ruler and controls.
     // Rows, bottom up: Edit Target buttons, transport, ruler.
@@ -73,7 +79,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let c = so.color;
         p.rect_filled(area.shrink(20.0), 0.0, Color32::from_rgb((c[0] * 255.0) as u8, (c[1] * 255.0) as u8, (c[2] * 255.0) as u8));
     } else {
-        p.text(area.center(), Align2::CENTER_CENTER, "No video", Tokens::ui(12.0), t.text_faint);
+        p.text(area.center(), Align2::CENTER_CENTER, tr("No video"), Tokens::ui(12.0), t.text_faint);
     }
     // Ruler: ticks, In/Out span, CTI; click or drag to scrub.
     let x_of = |tt: Tick| ruler.min.x + (tt.seconds() / dur.seconds().max(1e-9)) as f32 * ruler.width();
@@ -115,7 +121,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     p.text(
         pos2(x, bar.center().y),
         Align2::LEFT_CENTER,
-        effectcraft_engine::time::format_timecode_ae(fr.frame_at(view.time), fr, false),
+        effectcraft_engine::commands::footage_panel::timecode(Some(&item), fr, fr.frame_at(view.time)),
         Tokens::mono(12.0),
         t.timecode,
     );
@@ -139,7 +145,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let ey = edit_row.min.y + 5.0;
     let bx = (edit_row.max.x - 238.0).max(edit_row.min.x + 10.0);
     if !target.is_empty() && bx > edit_row.min.x + 140.0 {
-        p.text(pos2(bx - 8.0, edit_row.center().y), Align2::RIGHT_CENTER, format!("Edit Target: {target}"), Tokens::ui(11.0), t.text_dim);
+        p.text(pos2(bx - 8.0, edit_row.center().y), Align2::RIGHT_CENTER, tr_args("Edit Target: {}", &[&target]), Tokens::ui(11.0), t.text_dim);
     }
     if kit::button(app, ui, Rect::from_min_size(pos2(bx, ey), vec2(110.0, 20.0)), "footage.rippleInsertEdit", "Ripple Insert Edit", false) && comp_ok {
         kit::exec(app, "footage.rippleInsertEdit", json!({}));

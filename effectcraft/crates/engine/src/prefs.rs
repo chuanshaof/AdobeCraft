@@ -23,16 +23,49 @@ pub const PREFS_VERSION: u32 = 2;
 pub const PREFS_FILE: &str = "prefs.json";
 
 /// Settings ▸ General ▸ Language: (label, `general.language` value).
-pub const LANGUAGES: &[(&str, &str)] = &[("Match System", "system"), ("English", "en"), ("日本語", "ja"), ("简体中文", "zh-hans"), ("繁體中文", "zh-hant")];
+pub const LANGUAGES: &[(&str, &str)] = &[
+    ("Match System", "system"),
+    ("English", "en"),
+    // Alphabetical by the language's own name after English; Cyrillic, Georgian, then CJK names
+    // follow the Latin ones.
+    ("Čeština", "cs"),
+    ("Deutsch", "de"),
+    ("Español", "es"),
+    ("Français", "fr"),
+    ("Português (Brasil)", "pt-br"),
+    ("Русский", "ru"),
+    ("Українська", "uk"),
+    ("ქართული", "ka"),
+    ("日本語", "ja"),
+    ("简体中文", "zh-hans"),
+    ("繁體中文", "zh-hant"),
+];
 
 /// Settings ▸ Startup & Repair ▸ Window Graphics: (label, `startup.windowGraphics` value).
 pub const WINDOW_GRAPHICS: &[(&str, &str)] = &[("Automatic", "auto"), ("OpenGL (compatibility)", "gl")];
+
+/// Settings ▸ Appearance ▸ Appearance Mode: (label, `appearance.appearanceMode` value). Auto
+/// follows the operating system's light or dark appearance.
+pub const APPEARANCE_MODES: &[(&str, &str)] = &[("Sync with System", "auto"), ("Dark", "dark"), ("Light", "light")];
+
+/// The dark family of themes: (label, `appearance.darkTheme` value).
+pub const DARK_THEMES: &[(&str, &str)] = &[("Dark", "dark"), ("Darker", "darker")];
+
+/// The light family of themes: (label, `appearance.lightTheme` value).
+pub const LIGHT_THEMES: &[(&str, &str)] = &[("Light", "light")];
+
+/// Every theme (the legacy single-theme `appearance.theme`).
+pub const THEMES: &[(&str, &str)] = &[("Dark", "dark"), ("Darker", "darker"), ("Light", "light")];
 
 /// The settings whose value must be one of their choices.
 fn choices(key: &str) -> Option<&'static [(&'static str, &'static str)]> {
     match key {
         "general.language" => Some(LANGUAGES),
         "startup.windowGraphics" => Some(WINDOW_GRAPHICS),
+        "appearance.appearanceMode" => Some(APPEARANCE_MODES),
+        "appearance.darkTheme" => Some(DARK_THEMES),
+        "appearance.lightTheme" => Some(LIGHT_THEMES),
+        "appearance.theme" => Some(THEMES),
         _ => None,
     }
 }
@@ -64,7 +97,7 @@ macro_rules! page {
 
 page!(General {
     /// Interface language: `system` (the operating system's, where EffectCraft has it, else
-    /// English), `en` or `ja`.
+    /// English), or a language code from `LANGUAGES`.
     language: String = "system".into(),
     /// Levels of Undo (1–99).
     undo_levels: u32 = 32,
@@ -80,7 +113,8 @@ page!(General {
     /// Synchronize Time of All Related Items.
     sync_time_related_items: bool = true,
     expression_pick_whip_compact: bool = true,
-    create_split_layers_above: bool = false,
+    /// Create Split Layers Above Original Layer (After Effects' default).
+    create_split_layers_above: bool = true,
     use_system_color_picker: bool = false,
     /// Number of projects in File ▸ Open Recent.
     recent_items: u32 = 10,
@@ -92,8 +126,8 @@ page!(Startup {
     /// After a crash, offer to open the most recent auto-save.
     offer_crash_recovery: bool = true,
     /// What the desktop window draws with, from the next launch: `auto` (the platform's best
-    /// graphics API) or `gl` (OpenGL, for drivers that crash with the others). A launch whose
-    /// window never drew switches it to `gl` (#243).
+    /// graphics API) or `gl` (OpenGL, for drivers that crash with the others). A launch that
+    /// stops as its window opens switches it to `gl` (#243).
     window_graphics: String = "auto".into(),
 });
 
@@ -136,10 +170,22 @@ page!(Previews {
 });
 
 page!(Appearance {
-    /// `dark`, `darker` or `light`.
+    /// The single theme before appearance modes (`dark`, `darker` or `light`), kept for older
+    /// settings files and automation: setting it picks its family's mode and theme. While the mode
+    /// is Dark or Light it mirrors the theme in use.
     theme: String = "dark".into(),
+    /// `auto` (follow the operating system), `dark` or `light`. New installs stay Dark.
+    appearance_mode: String = "dark".into(),
+    /// The theme used in dark appearance: `dark` or `darker`.
+    dark_theme: String = "dark".into(),
+    /// The theme used in light appearance: `light`.
+    light_theme: String = "light".into(),
+    /// Theme shortcuts in the appearance context menu.
+    favorite_themes: Vec<String> = Vec::new(),
     /// User interface brightness, -1 (darker) … 1 (lighter).
     brightness: f64 = 0.0,
+    /// The size of the whole interface in percent (75–200), on top of the display's own scale.
+    ui_scale: u32 = 100,
     use_label_color_for_handles: bool = true,
     use_label_color_for_tabs: bool = true,
     cycle_mask_colors: bool = true,
@@ -176,6 +222,10 @@ page!(Import {
     still_seconds: f64 = 5.0,
     sequence_fps: f64 = 30.0,
     report_missing_frames: bool = true,
+    /// Automatically Reload Footage whose file another app changed (size or modification time),
+    /// checked every two seconds and when the window comes back to the front: `off`,
+    /// `nonSequence` (the default, as in After Effects: image sequences are left alone) or `all`.
+    auto_reload_footage: String = "nonSequence".into(),
     /// Interpret unlabeled alpha as: `ask`, `guess`, `ignore`, `straight`, `premultiplied`.
     unlabeled_alpha: String = "ask".into(),
     /// Default drag import as: `footage`, `comp`, `compLayerSizes`.
@@ -266,11 +316,66 @@ page!(Scripting {
     error_banner: bool = true,
 });
 
+impl Scripting {
+    /// Whether `other` grants scripts the same as this: Application Scripting (file and network
+    /// access, the warning before executing files, the debugger). Scripts can't change these
+    /// ([`crate::Session::execute_for_script`]): a script could otherwise give itself the
+    /// access the user withheld.
+    pub fn same_permissions(&self, other: &Scripting) -> bool {
+        self.allow_scripts_write_files == other.allow_scripts_write_files
+            && self.warn_executing_files == other.warn_executing_files
+            && self.enable_js_debugger == other.enable_js_debugger
+    }
+
+    /// Take `from`'s Application Scripting settings (see [`Scripting::same_permissions`]).
+    pub fn keep_permissions(&mut self, from: &Scripting) {
+        self.allow_scripts_write_files = from.allow_scripts_write_files;
+        self.warn_executing_files = from.warn_executing_files;
+        self.enable_js_debugger = from.enable_js_debugger;
+    }
+}
+
 /// One editable label: name and `#rrggbb` colour.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LabelPref {
     pub name: String,
     pub color: String,
+}
+
+/// A Composition Settings preset the user saved (Composition Settings ▸ Preset ▸ Save): the
+/// frame size, pixel aspect and frame rate, as in After Effects' own presets.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompPreset {
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub pixel_aspect: f64,
+    pub frame_rate: f64,
+}
+
+impl CompPreset {
+    /// Longest preset name kept.
+    pub const MAX_NAME: usize = 128;
+
+    /// Values a composition accepts (a hand-edited settings file can hold anything).
+    pub fn is_valid(&self) -> bool {
+        let size = 4..=30000;
+        !self.name.trim().is_empty()
+            && self.name.chars().count() <= Self::MAX_NAME
+            && size.contains(&self.width)
+            && size.contains(&self.height)
+            && self.pixel_aspect.is_finite()
+            && (0.01..=100.0).contains(&self.pixel_aspect)
+            && self.frame_rate.is_finite()
+            && (1.0..=999.0).contains(&self.frame_rate)
+    }
+}
+
+/// Saved composition presets, skipping entries that don't parse instead of losing the list.
+fn lenient_comp_presets<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<CompPreset>, D::Error> {
+    let v = Vec::<Value>::deserialize(d)?;
+    Ok(v.into_iter().filter_map(|x| serde_json::from_value(x).ok()).collect())
 }
 
 fn default_labels() -> Vec<LabelPref> {
@@ -327,10 +432,15 @@ pub struct Prefs {
     pub recent_presets: Vec<String>,
     /// Character panel: recently used font families, newest first.
     pub recent_fonts: Vec<String>,
+    /// Effects & Presets: the starred effects' ids, in the order starred.
+    pub effects_favorites: Vec<String>,
     /// Preview panel: every shortcut's options.
     pub preview: crate::preview::PreviewSettings,
     /// View ▸ Simulate Output ▸ My Custom RGB.
     pub custom_rgb: crate::viewer::CustomRgb,
+    /// Composition Settings presets the user saved, in the order saved.
+    #[serde(deserialize_with = "lenient_comp_presets")]
+    pub comp_presets: Vec<CompPreset>,
     /// Top-level keys this version doesn't know (kept for newer versions).
     #[serde(flatten)]
     pub extra: Extra,
@@ -364,8 +474,10 @@ impl Default for Prefs {
             recent_footage: vec![],
             recent_presets: vec![],
             recent_fonts: vec![],
+            effects_favorites: vec![],
             preview: crate::preview::PreviewSettings::default(),
             custom_rgb: crate::viewer::CustomRgb::default(),
+            comp_presets: vec![],
             extra: Extra::new(),
         }
     }
@@ -402,8 +514,59 @@ pub fn migrate(mut v: Value) -> Value {
             obj.insert("labels".into(), serde_json::to_value(labels).unwrap_or_default());
         }
     }
+    // Settings saved before appearance modes had one theme: keep showing it, as a fixed Dark or
+    // Light mode, instead of switching established users to Auto.
+    if let Some(a) = obj.get_mut("appearance").and_then(Value::as_object_mut)
+        && !a.contains_key("appearanceMode")
+        && let Some(theme) = a.get("theme").and_then(Value::as_str).map(str::to_string)
+        && let Some((mode, slot)) = theme_family(&theme)
+    {
+        a.insert("appearanceMode".into(), json!(mode));
+        a.insert(slot.into(), json!(theme));
+    }
     obj.insert("version".into(), json!(PREFS_VERSION));
     v
+}
+
+/// The appearance mode and the per-mode setting a theme belongs to (`darker` → (`dark`,
+/// `darkTheme`)); `None` for an unknown theme.
+pub fn theme_family(theme: &str) -> Option<(&'static str, &'static str)> {
+    if is_choice(DARK_THEMES, theme) {
+        Some(("dark", "darkTheme"))
+    } else if is_choice(LIGHT_THEMES, theme) {
+        Some(("light", "lightTheme"))
+    } else {
+        None
+    }
+}
+
+impl Appearance {
+    /// Show the legacy single `theme`: fix the mode to its family and remember it as that
+    /// family's theme. An unknown theme changes nothing.
+    pub fn select_theme(&mut self) {
+        match theme_family(&self.theme) {
+            Some((mode, "darkTheme")) => {
+                self.appearance_mode = mode.into();
+                self.dark_theme = self.theme.clone();
+            }
+            Some((mode, _)) => {
+                self.appearance_mode = mode.into();
+                self.light_theme = self.theme.clone();
+            }
+            None => {}
+        }
+    }
+
+    /// The theme to show: the light or dark family's choice by the mode; Auto follows `system_light`
+    /// (`None` = the system said nothing: dark).
+    pub fn resolved_theme(&self, system_light: Option<bool>) -> &str {
+        let light = match self.appearance_mode.as_str() {
+            "light" => true,
+            "auto" => system_light == Some(true),
+            _ => false,
+        };
+        if light { &self.light_theme } else { &self.dark_theme }
+    }
 }
 
 impl Prefs {
@@ -440,6 +603,10 @@ impl Prefs {
     /// Clamp values into their valid ranges and fill missing labels.
     pub fn normalize(&mut self) {
         self.version = PREFS_VERSION;
+        self.comp_presets.retain(CompPreset::is_valid);
+        let mut seen = std::collections::HashSet::new();
+        self.effects_favorites.retain(|id| !id.is_empty() && seen.insert(id.clone()));
+        self.effects_favorites.truncate(MAX_EFFECTS_FAVORITES);
         if !is_choice(WINDOW_GRAPHICS, &self.startup.window_graphics) {
             self.startup.window_graphics = Startup::default().window_graphics;
         }
@@ -453,7 +620,28 @@ impl Prefs {
         let a = &mut self.auto_save;
         a.interval_minutes = a.interval_minutes.clamp(1, 240);
         a.max_versions = a.max_versions.clamp(1, 99);
+        let ap = &mut self.appearance;
+        let mut seen = std::collections::BTreeSet::new();
+        ap.favorite_themes.retain(|id| is_choice(THEMES, id) && seen.insert(id.clone()));
+        if !is_choice(APPEARANCE_MODES, &ap.appearance_mode) {
+            ap.appearance_mode = Appearance::default().appearance_mode;
+        }
+        if !is_choice(DARK_THEMES, &ap.dark_theme) {
+            ap.dark_theme = Appearance::default().dark_theme;
+        }
+        if !is_choice(LIGHT_THEMES, &ap.light_theme) {
+            ap.light_theme = Appearance::default().light_theme;
+        }
+        // The legacy single theme mirrors the theme a fixed mode shows (Auto depends on the
+        // system, so it keeps the last one).
+        match ap.appearance_mode.as_str() {
+            "dark" => ap.theme = ap.dark_theme.clone(),
+            "light" => ap.theme = ap.light_theme.clone(),
+            _ if !is_choice(THEMES, &ap.theme) => ap.theme = ap.dark_theme.clone(),
+            _ => {}
+        }
         self.appearance.brightness = self.appearance.brightness.clamp(-1.0, 1.0);
+        self.appearance.ui_scale = self.appearance.ui_scale.clamp(75, 200);
         let defaults = default_labels();
         self.labels.truncate(defaults.len());
         for d in defaults.iter().skip(self.labels.len()) {
@@ -491,19 +679,44 @@ impl Prefs {
             let all: Vec<&str> = c.iter().map(|(_, v)| *v).collect();
             return Err(format!("`{key}` expects one of {}", all.join(", ")));
         }
+        let favorites = if key == "appearance.favoriteThemes" {
+            Some(&value)
+        } else if key == "appearance" {
+            value.get("favoriteThemes")
+        } else {
+            None
+        };
+        if let Some(favorites) = favorites {
+            let values = favorites.as_array().ok_or("favorite themes must be a list")?;
+            let mut seen = std::collections::BTreeSet::new();
+            for value in values {
+                let id = value.as_str().ok_or("favorite theme must be a string")?;
+                if !is_choice(THEMES, id) || !seen.insert(id) {
+                    return Err("unknown or duplicate favorite theme".into());
+                }
+            }
+        }
+        // Older clients set the single theme (by key, or inside the page object): it still picks
+        // a visible theme, fixing the mode to its family.
+        let legacy_theme = key == "appearance.theme" || (key == "appearance" && value.get("theme").is_some() && value.get("appearanceMode").is_none());
         let mut v = serde_json::to_value(&*self).map_err(|e| e.to_string())?;
         let ptr = format!("/{}", key.replace('.', "/"));
         let slot = v.pointer_mut(&ptr).ok_or_else(|| format!("unknown setting `{key}`"))?;
         let value = coerce(slot, value).ok_or_else(|| format!("`{key}` expects a {}", kind_name(slot)))?;
         *slot = value;
         let mut next: Prefs = serde_json::from_value(v).map_err(|e| format!("`{key}`: {e}"))?;
+        let (a, b) = (&self.appearance, &next.appearance);
+        let only_theme_changed = a.theme != b.theme && a.appearance_mode == b.appearance_mode && a.dark_theme == b.dark_theme && a.light_theme == b.light_theme;
+        if legacy_theme || only_theme_changed {
+            next.appearance.select_theme();
+        }
         next.normalize();
         *self = next;
         Ok(())
     }
 
-    /// Reset one page (`general`, `labels`, `autoSave`…) or everything (`None`). Open Recent is
-    /// kept.
+    /// Reset one page (`general`, `labels`, `autoSave`…) or everything (`None`). Open Recent and
+    /// the saved composition presets are kept.
     pub fn reset(&mut self, page: Option<&str>) -> Result<(), String> {
         let d = Prefs::default();
         let Some(page) = page else {
@@ -512,7 +725,9 @@ impl Prefs {
                 recent_footage: std::mem::take(&mut self.recent_footage),
                 recent_presets: std::mem::take(&mut self.recent_presets),
                 recent_fonts: std::mem::take(&mut self.recent_fonts),
+                effects_favorites: std::mem::take(&mut self.effects_favorites),
                 preview: std::mem::take(&mut self.preview),
+                comp_presets: std::mem::take(&mut self.comp_presets),
                 ..d
             };
             return Ok(());
@@ -579,8 +794,18 @@ impl Prefs {
     /// budgets, scaled down so together they leave **RAM Reserved for Other Applications** free,
     /// and halved while the system is low on memory when **Reduce Cache Size When System Is Low
     /// on Memory** is on. `mem` = the system's memory (`None` = unknown: configured budgets).
+    /// In the browser the layer and footage caches also stay within [`WEB_LAYER_CACHE`] and
+    /// [`WEB_MEDIA_CACHE`].
     pub fn cache_budgets(&self, mem: Option<crate::sysinfo::SysMemory>) -> CacheBudgets {
+        self.cache_budgets_in(mem, cfg!(target_arch = "wasm32"))
+    }
+
+    /// [`Prefs::cache_budgets`], in the browser's memory (`web`) or not.
+    pub(crate) fn cache_budgets_in(&self, mem: Option<crate::sysinfo::SysMemory>, web: bool) -> CacheBudgets {
         let (mut l, mut m, mut p) = (self.layer_cache_bytes() as u64, self.media_cache_bytes() as u64, self.preview_cache_bytes() as u64);
+        if web {
+            (l, m) = (l.min(WEB_LAYER_CACHE), m.min(WEB_MEDIA_CACHE));
+        }
         let floor = 64u64 << 20;
         let mut capped = false;
         let mut reduced = false;
@@ -702,6 +927,23 @@ impl Prefs {
         push_mru(&mut self.recent_fonts, family, 30);
     }
 
+    /// Is effect `id` starred in Effects & Presets?
+    pub fn is_effect_favorite(&self, id: &str) -> bool {
+        self.effects_favorites.iter().any(|f| f == id)
+    }
+
+    /// Star effect `id` in Effects & Presets, or un-star it; true when it is starred now.
+    pub fn toggle_effect_favorite(&mut self, id: &str) -> bool {
+        if self.is_effect_favorite(id) {
+            self.effects_favorites.retain(|f| f != id);
+            false
+        } else {
+            self.effects_favorites.push(id.to_string());
+            self.effects_favorites.truncate(MAX_EFFECTS_FAVORITES);
+            self.is_effect_favorite(id)
+        }
+    }
+
     /// The recent fonts the Character panel shows (at most Number of Recent Fonts to Display).
     pub fn recent_fonts_shown(&self) -> &[String] {
         let n = (self.type_.recent_fonts as usize).min(self.recent_fonts.len());
@@ -719,11 +961,23 @@ impl Prefs {
     }
 }
 
+/// Most effects Effects & Presets keeps starred (a hand-edited settings file can hold more).
+const MAX_EFFECTS_FAVORITES: usize = 1000;
+
 fn push_mru(list: &mut Vec<String>, v: &str, max: usize) {
     list.retain(|x| x != v);
     list.insert(0, v.to_string());
     list.truncate(max.max(1));
 }
+
+/// The most the layer cache holds in the browser. A wasm32 page addresses at most 4 GiB, which
+/// these caches share with the app and with the decoders' own decoded frames (FilmCraft keeps
+/// up to 384 MB per open movie): with the desktop's 1 GB defaults, eight stacked 1080p clips ran
+/// the page out of memory a few seconds into playback.
+pub const WEB_LAYER_CACHE: u64 = 512 << 20;
+
+/// The most the footage frame cache holds in the browser (see [`WEB_LAYER_CACHE`]).
+pub const WEB_MEDIA_CACHE: u64 = 256 << 20;
 
 /// Effective cache budgets in bytes (see [`Prefs::cache_budgets`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -941,7 +1195,7 @@ pub fn pages() -> Vec<Page> {
                 s("startup.offerCrashRecovery", "Offer to Open the Latest Auto-Save After a Crash", B, true),
                 s("startup.windowGraphics", "Window Graphics", Kind::Choice(WINDOW_GRAPHICS), true),
                 Note(
-                    "Window Graphics applies from the next launch. When the graphics driver stops EffectCraft before its window draws, the next launch switches to OpenGL.",
+                    "Window Graphics applies from the next launch. When the graphics driver stops EffectCraft as its window opens, the next launch switches to OpenGL.",
                 ),
                 Section("Repair"),
                 Button { label: "Reset Settings", command: "prefs.reset", params: "{}" },
@@ -1007,8 +1261,11 @@ pub fn pages() -> Vec<Page> {
             id: "appearance",
             title: "Appearance",
             items: vec![
-                s("appearance.theme", "Theme", Kind::Choice(&[("Dark", "dark"), ("Darker", "darker"), ("Light", "light")]), true),
+                s("appearance.appearanceMode", "Appearance Mode", Kind::Choice(APPEARANCE_MODES), true),
+                s("appearance.lightTheme", "Light Theme", Kind::Choice(LIGHT_THEMES), true),
+                s("appearance.darkTheme", "Dark Theme", Kind::Choice(DARK_THEMES), true),
                 s("appearance.brightness", "Brightness", Kind::Slider(-1.0, 1.0), true),
+                s("appearance.uiScale", "UI Scale", Kind::Int(75, 200, "%"), true),
                 Section("Labels and Colors"),
                 s("appearance.useLabelColorForHandles", "Use Label Color for Layer Handles and Paths", B, true),
                 s("appearance.useLabelColorForTabs", "Use Label Color for Related Tabs", B, true),
@@ -1057,6 +1314,12 @@ pub fn pages() -> Vec<Page> {
                 s("import.stillSeconds", "Still Duration", Kind::Float(0.04, 86_400.0, "s"), true),
                 s("import.sequenceFps", "Sequence Footage", Kind::Float(1.0, 999.0, "frames per second"), true),
                 s("import.reportMissingFrames", "Report Missing Frames", B, true),
+                s(
+                    "import.autoReloadFootage",
+                    "Automatically Reload Footage",
+                    Kind::Choice(&[("Off", "off"), ("Non-Sequence Footage", "nonSequence"), ("All Footage", "all")]),
+                    true,
+                ),
                 s(
                     "import.unlabeledAlpha",
                     "Interpret Unlabeled Alpha As",

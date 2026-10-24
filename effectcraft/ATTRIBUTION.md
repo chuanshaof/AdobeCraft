@@ -17,6 +17,7 @@ iconography, images or other Adobe assets; open licences only; every asset attri
 | `assets/fonts/NotoSerif-Regular.ttf` | The Noto Project Authors | https://github.com/notofonts/latin-greek-cyrillic | OFL-1.1 (`assets/fonts/OFL-NotoSerif.txt`) |
 | `assets/fonts/JetBrainsMono-Regular.ttf` | The JetBrains Mono Project Authors | https://github.com/JetBrains/JetBrainsMono | OFL-1.1 (`assets/fonts/OFL-JetBrainsMono.txt`) |
 | `apps/effectcraft-web/web/favicon.svg` | EffectCraft contributors | Original work: web app icon, a copy of `assets/app-icon/effectcraft-small.svg` (the unicorn app icon) | MIT OR Apache-2.0 (`assets/app-icon/LICENSE.txt`) |
+| `packaging/macos/dmg/background.svg` | @XusBadia | Original work: macOS DMG Finder window background, derived from the EffectCraft app icon (`assets/app-icon/effectcraft.svg`); rendered to a TIFF by `packaging/macos/package.sh` at package time | MIT OR Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`) |
 | `assets/app-icon/effectcraft-1024.png` | EffectCraft contributors | Original work: effectCraft app icon, 1024 px (owner's ArtCraft unicorn drawing, vectorised) | MIT OR Apache-2.0 (`assets/app-icon/LICENSE.txt`) |
 | `assets/app-icon/effectcraft-macos-512.png` | EffectCraft contributors | Original work: effectCraft runtime Dock icon (macOS) (owner's ArtCraft unicorn drawing, vectorised) | MIT OR Apache-2.0 (`assets/app-icon/LICENSE.txt`) |
 | `assets/app-icon/effectcraft-small.svg` | EffectCraft contributors | Original work: effectCraft app icon, light vector (owner's ArtCraft unicorn drawing, vectorised) | MIT OR Apache-2.0 (`assets/app-icon/LICENSE.txt`) |
@@ -57,17 +58,23 @@ Screenshots of EffectCraft itself, rendered headlessly, showing only procedurall
 
 ## Code-drawn assets (original work, MIT OR Apache-2.0)
 
-- UI icons drawn in code: `crates/ui-egui/src/icons.rs`.
+- UI icons drawn in code: `crates/ui-egui/src/icons.rs`, including the original filled favorite star (2026-10-11, EffectCraft contributors).
 - Procedural demo content (solids, shapes, gradients, text animations): `crates/engine/src/demo.rs`.
 - Built-in project templates (Lower Third, Title Card, Logo Reveal, Kinetic Type, Social Square, Vertical Story,
   Slideshow, 3D Text Orbit) built from engine commands, and their thumbnails rendered by our own renderer:
   `crates/engine/src/templates.rs`.
 - Text animator presets (Typewriter, Fade Up Characters, Bounce In Words, Tracking In, Scramble, Blur In, Jitter,
   Drop In Lines): `crates/engine/presets/text_animators.json` (sidecar `.attribution`).
+- Transition animation presets (23: wipes, clock and fan reveals, blinds, dissolves, card flips, CC wipes, fades):
+  `crates/engine/presets/transitions.json` (sidecar `.attribution`).
+- Backgrounds animation presets (23: drifting gradients, fog, cloud and smoke, plasma and magma, cells and crystals, scrolling grids
+  and checks, pulse rings, bokeh, light sweep): `crates/engine/presets/backgrounds.json` (sidecar `.attribution`).
 - Sample scripts (File ▸ Scripts) and ScriptUI panel: `crates/engine/scripts/Rename Layers.jsx`,
   `crates/engine/scripts/Sort Layers by In Point.jsx`, `crates/engine/scripts/Create Null at Selected Layers.jsx`,
   `crates/engine/scripts/Render Queue Batch.jsx`, `crates/engine/scripts/ScriptUI Panels/Layer Tools.jsx`
   (sidecars `.attribution`).
+- Bundled extension (ScriptUI panel) with its twelve built-in ease presets:
+  `extensions/scriptui-panels/Ease Presets.jsx` (sidecar `.attribution`).
 - Example effect plug-in: `examples/plugins/posterize-bands` (plug-in API v1, WebAssembly).
 
 ## Trained models (optional downloads, not bundled)
@@ -115,3 +122,5 @@ under [`docs/brand/LICENSE-brand.txt`](docs/brand/LICENSE-brand.txt). Forks and 
 | `docs/brand/artcraft-mark-black.svg` | ArtCraft Team | Original work: first-party ArtCraft brand mark (ArtCraft symbol ("A" mark), black) | ArtCraft brand terms, not open source (`docs/brand/LICENSE-brand.txt`) |
 | `docs/brand/artcraft-mark.png` | ArtCraft Team | Original work: first-party ArtCraft brand mark (ArtCraft symbol ("A" mark), blue) | ArtCraft brand terms, not open source (`docs/brand/LICENSE-brand.txt`) |
 | `docs/brand/artcraft-mark.svg` | ArtCraft Team | Original work: first-party ArtCraft brand mark (ArtCraft symbol ("A" mark), blue) | ArtCraft brand terms, not open source (`docs/brand/LICENSE-brand.txt`) |
+
+- Appearance theme previews, drawn procedurally from original shapes: `crates/ui-egui/src/panels/settings.rs` (original work, MIT OR Apache-2.0).

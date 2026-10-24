@@ -3,6 +3,7 @@
 //! build.rs from contributors/contributors.json (craftrules standards/contributors.md); nothing is
 //! read at run time.
 
+use crate::i18n::{tr, tr_args};
 use std::cmp::Ordering;
 
 use egui::RichText;
@@ -243,7 +244,7 @@ pub fn contributors_ui(ui: &mut egui::Ui, auto: &mut Registry) {
     let id = egui::Id::new("credits_view");
     let mut v = ui.data_mut(|d| d.get_temp::<View>(id)).unwrap_or_default();
     ui.horizontal_wrapped(|ui| {
-        ui.label("Show");
+        ui.label(tr("Show"));
         for m in NameMode::ALL {
             let r = ui.selectable_label(v.names == m, m.label());
             auto.add(&format!("about.credits.show.{}", m.id()), r.rect, m.label());
@@ -252,7 +253,7 @@ pub fn contributors_ui(ui: &mut egui::Ui, auto: &mut Registry) {
             }
         }
         ui.separator();
-        ui.label("Sort");
+        ui.label(tr("Sort"));
         let combo = egui::ComboBox::from_id_salt("credits_sort").selected_text(v.key.label().0).show_ui(ui, |ui| {
             for k in SortKey::ALL {
                 let r = ui.selectable_label(v.key == k, k.label().0);
@@ -264,29 +265,29 @@ pub fn contributors_ui(ui: &mut egui::Ui, auto: &mut Registry) {
             }
         });
         auto.add("about.credits.sort", combo.response.rect, "Sort");
-        let r = ui.button(if v.ascending { "▲" } else { "▼" }).on_hover_text("Reverse the order");
+        let r = ui.button(if v.ascending { "▲" } else { "▼" }).on_hover_text(tr("Reverse the order"));
         auto.add("about.credits.reverse", r.rect, "Reverse the order");
         if r.clicked() {
             v.ascending = !v.ascending;
         }
         ui.separator();
-        let r = ui.selectable_label(!v.table, "Grab bag");
+        let r = ui.selectable_label(!v.table, tr("Grab bag"));
         auto.add("about.credits.view.grabBag", r.rect, "Grab bag");
         if r.clicked() {
             v.table = false;
         }
-        let r = ui.selectable_label(v.table, "Table");
+        let r = ui.selectable_label(v.table, tr("Table"));
         auto.add("about.credits.view.table", r.rect, "Table");
         if r.clicked() {
             v.table = true;
         }
     });
     let list = sorted(CONTRIBUTORS, v.names, v.key, v.ascending);
-    ui.label(RichText::new(format!("{} contributors · {} commits", list.len(), group(TOTAL_COMMITS))).small().weak());
+    ui.label(RichText::new(tr_args("{} contributors · {} commits", &[&(list.len()), &(group(TOTAL_COMMITS))])).small().weak());
     ui.separator();
     egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
         if list.is_empty() {
-            ui.label("No contributor data was built into this copy.");
+            ui.label(tr("No contributor data was built into this copy."));
         } else if v.table {
             table(ui, &list, &mut v, auto);
         } else {
@@ -340,7 +341,7 @@ fn table(ui: &mut egui::Ui, list: &[&Contributor], v: &mut View, auto: &mut Regi
 /// About ▸ Models: AI models credited in Co-Authored-By trailers.
 pub fn models_ui(ui: &mut egui::Ui) {
     if MODELS.is_empty() {
-        ui.label("No model credits were built into this copy.");
+        ui.label(tr("No model credits were built into this copy."));
         return;
     }
     let assisted: u64 = MODELS.iter().map(|m| m.commits).max().unwrap_or(0).max(1);

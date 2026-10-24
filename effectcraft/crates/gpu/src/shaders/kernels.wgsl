@@ -561,7 +561,7 @@ fn soft_linear_noise(x: f32, y: f32, z: f32, seed: u32) -> f32 {
     let wy = bspline(y + 0.5 - y0);
     let a = soft_linear_slice(i32(x0), i32(y0), i32(z0), wx, wy, seed);
     let b = soft_linear_slice(i32(x0), i32(y0), i32(z0) + 1, wx, wy, seed);
-    let n = a + (b - a) * fade(z - z0);
+    let n = a + (b - a) * (z - z0);
     return 0.5 + (n - 0.5) * SOFT_LINEAR_GAIN;
 }
 
@@ -605,7 +605,9 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
         case 1u: {
             if (a > 0.0) {
                 let c = straight(px);
-                let l = clamp(luminance(c), 0.0, 1.0);
+                // Rec. 601 weights, as After Effects: effects::LUMA_601 (checked by the test
+                // shader_constants_match_the_cpu).
+                let l = clamp(0.299 * c.x + 0.587 * c.y + 0.114 * c.z, 0.0, 1.0);
                 let blk = P.f[0].xyz;
                 let wht = P.f[1].xyz;
                 let t = blk + (wht - blk) * l;
@@ -621,18 +623,31 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
                 if (P.u[0].y == 1u) {
                     px = vec4<f32>(max((c + br - 0.5) * k + 0.5, vec3<f32>(0.0)) * a, a);
                 } else if (P.u[0].y == 2u) {
-                    // Brightness & Contrast tone curves (effects crate bc_modern).
+                    // Brightness & Contrast tone curves (effects crate bc_modern, AE-fitted #681).
                     var o = c;
-                    let pb = exp2(-br);
-                    let g = exp2(2.0 * ct);
+                    // Negative settings invert the positive curves (reciprocal exponents).
+                    var g = max(1.0 + 0.53 * abs(ct), 0.05);
+                    if (ct < 0.0) {
+                        g = 1.0 / g;
+                    }
+                    var e = exp2(1.24 * abs(br));
+                    if (br < 0.0) {
+                        e = 1.0 / e;
+                    }
                     for (var i = 0; i < 3; i++) {
                         if (c[i] < 1.0) {
-                            let v = powz(max(c[i], 0.0), pb);
-                            if (v < 0.5) {
-                                o[i] = 0.5 * powz(2.0 * v, g);
-                            } else {
-                                o[i] = 1.0 - 0.5 * powz(max(2.0 - 2.0 * v, 0.0), g);
+                            var v = max(c[i], 0.0);
+                            if (br != 0.0) {
+                                v = 1.0 - powz(1.0 - v, e);
                             }
+                            if (ct != 0.0) {
+                                if (v < 0.5) {
+                                    v = 0.5 * powz(2.0 * v, g);
+                                } else {
+                                    v = 1.0 - 0.5 * powz(max(2.0 - 2.0 * v, 0.0), g);
+                                }
+                            }
+                            o[i] = v;
                         }
                     }
                     px = vec4<f32>(o * a, a);
@@ -695,7 +710,12 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
                     if (P.u[0].z != 0u) {
                         t = min(t, 1.0);
                     }
-                    t = powz(max(t, 0.0), 1.0 / g);
+                    // color_fx::levels_gamma: unclipped values below 0 mirror the curve.
+                    if (t >= 0.0) {
+                        t = powz(t, 1.0 / g);
+                    } else {
+                        t = -powz(-t, 1.0 / g);
+                    }
                     o[i] = ob + (ow - ob) * t;
                 }
                 px = vec4<f32>(o * a, a);
@@ -706,14 +726,16 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let c = straight(px);
                 var o = vec3<f32>(0.0);
                 for (var i = 0; i < 3; i++) {
-                    // Per-channel gain, offset, gamma; negative values are mirrored.
+                    // Per-channel gain, offset, gamma; negative values are mirrored. The
+                    // linear-light conversion is a pure 2.2 power: effects::EXPOSURE_LINEAR_GAMMA
+                    // (checked by the test shader_constants_match_the_cpu).
                     if (P.u[0].y != 0u) {
                         let x = c[i] * P.f[0][i] + P.f[1][i];
                         o[i] = sign(x) * powz(abs(x), 1.0 / P.f[2][i]);
                     } else {
-                        let lin = srgb_to_linear(max(c[i], 0.0));
+                        let lin = sign(c[i]) * powz(abs(c[i]), 2.2);
                         let x = lin * P.f[0][i] + P.f[1][i];
-                        o[i] = sign(x) * linear_to_srgb(powz(abs(x), 1.0 / P.f[2][i]));
+                        o[i] = sign(x) * powz(powz(abs(x), 1.0 / P.f[2][i]), 1.0 / 2.2);
                     }
                 }
                 px = vec4<f32>(o * a, a);
@@ -746,17 +768,13 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
             let c = P.f[0];
             let invert = P.u[0].y != 0u;
             let opacity = P.f[1].x;
+            // The fill colour at the layer's (or inverted) alpha times Opacity (color_fx::fill).
             var fa = px.w;
             if (invert) {
                 fa = 1.0 - px.w;
             }
-            let f = c.xyz * fa;
-            let rgb = px.xyz + (f - px.xyz) * opacity;
-            var alpha = px.w;
-            if (invert) {
-                alpha = px.w + (fa - px.w) * opacity;
-            }
-            px = vec4<f32>(rgb, alpha);
+            fa = fa * opacity;
+            px = vec4<f32>(c.xyz * fa, fa);
         }
         case 8u: {
             // effects::color2::map_ca: transparent pixels only change through the alpha curve.
@@ -799,7 +817,8 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
             t = clamp(t, 0.0, 1.0);
             let c0 = P.f[1].xyz;
             let c1 = P.f[2].xyz;
-            px = put(px, c0 + (c1 - c0) * t, 1.0, P.f[3].z);
+            // Keep the source alpha, as the CPU path does (#1063): the ramp fills only the shape.
+            px = put(px, c0 + (c1 - c0) * t, px.w, P.f[3].z);
         }
         case 10u: {
             let contrast = P.f[0].x;
@@ -858,13 +877,13 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
                 val = 1.0 - val;
             }
             let op = P.f[2].z;
+            var fx = vec4<f32>(vec3<f32>(val) * op, op);
             if (P.u[1].z == 1u) {
-                // Normal: the noise over the layer at Opacity, then Blend With Original.
-                let over = vec4<f32>(vec3<f32>(val) * op, op) + px * (1.0 - op);
-                px = px * P.f[2].y + over * (1.0 - P.f[2].y);
-            } else {
-                px = put(px, vec3<f32>(val), op, P.f[2].y);
+                // Normal: the noise over the layer at Opacity.
+                fx = fx + px * (1.0 - op);
             }
+            // Inside the layer's alpha (its masks), then Blend With Original.
+            px = px * P.f[2].y + fx * px.w * (1.0 - P.f[2].y);
         }
         default: {}
     }

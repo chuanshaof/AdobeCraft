@@ -6,6 +6,9 @@ The desktop app exposes a control channel for agents, tests and the MCP bridge:
 effectcraft --control 9877        # or EFFECTCRAFT_CONTROL_PORT=9877
 ```
 
+The port must be a number from 1 to 65535, and `--control` overrides the variable. A bad port or an
+unknown option prints an error and the app exits with status 1 before it opens a window.
+
 - **Transport:** TCP on `127.0.0.1` only, one JSON object per line in each direction. Connections are
   persistent; requests on one connection are answered in order.
 - **Request:** `{"id": 1, "method": "engine.execute", "params": {...}}` (`id` is echoed back, `params`
@@ -34,7 +37,8 @@ printf '{"id":1,"method":"engine.execute","params":{"command":"comp.new","params
 |---|---|---|
 | `engine.execute` | `{command, params?}` | The command's result. Every engine command (`effectcraft-cli commands`) runs exactly as it does headless, so it never opens a dialog: `comp.new {}` creates a default comp. UI-only ids (`tool.*`, `view.*`, `window.*`, `playback.*`, `timeline.*`, `app.*`) fall through to the menu dispatcher. Unknown top-level params are rejected, and the error lists the accepted keys. |
 | `ui.menu.invoke` | `{id, params?}` | Like a menu click: commands with empty params may open their dialog (New Composition, Solid Settings, file pickers). |
-| UI commands (via either) | | `timeline.column {column, visible?}` (av, keys, label, num, comment, switches, modes, parent, in, out, duration, stretch), `timeline.sourceName {value?}`, `timeline.search {query}`, `timeline.reveal.<kind>` / `timeline.revealAdd.<kind>` (the property shortcuts and Shift+shortcut: position, scale, rotation, opacity, anchor, effects, masks, feather, levels, animated, and the double-press sets maskPath, maskOpacity, timeRemap, expressions, material, paint, selected, missingEffects, waveform), `timeline.keyAt.<anchor\|position\|scale\|rotation\|opacity>` (Alt+Shift+A/P/S/R/T), `timeline.twirlSelected` (Ctrl/Cmd+`), `timeline.collapseAll`, `flowchart.options {layers?, effects?, solids?, direction?: lr\|tb, comp?}`, `flowchart.graph {comp?}` → `{nodes, edges}`, `window.workspace {name}` (all After Effects workspaces). |
+| Copy a Media Browser source path | `ui.menu.invoke {id: "mediaBrowser.copySourcePath", params: {path}}` | Copies the exact non-empty path string to the clipboard and returns `{path}`. Supports file/folder paths and virtual source identifiers. Missing, empty or non-string paths return an error. |
+| UI commands (via either) | | `timeline.column {column, visible?}` (av, keys, label, num, comment, switches, modes, parent, in, out, duration, stretch), `timeline.sourceName {value?}`, `timeline.search {query}`, `timeline.reveal.<kind>` / `timeline.revealAdd.<kind>` (the property shortcuts and Shift+shortcut: position, scale, rotation, opacity, anchor, effects, masks, feather, levels, animated, and the double-press sets maskPath, maskOpacity, timeRemap, expressions, material, paint, selected, missingEffects, waveform), `timeline.keyAt.<anchor\|position\|scale\|rotation\|opacity>` (Alt+Shift+A/P/S/R/T), `timeline.twirlSelected` ``(Ctrl/Cmd+`)``, `timeline.collapseAll`, `flowchart.options {layers?, effects?, solids?, direction?: lr\|tb, comp?}`, `flowchart.graph {comp?}` → `{nodes, edges}`, `window.workspace {name}` (all After Effects workspaces). |
 | `engine.commands` | `{filter?, enabledOnly?}` | `[{id, label, menu, shortcut, params, enabled, why}]` |
 | `ui.menu.list` | `{}` | The menu tree with enablement. |
 | `render.frame` | `{comp?, time?, max_side?, path?, base64?}` | Renders a comp frame through the session, independent of the viewer zoom or resolution. `comp` is an id or name (default: the active comp), `time` is in comp seconds (default: the CTI), `max_side` caps the longest side (0 = full size). Writes a PNG to `path` (default: a temp file) and returns `{comp, time, width, height, path}`. With `base64: true` it returns `{…, png: "<base64>"}` and writes no file. |
@@ -47,13 +51,13 @@ export formats, parity summary), `jobs.list` (Progress panel jobs, e.g. the back
 `footage.check` after File ▸ Open).
 
 Every engine command is reachable through `engine.execute`, and every interactive widget of every
-panel registers an element id; both are enforced by `crates/ui-egui/tests/ui_agent_audit.rs`.
+panel registers an element id; both are enforced by `crates/ui-egui/tests/it/ui_agent_audit.rs`.
 
 ## UI state
 
 | Method | Params | Result |
 |---|---|---|
-| `ui.inspect` | `{}` | Window size, pixels per point, fps, serialized `UiState`, playback, time, active comp, selection, open dialog, last render ms. |
+| `ui.inspect` | `{}` | Window size, pixels per point, fps, serialized `UiState`, playback, time, active comp, selection, open dialog, last render ms, `keyboardFocus`, `windowFocused`, `workspaceStorageError`. |
 | `ui.elements` | `{prefix?}` | `[{id, label, rect: [x, y, w, h]}]`: the widgets drawn in the last frame, in points. |
 | `ui.set` | `{tool?, workspace?, theme?, focused?, viewer?, timeline?, menuBar?, home?}` | `viewer: {zoom (null = fit), res: Full\|Half\|Third\|Quarter\|Auto, pan: [x,y], grid, rulers, safeMargins, transparencyGrid}`; `timeline: {pps (null = fit), start, graphEditor, showModes, openLayers: [ids], openGroups: [uids]}`. |
 | `ui.panel.show` / `ui.panel.close` | `{panel}` | Panels: `Project`, `Composition`, `Timeline`, `EffectControls`, `EffectsPresets`, `Info`, `Preview`, `Character`, `Paragraph`, `Align` and others. |
@@ -61,6 +65,32 @@ panel registers an element id; both are enforced by `crates/ui-egui/tests/ui_age
 | `ui.resize` | `{width, height}` | Resizes the window (points). |
 | `ui.focus` | `{}` | Activates the window and takes keyboard focus. Agents normally avoid this, because the app is started without stealing focus. |
 | `app.quit` | `{force?}` | Closes the app. A modified project shows the Save / Don't Save / Cancel prompt first (automation ids `dialog.unsaved.save`, `dialog.unsaved.dontSave`, `dialog.unsaved.cancel`) unless `force: true`. |
+
+`keyboardFocus` is `null` when no egui widget has keyboard focus. Otherwise it contains the
+actual widget `id` (hexadecimal), its `rect: [x, y, w, h]` when available, an `automationId`
+when the widget registered its response identity, and `registryCandidates` containing exact
+rectangle matches. Candidates alone do not establish widget identity. Header, toolbar and
+dock-tab controls register their response identity. `ui.focused` continues to identify the
+focused panel; it is separate from keyboard widget focus. `windowFocused` reports the native
+window focus received by egui, which can differ from the retained widget focus.
+
+When a configuration store is available, current dock and floating geometry, focused and
+maximized panels, and named workspace snapshots persist in `workspaces.json`. The current
+layout and named snapshots are independent: changing a divider does not overwrite the named
+snapshot until `window.saveWorkspace` runs. Changes save after pointer release, at most once
+per second, with a final save on normal exit. Version 1 files are limited to 1 MiB and bounded
+workspace trees; extra viewer IDs must be between 1 and 65,535. Native reads enforce the size
+limit while reading and report I/O and UTF-8
+errors. Unreadable, invalid or newer files leave the default workspace available and are
+preserved for the entire session, including after later layout changes. Load and save errors
+appear in the status message and the nullable
+`workspaceStorageError` field; a failed write remains eligible for retry.
+`window.saveWorkspace`, `window.saveWorkspaceAs` and `window.editWorkspaces` (rename, delete)
+write the file immediately. Through `ui.menu.invoke` they return an error when it isn't written
+(a failed write, a file preserved after a failed load, or no configuration store);
+`engine.execute` hands them to the UI and returns `{frontend}` first, so check
+`workspaceStorageError` there. The changed workspaces still apply for the session, and a later
+save retries them.
 
 ## Input
 
@@ -76,6 +106,13 @@ Points are logical window coordinates. A target is `{id}` (the element's centre;
 | `ui.scroll` | `{id \| x,y, dx, dy}` |
 | `ui.key` | `{key}`, for example `Space`, `F9`, `Cmd+Z`, `Cmd+Shift+Z`, `PageDown`, `Escape` |
 | `ui.type` | `{text}`: text input into the focused field |
+
+Shortcut presets also accept `Physical+<shortcut>` for a keyboard position, using egui's
+US-position names (for example `Physical+6` and `Physical+Minus` distinguish AZERTY's
+`-` and `)` keys). Physical bindings take precedence over logical bindings for that key
+press. `ui.key` accepts the same notation to test them. Ordinary shortcuts remain layout-aware.
+`time.workAreaStart` and `time.workAreaEnd` navigate to the first and last included work-area
+frames and can be assigned through `shortcuts.set`.
 
 ## Locating things
 
@@ -98,7 +135,8 @@ one), `panel.tab.Viewer(<n>)` and `viewers.<n>` (View ▸ New Viewer's other Com
 renames it), `viewer.comp`, `viewer.handle.<layer>.<i>`,
 `timeline.layer.<id>.bar`, `timeline.layer.<id>.nestedMarker.<i>` (a precomp's comp markers), `timeline.layer.<id>.twirl`, `timeline.layer.<id>.row` (click selects,
 Enter or a double-click renames, drag reorders), `timeline.prop.<uid>.stopwatch`,
-`timeline.key.<uid>.<frame>`, `timeline.cti`, `effectControls.prop.<uid>.value` (an angle's
+`timeline.key.<uid>.<frame>` (and `timeline.keyAt.<uid>.<ticks>`, exact in layer-time ticks, for
+keys on subframes), `timeline.cti`, `effectControls.prop.<uid>.value` (an angle's
 revolutions are `timeline.prop.<uid>.revolutions`, `effectControls.prop.<uid>.revolutions` and
 `properties.prop.<uid>.revolutions`) and `effects.item.<name>`. The Composition viewer adds `viewer.magnification`, `viewer.resolution`,
 `viewer.roi`, `viewer.grid`, `viewer.channel`, `viewer.exposure`, `viewer.snapshot`,
@@ -110,11 +148,18 @@ revolutions are `timeline.prop.<uid>.revolutions`, `effectControls.prop.<uid>.re
 `timeline.graph.snap` and `timeline.graph.reference`. Use `ui.elements` to see what is on screen.
 
 Viewer state that agents drive headless too: `view.snapping`, `view.snappingOptions
-{edgesExtended?, edges?, corners?, centers?, anchorPoints?, paths?, toggle?}` (the Tools bar's
-Snapping options, `header.snappingOptions`), `view.channel {channel, colorized?}`,
+{edgesExtended?, collapsedFeatures?, toggle?}` (the Tools bar's Snapping options,
+`header.snappingOptions`: After Effects' Snap Edges Extended and Snap to Features in Collapsed
+Compositions and Text Layers), `view.channel {channel, colorized?}`,
 `view.exposure {stops | delta}`, `view.resetExposure`, `view.takeSnapshot`, `view.showSnapshot`,
-`view.fastPreviewMode {mode}`, `view.setRegionOfInterest {rect}`, `view.addGuide`,
-`view.moveGuide`, `view.removeGuide`; editing: `shape.newPath` (Pen on shape layers),
+`view.fastPreviewMode {mode}` (one mode each, for shortcuts:
+`view.fastPreviews.off|adaptive|draft|fastDraft|wireframe`, and for the channels
+`view.channel.red|green|blue|alpha|redColorized|greenColorized|blueColorized|rgbStraight`), `view.res.full|half|third|quarter|auto {comp?}` and
+`view.res.custom {factor, comp?}` (the comp's Resolution, saved with the project but no undo
+step; `ui.set {viewer: {res}}` sets the active comp's, and `ui.inspect` reports it as
+`ui.viewer.res`), `view.setRegionOfInterest {rect}`, `view.addGuide {percent?}`,
+`view.addPercentGuide`, `view.convertGuides {to: percent|pixels, index?}`,
+`view.moveGuide` (comp pixels, whatever the guide's unit), `view.removeGuide`, `effect.setLabel {layer?, effect, label}`; editing: `shape.newPath` (Pen on shape layers),
 `shape.newShape` (the shape tools: a new group in the selected shape layer, else a new shape layer),
 `shape.toolOptions` (the Tools bar's Tool Creates Shape / Mask and Fill and Stroke Options),
 `mask.insertVertex`, `mask.convertVertex`, `mask.deleteVertices`, `path.freeTransform` (masks and
@@ -123,3 +168,38 @@ Editor transform box, timeline Alt-drag scaling).
 
 The MCP server's bridge mode (`effectcraft-cli mcp --bridge 9877`) is a thin client of this protocol;
 see [agents.md](agents.md).
+
+Keyframe command times (`prop.set`, `prop.addKey`, `keys.set`, `keys.select`) default to layer
+seconds. Set `timeBase: "comp"` for comp seconds; `keys.set.newTime` and every
+`keys.select.keys[].time` use the same input base. Omitted `prop.set` or `prop.addKey` times use
+the target comp's CTI. Supplied write times snap to its nearest comp frame before conversion
+to stored layer time, including on stretched or reversed layers. Existing `keys.set` neighbor
+constraints and roving adjustment can change the final stored time.
+
+Explicit bases add `layerTime` and `compTime` to unsplit `prop.set` and `prop.addKey` replies,
+alongside `value` or `count`. Separated Position `prop.set` keeps an array of per-axis replies.
+Explicit `keys.select` replies contain `count` and `keys[]`, with timing on each key in the
+resulting selection. Key metadata's `time` remains layer seconds regardless of the input base.
+Without `timeBase`, these three commands retain their existing JSON value/count replies,
+including outside the layer's `[in, out)` range. Timing metadata carries outside-range warnings;
+`keys.set` and `prop.get.keys[]` report both bases and warnings without an explicit base too.
+`prop.get.time` is comp seconds. For these commands, `path` or `prop` identifies a property, not a group.
+Set a layer's offset with `layer.timing {layer, start}` (comp seconds).
+
+Panel moves, tab ordering, edge splits and floating geometry use shared docking transactions.
+`window.floatPanel` requires exactly four finite numbers when `rect` is supplied. Invalid
+geometry or missing source/anchor panels leaves the layout unchanged. The persisted workspace
+shape is unchanged: accordion open states and explicit heights, floating groups, and dynamic
+viewer/ScriptUI identities remain app data. Pointer drops use the same shared placement rules
+as commands, with floating groups resolved in their actual window stacking order.
+
+`window.dockAction` accepts `{action}` using the shared docking action's JSON form. It
+covers tab moves and ordering, split and floating geometry, activation, and closing.
+For example, `{"action":{"ResizeSplit":{"path":[],"size":{"FixedFirst":360}}}}`
+resizes the root split; path entries use `false` for the first child and `true` for
+the second. `{"action":{"MoveFloating":{"panel":"Info","rect":[45,65,420,320]}}}`
+repositions and resizes the floating group containing Info. Invalid actions leave the
+layout unchanged. Pointer gestures dispatch through this same catalog command.
+EffectCraft also supports `SetStackOpen` and `ResizeStack`. Dynamic panel identities use
+`{"Viewer":42}` or `{"ScriptPanel":77}` in the action. Closing runs the existing viewer
+and ScriptUI lifecycle callbacks; opening uses the existing panel creation commands.

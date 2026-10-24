@@ -9,15 +9,20 @@
 //! - Glow: the colour map (A & B Colors: a preview strip of the gradient over glow brightness;
 //!   Arbitrary Map: red / green / blue curve graphs and the resulting strip);
 //! - Reshape: correspondence point list buttons here, and on the Composition viewer the source
-//!   and destination mask outlines with draggable correspondence handles ([`reshape_overlay`]).
+//!   and destination mask outlines with draggable correspondence handles ([`reshape_overlay`]);
+//! - EXtractoR: a Layer popup of the footage's OpenEXR layers, and Red / Green / Blue / Alpha
+//!   popups of its channels ([`channel_popup`]);
+//! - Mesh Warp: on the Composition viewer, the distortion mesh's grid over the layer with a
+//!   draggable handle on every vertex ([`mesh_warp_overlay`], #303).
 //!
 //! Every edit is a `prop.set` engine command (undoable; one drag = one undo step) and every
 //! handle registers an automation id.
 
+use crate::i18n::{tr, tr_args};
 use effectcraft_engine::effects::{ColoramaPalette, OffsetCurve};
 use effectcraft_engine::geom::Mat3;
 use effectcraft_engine::keyframe::Value;
-use effectcraft_engine::project::{Layer, PropGroup};
+use effectcraft_engine::project::{GroupKind, Layer, PropGroup};
 use effectcraft_engine::render::EvalCtx;
 use egui::{Align2, Color32, Pos2, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use serde_json::json;
@@ -33,6 +38,8 @@ pub const LUMETRI: &str = "ec.color.lumetri";
 pub const COLORAMA: &str = "ec.color.colorama";
 pub const GLOW: &str = "ec.stylize.glow";
 pub const RESHAPE: &str = "ec.distort.reshape";
+pub const EXTRACTOR: &str = "ec.3d.extractor";
+pub const MESH_WARP: &str = "ec.distort.meshwarp";
 
 fn str_value(layer: &Layer, ectx: &EvalCtx, g: &PropGroup, id: &str) -> String {
     match g.get(id).map(|p| ectx.value(layer, p)) {
@@ -107,7 +114,7 @@ fn tabs(
 fn reset_link(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, r: Rect, id: &str) -> bool {
     let t = app.tokens;
     let resp = ui.interact(r, egui::Id::new(id), Sense::click());
-    p.text(r.center(), Align2::CENTER_CENTER, "Reset", Tokens::ui(11.5), if resp.hovered() { t.hot_text } else { t.text_dim });
+    p.text(r.center(), Align2::CENTER_CENTER, tr("Reset"), Tokens::ui(11.5), if resp.hovered() { t.hot_text } else { t.text_dim });
     app.auto.add(id, r, "Reset");
     resp.clicked()
 }
@@ -186,14 +193,14 @@ fn rgb_curves(
     }
     let gr = Rect::from_min_size(pos2(x0, r.min.y + 30.0), vec2(size, size));
     let gid = egui::Id::new(("lumetri-rgb", euid, ch));
-    let (resp, edit) = fw::curves_graph(ui, gr, &cur, ch, false, gid, &t);
+    let (resp, edit) = fw::curves_graph(ui, gr, &cur, ch, false, false, gid, &t);
     app.auto.add(&format!("{prefix}.graph"), gr, "RGB Curves");
     register_points(app, &prefix, gr, &cur.0);
     let key = gesture_key(ui, gid, resp.drag_started() || resp.clicked());
     if let Some(np) = edit.changed {
         set_str(actions, layer, g, id, np.format(), Some(key));
     }
-    p.text(pos2(gr.min.x, gr.max.y + 11.0), Align2::LEFT_CENTER, "Click adds a point; drag one off to remove", Tokens::ui(10.5), t.text_faint);
+    p.text(pos2(gr.min.x, gr.max.y + 11.0), Align2::LEFT_CENTER, tr("Click adds a point; drag one off to remove"), Tokens::ui(10.5), t.text_faint);
 }
 
 /// A hue / saturation curve's points (`x,y` in 0..1, y = ½ neutral), any count (empty = flat).
@@ -391,7 +398,7 @@ fn huesat_curves(
     if reset_link(app, ui, p, Rect::from_min_size(pos2(gr.max.x - 44.0, gr.max.y + 4.0), vec2(44.0, 18.0)), &format!("{prefix}.reset")) {
         set_str(actions, layer, g, id, String::new(), None);
     }
-    p.text(pos2(gr.min.x, gr.max.y + 13.0), Align2::LEFT_CENTER, "Click adds a point (½ height = no change)", Tokens::ui(10.5), t.text_faint);
+    p.text(pos2(gr.min.x, gr.max.y + 13.0), Align2::LEFT_CENTER, tr("Click adds a point (½ height = no change)"), Tokens::ui(10.5), t.text_faint);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -455,7 +462,7 @@ fn colorama_wheel(
     let pal = if custom { ColoramaPalette::parse(&str_value(layer, ectx, g, "palette")) } else { None }.unwrap_or_else(|| ColoramaPalette::preset(preset));
     let x0 = r.min.x + 38.0;
     let label = if custom { "Custom palette" } else { effectcraft_engine::effects::COLORAMA_PRESETS.get(preset as usize).copied().unwrap_or("Preset") };
-    p.text(pos2(x0, r.min.y + 15.0), Align2::LEFT_CENTER, format!("Output Cycle: {label}"), Tokens::ui(11.5), t.text_dim);
+    p.text(pos2(x0, r.min.y + 15.0), Align2::LEFT_CENTER, tr_args("Output Cycle: {}", &[&label]), Tokens::ui(11.5), t.text_dim);
     let size = wheel_size(r.width());
     let c = pos2(x0 + size / 2.0, r.min.y + 30.0 + size / 2.0);
     let (outer, inner) = (size / 2.0 - 8.0, size / 2.0 - 26.0);
@@ -569,9 +576,15 @@ fn colorama_wheel(
             widgets::open_popup(ui, pop);
         }
         app.auto.add(&format!("{prefix}.color"), sr, "Stop color");
-        p.text(pos2(sr.max.x + 8.0, sr.center().y), Align2::LEFT_CENTER, format!("Stop {} at {:.0}°", sel + 1, ph * 360.0), Tokens::ui(11.0), t.text_dim);
+        p.text(
+            pos2(sr.max.x + 8.0, sr.center().y),
+            Align2::LEFT_CENTER,
+            tr_args("Stop {} at {}°", &[&(sel + 1), &format!("{:.0}", ph * 360.0)]),
+            Tokens::ui(11.0),
+            t.text_dim,
+        );
         let mut rgb = [col[0], col[1], col[2]];
-        if crate::header::color_popup(ui, pop, sr.left_bottom(), &mut rgb) {
+        if crate::widgets::color_popup(ui, pop, sr.left_bottom(), &mut rgb) {
             let mut st = pal.stops.clone();
             st[sel].1 = [rgb[0], rgb[1], rgb[2], col[3]];
             new_stops = Some(st);
@@ -609,6 +622,7 @@ pub fn header_height(effect: &str, g: &PropGroup, width: f32) -> f32 {
             _ => 0.0,
         },
         RESHAPE => 50.0,
+        EXTRACTOR => 30.0,
         _ => 0.0,
     }
 }
@@ -628,6 +642,7 @@ pub fn header_editor(
     match effect {
         GLOW => glow_map(app, ui, p, layer, g, ectx, r, actions),
         RESHAPE => reshape_buttons(app, ui, p, layer, g, ectx, r, actions),
+        EXTRACTOR => extractor_layers(app, ui, p, layer, g, ectx, r, actions),
         _ => {}
     }
 }
@@ -682,7 +697,7 @@ fn glow_map(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, laye
     }
     p.rect_stroke(strip, 0.0, Stroke::new(1.0, t.field_border), StrokeKind::Outside);
     app.auto.add(&format!("{prefix}.colorMap"), strip, "Glow colour map");
-    p.text(pos2(strip.max.x + 8.0, strip.center().y), Align2::LEFT_CENTER, "Colour map", Tokens::ui(10.5), t.text_faint);
+    p.text(pos2(strip.max.x + 8.0, strip.center().y), Align2::LEFT_CENTER, tr("Colour map"), Tokens::ui(10.5), t.text_faint);
     if mode != 2 {
         return;
     }
@@ -698,7 +713,7 @@ fn glow_map(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, laye
     }
     let gr = Rect::from_min_size(pos2(x0, r.min.y + 30.0), vec2(size, size));
     let gid = egui::Id::new(("glow-map", euid, ch));
-    let (resp, edit) = fw::curves_graph(ui, gr, &map[ch], ch + 1, false, gid, &t);
+    let (resp, edit) = fw::curves_graph(ui, gr, &map[ch], ch + 1, false, false, gid, &t);
     app.auto.add(&format!("{prefix}.graph"), gr, "Arbitrary Map");
     register_points(app, &prefix, gr, &map[ch].0);
     let key = gesture_key(ui, gid, resp.drag_started() || resp.clicked());
@@ -793,6 +808,115 @@ fn reshape_buttons(
         format!("{} correspondence point(s): drag them along the mask outlines in the viewer", pairs.len())
     };
     p.text(pos2(r.min.x + 24.0, r.min.y + 38.0), Align2::LEFT_CENTER, status, Tokens::ui(11.5), t.text_dim);
+}
+
+// ---------------------------------------------------------------------------------------------
+// EXtractoR: the layer's OpenEXR layers and channels
+
+/// EXtractoR's channel parameters, shown in red, green, blue and alpha.
+const EXTRACTOR_CHANNELS: [&str; 4] = ["red", "green", "blue", "alpha"];
+/// What an empty channel name shows.
+const NO_CHANNEL: &str = "(none)";
+
+/// Whether `prop` (in group `g`) is one of EXtractoR's channel parameters.
+pub fn is_extractor_channel(g: &PropGroup, prop: &effectcraft_engine::project::Property) -> bool {
+    matches!(&g.kind, GroupKind::Effect { effect } if effect == EXTRACTOR) && EXTRACTOR_CHANNELS.contains(&prop.match_id.as_str())
+}
+
+/// The OpenEXR layer EXtractoR's red, green and blue come from (`""`: the unnamed layer), or
+/// `None` when they mix layers.
+fn extractor_layer(vals: &[String; 4]) -> Option<&str> {
+    let mut layers = vals[..3].iter().filter(|v| !v.trim().is_empty()).map(|v| effectcraft_engine::raster::channels3d::split_channel(v.trim()).0);
+    let first = layers.next()?;
+    layers.all(|l| l == first).then_some(first)
+}
+
+/// EXtractoR's Layer popup (above its channels): picking an OpenEXR layer of the footage
+/// (`diffuse`, `ViewLayer.Combined`, …) shows its channels in red, green, blue and alpha in one
+/// undo step, as After Effects' EXtractoR dialog does.
+#[allow(clippy::too_many_arguments)]
+fn extractor_layers(
+    app: &mut EffectcraftApp,
+    ui: &mut egui::Ui,
+    p: &egui::Painter,
+    layer: &Layer,
+    g: &PropGroup,
+    ectx: &EvalCtx,
+    r: Rect,
+    actions: &mut Actions,
+) {
+    let t = app.tokens;
+    let euid = g.uid;
+    let vals = EXTRACTOR_CHANNELS.map(|id| str_value(layer, ectx, g, id));
+    let label = match extractor_layer(&vals) {
+        Some("") => "RGBA".to_string(),
+        Some(l) => l.to_string(),
+        None => "Custom".to_string(),
+    };
+    // Lined up with the parameter names and value popups below (Effect Controls' row layout).
+    p.text(pos2(r.min.x + 37.0, r.center().y), Align2::LEFT_CENTER, tr("Layer"), Tokens::ui(12.0), t.text);
+    let vx = (r.min.x + r.width() * 0.48).max(r.min.x + 161.0);
+    let dr = Rect::from_min_size(pos2(vx, r.center().y - 9.0), vec2((r.max.x - vx - 56.0).clamp(80.0, 200.0), 18.0));
+    let pop = egui::Id::new(("extractor-layers", euid));
+    if widgets::dropdown(ui, dr, &label, &t, egui::Id::new(("extractor-layer", euid)))
+        .on_hover_text(tr("The OpenEXR layer shown in red, green, blue and alpha"))
+        .clicked()
+    {
+        widgets::open_popup(ui, pop);
+    }
+    app.auto.add(&format!("effectControls.effect.{euid}.extractor.layer"), dr, "Layer");
+    // The footage's layers, read only while the list is open (each frame of a sequence is a file).
+    if !widgets::popup_is_open(ui, pop) {
+        return;
+    }
+    let aux = app.session.layer_channels(layer.id);
+    let layers: Vec<&str> = aux.as_ref().map(|a| a.layers()).unwrap_or_default();
+    let names: Vec<String> = match layers.as_slice() {
+        [] => vec!["No layers: not a multi-layer OpenEXR file".into()],
+        _ => layers.iter().map(|l| if l.is_empty() { "RGBA".to_string() } else { l.to_string() }).collect(),
+    };
+    let cur = names.iter().position(|n| *n == label);
+    if let (Some(i), Some(aux)) = (widgets::popup_menu(ui, pop, dr.left_bottom(), &names, cur), aux.as_ref()) {
+        let Some(l) = layers.get(i) else { return };
+        let merge = format!("extractor-layer-{euid}-{}", ui.ctx().cumulative_pass_nr());
+        for (id, v) in EXTRACTOR_CHANNELS.iter().zip(aux.layer_rgba(l)) {
+            set_str(actions, layer, g, id, v, Some(merge.clone()));
+        }
+    }
+}
+
+/// An EXtractoR channel popup (in place of a text field): the layer's own R, G, B and A, then
+/// every channel of its OpenEXR footage, and (none).
+pub fn channel_popup(
+    app: &mut EffectcraftApp,
+    ui: &mut egui::Ui,
+    layer: &Layer,
+    prop: &effectcraft_engine::project::Property,
+    cur: &str,
+    r: Rect,
+    actions: &mut Actions,
+) {
+    let t = app.tokens;
+    let uid = prop.uid;
+    let label = if cur.trim().is_empty() { NO_CHANNEL } else { cur };
+    let pop = egui::Id::new(("ec-chpop", uid));
+    if widgets::dropdown(ui, r, label, &t, egui::Id::new(("ec-ch", uid))).clicked() {
+        widgets::open_popup(ui, pop);
+    }
+    app.auto.add(&format!("effectControls.prop.{uid}.value"), r, &prop.name);
+    if !widgets::popup_is_open(ui, pop) {
+        return;
+    }
+    let mut opts: Vec<String> = ["R", "G", "B", "A"].map(String::from).to_vec();
+    if let Some(aux) = app.session.layer_channels(layer.id) {
+        opts.extend(aux.names().into_iter().filter(|n| !opts.iter().any(|o| o.eq_ignore_ascii_case(n))).map(String::from).collect::<Vec<_>>());
+    }
+    opts.push(NO_CHANNEL.into());
+    let sel = opts.iter().position(|o| o.eq_ignore_ascii_case(label));
+    if let Some(i) = widgets::popup_menu(ui, pop, r.left_bottom(), &opts, sel) {
+        let v = opts.get(i).filter(|o| *o != NO_CHANNEL).cloned().unwrap_or_default();
+        actions.push(("prop.set".into(), json!({"layer": layer.id.0, "prop": uid, "value": v})));
+    }
 }
 
 /// Arc-length fraction (0..1) of the point of a polyline nearest to `q`.
@@ -897,9 +1021,108 @@ pub fn reshape_overlay(
     }
 }
 
+/// Mesh Warp's grid: (rows, columns, vertex offsets in layer pixels, row-major). A stored mesh
+/// that doesn't match the grid (Rows or Columns changed since) reads as undistorted, as it
+/// renders.
+fn mesh_grid(layer: &Layer, ectx: &EvalCtx, g: &PropGroup) -> (usize, usize, Vec<(f64, f64)>) {
+    let n = |id: &str| {
+        let v = g.get(id).map(|p| ectx.value(layer, p).as_f64()).unwrap_or(7.0);
+        if v.is_finite() { v.round().clamp(1.0, 31.0) as usize } else { 7 }
+    };
+    let (rows, cols) = (n("rows"), n("columns"));
+    let count = (rows + 1) * (cols + 1);
+    let mut offs = effectcraft_engine::effects::parse_mesh(&str_value(layer, ectx, g, "mesh"));
+    if offs.len() != count {
+        offs = vec![(0.0, 0.0); count];
+    }
+    (rows, cols, offs)
+}
+
+/// The `mesh` parameter's text for these offsets (the inverse of `parse_mesh`).
+fn format_mesh(offs: &[(f64, f64)]) -> String {
+    let r = |v: f64| if v.is_finite() { (v * 1000.0).round() / 1000.0 + 0.0 } else { 0.0 };
+    offs.iter().map(|o| format!("{},{}", r(o.0), r(o.1))).collect::<Vec<_>>().join(" ")
+}
+
+/// Mesh Warp on the Composition viewer (#303): the distortion mesh's grid over the layer, with
+/// a handle on every vertex. Dragging a vertex moves it (its offset in the hidden `mesh`
+/// parameter; the first drag of an undistorted mesh writes the whole grid). `fm` maps effect
+/// space to comp.
+#[allow(clippy::too_many_arguments)]
+pub fn mesh_warp_overlay(
+    app: &mut EffectcraftApp,
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    map: &super::viewer::ViewerMap,
+    ectx: &EvalCtx,
+    layer: &Layer,
+    g: &PropGroup,
+    fm: &Mat3,
+    actions: &mut Actions,
+) {
+    let (rows, cols, offs) = mesh_grid(layer, ectx, g);
+    let [lw, lh] = ectx.effect_bounds(layer).0;
+    let rest = |k: usize| [(k % (cols + 1)) as f64 / cols as f64 * lw, (k / (cols + 1)) as f64 / rows as f64 * lh];
+    let screen: Vec<Pos2> = offs
+        .iter()
+        .enumerate()
+        .map(|(k, o)| {
+            let r = rest(k);
+            map.to_screen(fw::layer_to_comp(fm, [r[0] + o.0, r[1] + o.1]))
+        })
+        .collect();
+    let line = Stroke::new(1.0, Color32::from_white_alpha(150));
+    for (k, s) in screen.iter().enumerate() {
+        if k % (cols + 1) < cols
+            && let Some(e) = screen.get(k + 1)
+        {
+            painter.line_segment([*s, *e], line);
+        }
+        if let Some(e) = screen.get(k + cols + 1) {
+            painter.line_segment([*s, *e], line);
+        }
+    }
+    let ctx = ui.ctx().clone();
+    let accent = app.tokens.accent;
+    for (k, s) in screen.iter().enumerate() {
+        let hr = Rect::from_center_size(*s, vec2(10.0, 10.0));
+        let id = egui::Id::new(("mesh-warp-vertex", g.uid, k));
+        let resp = ui.interact(hr, id, Sense::drag());
+        let hot = resp.hovered() || resp.dragged();
+        let dot = Rect::from_center_size(*s, vec2(5.0, 5.0));
+        painter.rect_filled(dot, 0.0, if hot { accent } else { Color32::WHITE });
+        painter.rect_stroke(dot, 0.0, Stroke::new(1.0, Color32::BLACK), StrokeKind::Outside);
+        let (row, col) = (k / (cols + 1), k % (cols + 1));
+        app.auto.add(&format!("viewer.meshWarp.{}.{row}.{col}", g.uid), hr, &format!("Mesh vertex (row {row}, column {col})"));
+        if hot {
+            ctx.set_cursor_icon(egui::CursorIcon::Move);
+        }
+        if resp.dragged()
+            && let Some(pos) = resp.interact_pointer_pos()
+            && let Some(lp) = fw::comp_to_layer(fm, map.to_comp(pos))
+        {
+            let mut v = offs.clone();
+            let r = rest(k);
+            if let Some(o) = v.get_mut(k) {
+                *o = (lp[0] - r[0], lp[1] - r[1]);
+            }
+            let key = gesture_key(ui, id, resp.drag_started());
+            set_str(actions, layer, g, "mesh", format_mesh(&v), Some(key));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mesh_text_round_trips() {
+        let offs = vec![(0.0, 0.0), (12.5, -3.25), (1.0 / 3.0, f64::NAN)];
+        let s = format_mesh(&offs);
+        assert_eq!(s, "0,0 12.5,-3.25 0.333,0");
+        assert_eq!(effectcraft_engine::effects::parse_mesh(&s), vec![(0.0, 0.0), (12.5, -3.25), (0.333, 0.0)]);
+    }
 
     #[test]
     fn offset_points_and_palettes_round_trip() {

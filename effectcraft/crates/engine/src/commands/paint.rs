@@ -53,7 +53,7 @@ pub struct PaintOptions {
     pub clone_preset: u32,
     /// Source layer (None = the layer being painted).
     pub clone_source: Option<u64>,
-    /// Source point set with Alt/Option-click (layer space of the source layer).
+    /// Source point set with Alt/Option-click (effect space of the source layer).
     pub clone_point: Option<[f64; 2]>,
     /// Aligned: keep the source/destination offset between strokes.
     pub aligned: bool,
@@ -271,7 +271,7 @@ fn preset(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn set_clone_source(s: &mut Session, p: &Value) -> Result<Value> {
-    let point = pt(p.get("point")).ok_or_else(|| bad("paint.setCloneSource", "missing `point` [x, y] (layer space)"))?;
+    let point = pt(p.get("point")).ok_or_else(|| bad("paint.setCloneSource", "missing `point` [x, y] (effect space)"))?;
     let (_, lid) = layer_p(s, p, "paint.setCloneSource")?;
     s.state.paint.clone_source = Some(lid.0);
     s.state.paint.clone_point = Some(point);
@@ -300,7 +300,7 @@ fn stroke(s: &mut Session, p: &Value) -> Result<Value> {
         Some(k) => StrokeKind::from_name(k).ok_or_else(|| bad(cmd, format!("unknown kind `{k}` (brush | clone | eraser)")))?,
         None => StrokeKind::Brush,
     };
-    let raw = p.get("points").and_then(Value::as_array).ok_or_else(|| bad(cmd, "missing `points` [[x, y, pressure?], …] (layer space)"))?;
+    let raw = p.get("points").and_then(Value::as_array).ok_or_else(|| bad(cmd, "missing `points` [[x, y, pressure?], …] (effect space)"))?;
     let mut points = vec![];
     let mut pressure = vec![];
     for q in raw {
@@ -325,8 +325,7 @@ fn stroke(s: &mut Session, p: &Value) -> Result<Value> {
     let t = fr.snap_nearest(super::time_p(s, p, Some(comp)));
     let layer = comp.layer(lid).ok_or_else(|| bad(cmd, "no layer"))?;
     let lt = layer.layer_time(t);
-    let (w, h) = effectcraft_render::source_size(&s.project, layer);
-    let size = if w == 0 { [comp.width as f64, comp.height as f64] } else { [w as f64, h as f64] };
+    let size = effectcraft_render::effect_bounds(&s.project, comp, layer).0;
     if layer.effects().is_none() || !layer.source.is_av() {
         return Err(bad(cmd, "this layer can't be painted on"));
     }
@@ -463,7 +462,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Paint Stroke",
             [],
             None,
-            "{layer?, kind?: brush|clone|eraser, points: [[x,y,pressure?],…] (layer space), time? (s) | frame?, duration? (s, drawing time for Write On), color?: [r,g,b,a], diameter?, angle?, hardness?, roundness?, spacing?, opacity?, flow?, mode?, channels?: RGBA|RGB|Alpha, durationMode?: constant|writeOn|singleFrame|custom, customFrames?, eraseMode?: layerSourceAndPaint|paintOnly|lastStrokeOnly, cloneSource?: layer id, clonePosition?: [x,y], cloneTimeShift? (s), lockSourceTime?, cloneTime? (s), sizePressure?, minSize?, opacityPressure?, flowPressure?}",
+            "{layer?, kind?: brush|clone|eraser, points: [[x,y,pressure?],…] (effect space), time? (s) | frame?, duration? (s, drawing time for Write On), color?: [r,g,b,a], diameter?, angle?, hardness?, roundness?, spacing?, opacity?, flow?, mode?, channels?: RGBA|RGB|Alpha, durationMode?: constant|writeOn|singleFrame|custom, customFrames?, eraseMode?: layerSourceAndPaint|paintOnly|lastStrokeOnly, cloneSource?: layer id, clonePosition?: [x,y], cloneTimeShift? (s), lockSourceTime?, cloneTime? (s), sizePressure?, minSize?, opacityPressure?, flowPressure?}",
             has_comp,
             stroke
         ),

@@ -14,12 +14,27 @@ fn mix(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
     [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
 }
 
+/// Rec. 601 luminance on the working-space values (sRGB working space, not linearised: red
+/// 76/255, green 150/255, blue 29/255), as After Effects 2026 renders Tint, Tritone, Luma Key and
+/// Extract. Tritone, case 718: a red solid with Blend With Original 25 gives (132, 23, 46), from
+/// luminance 0.299; Rec. 709's 0.213 gave (113, 16, 49); on a grey ramp both weightings agree
+/// (case 815). Luma Key and Extract: Key Out Darker / Extract Black Point at 65, 166 and 24 on
+/// pure red, green and blue keep red (601: 76, 709: 54) and blue (29 / 18) and key out green
+/// (150 / 182). The GPU kernels (`pointwise` op 1, `fx_color` op 4, `fxk_key_luma`) mirror it.
+pub(crate) fn luma_601(c: [f32; 3]) -> f32 {
+    LUMA_601[0] * c[0] + LUMA_601[1] * c[1] + LUMA_601[2] * c[2]
+}
+
+/// The Rec. 601 luma weights of [`luma_601`]. The WGSL kernels repeat them as literals; the GPU
+/// test `shader_constants_match_the_cpu` checks that they are these.
+pub const LUMA_601: [f32; 3] = [0.299, 0.587, 0.114];
+
 fn tint(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let black = ctx.params.color("black");
     let white = ctx.params.color("white");
     let amt = ctx.params.f("amount") as f32 / 100.0;
     b.img.map_straight(|c| {
-        let l = luminance(c[0], c[1], c[2]).clamp(0.0, 1.0);
+        let l = luma_601(c).clamp(0.0, 1.0);
         let t = [black[0] + (white[0] - black[0]) * l, black[1] + (white[1] - black[1]) * l, black[2] + (white[2] - black[2]) * l];
         mix(c, t, amt)
     });
@@ -32,7 +47,7 @@ fn tritone(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let sh = ctx.params.color("shadows");
     let blend = 1.0 - ctx.params.f("blend") as f32 / 100.0;
     b.img.map_straight(|c| {
-        let l = luminance(c[0], c[1], c[2]).clamp(0.0, 1.0);
+        let l = luma_601(c).clamp(0.0, 1.0);
         let t = if l < 0.5 {
             mix([sh[0], sh[1], sh[2]], [mid[0], mid[1], mid[2]], l * 2.0)
         } else {
@@ -43,16 +58,31 @@ fn tritone(ctx: &EffectCtx, mut b: Buf) -> Buf {
     b
 }
 
-/// Brightness & Contrast without Use Legacy: tone curves that keep black and white fixed (no
-/// clipping). Brightness bends the curve with a power (`b` in -1.5..1.5), contrast is an S
-/// curve around mid grey (`c` in -1..1). Values above 1 pass through. The GPU kernel mirrors it.
+/// Brightness & Contrast without Use Legacy: pin black and white, then a mild S-curve.
+///
+/// Fitted to After Effects non-legacy grey ramps (#681, kasper9n oracles). Brightness is a
+/// power toward white (`1-(1-v)^e`) or black (`v^e`); contrast uses `g = 1 + 0.53 c` instead of
+/// the old `2^(2c)` (that crushed 0.25 to ~8/255 at Contrast 100; AE is ~40/255). Values above 1
+/// pass through. The GPU kernel mirrors it.
+///
+/// Negative Brightness and Contrast are the inverse curves of the positive ones (After Effects
+/// 2026 ramps: Brightness −40 is Brightness +40 inverted within 2.6/255, Contrast −50 likewise),
+/// so they use the reciprocal exponents: Brightness −40 was 20/255 off AE, now 6.2.
 pub fn bc_modern(v: f32, b: f32, c: f32) -> f32 {
     if v >= 1.0 {
         return v;
     }
-    let v = v.max(0.0).powf(2f32.powf(-b));
-    let g = 2f32.powf(2.0 * c);
-    if v < 0.5 { 0.5 * (2.0 * v).powf(g) } else { 1.0 - 0.5 * (2.0 - 2.0 * v).max(0.0).powf(g) }
+    let mut v = v.max(0.0);
+    if b != 0.0 {
+        let e = 2f32.powf(1.24 * b.abs());
+        v = 1.0 - (1.0 - v).powf(if b > 0.0 { e } else { 1.0 / e });
+    }
+    if c != 0.0 {
+        let g = (1.0 + 0.53 * c.abs()).max(0.05);
+        let g = if c > 0.0 { g } else { 1.0 / g };
+        v = if v < 0.5 { 0.5 * (2.0 * v).powf(g) } else { 1.0 - 0.5 * (2.0 - 2.0 * v).max(0.0).powf(g) };
+    }
+    v
 }
 
 fn brightness_contrast(ctx: &EffectCtx, mut b: Buf) -> Buf {
@@ -186,14 +216,30 @@ fn hue_saturation(ctx: &EffectCtx, mut b: Buf) -> Buf {
 pub const LEVELS_CLIP: [&str; 3] = ["Off", "On", "Off for 32 bpc Color"];
 
 /// Whether Levels clips below Input Black / above Input White. "Off for 32 bpc Color" clips
-/// (effects can't see the project's bit depth; 8/16 bpc behaviour). The hidden `noClip` switch
-/// of projects saved before the two popups existed turns both off.
+/// in 8 and 16 bpc projects and not in 32 bpc ones (After Effects 2026, Levels (Individual
+/// Controls) in a 32 bpc project: values below Input Black end below Output Black). The hidden
+/// `noClip` switch of projects saved before the two popups existed turns both off.
 pub fn levels_clip(ctx: &EffectCtx) -> (bool, bool) {
     if ctx.params.b("noClip") {
         return (false, false);
     }
-    let on = |id: &str| ctx.params.get(id).is_none_or(|v| v.as_enum() != 0);
+    let on = |id: &str| levels_clip_on(ctx, id);
     (on("clipToOutputBlack"), on("clipToOutputWhite"))
+}
+
+/// One Clip To Output popup: 0 Off, 1 On, 2 Off for 32 bpc Color (missing: clip).
+pub fn levels_clip_on(ctx: &EffectCtx, id: &str) -> bool {
+    match ctx.params.get(id).map(|v| v.as_enum()) {
+        Some(0) => false,
+        Some(2) => !ctx.env.float_depth,
+        _ => true,
+    }
+}
+
+/// Levels' gamma on the normalised input `t`: unclipped values below Input Black extrapolate
+/// (the curve mirrored through 0) instead of stopping at Output Black.
+pub fn levels_gamma(t: f32, g: f32) -> f32 {
+    if t >= 0.0 { t.powf(1.0 / g) } else { -(-t).powf(1.0 / g) }
 }
 
 /// Levels' Channel popup.
@@ -221,8 +267,7 @@ fn level(v: f32, [ib, iw, g, ob, ow]: [f32; 5], (clip_b, clip_w): (bool, bool)) 
     if clip_w {
         t = t.min(1.0);
     }
-    let t = t.max(0.0).powf(1.0 / g);
-    ob + (ow - ob) * t
+    ob + (ow - ob) * levels_gamma(t, g)
 }
 
 const LEVELS_IDENTITY: [f32; 5] = [0.0, 1.0, 1.0, 0.0, 1.0];
@@ -265,7 +310,7 @@ pub fn levels_channel_settings(ctx: &EffectCtx) -> [([f32; 5], (bool, bool)); 4]
         let ids = levels_channel_ids(i + 1);
         let v: [f32; 5] = std::array::from_fn(|k| ctx.params.get(&ids[k]).map(|v| v.as_f64() as f32).unwrap_or(LEVELS_IDENTITY[k]));
         let pre = LEVELS_CHANNEL_PREFIX[i];
-        let on = |id: String| ctx.params.get(&id).is_none_or(|v| v.as_enum() != 0);
+        let on = |id: String| levels_clip_on(ctx, &id);
         let clip = if ctx.params.b("noClip") { (false, false) } else { (on(format!("{pre}ClipToOutputBlack")), on(format!("{pre}ClipToOutputWhite"))) };
         ([v[0], v[1], v[2].max(0.01), v[3], v[4]], clip)
     })
@@ -293,6 +338,18 @@ pub fn exposure_settings(ctx: &EffectCtx) -> [(f32, f32, f32); 3] {
     }
 }
 
+/// The power curve Exposure's own linear-light conversion uses (Bypass Linear Light Conversion
+/// off). After Effects decodes with a pure 2.2 power, not the piecewise sRGB curve: Offset 0.0005
+/// on black measures 8/255 there, which 2.2 predicts (8.06) and sRGB does not (1.65).
+/// `kernels.wgsl` repeats it as a literal; the GPU test `shader_constants_match_the_cpu` checks it.
+pub const EXPOSURE_LINEAR_GAMMA: f32 = 2.2;
+
+/// Exposure: per channel, `(value · 2^exposure + offset)^(1 / gamma)`, in linear light unless
+/// Bypass Linear Light Conversion is on. The conversion is the effect's own pure 2.2 power curve
+/// (see [`EXPOSURE_LINEAR_GAMMA`]), applied whatever the project's working space, also when it
+/// is already linear (Linearize Working Space), as before. Negative values (32 bpc, or a
+/// negative Offset) go through the curves mirrored, so a negative Offset darkens smoothly past
+/// black and the default settings leave every value unchanged.
 fn exposure(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let s = exposure_settings(ctx);
     let bypass = ctx.params.b("bypassLinearLight");
@@ -302,9 +359,9 @@ fn exposure(ctx: &EffectCtx, mut b: Buf) -> Buf {
             if bypass {
                 return mirror_pow(c[i] * e + off, 1.0 / g);
             }
-            let lin = effectcraft_color::srgb_to_linear(c[i].max(0.0));
+            let lin = mirror_pow(c[i], EXPOSURE_LINEAR_GAMMA);
             let o = mirror_pow(lin * e + off, 1.0 / g);
-            effectcraft_color::linear_to_srgb(o.abs()).copysign(o)
+            mirror_pow(o, 1.0 / EXPOSURE_LINEAR_GAMMA)
         })
     });
     b
@@ -315,27 +372,59 @@ pub fn mirror_pow(v: f32, p: f32) -> f32 {
     v.abs().powf(p).copysign(v)
 }
 
+/// Black & White: a pixel's gray is its smallest channel plus its chroma (largest − smallest
+/// channel) times the colour sliders' weight for its hue. A neutral pixel keeps its value, a pure
+/// hue becomes its slider's percentage (Reds 40 % turns pure red into 40 % gray), and the gray
+/// never moves further from the smallest channel than the pixel's own chroma times the weight.
+/// It used to offset the luminance by the HSL saturation, which is near 1 for any tinted
+/// near-black pixel: the faint colour noise of compressed footage's shadows came out as bright
+/// and black blocks (#1463), and 32-bpc overbrights divided by zero.
+/// Black & White's Tint: the tint colour's hue and saturation at the gray's luminosity, as a
+/// Color blend does (luminosity with weights 0.3 / 0.59 / 0.11, out-of-range channels pulled
+/// back toward the gray). After Effects 2026 with Tint Color [1, 0.5, 0]: gray 0.1 (a red solid
+/// at Reds 10, case 717) → (43, 21, 0), gray 0.6 (yellow at defaults, case 825) → (255, 129, 2),
+/// white → white; the old hue / saturation / lightness mix gave (51, 26, 0) for the first.
+/// The luminosity weights of [`bw_tint`] (a Color blend's). `fx_color.wgsl` repeats them; the GPU
+/// test `shader_constants_match_the_cpu` checks that they are these.
+pub const BW_TINT_LUMA: [f32; 3] = [0.3, 0.59, 0.11];
+
+pub fn bw_tint(tint: [f32; 3], gray: f32) -> [f32; 3] {
+    let lum = |c: [f32; 3]| BW_TINT_LUMA[0] * c[0] + BW_TINT_LUMA[1] * c[1] + BW_TINT_LUMA[2] * c[2];
+    if !gray.is_finite() || gray <= 0.0 {
+        return [0.0; 3];
+    }
+    if gray >= 1.0 {
+        return [gray; 3];
+    }
+    let d = gray - lum(tint);
+    let c = tint.map(|v| v + d);
+    let l = lum(c);
+    let (n, x) = (c[0].min(c[1]).min(c[2]), c[0].max(c[1]).max(c[2]));
+    let mut o = c;
+    if n < 0.0 && l - n > 1e-9 {
+        o = o.map(|v| l + (v - l) * l / (l - n));
+    }
+    if x > 1.0 && x - l > 1e-9 {
+        o = o.map(|v| l + (v - l) * (1.0 - l) / (x - l));
+    }
+    o
+}
+
 fn black_white(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let w = [ctx.params.f("reds"), ctx.params.f("yellows"), ctx.params.f("greens"), ctx.params.f("cyans"), ctx.params.f("blues"), ctx.params.f("magentas")]
         .map(|v| v as f32 / 100.0);
     let tint_on = ctx.params.b("tint");
     let tc = ctx.params.color("tintColor");
     b.img.map_straight(|c| {
-        let (h, s, _) = rgb_to_hsl(c[0], c[1], c[2]);
+        let (h, _, _) = rgb_to_hsl(c[0], c[1], c[2]);
         // Interpolate the six hue weights around the colour wheel.
         let hp = h * 6.0;
         let i = hp.floor() as usize % 6;
         let f = hp - hp.floor();
         let wt = w[i] + (w[(i + 1) % 6] - w[i]) * f;
-        let base = luminance(c[0], c[1], c[2]);
-        let gray = (base + (wt - 0.5) * s * 0.6).max(0.0);
-        if tint_on {
-            let (th, ts, _) = rgb_to_hsl(tc[0], tc[1], tc[2]);
-            let (r, g, bl) = hsl_to_rgb(th, ts, gray.min(1.0));
-            [r, g, bl]
-        } else {
-            [gray, gray, gray]
-        }
+        let (max, min) = (c[0].max(c[1]).max(c[2]), c[0].min(c[1]).min(c[2]));
+        let gray = (min + (max - min) * wt).max(0.0);
+        if tint_on { bw_tint([tc[0], tc[1], tc[2]], gray) } else { [gray, gray, gray] }
     });
     b
 }
@@ -400,15 +489,12 @@ fn fill(ctx: &EffectCtx, mut b: Buf) -> Buf {
         });
         return b;
     }
+    // Without masks the layer becomes the fill colour, and Opacity is the layer's opacity: After
+    // Effects 2026 renders Fill (0, 0.5, 1) at Opacity 50 % as that colour at half alpha, with
+    // nothing of the original showing through (it is not a mix with the original).
     b.img.data.iter_mut().for_each(|px| {
-        let a = if invert { 1.0 - px[3] } else { px[3] };
-        let f = [c[0] * a, c[1] * a, c[2] * a];
-        for i in 0..3 {
-            px[i] += (f[i] - px[i]) * opacity;
-        }
-        if invert {
-            px[3] += (a - px[3]) * opacity;
-        }
+        let a = if invert { 1.0 - px[3] } else { px[3] } * opacity;
+        *px = [c[0] * a, c[1] * a, c[2] * a, a];
     });
     b
 }
@@ -951,11 +1037,13 @@ pub fn specs() -> Vec<EffectSpec> {
             "Exposure",
             {
                 let mut v = vec![p("channels", "Channels", Value::Enum(0), popup(&["Master", "Individual Channels"]))];
+                // After Effects' ranges (valid, slider, decimals). Gamma values below 0.1 from
+                // older projects or Photoshop imports (0.01..9.99) are kept and still render.
                 let group = |ids: [&'static str; 3]| {
                     [
-                        p(ids[0], "Exposure", num(0.0), slider(-20.0, 20.0, -5.0, 5.0, 2)),
+                        p(ids[0], "Exposure", num(0.0), slider(-100.0, 100.0, -4.0, 4.0, 2)),
                         p(ids[1], "Offset", num(0.0), slider(-2.0, 2.0, -0.5, 0.5, 4)),
-                        p(ids[2], "Gamma Correction", num(1.0), slider(0.01, 9.99, 0.1, 3.0, 2)),
+                        p(ids[2], "Gamma Correction", num(1.0), slider(0.1, 10.0, 0.1, 10.0, 2)),
                     ]
                 };
                 v.extend(group(["master/exposure", "master/offset", "master/gamma"]));
@@ -1155,6 +1243,17 @@ mod tests {
         }
     }
 
+    /// After Effects 2026 renders of full-frame solids with Tint at its defaults (sRGB working
+    /// space, not linearised, 32 bpc, 8-bit capture): Rec. 601 weights on the encoded values.
+    #[test]
+    fn tint_defaults_match_after_effects_greys() {
+        for (c, want) in [([1.0, 0.0, 0.0], 76.0), ([0.0, 1.0, 0.0], 150.0), ([0.0, 0.0, 1.0], 29.0), ([0.5, 0.5, 0.5], 128.0)] {
+            let o = px("ec.color.tint", &[], [c[0], c[1], c[2], 1.0]);
+            let want = want / 255.0;
+            assert!(close(o, [want, want, want, 1.0], 1.0 / 255.0), "{c:?}: {o:?} vs {want}");
+        }
+    }
+
     #[test]
     fn colorama_reads_get_phase_from() {
         // Same intensity, different red: Intensity gives one colour, Red gives two.
@@ -1179,6 +1278,163 @@ mod tests {
         let legacy = [("brightness", num(50.0)), ("useLegacy", Value::Bool(true))];
         assert!((bc(&legacy, 0.2) - 0.7).abs() < 1e-5);
         assert!((bc(&legacy, 0.0) - 0.5).abs() < 1e-5);
+    }
+
+    /// After Effects non-legacy ramps (kasper9n, #681). B0 C-100 matched B0 C-50 and is omitted.
+    #[test]
+    fn brightness_contrast_modern_matches_ae_ramp_samples() {
+        let u8 = |v: f32| (v * 255.0).round() as i32;
+        let go = |b: f64, c: f64, x: u8| {
+            u8(px("ec.color.brightnesscontrast", &[("brightness", num(b)), ("contrast", num(c))], [x as f32 / 255.0, x as f32 / 255.0, x as f32 / 255.0, 1.0])
+                [0])
+        };
+        // (brightness, contrast, input, AE 8-bit)
+        let samples: &[(f64, f64, u8, u8)] = &[
+            (0.0, 100.0, 64, 40),
+            (0.0, 100.0, 128, 129),
+            (0.0, 100.0, 192, 217),
+            (0.0, 50.0, 64, 53),
+            (0.0, 50.0, 192, 205),
+            (0.0, -50.0, 64, 77),
+            (100.0, 0.0, 128, 209),
+            (50.0, 0.0, 128, 171),
+            (106.0, -18.0, 128, 214),
+        ];
+        for &(b, c, x, ae) in samples {
+            let got = go(b, c, x);
+            assert!((got - ae as i32).abs() <= 10, "B{b} C{c} in {x}: got {got} AE {ae}");
+        }
+        // Old g=4 S-curve put Contrast 100 at ~8/255 here.
+        assert!(go(0.0, 100.0, 64) >= 30);
+    }
+
+    /// After Effects 2026: Tritone Highlights [1, 1, 0.8], Midtones [0.6, 0.2, 0.2], Shadows
+    /// [0, 0, 0.3]. On a red solid with Blend With Original 25 (case 718) AE gives (132, 23, 46);
+    /// on a grey ramp (case 815) levels 0, 63.9, 127.6, 191.4 give (0, 0, 77), (77, 26, 64),
+    /// (153, 51, 51), (204, 153, 128).
+    #[test]
+    fn tritone_matches_after_effects() {
+        let colours = [
+            ("highlights", Value::Color([1.0, 1.0, 0.8, 1.0])),
+            ("midtones", Value::Color([0.6, 0.2, 0.2, 1.0])),
+            ("shadows", Value::Color([0.0, 0.0, 0.3, 1.0])),
+        ];
+        let near = |o: [f32; 4], ae: [f32; 3]| (0..3).all(|i| (o[i] * 255.0 - ae[i]).abs() <= 1.0);
+        let mut red = colours.to_vec();
+        red.push(("blend", num(25.0)));
+        let o = px("ec.color.tritone", &red, [1.0, 0.0, 0.0, 1.0]);
+        assert!(near(o, [132.0, 23.0, 46.0]), "{:?}", o.map(|v| v * 255.0));
+        for (level, ae) in [(0.1f32, [0.0, 0.0, 77.0]), (63.9, [77.0, 26.0, 64.0]), (127.6, [153.0, 51.0, 51.0]), (191.4, [204.0, 153.0, 128.0])] {
+            let v = level / 255.0;
+            let o = px("ec.color.tritone", &colours, [v, v, v, 1.0]);
+            assert!(near(o, ae), "level {level}: {:?} vs {ae:?}", o.map(|v| v * 255.0));
+        }
+    }
+
+    /// After Effects 2026, Tint Color [1, 0.5, 0]: a red solid at Reds 10 (case 717) and yellow
+    /// and white solids at the default sliders (case 825).
+    #[test]
+    fn black_white_tint_matches_after_effects() {
+        let tint = [("tint", Value::Bool(true)), ("tintColor", Value::Color([1.0, 0.5, 0.0, 1.0]))];
+        let near = |o: [f32; 4], ae: [f32; 3]| (0..3).all(|i| (o[i] * 255.0 - ae[i]).abs() <= 1.5);
+        let mut reds = tint.to_vec();
+        reds.push(("reds", num(10.0)));
+        let o = px("ec.color.blackwhite", &reds, [1.0, 0.0, 0.0, 1.0]);
+        assert!(near(o, [43.0, 21.0, 0.0]), "{:?}", o.map(|v| v * 255.0));
+        let o = px("ec.color.blackwhite", &tint, [1.0, 1.0, 0.0, 1.0]);
+        assert!(near(o, [255.0, 129.0, 2.0]), "{:?}", o.map(|v| v * 255.0));
+        let o = px("ec.color.blackwhite", &tint, [1.0, 1.0, 1.0, 1.0]);
+        assert!(near(o, [255.0, 255.0, 255.0]), "{:?}", o.map(|v| v * 255.0));
+        // Hostile grays stay finite.
+        for g in [f32::NAN, -1.0, 0.0, 4.0] {
+            assert!(bw_tint([1.0, 0.5, 0.0], g).iter().all(|v| v.is_finite()));
+        }
+    }
+
+    /// After Effects 2026 ramps (RENDERER round 2, session R8): negative Brightness and Contrast
+    /// are the inverses of the positive curves. (brightness, contrast, input, AE 8-bit)
+    #[test]
+    fn negative_brightness_and_contrast_invert_the_positive_curves() {
+        let go = |b: f64, c: f64, x: u8| {
+            let v = x as f32 / 255.0;
+            (px("ec.color.brightnesscontrast", &[("brightness", num(b)), ("contrast", num(c))], [v, v, v, 1.0])[0] * 255.0).round() as i32
+        };
+        let samples: &[(f64, f64, u8, u8)] = &[
+            (-40.0, 0.0, 64, 50),
+            (-40.0, 0.0, 128, 99),
+            (-40.0, 0.0, 191, 155),
+            (-40.0, 0.0, 234, 207),
+            (0.0, -50.0, 21, 28),
+            (0.0, -50.0, 64, 76),
+            (0.0, -50.0, 191, 179),
+            (0.0, -50.0, 234, 227),
+            (40.0, 0.0, 128, 162),
+            (0.0, 50.0, 64, 52),
+        ];
+        for &(b, c, x, ae) in samples {
+            let got = go(b, c, x);
+            assert!((got - ae as i32).abs() <= 7, "B{b} C{c} in {x}: got {got} AE {ae}");
+        }
+    }
+
+    /// #1463: Black & White's sliders set the gray of each pure hue and blend between
+    /// neighbouring hues; neutral pixels keep their value, overbright ones too, and an overbright
+    /// colour stays finite (it used to divide by zero).
+    #[test]
+    fn black_white_sliders_set_the_gray_of_each_hue() {
+        let bw = |vals: &[(&str, Value)], c: [f32; 3]| px("ec.color.blackwhite", vals, [c[0], c[1], c[2], 1.0]);
+        let gray = |v: f32| [v, v, v, 1.0];
+        // The defaults: Reds 40, Yellows 60, Greens 40, Cyans 60, Blues 20, Magentas 80 (%).
+        let hues = [
+            ([1.0, 0.0, 0.0], 0.4),
+            ([1.0, 1.0, 0.0], 0.6),
+            ([0.0, 1.0, 0.0], 0.4),
+            ([0.0, 1.0, 1.0], 0.6),
+            ([0.0, 0.0, 1.0], 0.2),
+            ([1.0, 0.0, 1.0], 0.8),
+            // Half as bright, half the gray; orange is halfway from Reds to Yellows.
+            ([0.5, 0.0, 0.0], 0.2),
+            ([1.0, 0.5, 0.0], 0.5),
+            // Neutral pixels keep their value.
+            ([0.3, 0.3, 0.3], 0.3),
+            ([4.0, 4.0, 4.0], 4.0),
+            // An overbright red: its smallest channel plus its chroma at Reds' 40 %.
+            ([1.5, 0.5, 0.5], 0.9),
+        ];
+        for (c, want) in hues {
+            let o = bw(&[], c);
+            assert!(close(o, gray(want), 1e-5), "{c:?}: {o:?}, want {want}");
+        }
+        assert!(close(bw(&[("reds", num(120.0))], [1.0, 0.0, 0.0]), gray(1.2), 1e-5));
+        assert!(close(bw(&[("reds", num(-200.0))], [1.0, 0.0, 0.0]), gray(0.0), 1e-5));
+        assert!(close(bw(&[("blues", num(300.0))], [0.1, 0.1, 0.3]), gray(0.7), 1e-5));
+    }
+
+    /// #1463: faint colour noise stays faint. The shadows of compressed footage carry a code or
+    /// two of colour noise, which Black & White turned into bright and black blocks (the HSL
+    /// saturation it scaled is near 1 for any tinted near-black pixel). At 8, 16 and 32 bpc the
+    /// gray of a dark ramp with ±2 steps of colour noise stays within 2 steps of the clean ramp's.
+    #[test]
+    fn black_white_keeps_faint_colour_noise_faint() {
+        // A step of 8 bpc, of 16 bpc (After Effects' 0..32768), and a small 32-bpc float one.
+        for step in [1.0 / 255.0, 1.0 / 32768.0, 1e-3_f32] {
+            let (w, h) = (64u32, 4u32);
+            let (mut clean, mut noisy) = (Image::new(w, h), Image::new(w, h));
+            for y in 0..h {
+                for x in 0..w {
+                    // A dark ramp up to a quarter gray, in whole steps...
+                    let v = (x as f32 / w as f32 * 0.25 / step).round() * step;
+                    // ...and up to ±2 steps of noise per channel, mixed differently in each pixel.
+                    let n = |k: u32| (((x * 7 + y * 13 + k * 2) % 5) as f32 - 2.0) * step;
+                    clean.set(x, y, [v, v, v, 1.0]);
+                    noisy.set(x, y, [(v + n(0)).max(0.0), (v + n(1)).max(0.0), (v + n(2)).max(0.0), 1.0]);
+                }
+            }
+            let bw = |img| run_fx("ec.color.blackwhite", &[], img, 0.0, EffectEnv::default()).img;
+            let (a, b) = (bw(clean), bw(noisy));
+            let worst = a.data.iter().zip(&b.data).map(|(p, q)| (p[0] - q[0]).abs()).fold(0.0, f32::max);
+            assert!(worst <= 2.0 * step + 1e-6, "step {step}: the noise moved the gray by {} steps", worst / step);
+        }
     }
 
     #[test]
@@ -1213,6 +1469,66 @@ mod tests {
             [0.25, 0.25, 0.25, 1.0],
         );
         assert!((neg[0] + 0.5).abs() < 1e-4, "{neg:?}");
+    }
+
+    /// After Effects' Exposure ranges for all twelve sliders; a saved value outside them (a gamma
+    /// of 0.05, valid before, as in Photoshop) survives loading and still renders.
+    #[test]
+    fn exposure_has_after_effects_ranges_and_keeps_old_values() {
+        use effectcraft_project::build::Ids;
+        let spec = crate::find("ec.color.exposure").unwrap();
+        let want = [(-100.0, 100.0, -4.0, 4.0, 2), (-2.0, 2.0, -0.5, 0.5, 4), (0.1, 10.0, 0.1, 10.0, 2)];
+        let sliders: Vec<_> = spec
+            .params
+            .iter()
+            .filter_map(|p| match p.ui {
+                ParamUi::Slider { min, max, slider_min, slider_max, decimals } => Some((p.id, (min, max, slider_min, slider_max, decimals))),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sliders.len(), 12);
+        for (i, (id, r)) in sliders.iter().enumerate() {
+            assert_eq!(*r, want[i % 3], "{id}");
+        }
+        let mut next = 1;
+        let mut g = crate::instantiate(spec, &mut Ids(&mut next), spec.name, [10.0, 10.0]);
+        let gamma = g.prop_mut("master/gamma").unwrap();
+        gamma.value = num(0.05);
+        gamma.ui = slider(0.01, 9.99, 0.1, 3.0, 2);
+        crate::migrate::upgrade_instance(spec, &mut g, &mut Ids(&mut next), [10.0, 10.0]);
+        let gamma = g.prop_mut("master/gamma").unwrap();
+        assert_eq!(gamma.value, num(0.05));
+        assert!(matches!(gamma.ui, ParamUi::Slider { min, .. } if min == 0.1));
+        let o = px("ec.color.exposure", &[("master/gamma", num(0.05)), ("bypassLinearLight", Value::Bool(true))], [0.5, 0.5, 0.5, 1.0]);
+        assert!((o[0] - 0.5f32.powf(20.0)).abs() < 1e-9, "{o:?}");
+    }
+
+    /// Exposure on a red [1, 0, 0] solid against After Effects 2026 renders (sRGB working space,
+    /// not linearised, 32 bpc, 8-bit captures): the linear-light conversion is a pure 2.2 power.
+    /// The piecewise sRGB curve gave 2 / 7 / 39 for the three smallest Offsets.
+    #[test]
+    fn exposure_matches_after_effects_gamma_2_2() {
+        let red = [1.0, 0.0, 0.0, 1.0];
+        let code = |o: [f32; 4], i: usize| o[i] * 255.0;
+        // Master Offset only: G and B carry the curve; R goes over 1 (255 in the 8-bit capture).
+        for (offset, ae) in [(0.0005, 8.0), (0.002, 15.0), (0.02, 43.0), (0.1, 90.0)] {
+            let o = px("ec.color.exposure", &[("master/offset", num(offset))], red);
+            for i in [1, 2] {
+                assert!((code(o, i) - ae).abs() <= 1.0, "offset {offset}: {} vs AE {ae}", code(o, i));
+            }
+            assert!(o[0] >= 1.0, "{o:?}");
+        }
+        // Exposure −2.25: AE 126; with Bypass Linear Light Conversion (gain on encoded values) 54.
+        let o = px("ec.color.exposure", &[("master/exposure", num(-2.25))], red);
+        assert!((code(o, 0) - 126.0).abs() <= 1.0 && o[1] == 0.0, "{o:?}");
+        let o = px("ec.color.exposure", &[("master/exposure", num(-2.25)), ("bypassLinearLight", Value::Bool(true))], red);
+        assert!((code(o, 0) - 54.0).abs() <= 1.0 && o[1] == 0.0, "{o:?}");
+        // Default settings leave 32-bpc values alone, negative and over-range ones included.
+        let hdr = [-0.25, 0.5, 2.0, 1.0];
+        assert!(close(px("ec.color.exposure", &[], hdr), hdr, 1e-5));
+        // A negative Offset pushes black below zero, mirrored, rather than clipping or NaN.
+        let o = px("ec.color.exposure", &[("master/offset", num(-0.02))], [0.0, 0.0, 0.0, 1.0]);
+        assert!((o[0] + 0.02f32.powf(1.0 / 2.2)).abs() < 1e-5, "{o:?}");
     }
 
     #[test]
@@ -1354,6 +1670,30 @@ mod tests {
         // Without masks, Fill fills the layer as before.
         let plain = run_fx("ec.generate.fill", &[("fillMask", num(1.0))], grey.clone(), 0.0, EffectEnv::default()).img;
         assert_eq!(plain.get(10, 5), [1.0, 0.0, 0.0, 1.0]);
+    }
+
+    /// After Effects 2026: Fill (0, 0.5, 1) at Opacity 50 % on an opaque layer (a Gradient Ramp
+    /// on a red solid) renders premultiplied (0, 0.251, 0.502) at alpha 0.502 everywhere: the
+    /// fill colour at half the layer's alpha, nothing of the ramp left.
+    #[test]
+    fn fill_opacity_is_the_layers_opacity_as_in_after_effects() {
+        let mut img = Image::new(16, 4);
+        for x in 0..16 {
+            let v = x as f32 / 15.0;
+            for y in 0..4 {
+                img.set(x, y, [v, 0.0, 0.0, 1.0]);
+            }
+        }
+        let vals = [("color", Value::Color([0.0, 0.5, 1.0, 1.0])), ("opacity", num(50.0))];
+        let out = run_fx("ec.generate.fill", &vals, img, 0.0, EffectEnv::default()).img;
+        for x in [0, 7, 15] {
+            let p = out.get(x, 2);
+            let ae = [0.0, 0.251, 0.502, 0.502];
+            assert!(p.iter().zip(ae).all(|(v, a)| (v - a).abs() < 1.0 / 255.0), "x {x}: {p:?} vs AE {ae:?}");
+        }
+        // A half-transparent pixel ends at a quarter alpha, still the fill colour.
+        let half = run_fx("ec.generate.fill", &vals, Image::filled(2, 2, [0.2, 0.2, 0.2, 0.5]), 0.0, EffectEnv::default()).img;
+        assert_eq!(half.get(0, 0), [0.0, 0.125, 0.25, 0.25]);
     }
 
     #[test]

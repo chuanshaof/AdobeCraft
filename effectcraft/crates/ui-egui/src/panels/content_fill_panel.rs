@@ -4,6 +4,7 @@
 //! live in `EditorState::content_fill` (`contentFill.set`); the button runs
 //! `contentFill.generate` as a background job (Window ▸ Progress).
 
+use crate::i18n::tr;
 use egui::{Align2, Rect, pos2, vec2};
 use serde_json::json;
 
@@ -25,7 +26,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let comp = app.session.active_comp_arc();
     let layer = comp.as_ref().and_then(|c| app.session.state.selected_layers.first().and_then(|l| c.layer(*l)).cloned());
     // Fill Target.
-    p.text(pos2(x0, y + 9.0), Align2::LEFT_CENTER, "Fill Target", Tokens::semibold(12.0), t.text);
+    p.text(pos2(x0, y + 9.0), Align2::LEFT_CENTER, tr("Fill Target"), Tokens::semibold(12.0), t.text);
     y += ROW - 6.0;
     let target = match &layer {
         Some(l) => {

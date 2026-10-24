@@ -20,6 +20,7 @@
 //! id (`essential.primary`, `essential.solo`, `essential.name`, `essential.control.<id>.value`,
 //! `essential.instance.<id>.value`, `essential.export`…).
 
+use crate::i18n::{tr, tr_args};
 use effectcraft_engine::keyframe::Value as KV;
 use effectcraft_engine::project::essential::{self, ControlType, EgControl, EgKind};
 use effectcraft_engine::project::{ItemId, ItemKind, LayerSource, ParamUi, Property};
@@ -61,7 +62,7 @@ fn body(app: &mut EffectcraftApp, ui: &mut egui::Ui) -> (Actions, Actions) {
     let mut actions: Actions = vec![];
     let mut invoke: Vec<(String, Value)> = vec![];
     let Some(cid) = primary(app) else {
-        ui.label(RichText::new("Open a composition to build Essential Graphics").color(t.text_faint));
+        ui.label(RichText::new(tr("Open a composition to build Essential Graphics")).color(t.text_faint));
         return (actions, invoke);
     };
     let project = app.session.project.clone();
@@ -69,7 +70,7 @@ fn body(app: &mut EffectcraftApp, ui: &mut egui::Ui) -> (Actions, Actions) {
 
     // ---- Primary + Solo.
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Primary:").color(t.text_dim));
+        ui.label(RichText::new(tr("Primary:")).color(t.text_dim));
         let r = egui::ComboBox::from_id_salt("eg-primary").selected_text(&comp_name).width(150.0).show_ui(ui, |ui| {
             for (id, _) in project.comps() {
                 let name = project.item(*id).map(|i| i.name.clone()).unwrap_or_default();
@@ -81,7 +82,7 @@ fn body(app: &mut EffectcraftApp, ui: &mut egui::Ui) -> (Actions, Actions) {
         app.auto.add("essential.primary", r.response.rect, &comp_name);
     });
     let solo = app.session.state.essential_solo;
-    let r = ui.add(egui::Button::new("Solo Supported Properties").selected(solo));
+    let r = ui.add(egui::Button::new(tr("Solo Supported Properties")).selected(solo));
     app.auto.add("essential.solo", r.rect, "Solo Supported Properties");
     if r.clicked() {
         actions.push(("essential.soloSupported".into(), json!({"on": !solo})));
@@ -91,7 +92,7 @@ fn body(app: &mut EffectcraftApp, ui: &mut egui::Ui) -> (Actions, Actions) {
     let shown_name = if eg.name.is_empty() { comp_name.clone() } else { eg.name.clone() };
     let name_id = egui::Id::new("eg-name-buf");
     let mut name: String = ctx.data(|d| d.get_temp(name_id)).unwrap_or_else(|| shown_name.clone());
-    let r = ui.add(egui::TextEdit::singleline(&mut name).hint_text("Template name").desired_width(f32::INFINITY));
+    let r = ui.add(egui::TextEdit::singleline(&mut name).hint_text(tr("Template name")).desired_width(f32::INFINITY));
     app.auto.add("essential.name", r.rect, &shown_name);
     if r.has_focus() {
         ctx.data_mut(|d| d.insert_temp(name_id, name.clone()));
@@ -107,7 +108,7 @@ fn body(app: &mut EffectcraftApp, ui: &mut egui::Ui) -> (Actions, Actions) {
     let list = ui.scope(|ui| {
         ui.set_min_height(60.0);
         if eg.controls.is_empty() {
-            ui.label(RichText::new("Drag properties here from the timeline,\nor use Animation > Add Property to Essential Graphics.").color(t.text_faint));
+            ui.label(RichText::new(tr("Drag properties here from the timeline,\nor use Animation > Add Property to Essential Graphics.")).color(t.text_faint));
         }
         controls(app, ui, cid, &eg.controls, None, &mut actions);
     });
@@ -128,12 +129,12 @@ fn body(app: &mut EffectcraftApp, ui: &mut egui::Ui) -> (Actions, Actions) {
 
     // ---- Bottom buttons.
     ui.horizontal_wrapped(|ui| {
-        let r = ui.menu_button("Add Formatting", |ui| {
-            if ui.button("Add Group").clicked() {
+        let r = crate::widgets::menu_button(ui, tr("Add Formatting"), |ui| {
+            if ui.button(tr("Add Group")).clicked() {
                 actions.push(("essential.addGroup".into(), json!({"comp": cid.0})));
                 ui.close();
             }
-            if ui.button("Add Comment").clicked() {
+            if ui.button(tr("Add Comment")).clicked() {
                 actions.push(("essential.addComment".into(), json!({"comp": cid.0})));
                 ui.close();
             }
@@ -142,7 +143,7 @@ fn body(app: &mut EffectcraftApp, ui: &mut egui::Ui) -> (Actions, Actions) {
         // The selected property as a Font control (Source Text) or a uniform Scale slider.
         let has_sel = !app.session.state.selected_props.is_empty();
         let r = ui.add_enabled_ui(has_sel, |ui| {
-            ui.menu_button("Add Selected As", |ui| {
+            crate::widgets::menu_button(ui, tr("Add Selected As"), |ui| {
                 for (label, as_type) in [("Font Control", "font"), ("Uniform Scale", "scale")] {
                     if ui.button(label).clicked() {
                         actions.push(("essential.addProperty".into(), json!({"as": as_type})));
@@ -155,14 +156,14 @@ fn body(app: &mut EffectcraftApp, ui: &mut egui::Ui) -> (Actions, Actions) {
         let footage_layer = app.session.active_comp().and_then(|c| {
             app.session.state.selected_layers.iter().filter_map(|l| c.layer(*l)).find(|l| matches!(l.source, LayerSource::Footage { .. })).map(|l| l.id.0)
         });
-        let r = ui.add_enabled(footage_layer.is_some(), egui::Button::new("Media Replacement"));
+        let r = ui.add_enabled(footage_layer.is_some(), egui::Button::new(tr("Media Replacement")));
         app.auto.add("essential.addMedia", r.rect, "Add Media Replacement");
         if r.clicked()
             && let Some(l) = footage_layer
         {
             actions.push(("essential.addMedia".into(), json!({"layer": l})));
         }
-        let r = ui.add_enabled(!eg.controls.is_empty(), egui::Button::new("Export Template…"));
+        let r = ui.add_enabled(!eg.controls.is_empty(), egui::Button::new(tr("Export Template…")));
         app.auto.add("essential.export", r.rect, "Export Template");
         if r.clicked() {
             invoke.push(("essential.exportTemplate".into(), json!({"comp": cid.0})));
@@ -234,7 +235,7 @@ fn controls(app: &mut EffectcraftApp, ui: &mut egui::Ui, cid: ItemId, list: &[Eg
                             }
                         }
                         None => {
-                            ui.label(RichText::new("(missing)").color(t.danger));
+                            ui.label(RichText::new(tr("(missing)")).color(t.danger));
                         }
                     }
                     link_menu(app, ui, cid, c, group, actions);
@@ -243,10 +244,10 @@ fn controls(app: &mut EffectcraftApp, ui: &mut egui::Ui, cid: ItemId, list: &[Eg
                     name_label(app, ui, cid, c, RichText::new(&c.name), actions);
                     let item = essential::source_media(&app.session.project, cid, c);
                     let name = item.and_then(|i| app.session.project.item(i)).map(|i| i.name.clone()).unwrap_or_default();
-                    ui.label(RichText::new(format!("▣ {name}")).color(t.text_dim));
+                    ui.label(RichText::new(tr_args("▣ {}", &[&name])).color(t.text_dim));
                 }
             }
-            let r = ui.add(egui::Button::new(RichText::new("×").size(10.0)).small().frame(false)).on_hover_text("Remove");
+            let r = ui.add(egui::Button::new(RichText::new("×").size(10.0)).small().frame(false)).on_hover_text(tr("Remove"));
             app.auto.add(&format!("essential.control.{}.remove", c.id), r.rect, "Remove");
             if r.clicked() {
                 actions.push(("essential.remove".into(), json!({"comp": cid.0, "control": c.id})));
@@ -269,17 +270,17 @@ fn link_menu(app: &mut EffectcraftApp, ui: &mut egui::Ui, cid: ItemId, c: &EgCon
         _ => vec![],
     };
     let has_sel = !app.session.state.selected_props.is_empty();
-    let r = ui.menu_button(RichText::new("⋯").size(10.0), |ui| {
-        if ui.button("Add Mirror").clicked() {
+    let r = crate::widgets::menu_button(ui, RichText::new("⋯").size(10.0), |ui| {
+        if ui.button(tr("Add Mirror")).clicked() {
             actions.push(("essential.addMirror".into(), json!({"comp": cid.0, "control": c.id, "group": group})));
             ui.close();
         }
-        if ui.add_enabled(has_sel, egui::Button::new("Link Selected Property")).clicked() {
+        if ui.add_enabled(has_sel, egui::Button::new(tr("Link Selected Property"))).clicked() {
             actions.push(("essential.linkProperty".into(), json!({"comp": cid.0, "control": c.id})));
             ui.close();
         }
         for (layer, prop, name) in &links {
-            if ui.button(format!("Unlink {name}")).clicked() {
+            if ui.button(tr_args("Unlink {}", &[&name])).clicked() {
                 actions.push(("essential.unlinkProperty".into(), json!({"comp": cid.0, "control": c.id, "layer": layer, "prop": prop})));
                 ui.close();
             }
@@ -343,11 +344,10 @@ fn value_widget(app: &mut EffectcraftApp, ui: &mut egui::Ui, auto: &str, ty: Opt
         }
         ControlType::Color => {
             let c = v.as_color();
-            let mut rgba = egui::Rgba::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
-            let r = egui::widgets::color_picker::color_edit_button_rgba(ui, &mut rgba, egui::widgets::color_picker::Alpha::Opaque);
+            let mut rgb = [c[0], c[1], c[2]];
+            let r = crate::widgets::srgb_color_button(ui, &mut rgb);
             if r.changed() {
-                let u = rgba.to_rgba_unmultiplied();
-                out = Some(json!([u[0], u[1], u[2], u[3]]));
+                out = Some(json!([rgb[0], rgb[1], rgb[2], c[3]]));
             }
             r.rect
         }
@@ -374,10 +374,41 @@ fn value_widget(app: &mut EffectcraftApp, ui: &mut egui::Ui, auto: &str, ty: Opt
             });
             r.response.rect
         }
+        // Scale keeps its Constrain Proportions link, on by default, as in After Effects (#338).
+        // The link is the property's own, shared with the Timeline's chain link.
+        ControlType::Point if p.match_id == "scale" && matches!(p.ui, ParamUi::Percent) => {
+            let comps = v.components();
+            let linked = !app.ui.timeline.unlinked.contains(&p.uid);
+            let (lr, link) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+            let t = app.tokens;
+            crate::icons::paint(ui.painter(), lr, crate::icons::Icon::Link, if linked { t.accent } else { t.text_faint });
+            let link = link.on_hover_text(tr("Constrain Proportions"));
+            app.auto.add(&format!("{auto}.link"), lr, "Constrain Proportions");
+            if link.clicked() && !app.ui.timeline.unlinked.remove(&p.uid) {
+                app.ui.timeline.unlinked.insert(p.uid);
+            }
+            let mut rect = lr;
+            for (d, &old) in comps.iter().enumerate() {
+                let mut x = old;
+                let r = ui.add(egui::DragValue::new(&mut x).speed(0.5).suffix(if d + 1 == comps.len() { "%" } else { "" }).max_decimals(1));
+                app.auto.add(&format!("{auto}.{d}"), r.rect, &p.name);
+                rect = rect.union(r.rect);
+                if r.changed() {
+                    // Alt edits one value of a linked pair, as in the Timeline.
+                    let next = if linked && !ui.input(|i| i.modifiers.alt) {
+                        widgets::constrained(&comps, d, x)
+                    } else {
+                        comps.iter().enumerate().map(|(e, &c)| if e == d { x } else { c }).collect()
+                    };
+                    out = Some(json!(next));
+                }
+            }
+            rect
+        }
         ControlType::Point => {
             let mut a = v.as_vec2();
-            let r1 = ui.add(egui::DragValue::new(&mut a[0]).speed(1.0).max_decimals(1));
-            let r2 = ui.add(egui::DragValue::new(&mut a[1]).speed(1.0).max_decimals(1));
+            let r1 = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut a[0]).speed(1.0).max_decimals(1)));
+            let r2 = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut a[1]).speed(1.0).max_decimals(1)));
             if r1.changed() || r2.changed() {
                 out = Some(json!(a));
             }
@@ -385,7 +416,7 @@ fn value_widget(app: &mut EffectcraftApp, ui: &mut egui::Ui, auto: &str, ty: Opt
         }
         ControlType::Angle => {
             let mut a = v.as_f64();
-            let r = ui.add(egui::DragValue::new(&mut a).speed(1.0).suffix("°").max_decimals(1));
+            let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut a).speed(1.0).suffix("°").max_decimals(1)));
             if r.changed() {
                 out = Some(json!(a));
             }
@@ -414,7 +445,7 @@ fn value_widget(app: &mut EffectcraftApp, ui: &mut egui::Ui, auto: &str, ty: Opt
                     }
                 }
             });
-            let r3 = ui.add(egui::DragValue::new(&mut d.size).speed(0.5).range(1.0..=2000.0).suffix(" px").max_decimals(1));
+            let r3 = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.size).speed(0.5).range(1.0..=2000.0).suffix(" px").max_decimals(1)));
             app.auto.add(&format!("{auto}.font"), r1.response.rect, "Font");
             app.auto.add(&format!("{auto}.style"), r2.response.rect, "Style");
             app.auto.add(&format!("{auto}.size"), r3.rect, "Size");
@@ -427,7 +458,7 @@ fn value_widget(app: &mut EffectcraftApp, ui: &mut egui::Ui, auto: &str, ty: Opt
             // One percentage for every axis.
             let comps = v.components();
             let mut x = comps.first().copied().unwrap_or(100.0);
-            let r = ui.add(egui::DragValue::new(&mut x).speed(0.5).suffix("%").max_decimals(1));
+            let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut x).speed(0.5).suffix("%").max_decimals(1)));
             if r.changed() {
                 out = Some(json!(vec![x; comps.len().max(1)]));
             }
@@ -437,7 +468,7 @@ fn value_widget(app: &mut EffectcraftApp, ui: &mut egui::Ui, auto: &str, ty: Opt
             let mut x = v.as_f64();
             let r = match p.ui {
                 ParamUi::Slider { slider_min, slider_max, .. } => ui.add(egui::Slider::new(&mut x, slider_min..=slider_max).max_decimals(2)),
-                _ => ui.add(egui::DragValue::new(&mut x).speed(0.5).max_decimals(2)),
+                _ => ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut x).speed(0.5).max_decimals(2))),
             };
             if r.changed() {
                 out = Some(json!(x));
@@ -460,7 +491,7 @@ fn instance(app: &mut EffectcraftApp, ui: &mut egui::Ui, actions: &mut Actions) 
     let over = essential::overridden(&layer);
     let lt = layer.layer_time(app.session.time());
     ui.separator();
-    ui.label(RichText::new(format!("Essential Properties — {}", layer.name)).strong());
+    ui.label(RichText::new(tr_args("Essential Properties — {}", &[&layer.name])).strong());
     let group = essential::group(&layer).cloned().unwrap_or_else(|| effectcraft_engine::project::PropGroup::new(0, "", ""));
     for c in eg.flat() {
         let m = essential::match_id(c.id);
@@ -527,12 +558,12 @@ fn instance(app: &mut EffectcraftApp, ui: &mut egui::Ui, actions: &mut Actions) 
     }
     ui.horizontal(|ui| {
         let any = !over.is_empty();
-        let r = ui.add_enabled(any, egui::Button::new("Push All to Comp"));
+        let r = ui.add_enabled(any, egui::Button::new(tr("Push All to Comp")));
         app.auto.add("essential.instance.pushAll", r.rect, "Push Override Values to Source");
         if r.clicked() {
             actions.push(("essential.pushToComp".into(), json!({"layer": layer.id.0})));
         }
-        let r = ui.add_enabled(any, egui::Button::new("Revert All"));
+        let r = ui.add_enabled(any, egui::Button::new(tr("Revert All")));
         app.auto.add("essential.instance.revertAll", r.rect, "Revert All");
         if r.clicked() {
             actions.push(("essential.revert".into(), json!({"layer": layer.id.0})));

@@ -99,6 +99,48 @@ fn range_based_on_words_and_lines() {
     assert_eq!(s, vec![0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0], "{s:?}");
 }
 
+/// With Units = Index a Range Selector's Start, End and Offset are character counts, not
+/// percentages (#1814); the selector's other values, and other selectors, are unaffected.
+#[test]
+fn index_units_mark_start_end_and_offset() {
+    let (mut p, _cid, comp) = setup(400, 200);
+    let mut l = text_layer(&mut p, &comp, doc("ABCDEFG", 30.0));
+    animator(&mut p, &mut l, &["opacity"], &["range", "wiggly"]);
+    let uid = |l: &Layer, path: &str| l.props.prop(path).unwrap_or_else(|| panic!("no {path}")).uid;
+    let base = "text/animators/#1/selectors/#1";
+    let range_values = ["start", "end", "offset"].map(|k| uid(&l, &format!("{base}/{k}")));
+    assert!(range_values.iter().all(|u| !in_index_units(&l, *u)), "Percentage, the default");
+    set(&mut l, &format!("{base}/advanced/units"), Value::Enum(1));
+    assert!(range_values.iter().all(|u| in_index_units(&l, *u)));
+    assert!(!in_index_units(&l, uid(&l, &format!("{base}/advanced/amount"))), "Amount stays a percentage");
+    assert!(!in_index_units(&l, uid(&l, "text/animators/#1/properties/opacity")));
+    assert!(!in_index_units(&l, uid(&l, "transform/opacity")));
+}
+
+#[test]
+fn range_start_end_and_offset_are_capped() {
+    let (mut p, cid, comp) = setup(400, 200);
+    let mut l = text_layer(&mut p, &comp, doc("ABCD", 30.0));
+    let a = animator(&mut p, &mut l, &["opacity"], &["range"]);
+    set(&mut l, "text/animators/#1/selectors/#1/advanced/smoothness", Value::Scalar(0.0));
+    // End 300% is capped at 100% (Offset -150% at -100%): the range is -100%..0% and selects nothing.
+    // Uncapped it would be -150%..150% and select everything.
+    set(&mut l, "text/animators/#1/selectors/#1/end", Value::Scalar(300.0));
+    set(&mut l, "text/animators/#1/selectors/#1/offset", Value::Scalar(-150.0));
+    p.comp_mut(cid).unwrap().layers.push(l);
+    assert_eq!(selection(&p, cid, 0.0, a), vec![0.0; 4]);
+    // Start -200% is capped at 0%: with Offset 100% the range is 100%..150% and selects nothing.
+    // Uncapped it would be -100%..150% and select everything.
+    let l = &mut p.comp_mut(cid).unwrap().layers[0];
+    set(l, "text/animators/#1/selectors/#1/start", Value::Scalar(-200.0));
+    set(l, "text/animators/#1/selectors/#1/end", Value::Scalar(50.0));
+    set(l, "text/animators/#1/selectors/#1/offset", Value::Scalar(100.0));
+    assert_eq!(selection(&p, cid, 0.0, a), vec![0.0; 4]);
+    let l = &mut p.comp_mut(cid).unwrap().layers[0];
+    set(l, "text/animators/#1/selectors/#1/offset", Value::Scalar(0.0));
+    assert_eq!(selection(&p, cid, 0.0, a), vec![1.0, 1.0, 0.0, 0.0]);
+}
+
 #[test]
 fn selector_modes_and_randomize() {
     let (mut p, cid, comp) = setup(400, 200);
@@ -484,4 +526,118 @@ fn caret_follows_animators_and_path_text() {
     assert!(qb.x < 100.5 && qt.x > 100.0, "baseline end on the path, top to its right: {qt:?} {qb:?}");
     let glyph_c = glyph_paths(&c, ly).iter().map(|g| effectcraft_path::bounds(std::slice::from_ref(&g.0)).unwrap().center().y).collect::<Vec<_>>();
     assert!(qt.y > glyph_c[1] && qt.y < glyph_c[2], "between the 2nd and 3rd characters: {} in {glyph_c:?}", qt.y);
+}
+
+/// Glyphs that touch or overlap are drawn as one outline, as After Effects draws a line of text:
+/// no light seam where their anti-aliased edges meet (the crossbars of "ff", #415).
+#[test]
+fn touching_glyphs_join_without_a_seam() {
+    use kurbo::Shape;
+    let glyph = |x0: f64, x1: f64, fill: [f32; 4], reversed: bool| {
+        let path = kurbo::Rect::new(x0, 4.0, x1, 16.0).to_path(0.1);
+        PlacedGlyph {
+            local: if reversed { path.reverse_subpaths() } else { path },
+            m: Mat4::IDENTITY,
+            xf: CharXf::default(),
+            fill,
+            stroke: [0.0; 4],
+            stroke_width: 0.0,
+            bold: 0.0,
+            apply_fill: true,
+            char_index: 0,
+            rest: [0.0; 2],
+        }
+    };
+    let draw = |glyphs: Vec<PlacedGlyph>, blend: BlendMode| {
+        let geom = TextGeom { doc: TextDoc::default(), glyphs, fill_stroke: 0, blend };
+        let mut img = crate::Image::new(24, 20);
+        draw_glyphs(&geom, &mut img, &Mat3::IDENTITY, 1.0, None);
+        img
+    };
+    let (white, red) = ([1.0; 4], [1.0, 0.0, 0.0, 1.0]);
+    // The shared edge runs through the middle of pixel column 10.
+    let seam = draw(vec![glyph(4.0, 10.5, white, false), glyph(10.5, 17.0, white, false)], BlendMode::Normal).get(10, 10);
+    assert!(seam[3] > 0.999 && seam[0] > 0.999, "touching glyphs leave no seam: {seam:?}");
+    // Outlines wound the other way (another font, a mirrored character) still add up.
+    let seam = draw(vec![glyph(4.0, 10.5, white, false), glyph(10.5, 17.0, white, true)], BlendMode::Normal).get(10, 10);
+    assert!(seam[3] > 0.999, "opposite windings join too: {seam:?}");
+    let overlap = draw(vec![glyph(4.0, 12.0, white, false), glyph(8.0, 17.0, white, true)], BlendMode::Normal).get(10, 10);
+    assert!(overlap[3] > 0.999, "and their overlap stays filled: {overlap:?}");
+    // Characters of other colours, or blended with each other, are still drawn one by one.
+    let two = draw(vec![glyph(4.0, 10.5, white, false), glyph(10.5, 17.0, red, false)], BlendMode::Normal).get(10, 10);
+    assert!((two[3] - 0.75).abs() < 0.02, "{two:?}");
+    let multiply = draw(vec![glyph(4.0, 10.5, white, false), glyph(10.5, 17.0, white, false)], BlendMode::Multiply).get(10, 10);
+    assert!(multiply[3] < 0.9, "{multiply:?}");
+}
+
+/// #1676: Faux Bold, and the synthetic bold of a style the family has no face for, are drawn.
+#[test]
+fn faux_bold_and_synthetic_bold_thicken_the_glyphs() {
+    // Total alpha and the alpha bounding box of a rendered word.
+    let ink = |d: TextDoc| {
+        let (mut p, cid, comp) = setup(400, 120);
+        let mut l = text_layer(&mut p, &comp, TextDoc { text: "Hamburg".into(), size: 60.0, ..d });
+        set(&mut l, "transform/position", Value::Vec3([40.0, 85.0, 0.0]));
+        p.comp_mut(cid).unwrap().layers.push(l);
+        let img = crate::render_frame(&p, cid, Tick::ZERO, 1.0);
+        (img.data.iter().map(|px| px[3]).sum::<f32>(), alpha_bbox(&img).unwrap())
+    };
+    let (plain, pb) = ink(TextDoc::default());
+    let (bold, bb) = ink(TextDoc { faux_bold: true, ..Default::default() });
+    assert!(bold > plain * 1.15, "faux bold adds ink: {plain} → {bold}");
+    // 0.03 em = 1.8 px on every side.
+    let grow = (bb[2] - bb[0]) - (pb[2] - pb[0]);
+    assert!((3..=6).contains(&grow), "and widens the word by about 3.6 px: {pb:?} → {bb:?}");
+    // Bundled Inter has no Bold Italic face: the italic face is drawn with synthetic bold.
+    let (italic, _) = ink(TextDoc { style: "Italic".into(), ..Default::default() });
+    let (bold_italic, _) = ink(TextDoc { style: "Bold Italic".into(), ..Default::default() });
+    assert!(bold_italic > italic * 1.15, "Bold Italic is bolder than Italic: {italic} → {bold_italic}");
+    // A stroke follows the bold outline: as wide as before, moved out with it.
+    let stroked = TextDoc { apply_fill: false, apply_stroke: true, stroke: [1.0; 4], stroke_width: 4.0, ..Default::default() };
+    let (ring, rb) = ink(stroked.clone());
+    let (bold_ring, brb) = ink(TextDoc { faux_bold: true, ..stroked });
+    assert!(bold_ring > ring * 0.95 && bold_ring < ring * 1.3, "the stroke keeps its width: {ring} → {bold_ring}");
+    assert!(brb[0] < rb[0] && brb[2] > rb[2], "{rb:?} → {brb:?}");
+}
+
+/// #1676: under a non-uniform character Scale the bold is grown in the character's space, so it
+/// reaches further along the stretched axis; it is neither clipped nor grown evenly in a run.
+#[test]
+fn faux_bold_under_a_non_uniform_scale() {
+    use kurbo::Shape;
+    let glyph = |x0: f64| PlacedGlyph {
+        local: kurbo::Rect::new(x0, 4.0, x0 + 4.0, 16.0).to_path(0.1),
+        m: Mat4::scale(vec3(9.0, 1.0, 1.0)),
+        xf: CharXf::default(),
+        fill: [1.0; 4],
+        stroke: [0.0; 4],
+        stroke_width: 0.0,
+        bold: 2.0,
+        apply_fill: true,
+        char_index: 0,
+        rest: [0.0; 2],
+    };
+    let geom = |glyphs| TextGeom { doc: TextDoc::default(), glyphs, fill_stroke: 0, blend: BlendMode::Normal };
+    assert_eq!(runs(&geom(vec![glyph(2.0), glyph(6.0)])).len(), 2, "bold glyphs stretched unevenly are drawn one by one");
+    // x 6..10 → 54..90, grown by 2 × 9 = 18 → 36..108; y 4..16 grown by 2 → 2..18.
+    let mut img = crate::Image::new(120, 24);
+    draw_glyphs(&geom(vec![glyph(6.0)]), &mut img, &Mat3::IDENTITY, 1.0, None);
+    for (x, y) in [(37, 10), (106, 10), (70, 3)] {
+        assert!(img.get(x, y)[3] > 0.99, "bold ink at ({x}, {y}): {:?}", img.get(x, y));
+    }
+    assert!(img.get(34, 10)[3] < 0.01 && img.get(110, 10)[3] < 0.01 && img.get(70, 0)[3] < 0.01);
+}
+
+/// #1011: what dragging a Range Selector bar to fraction `f` of the text writes.
+#[test]
+fn range_bar_drag_values() {
+    // Percentage: the bar's place less the Offset, within 0..100.
+    assert!((range_value_of(0.5, 0.0, false, 7) - 50.0).abs() < 1e-9);
+    assert!((range_value_of(0.5, 0.25, false, 7) - 25.0).abs() < 1e-9, "Offset 25%: the bar at 50% is Start 25%");
+    assert_eq!(range_value_of(0.1, 0.25, false, 7), 0.0, "never below 0");
+    assert_eq!(range_value_of(1.0, -0.5, false, 7), 100.0, "nor above 100");
+    // Index: whole units, the nearest boundary (3.4 of 7 characters → 3, 3.6 → 4).
+    assert_eq!(range_value_of(3.4 / 7.0, 0.0, true, 7), 3.0);
+    assert_eq!(range_value_of(3.6 / 7.0, 0.0, true, 7), 4.0);
+    assert_eq!(range_value_of(3.6 / 7.0, 2.0 / 7.0, true, 7), 2.0, "less a 2-character Offset");
 }

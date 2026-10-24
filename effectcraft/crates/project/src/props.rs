@@ -37,6 +37,11 @@ pub enum ParamUi {
     Mask,
     Path,
     Text,
+    /// A file path (a string value) chosen with a "Choose…" button, offering files with these
+    /// extensions: Apply Color LUT's LUT, an OCIO config.
+    File {
+        filters: Vec<String>,
+    },
     Gradient,
     /// Not shown in Effect Controls / the timeline (internal data).
     Hidden,
@@ -250,6 +255,10 @@ pub struct PropGroup {
     /// fx switch for effects, eye for shape groups, etc.
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// An effect's colour label (After Effects 26.5), shown in Effect Controls and the Timeline;
+    /// `None` is unlabelled. Absent in older projects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<effectcraft_color::Label>,
     #[serde(default)]
     pub children: Vec<Node>,
 }
@@ -332,8 +341,14 @@ pub fn parse_path(s: &str) -> Vec<Seg> {
 }
 
 impl PropGroup {
+    /// An instance in an indexed list (effect, mask, shape item, text animator, tracker): these
+    /// can be renamed, removed, duplicated and reordered; fixed groups (Transform…) can't.
+    pub fn is_instance(&self) -> bool {
+        matches!(self.kind, GroupKind::Indexed | GroupKind::Effect { .. } | GroupKind::Mask { .. } | GroupKind::Tracker { .. })
+    }
+
     pub fn new(uid: Uid, match_id: &str, name: &str) -> PropGroup {
-        PropGroup { uid, match_id: match_id.into(), name: name.into(), kind: GroupKind::Plain, enabled: true, children: vec![] }
+        PropGroup { uid, match_id: match_id.into(), name: name.into(), kind: GroupKind::Plain, enabled: true, label: None, children: vec![] }
     }
     pub fn with(mut self, n: impl Into<Node>) -> PropGroup {
         self.children.push(n.into());

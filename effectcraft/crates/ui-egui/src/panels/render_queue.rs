@@ -11,6 +11,7 @@
 //! every setting; entries needing numbers (custom time span and frame rate, crop, resize, bitrate,
 //! key frame interval, Make Template) open a form that runs the same command.
 
+use crate::i18n::{tr, tr_args};
 use effectcraft_engine::project::render_queue::{
     AlphaMode, AudioFormat, AudioOutput, Channels, ColorDepth, CurrentOrOff, EffectsMode, FieldRender, OpusApplication, OutputFormat, PostRenderAction,
     ProResProfile, Pulldown, RESIZE_PRESETS, RenderLog, RenderQuality, RenderQueueItem, RenderStatus, ResizeQuality, SwitchOverride, TimeSpan, WebmVideoCodec,
@@ -34,21 +35,33 @@ pub fn hms(secs: f64) -> String {
     format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
 }
 
-/// Unix seconds → `YYYY-MM-DD hh:mm:ss` (UTC).
+/// Unix seconds → (proleptic Gregorian year, the same wall-clock instant moved into chrono's range
+/// by whole 400-year cycles). The Gregorian calendar repeats every 400 years (146_097 days), so
+/// month, day and time of day come from chrono and only the year is carried, which keeps every
+/// input exact instead of collapsing out-of-range years to the epoch. `unix` is `u64`, so `days`
+/// always fits an `i64`.
+fn utc_parts(unix: u64) -> (i64, chrono::NaiveDateTime) {
+    use chrono::Datelike;
+    let (days, sod) = ((unix / 86_400) as i64, (unix % 86_400) as i64);
+    let (cycles, rest) = (days.div_euclid(146_097), days.rem_euclid(146_097));
+    // `rest + 719_163` (1970-01-01 is CE day 719_163) is always a valid CE day, and `sod` < 86_400.
+    let date = i32::try_from(rest + 719_163).ok().and_then(chrono::NaiveDate::from_num_days_from_ce_opt);
+    let time = u32::try_from(sod).ok().and_then(|s| chrono::NaiveTime::from_num_seconds_from_midnight_opt(s, 0));
+    match (date, time) {
+        (Some(d), Some(t)) => {
+            let y = i128::from(d.year()) + i128::from(cycles) * 400;
+            (i64::try_from(y).unwrap_or(i64::MAX), d.and_time(t))
+        }
+        _ => (1970, chrono::NaiveDateTime::default()), // unreachable
+    }
+}
+
+/// Unix seconds → `YYYY-MM-DD hh:mm:ss` (UTC). Years far outside chrono's own range are preserved
+/// (the old hand-rolled conversion kept them) rather than collapsing to the epoch.
 pub fn utc_stamp(unix: u64) -> String {
-    let days = (unix / 86_400) as i64;
-    let rem = unix % 86_400;
-    // Civil-from-days (proleptic Gregorian).
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}", rem / 3600, rem / 60 % 60, rem % 60)
+    let (y, t) = utc_parts(unix);
+    // `{:04}` rather than `%Y`, which writes a `+` before years past 9999.
+    format!("{y:04}-{}", t.format("%m-%d %H:%M:%S"))
 }
 
 fn status_color(t: &Tokens, s: &RenderStatus) -> Color32 {
@@ -78,33 +91,33 @@ fn settings_menu(it: &RenderQueueItem, templates: &RenderTemplates) -> Vec<(Stri
     }
     v.push(("-".into(), Value::Null));
     for (u, k) in effectcraft_engine::project::render_queue::ProxyUse::ALL.iter().zip(["current", "all", "comp", "none"]) {
-        v.push((mark(s.proxy_use == *u, &format!("Proxy Use: {}", u.label())), json!({"proxyUse": k})));
+        v.push((mark(s.proxy_use == *u, &tr_args("Proxy Use: {}", &[&(u.label())])), json!({"proxyUse": k})));
     }
     for (e, k) in EffectsMode::ALL.iter().zip(["current", "allOn", "allOff"]) {
-        v.push((mark(s.effects == *e, &format!("Effects: {}", e.label())), json!({"effects": k})));
+        v.push((mark(s.effects == *e, &tr_args("Effects: {}", &[&(e.label())])), json!({"effects": k})));
     }
     for (e, k) in [(CurrentOrOff::Current, "current"), (CurrentOrOff::AllOff, "allOff")] {
-        v.push((mark(s.solo == e, &format!("Solo Switches: {}", e.label())), json!({"solo": k})));
+        v.push((mark(s.solo == e, &tr_args("Solo Switches: {}", &[&(e.label())])), json!({"solo": k})));
     }
     for (e, k) in [(CurrentOrOff::Current, "current"), (CurrentOrOff::AllOff, "allOff")] {
-        v.push((mark(s.guide_layers == e, &format!("Guide Layers: {}", e.label())), json!({"guideLayers": k})));
+        v.push((mark(s.guide_layers == e, &tr_args("Guide Layers: {}", &[&(e.label())])), json!({"guideLayers": k})));
     }
     for (d, k) in ColorDepth::ALL.iter().zip(["current", "8", "16", "32"]) {
-        v.push((mark(s.color_depth == *d, &format!("Color Depth: {}", d.label())), json!({"colorDepth": k})));
+        v.push((mark(s.color_depth == *d, &tr_args("Color Depth: {}", &[&(d.label())])), json!({"colorDepth": k})));
     }
     v.push(("-".into(), Value::Null));
     for (m, k) in SwitchOverride::ALL.iter().zip(["current", "onForChecked", "offForAll"]) {
-        v.push((mark(s.frame_blending == *m, &format!("Frame Blending: {}", m.label())), json!({"frameBlending": k})));
+        v.push((mark(s.frame_blending == *m, &tr_args("Frame Blending: {}", &[&(m.label())])), json!({"frameBlending": k})));
     }
     for (m, k) in SwitchOverride::ALL.iter().zip(["current", "onForChecked", "offForAll"]) {
-        v.push((mark(s.motion_blur_override() == *m, &format!("Motion Blur: {}", m.label())), json!({"motionBlur": k})));
+        v.push((mark(s.motion_blur_override() == *m, &tr_args("Motion Blur: {}", &[&(m.label())])), json!({"motionBlur": k})));
     }
     for (f, k) in FieldRender::ALL.iter().zip(["off", "upper", "lower"]) {
-        v.push((mark(s.field_render == *f, &format!("Field Render: {}", f.label())), json!({"fieldRender": k})));
+        v.push((mark(s.field_render == *f, &tr_args("Field Render: {}", &[&(f.label())])), json!({"fieldRender": k})));
     }
     if s.field_render != FieldRender::Off {
         for pd in Pulldown::ALL {
-            v.push((mark(s.pulldown == pd, &format!("3:2 Pulldown: {}", pd.label())), json!({"pulldown": pd.label()})));
+            v.push((mark(s.pulldown == pd, &tr_args("3:2 Pulldown: {}", &[&(pd.label())])), json!({"pulldown": pd.label()})));
         }
     }
     v.push(("-".into(), Value::Null));
@@ -136,7 +149,7 @@ fn output_menu(it: &RenderQueueItem, available: &[OutputFormat], templates: &Ren
     v.push(("-".into(), Value::Null));
     for f in OutputFormat::ALL {
         if available.contains(&f) {
-            v.push((mark(o.format == f, &format!("Format: {}", f.label())), json!({"format": format!("{f:?}")})));
+            v.push((mark(o.format == f, &tr_args("Format: {}", &[&(f.label())])), json!({"format": format!("{f:?}")})));
         }
     }
     v.push(("-".into(), Value::Null));
@@ -168,7 +181,7 @@ fn output_menu(it: &RenderQueueItem, available: &[OutputFormat], templates: &Ren
         OutputFormat::WebM => {
             v.push(("-".into(), Value::Null));
             for c in [WebmVideoCodec::Vp9, WebmVideoCodec::Av1] {
-                v.push((mark(o.webm_codec == c, &format!("Video Codec: {}", c.label())), json!({"webmCodec": c.label().to_ascii_lowercase()})));
+                v.push((mark(o.webm_codec == c, &tr_args("Video Codec: {}", &[&(c.label())])), json!({"webmCodec": c.label().to_ascii_lowercase()})));
             }
             if o.webm_codec == WebmVideoCodec::Av1 {
                 codec_menu(o, &mut v);
@@ -182,10 +195,10 @@ fn output_menu(it: &RenderQueueItem, available: &[OutputFormat], templates: &Ren
             }
             v.push(("-".into(), Value::Null));
             for kbps in [24u32, 32, 64, 96, 128, 192, 256] {
-                v.push((mark(o.opus_bitrate_kbps == kbps, &format!("Opus Bitrate: {kbps} kbps")), json!({"audioBitrate": kbps})));
+                v.push((mark(o.opus_bitrate_kbps == kbps, &tr_args("Opus Bitrate: {} kbps", &[&kbps])), json!({"audioBitrate": kbps})));
             }
             for (a, k) in [(OpusApplication::Audio, "audio"), (OpusApplication::Voip, "voice")] {
-                v.push((mark(o.opus_application == a, &format!("Opus Tuning: {}", a.label())), json!({"opusApplication": k})));
+                v.push((mark(o.opus_application == a, &tr_args("Opus Tuning: {}", &[&(a.label())])), json!({"opusApplication": k})));
             }
         }
         OutputFormat::JpegSequence => {
@@ -226,7 +239,7 @@ fn output_menu(it: &RenderQueueItem, available: &[OutputFormat], templates: &Ren
         (PostRenderAction::ImportAndReplace, "importAndReplace"),
         (PostRenderAction::SetProxy, "setProxy"),
     ] {
-        v.push((mark(it.post_render == a, &format!("Post-Render Action: {}", a.label())), json!({"postRenderAction": k})));
+        v.push((mark(it.post_render == a, &tr_args("Post-Render Action: {}", &[&(a.label())])), json!({"postRenderAction": k})));
     }
     v.push((mark(o.include_project_link, "Include Project Link"), json!({"includeProjectLink": !o.include_project_link})));
     if o.format.supports_audio() {
@@ -244,9 +257,9 @@ fn output_menu(it: &RenderQueueItem, available: &[OutputFormat], templates: &Ren
         }
         v.push((mark(o.audio_channels == 1, "Audio Channels: Mono"), json!({"audioChannels": "mono"})));
         v.push((mark(o.audio_channels != 1, "Audio Channels: Stereo"), json!({"audioChannels": "stereo"})));
-        if matches!(o.format, OutputFormat::ProRes | OutputFormat::Wav | OutputFormat::Aiff) {
+        if matches!(o.format, OutputFormat::ProRes | OutputFormat::Uncompressed | OutputFormat::Wav | OutputFormat::Aiff) {
             for f in [AudioFormat::S16, AudioFormat::S24, AudioFormat::F32] {
-                v.push((mark(o.audio_format == f, &format!("Sample Format: {}", f.label())), json!({"audioFormat": f.label()})));
+                v.push((mark(o.audio_format == f, &tr_args("Sample Format: {}", &[&(f.label())])), json!({"audioFormat": f.label()})));
             }
         }
     }
@@ -259,7 +272,7 @@ fn codec_menu(o: &effectcraft_engine::project::render_queue::OutputModule, v: &m
     let c = &o.codec;
     v.push(("-".into(), Value::Null));
     for p in CodecProfile::ALL {
-        v.push((mark(c.profile == p, &format!("Profile: {}", p.label())), json!({"profile": format!("{p:?}").to_ascii_lowercase()})));
+        v.push((mark(c.profile == p, &tr_args("Profile: {}", &[&(p.label())])), json!({"profile": format!("{p:?}").to_ascii_lowercase()})));
     }
     v.push(("-".into(), Value::Null));
     v.push((mark(c.level.is_none(), "Level: Auto"), json!({"level": "auto"})));
@@ -271,7 +284,7 @@ fn codec_menu(o: &effectcraft_engine::project::render_queue::OutputModule, v: &m
     }
     v.push(("-".into(), Value::Null));
     for r in [RateControlMode::Bitrate, RateControlMode::Quality] {
-        v.push((mark(c.rate_control == r, &format!("Rate Control: {}", r.label())), json!({"rateControl": format!("{r:?}").to_ascii_lowercase()})));
+        v.push((mark(c.rate_control == r, &tr_args("Rate Control: {}", &[&(r.label())])), json!({"rateControl": format!("{r:?}").to_ascii_lowercase()})));
     }
     if c.rate_control == RateControlMode::Bitrate {
         for kbps in [1_000u32, 2_000, 5_000, 10_000, 20_000, 40_000] {
@@ -396,12 +409,10 @@ fn output_to_menu(it: &RenderQueueItem) -> Vec<(String, Value)> {
 }
 
 /// Output To's save dialog, as After Effects' Output Movie To: it opens at the current output
-/// (folder and name) and offers the output format's extension. `None` when the host has no
-/// save dialog for other file kinds; `Some(None)` when the dialog was cancelled.
+/// (folder and name, which ends in the format's extension) and offers that extension. `None`
+/// when the host has no save dialog; `Some(None)` when the dialog was cancelled.
 fn pick_output(app: &EffectcraftApp, it: &RenderQueueItem) -> Option<Option<String>> {
-    let pick = app.hooks.pick_save_file.as_ref()?;
-    let default = app.session.resolve_output(it).unwrap_or_default();
-    Some(pick(&default, it.output.format.extension()))
+    app.hooks.save_dialog(&app.session.resolve_output(it).unwrap_or_default())
 }
 
 pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
@@ -440,7 +451,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let top = Rect::from_min_size(rect.min, vec2(rect.width(), TOP_H));
     p.rect_filled(top, 0.0, t.tl_ruler_bg);
     let x0 = rect.min.x + 12.0;
-    p.text(pos2(x0, top.min.y + 16.0), Align2::LEFT_CENTER, "Current Render", Tokens::semibold(12.5), t.text);
+    p.text(pos2(x0, top.min.y + 16.0), Align2::LEFT_CENTER, tr("Current Render"), Tokens::semibold(12.5), t.text);
     let cur_item = progress.as_ref().and_then(|p| p.current).and_then(|id| queue.iter().find(|i| i.id == id));
     let cur_name = cur_item.and_then(|i| app.session.project.item(i.comp)).map(|i| i.name.clone());
     if let Some(pr) = &progress {
@@ -467,7 +478,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if widgets::checkbox(ui, nb, notify, &t, egui::Id::new("rq-notify")).clicked() {
         actions.push(("renderQueue.setNotify", json!({"notify": !notify})));
     }
-    p.text(pos2(nb.max.x + 5.0, nb.center().y), Align2::LEFT_CENTER, "Notify", Tokens::ui(11.5), t.text_dim);
+    p.text(pos2(nb.max.x + 5.0, nb.center().y), Align2::LEFT_CENTER, tr("Notify"), Tokens::ui(11.5), t.text_dim);
     app.auto.add("renderQueue.notify", nb, if notify { "Notify: on" } else { "Notify: off" });
     if rendering {
         if widgets::text_button(ui, stop_b, "Stop", false, &t, egui::Id::new("rq-stop")).clicked() {
@@ -533,7 +544,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     ui.set_clip_rect(list.intersect(panel_clip));
     let mut y = list.min.y - scroll.offset;
     if queue.is_empty() {
-        lp.text(pos2(list.center().x, list.min.y + 30.0), Align2::CENTER_CENTER, "The render queue is empty.", Tokens::ui(12.0), t.text_faint);
+        lp.text(pos2(list.center().x, list.min.y + 30.0), Align2::CENTER_CENTER, tr("The render queue is empty."), Tokens::ui(12.0), t.text_faint);
     }
     let editing_id = egui::Id::new("rq-edit-output");
     let mut editing: Option<(u64, String)> = ui.data(|d| d.get_temp(editing_id));
@@ -560,20 +571,20 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             app.ui.focused = crate::dock::PanelKind::RenderQueue;
         }
         let item_id = it.id;
-        row_resp.context_menu(|ui| {
-            if ui.button("Duplicate").clicked() {
+        crate::widgets::context_menu(&row_resp, |ui| {
+            if ui.button(tr("Duplicate")).clicked() {
                 actions.push(("renderQueue.duplicate", json!({"item": item_id})));
                 ui.close();
             }
-            if ui.button("Remove").clicked() {
+            if ui.button(tr("Remove")).clicked() {
                 actions.push(("renderQueue.remove", json!({"item": item_id})));
                 ui.close();
             }
-            if k > 0 && ui.button("Move Up").clicked() {
+            if k > 0 && ui.button(tr("Move Up")).clicked() {
                 actions.push(("renderQueue.move", json!({"item": item_id, "to": n - 1})));
                 ui.close();
             }
-            if n < queue.len() && ui.button("Move Down").clicked() {
+            if n < queue.len() && ui.button(tr("Move Down")).clicked() {
                 actions.push(("renderQueue.move", json!({"item": item_id, "to": n + 1})));
                 ui.close();
             }
@@ -672,7 +683,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
                 // Log: Errors Only / Plus Settings / Plus Per Frame Info.
                 let ld = Rect::from_min_size(pos2(r.max.x - 190.0, r.min.y + 3.0), vec2(150.0, ROW_H - 6.0));
-                lp.text(pos2(ld.min.x - 6.0, r.center().y), Align2::RIGHT_CENTER, "Log:", Tokens::ui(11.5), t.text_dim);
+                lp.text(pos2(ld.min.x - 6.0, r.center().y), Align2::RIGHT_CENTER, tr("Log:"), Tokens::ui(11.5), t.text_dim);
                 let lid = egui::Id::new(("rq-log", it.id));
                 if widgets::dropdown(ui, ld, it.log.label(), &t, lid).clicked() && !rendering {
                     widgets::open_popup(ui, lid);
@@ -686,7 +697,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             }
             // Output To.
             let ox = dd.max.x + 14.0;
-            lp.text(pos2(ox, r.center().y), Align2::LEFT_CENTER, "Output To:", Tokens::ui(11.5), t.text_dim);
+            lp.text(pos2(ox, r.center().y), Align2::LEFT_CENTER, tr("Output To:"), Tokens::ui(11.5), t.text_dim);
             let odd = Rect::from_min_size(pos2(ox + 62.0, r.min.y + 3.0), vec2(22.0, ROW_H - 6.0));
             let oid = egui::Id::new(("rq-out", it.id));
             if widgets::dropdown(ui, odd, "", &t, oid).clicked() && !rendering {
@@ -697,13 +708,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
             let olabels: Vec<String> = omenu.iter().map(|(l, _)| l.clone()).collect();
             if let Some(i) = widgets::popup_menu(ui, oid, odd.left_bottom(), &olabels, None) {
                 if omenu[i].1.get("choose").is_some() {
-                    // The web has no folders to choose from: its save "dialog" only names the file.
-                    let picked = pick_output(app, it).or_else(|| {
-                        let default = app.session.resolve_output(it).unwrap_or_default();
-                        let name = std::path::Path::new(&default).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                        app.hooks.pick_save.as_ref().map(|f| f(&name))
-                    });
-                    match picked {
+                    match pick_output(app, it) {
                         Some(Some(path)) => actions.push(("renderQueue.setOutput", json!({"item": it.id, "path": path}))),
                         Some(None) => {}
                         None => editing = Some((it.id, it.output.output.clone())),
@@ -745,7 +750,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     }
                 }
                 let how = if dialog { "Click to choose where to save; Alt-click to edit the template" } else { "Click to edit" };
-                resp.on_hover_text(format!("Template: {}\n{how}", it.output.output));
+                resp.on_hover_text(tr_args("Template: {}\n{}", &[&it.output.output, &how]));
                 app.auto.add(&aid("outputPath"), path_rect, &shown);
             }
         }
@@ -814,6 +819,10 @@ mod tests {
     fn stamps() {
         assert_eq!(super::utc_stamp(0), "1970-01-01 00:00:00");
         assert_eq!(super::utc_stamp(1_700_000_000), "2023-11-14 22:13:20");
+        // Years far outside chrono's own range are preserved (the old hand-rolled conversion kept
+        // them) rather than collapsing to the epoch.
+        assert_eq!(super::utc_stamp(10_000_000_000_000), "318857-05-20 17:46:40");
+        assert_eq!(super::utc_stamp(u64::MAX), "584554051223-11-09 07:00:15");
         assert_eq!(super::hms(3725.4), "1:02:05");
     }
 }

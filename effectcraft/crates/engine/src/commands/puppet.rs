@@ -5,7 +5,7 @@
 //! selected pins, not their layer). Follow-Through (`puppet.follow`) makes pins trail a leader pin
 //! with a delay, for hair, cloth and overlapping action.
 //!
-//! Pin positions are layer space. A new pin is attached to the mesh under it: the click is
+//! Pin positions are in effect space. A new pin is attached to the mesh under it: the click is
 //! mapped back through the current deformation to the rest mesh (its hidden rest position), and
 //! Position / Advanced pins get a Position keyframe at the current time, as in After Effects.
 
@@ -20,6 +20,10 @@ use serde_json::{Value, json};
 
 use super::{CommandSpec, bad, f_p, has_comp, layer_mut, layer_p, merge_p, str_p};
 use crate::{EngineError, Result, Session, cmd};
+
+fn dist2(a: [f64; 2], b: [f64; 2]) -> f64 {
+    (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)
+}
 
 fn pt(v: Option<&Value>) -> Option<[f64; 2]> {
     let a = v?.as_array()?;
@@ -64,7 +68,7 @@ fn add_pin(s: &mut Session, p: &Value) -> Result<Value> {
         Some(k) => PinKind::from_name(k).ok_or_else(|| bad(cmd, format!("unknown kind `{k}` (position | advanced | bend | starch | overlap)")))?,
         None => PinKind::Position,
     };
-    let at = pt(p.get("position")).ok_or_else(|| bad(cmd, "missing `position` [x, y] (layer space)"))?;
+    let at = pt(p.get("position")).ok_or_else(|| bad(cmd, "missing `position` [x, y] (effect space)"))?;
     let t = snapped(s, cid, p)?;
     let lt = layer_time(s, cid, lid, t)?;
     {
@@ -77,7 +81,8 @@ fn add_pin(s: &mut Session, p: &Value) -> Result<Value> {
     let fx_uid = find_puppet(s, cid, lid);
     let want_mesh = p.get("mesh").and_then(Value::as_u64);
     let new_mesh = p.get("newMesh").and_then(Value::as_bool).unwrap_or(false);
-    let mut target: Option<(Uid, [f64; 2])> = None;
+    // (mesh, the pin's rest point, where it is now)
+    let mut target: Option<(Uid, [f64; 2], [f64; 2])> = None;
     if let Some(fu) = fx_uid
         && !new_mesh
         && let Some((buf, params)) = puppet_eval(s, cid, lid, fu, t)
@@ -87,14 +92,25 @@ fn add_pin(s: &mut Session, p: &Value) -> Result<Value> {
             if want_mesh.is_some_and(|w| w != *uid) || mesh.tris.is_empty() {
                 continue;
             }
-            let inside = mesh.tris.iter().any(|tr| {
-                let (a, b, c) = (def[tr[0]], def[tr[1]], def[tr[2]]);
-                let cr = |o: [f64; 2], u: [f64; 2], v: [f64; 2]| (u[0] - o[0]) * (v[1] - o[1]) - (u[1] - o[1]) * (v[0] - o[0]);
-                cr(a, b, at) >= 0.0 && cr(b, c, at) >= 0.0 && cr(c, a, at) >= 0.0
-            });
+            let inside = puppet::contains(mesh, def, at);
             let near = def.iter().map(|v| (v[0] - at[0]).hypot(v[1] - at[1])).fold(f64::MAX, f64::min) < 12.0;
             if inside || near || want_mesh.is_some() {
-                target = Some((*uid, puppet::unmap(mesh, def, at)));
+                let rest = puppet::unmap(mesh, def, at);
+                // A moving pin holds its nearest mesh vertex at `position + (vertex - rest)`
+                // (puppet::solve). Choose the position that keeps that vertex where it is now, so
+                // adding a pin to a bent mesh moves nothing (After Effects, #318); on an unbent
+                // mesh that is the click itself.
+                let now = (0..mesh.verts.len().min(def.len()))
+                    .filter(|_| kind.moves())
+                    .min_by(|a, b| dist2(mesh.verts[*a], rest).total_cmp(&dist2(mesh.verts[*b], rest)))
+                    .and_then(|v| {
+                        let (r, d) = (mesh.verts.get(v)?, def.get(v)?);
+                        Some([d[0] - (r[0] - rest[0]), d[1] - (r[1] - rest[1])])
+                    })
+                    // Round-off only (an unbent mesh): exactly the click.
+                    .filter(|n| dist2(*n, at) > 1e-12)
+                    .unwrap_or(at);
+                target = Some((*uid, rest, now));
                 break;
             }
         }
@@ -112,8 +128,7 @@ fn add_pin(s: &mut Session, p: &Value) -> Result<Value> {
     let size = {
         let comp = s.project.comp(cid).ok_or(EngineError::NoComp)?;
         let l = comp.layer(lid).ok_or(EngineError::NoComp)?;
-        let (w, h) = effectcraft_render::source_size(&s.project, l);
-        if w == 0 { [comp.width as f64, comp.height as f64] } else { [w as f64, h as f64] }
+        effectcraft_render::effect_bounds(&s.project, comp, l).0
     };
     let label = match kind {
         PinKind::Starch => "Add Starch Pin",
@@ -136,14 +151,14 @@ fn add_pin(s: &mut Session, p: &Value) -> Result<Value> {
             }
         };
         let pg = fxg.find_group_mut(fx_uid).ok_or_else(|| bad(cmd, "Puppet effect gone"))?;
-        let (mesh_uid, rest) = match target {
-            Some((m, r)) => (m, r),
+        let (mesh_uid, rest, now) = match target {
+            Some(t) => t,
             None => {
                 let n = puppet::meshes(pg).count();
                 let g = puppet::mesh_group(&mut ids, &format!("Mesh {}", n + 1), at, &opts);
                 let u = g.uid;
                 pg.children.push(g.into());
-                (u, at)
+                (u, at, at)
             }
         };
         let name = puppet::next_pin_name(pg, kind);
@@ -151,7 +166,7 @@ fn add_pin(s: &mut Session, p: &Value) -> Result<Value> {
         let mut pin = puppet::pin_group(&mut ids, &name, kind, rest);
         if let Some(pos) = pin.get_mut("position") {
             if kind.moves() {
-                pos.value = KV::Vec2(at);
+                pos.value = KV::Vec2(now);
                 pos.set_animated(true, lt);
             } else {
                 pos.value = KV::Vec2(rest);
@@ -282,7 +297,7 @@ fn with_pin<T>(s: &mut Session, p: &Value, cmd: &str, label: &str, f: impl FnOnc
 
 fn move_pin(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "puppet.movePin";
-    let to = pt(p.get("position")).ok_or_else(|| bad(cmd, "missing `position` [x, y] (layer space)"))?;
+    let to = pt(p.get("position")).ok_or_else(|| bad(cmd, "missing `position` [x, y] (effect space)"))?;
     with_pin(s, p, cmd, "Move Puppet Pin", |g, lt| {
         let kind = PinKind::from_index(g.get("kind").map(|k| k.value.as_enum()).unwrap_or(0));
         let pos = g.get_mut("position").ok_or_else(|| bad(cmd, "Bend pins have no position (use puppet.setPin rotation/scale)"))?;
@@ -391,12 +406,12 @@ fn mesh_opts(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(Value::Null)
 }
 
-/// Parse recorded samples `[[t, x, y]…]` (t = seconds since the drag began, layer space).
+/// Parse recorded samples `[[t, x, y]…]` (t = seconds since the drag began, effect space).
 fn samples(p: &Value, cmd: &str) -> Result<Vec<(f64, [f64; 2])>> {
     let arr = p
         .get("samples")
         .and_then(Value::as_array)
-        .ok_or_else(|| bad(cmd, "missing `samples`: [[t, x, y]…] (t = seconds since the drag began, layer space)"))?;
+        .ok_or_else(|| bad(cmd, "missing `samples`: [[t, x, y]…] (t = seconds since the drag began, effect space)"))?;
     let mut rec = Vec::with_capacity(arr.len());
     for (i, v) in arr.iter().enumerate() {
         let a: Vec<f64> = v.as_array().map(|a| a.iter().filter_map(Value::as_f64).collect()).unwrap_or_default();
@@ -606,7 +621,7 @@ fn record_options(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"speed": o.record_speed, "smoothing": o.record_smoothing, "useDraftDeformation": o.record_draft, "showMesh": o.record_show_mesh}))
 }
 
-/// Meshes, pins and the deformed mesh at the current time (layer space).
+/// Meshes, pins and the deformed mesh at the current time (effect space).
 fn info(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, lid) = layer_p(s, p, "puppet.info")?;
     let Some(fx) = find_puppet(s, cid, lid) else { return Ok(json!({"meshes": []})) };
@@ -636,7 +651,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add Puppet Pin",
             [],
             None,
-            "{layer?, kind?: position|advanced|bend|starch|overlap, position: [x,y] (layer space), time? (s) | frame?, mesh?: uid, newMesh?, density?, expansion?, triangles?}",
+            "{layer?, kind?: position|advanced|bend|starch|overlap, position: [x,y] (effect space), time? (s) | frame?, mesh?: uid, newMesh?, density?, expansion?, triangles?}",
             has_comp,
             add_pin
         ),
@@ -675,7 +690,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Record Puppet Pin",
             [],
             None,
-            "{layer?, pin: uid | name, samples: [[t, x, y]…] (t = seconds since the drag began, layer space), pins?: [uid | name…] (more pins that move by the same displacement), start? (s, default current time), speed? (%, Record Options), smoothing? (Record Options)}",
+            "{layer?, pin: uid | name, samples: [[t, x, y]…] (t = seconds since the drag began, effect space), pins?: [uid | name…] (more pins that move by the same displacement), start? (s, default current time), speed? (%, Record Options), smoothing? (Record Options)}",
             has_comp,
             record_pin
         ),

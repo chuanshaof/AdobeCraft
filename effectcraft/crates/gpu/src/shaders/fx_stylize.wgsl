@@ -40,7 +40,9 @@ fn fxs_smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
 fn fxs_qdiv(x: vec3<f32>, a: f32) -> vec3<f32> {
     let q = x / a;
     let r = fma(-q, vec3<f32>(a), x);
-    return q + r / a;
+    // `q + r / a`, written as an fma so drivers (NVIDIA Vulkan) can't contract it another way
+    // and round differently from the CPU.
+    return fma(r / a, vec3<f32>(1.0), q);
 }
 
 fn fxs_rem2(i: i32) -> i32 {

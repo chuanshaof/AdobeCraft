@@ -5,7 +5,7 @@
 .DESCRIPTION
   Produces, in $env:DIST (default: dist/release):
     effectcraft-<version>-windows-<arch>.msi            per-machine installer (WiX v5)
-    effectcraft-<version>-windows-<arch>-portable.zip   effectcraft.exe + effectcraft-cli.exe
+    effectcraft-<version>-windows-<arch>-portable.zip   effectcraft.exe + effectcraft-cli.exe + portable.txt
 
   The binaries link the C runtime statically (+crt-static), so neither the MSI nor the portable
   zip needs the Visual C++ redistributable. Signing is delegated to sign.ps1 (skipped with a
@@ -93,7 +93,7 @@ Copy-Item (Join-Path $Bin 'effectcraft.exe'), (Join-Path $Bin 'effectcraft-cli.e
 # ---- MSI ---------------------------------------------------------------------------------------
 $Msi = Join-Path $Dist "effectcraft-$Version-windows-$Arch.msi"
 Invoke-Native 'wix build' {
-  wix build (Join-Path $PSScriptRoot 'effectcraft.wxs') -arch $Arch `
+  wix build (Join-Path $PSScriptRoot 'effectcraft.wxs') (Join-Path $PSScriptRoot 'installer-ui.wxs') -arch $Arch `
     -d "Version=$MsiVersion" -d "BinDir=$Stage" -d "IconPath=$(Join-Path $Root 'assets\app-icon\effectcraft.ico')" `
     -o $Msi
 }
@@ -110,6 +110,9 @@ foreach ($f in 'README.md', 'LICENSE', 'LICENSE-MIT', 'LICENSE-APACHE') {
   $p = Join-Path $Root $f
   if (Test-Path $p) { Copy-Item $p $Portable }
 }
+# portable.txt beside effectcraft.exe switches on portable mode: settings, shortcuts and recovery
+# files go to EffectCraftData\ next to the exe instead of %APPDATA% (#993; see app_dirs.rs).
+Copy-Item (Join-Path $PSScriptRoot 'portable.txt') $Portable
 $Zip = Join-Path $Dist "effectcraft-$Version-windows-$Arch-portable.zip"
 Remove-Item -Force $Zip -ErrorAction SilentlyContinue
 Compress-Archive -Path $Portable -DestinationPath $Zip

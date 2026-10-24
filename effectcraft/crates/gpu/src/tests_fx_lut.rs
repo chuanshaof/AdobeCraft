@@ -241,3 +241,105 @@ fn ocio_custom_config() {
     }
     effect_case("ec.color.ociocolorspace", &[("config", e(1)), ("configFile", s("/missing.ocio"))]);
 }
+
+/// A config with the OCIO v2 transforms of Blender's (#410): an E-white XYZ reference,
+/// ColorSpaceTransform, ExponentWithLinearTransform, display-referred spaces through the
+/// default view transform, AllocationTransform, BuiltinTransform (a matrix, the PQ and ACEScc
+/// curves), a minimum-only RangeTransform and a look in a view.
+const CONFIG_V2: &str = r#"ocio_profile_version: 2
+roles:
+  reference: XYZ E
+  scene_linear: Linear Rec.709
+default_view_transform: Standard
+view_transforms:
+  - !<ViewTransform>
+    name: Standard
+    from_scene_reference: !<MatrixTransform> {matrix: [0.9531, -0.0266, 0.0239, 0, -0.0382, 1.0288, 0.0094, 0, 0.0026, -0.0030, 1.0893, 0, 0, 0, 0, 1]}
+displays:
+  sRGB:
+    - !<View> {name: Standard, view_transform: Standard, display_colorspace: sRGB Display}
+    - !<View> {name: Log, colorspace: Log, looks: +Lift}
+    - !<View> {name: PQ, view_transform: Standard, display_colorspace: PQ Display}
+display_colorspaces:
+  - !<ColorSpace>
+    name: XYZ D65
+  - !<ColorSpace>
+    name: sRGB Display
+    from_display_reference: !<GroupTransform>
+      children:
+        - !<ColorSpaceTransform> {src: XYZ D65, dst: Linear Rec.709}
+        - !<ExponentWithLinearTransform> {gamma: 2.4, offset: 0.055, direction: inverse}
+  - !<ColorSpace>
+    name: PQ Display
+    from_display_reference: !<BuiltinTransform> {style: DISPLAY - CIE-XYZ-D65_to_REC.2100-PQ}
+colorspaces:
+  - !<ColorSpace>
+    name: XYZ E
+  - !<ColorSpace>
+    name: Linear Rec.709
+    from_scene_reference: !<GroupTransform>
+      children:
+        - !<MatrixTransform> {matrix: [0.9531, -0.0266, 0.0239, 0, -0.0382, 1.0288, 0.0094, 0, 0.0026, -0.0030, 1.0893, 0, 0, 0, 0, 1]}
+        - !<MatrixTransform> {matrix: [3.2410, -1.5374, -0.4986, 0, -0.9692, 1.8760, 0.0416, 0, 0.0556, -0.2040, 1.0570, 0, 0, 0, 0, 1]}
+  - !<ColorSpace>
+    name: sRGB
+    from_scene_reference: !<GroupTransform>
+      children:
+        - !<ColorSpaceTransform> {src: XYZ E, dst: Linear Rec.709}
+        - !<ExponentWithLinearTransform> {gamma: 2.4, offset: 0.055, direction: inverse}
+  - !<ColorSpace>
+    name: Log
+    from_scene_reference: !<GroupTransform>
+      children:
+        - !<ColorSpaceTransform> {src: XYZ E, dst: Linear Rec.709}
+        - !<AllocationTransform> {allocation: lg2, vars: [-10, 6.5]}
+  - !<ColorSpace>
+    name: ACEScg
+    from_scene_reference: !<GroupTransform>
+      children:
+        - !<ColorSpaceTransform> {src: XYZ E, dst: XYZ D65}
+        - !<BuiltinTransform> {style: "UTILITY - ACES-AP1_to_CIE-XYZ-D65_BFD", direction: inverse}
+  - !<ColorSpace>
+    name: ACEScc
+    to_scene_reference: !<GroupTransform>
+      children:
+        - !<BuiltinTransform> {style: ACEScc_to_ACES2065-1}
+        - !<MatrixTransform> {matrix: [0.9525, 0, 0.0001, 0, 0.3439, 0.7281, -0.0721, 0, 0, 0, 1.0088, 0, 0, 0, 0, 1]}
+  - !<ColorSpace>
+    name: Floor
+    from_scene_reference: !<GroupTransform>
+      children:
+        - !<ColorSpaceTransform> {src: XYZ E, dst: sRGB}
+        - !<RangeTransform> {min_in_value: 0.1, min_out_value: 0.1}
+  - !<ColorSpace>
+    name: Uniform
+    from_scene_reference: !<AllocationTransform> {allocation: uniform, vars: [-0.5, 2]}
+looks:
+  - !<Look>
+    name: Lift
+    process_space: Log
+    transform: !<CDLTransform> {offset: [0.05, 0.02, 0], sat: 0.8}
+"#;
+
+#[test]
+fn ocio_custom_config_v2() {
+    let cfg = [("config", e(1)), ("configFile", s(CONFIG_V2))];
+    for (a, z) in [
+        ("Linear Rec.709", "sRGB"),
+        ("Linear Rec.709", "sRGB Display"),
+        ("sRGB", "Log"),
+        ("ACEScg", "sRGB"),
+        ("ACEScc", "Linear Rec.709"),
+        ("sRGB", "Floor"),
+        ("Linear Rec.709", "Uniform"),
+    ] {
+        for dir in 0..2 {
+            let vals = [cfg.as_slice(), &[("sourceName", s(a)), ("destinationName", s(z)), ("direction", e(dir))]].concat();
+            effect_case("ec.color.ociocolorspace", &vals);
+        }
+    }
+    for (view, dir) in [("Standard", 0), ("Standard", 1), ("Log", 0), ("Log", 1), ("PQ", 0)] {
+        let vals = [cfg.as_slice(), &[("sourceName", s("Linear Rec.709")), ("displayName", s("sRGB")), ("viewName", s(view)), ("direction", e(dir))]].concat();
+        effect_case("ec.color.ociodisplay", &vals);
+    }
+}

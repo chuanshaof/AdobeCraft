@@ -49,23 +49,63 @@ pub(crate) fn hold_gpu_lock() {
 
 /// The shared test device (the calling test holds [`hold_gpu_lock`]).
 pub(crate) fn gpu() -> Option<&'static Gpu> {
-    static G: OnceLock<Option<Gpu>> = OnceLock::new();
+    static G: OnceLock<Result<Gpu, String>> = OnceLock::new();
     hold_gpu_lock();
-    G.get_or_init(|| {
-        let g = Gpu::headless();
-        if g.is_none() {
-            eprintln!("effectcraft-gpu tests: no GPU adapter, skipping GPU comparisons");
-        } else if let Some(g) = &g {
-            eprintln!("effectcraft-gpu tests: adapter {}", g.ctx.name);
+    let g = G.get_or_init(|| {
+        let g = Gpu::try_headless();
+        match &g {
+            Ok(g) => eprintln!("effectcraft-gpu tests: adapter {}", g.ctx.name),
+            Err(e) => eprintln!("effectcraft-gpu tests: no GPU ({e}), skipping GPU comparisons"),
         }
         g
-    })
-    .as_ref()
+    });
+    require_gpu("effectcraft-gpu tests", g.as_ref())
+}
+
+/// `g`, or `None` (the GPU tests skip) when there is no GPU, unless `EFFECTCRAFT_REQUIRE_GPU=1`
+/// (as in `tests_init`): then a GPU that didn't start fails the test, with why.
+pub(crate) fn require_gpu<G>(tests: &str, g: Result<G, &String>) -> Option<G> {
+    match g {
+        Ok(g) => Some(g),
+        Err(e) if std::env::var("EFFECTCRAFT_REQUIRE_GPU").is_ok_and(|v| v == "1") => {
+            panic!("{tests}: EFFECTCRAFT_REQUIRE_GPU=1 but GPU initialization failed: {e}")
+        }
+        Err(_) => None,
+    }
 }
 
 /// The test device is on wgpu's OpenGL backend (Mesa's llvmpipe on the FreeBSD CI job).
 pub(crate) fn on_gl() -> bool {
     gpu().is_some_and(|g| g.ctx.name.ends_with("(Gl)"))
+}
+
+/// The test device is Mesa's software rasteriser, llvmpipe: on OpenGL, or as lavapipe on Vulkan
+/// (the Linux CI gate).
+pub(crate) fn on_llvmpipe() -> bool {
+    gpu().is_some_and(|g| g.ctx.name.starts_with("llvmpipe"))
+}
+
+thread_local! {
+    static LLVMPIPE_FLIPS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Until the guard drops, comparisons on lavapipe get [`GL_BOUNDARY_FLIPS`] too. Only the tests
+/// that measured such flips there opt in (CC HexTile cell edges, CC Threshold RGB thresholds);
+/// every other comparison on the Linux gate stays exact.
+pub(crate) fn allow_llvmpipe_boundary_flips() -> impl Drop {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            LLVMPIPE_FLIPS.with(|f| f.set(false));
+        }
+    }
+    LLVMPIPE_FLIPS.with(|f| f.set(true));
+    Reset
+}
+
+/// The boundary-flip allowance applies: OpenGL, or llvmpipe in a test that opted in.
+fn boundary_flips_allowed() -> bool {
+    on_gl() || (LLVMPIPE_FLIPS.with(std::cell::Cell::get) && on_llvmpipe())
 }
 
 /// On GL, the fraction of pixels allowed past the tolerance: pixels on a decision boundary (a
@@ -160,8 +200,8 @@ impl Scene {
     pub(crate) fn effect(&mut self, l: &mut Layer, id: &str, vals: &[(&str, Value)]) {
         let spec = effectcraft_effects::find(id).unwrap();
         let mut next = self.p.next_id;
-        let size = effectcraft_render::source_size(&self.p, l);
-        let mut g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, [size.0 as f64, size.1 as f64]);
+        let size = effectcraft_render::effect_bounds(&self.p, &self.comp, l).0;
+        let mut g = effectcraft_effects::instantiate(spec, &mut Ids(&mut next), spec.name, size);
         self.p.next_id = next;
         for (k, v) in vals {
             g.prop_mut(k).unwrap_or_else(|| panic!("{id}: no {k}")).value = v.clone();
@@ -244,7 +284,7 @@ pub(crate) fn check(label: &str, d: Option<Diff>, allow: f64) {
     let frac = d.over as f64 / d.total as f64;
     // Quantised depths: rounding-boundary flips (see the module docs).
     let (allow, cap) = if d.quantized && allow == 0.0 { (0.003, 4.0 / 255.0 + 1e-6) } else { (allow, f32::INFINITY) };
-    let (allow, cap) = if on_gl() { (allow.max(GL_BOUNDARY_FLIPS), f32::INFINITY) } else { (allow, cap) };
+    let (allow, cap) = if boundary_flips_allowed() { (allow.max(GL_BOUNDARY_FLIPS), f32::INFINITY) } else { (allow, cap) };
     assert!(frac <= allow && d.max <= cap, "{label}: {} of {} pixels over tolerance (max {:.6}); worst {:?}", d.over, d.total, d.max, d.worst);
     if d.over > 0 {
         eprintln!("{label}: {} of {} pixels over tolerance (max {:.6})", d.over, d.total, d.max);
@@ -435,15 +475,19 @@ pub(crate) fn effect_direct(id: &str, vals: &[(&str, Value)], adjustment: bool) 
     for (k, v) in vals {
         params.values.insert(k.to_string(), v.clone());
     }
+    let expect_empty = id == "ec.distort.ccblobbylize" && vals.iter().any(|(k, v)| *k == "cutAway" && matches!(v, Value::Scalar(x) if *x == 100.0));
     for scale in [1.0, 0.5] {
         let img = pattern(7, (size[0] * scale) as u32, (size[1] * scale) as u32);
         let buf = effectcraft_effects::Buf { img, offset: [0.0, 0.0], scale };
         let ctx = || effectcraft_effects::EffectCtx { params: &params, time: 0.25, layer_size: size, seed: 11, adjustment, env: Default::default() };
         let cpu = (spec.render)(&ctx(), buf.clone());
         let out = effectcraft_render::Accelerator::effects(g, &[effectcraft_render::FxStep { spec, ctx: ctx() }], &buf, None).expect("the GPU runs the effect");
+        if expect_empty {
+            assert!(out.img.data.iter().all(|p| p[3] == 0.0), "{id} {vals:?} adj {adjustment} scale {scale}: Cut Away 100 produced non-zero alpha");
+        }
         assert_eq!((out.offset, out.scale), (cpu.offset, cpu.scale), "{id}: geometry");
         let d = diff(&cpu.img, &out.img, 1e-3);
-        let allow = if on_gl() { (d.total as f64 * GL_BOUNDARY_FLIPS) as usize } else { 0 };
+        let allow = if boundary_flips_allowed() { (d.total as f64 * GL_BOUNDARY_FLIPS) as usize } else { 0 };
         assert!(
             d.over <= allow,
             "{id} {vals:?} adj {adjustment} scale {scale}: {} of {} pixels over 1e-3 (max {}); worst {:?}",
@@ -481,11 +525,26 @@ pub(crate) fn c(r: f64, g: f64, b: f64) -> Value {
 }
 
 #[test]
+fn small_blurs_fall_back_to_the_cpu() {
+    // #1939: small Gaussian sigmas and fractional box radii render on the CPU kernel.
+    for (id, vals) in [("ec.blur.gaussian", [("blurriness", n(0.9))]), ("ec.blur.fastbox", [("radius", n(1.5))])] {
+        let mut s = Scene::new(BitDepth::Bpc32);
+        let bg = s.solid([0.15, 0.1, 0.2], 97, 61);
+        s.push(bg);
+        let mut l = s.footage(70, 44);
+        s.effect(&mut l, id, &vals);
+        s.push(l);
+        check(&format!("{id} {vals:?}"), compare_at(&s, opts(), Tick::ZERO), 0.0);
+    }
+}
+
+#[test]
 fn gpu_effects_match_cpu() {
-    effect_case("ec.blur.gaussian", &[("blurriness", n(9.0))]);
-    effect_case("ec.blur.gaussian", &[("blurriness", n(4.0)), ("dimensions", Value::Enum(1)), ("repeatEdge", Value::Bool(true))]);
-    effect_case("ec.blur.fastbox", &[("radius", n(5.0)), ("iterations", n(2.0))]);
-    effect_case("ec.blur.fastbox", &[("radius", n(3.0)), ("dimensions", Value::Enum(2)), ("repeatEdge", Value::Bool(true))]);
+    // Sigma 3 px and up and even radii, so the half-scale pass stays on the GPU too (#1939).
+    effect_case("ec.blur.gaussian", &[("blurriness", n(14.0))]);
+    effect_case("ec.blur.gaussian", &[("blurriness", n(12.0)), ("dimensions", Value::Enum(1)), ("repeatEdge", Value::Bool(true))]);
+    effect_case("ec.blur.fastbox", &[("radius", n(6.0)), ("iterations", n(2.0))]);
+    effect_case("ec.blur.fastbox", &[("radius", n(4.0)), ("dimensions", Value::Enum(2)), ("repeatEdge", Value::Bool(true))]);
     effect_case("ec.blur.directional", &[("direction", n(30.0)), ("length", n(12.0))]);
     effect_case("ec.stylize.glow", &[("threshold", n(40.0)), ("radius", n(14.0)), ("intensity", n(1.5))]);
     effect_case("ec.stylize.glow", &[("colors", Value::Enum(1)), ("operation", Value::Enum(1)), ("colorA", c(1.0, 0.8, 0.1))]);
@@ -635,6 +694,52 @@ fn backend_selection_and_display_frames() {
     }
 }
 
+/// The display texture carries a full mip chain, each level the 2 × 2 mean of the one above, so the
+/// viewer minifies a frame without aliasing (#417).
+#[test]
+fn display_frames_are_mipmapped() {
+    let Some(g) = gpu() else { return };
+    let s = blend_scene(BitDepth::Bpc8, BlendMode::Screen);
+    let mut r = Renderer::new(&s.p, &Pattern, opts());
+    r.accel = Some(g);
+    let f = g.render_display(&r, s.cid, Tick::ZERO).expect("display frame");
+    assert_eq!(f.texture.mip_level_count(), crate::context::mip_levels(f.width, f.height));
+    assert_eq!(f.texture.mip_level_count(), u32::BITS - f.width.max(f.height).leading_zeros());
+    let base = g.read_display(&f).expect("readback");
+    // Level 1, copied out to read it back.
+    let (w1, h1) = (f.width / 2, f.height / 2);
+    let tex = g.device().create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d { width: w1, height: h1, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let mut e = crate::context::Enc::new(&g.ctx);
+    e.encoder().copy_texture_to_texture(
+        wgpu::TexelCopyTextureInfo { texture: &f.texture, mip_level: 1, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        wgpu::Extent3d { width: w1, height: h1, depth_or_array_layers: 1 },
+    );
+    let level1 = e.read_texture(&tex, w1, h1, 4).expect("level 1");
+    let at = |x: u32, y: u32, c: usize| base[((y * f.width + x) * 4) as usize + c] as f32;
+    let mut varied = false;
+    for y in 0..h1 {
+        for x in 0..w1 {
+            for c in 0..4 {
+                let want = (at(2 * x, 2 * y, c) + at(2 * x + 1, 2 * y, c) + at(2 * x, 2 * y + 1, c) + at(2 * x + 1, 2 * y + 1, c)) / 4.0;
+                let got = level1[((y * w1 + x) * 4) as usize + c] as f32;
+                assert!((want - got).abs() <= 1.0, "({x}, {y}) channel {c}: {got} against the mean {want}");
+                varied |= want != at(2 * x, 2 * y, c);
+            }
+        }
+    }
+    assert!(varied, "the scene has edges to average");
+}
+
 /// Browsers' WGSL compilers reject an f32 literal whose exact decimal value lies outside the f32
 /// range (`3.40282347e38` rounds to f32::MAX in Rust but exceeds it), which invalidates the whole
 /// module (every kernel); naga accepts it, so native runs can't catch it. Every float literal
@@ -698,4 +803,375 @@ fn within_memory_returns_the_work_when_there_is_room() {
     let Some(g) = gpu() else { return };
     let img = g.within_memory(|| g.ctx.image(64, 32)).expect("room for a 64×32 texture");
     assert_eq!((img.width, img.height), (64, 32));
+}
+
+/// A buffer whose allocation fails (here: over the device's buffer size limit; on Adreno an
+/// internal `ERROR_INITIALIZATION_FAILED`) is reported to the caller's error scope instead of
+/// panicking in `create_buffer_init`'s mapped range on a frame thread (#591).
+#[test]
+fn a_failed_buffer_allocation_is_an_error_not_a_panic() {
+    hold_gpu_lock();
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return };
+    let required_limits =
+        wgpu::Limits { max_buffer_size: 4096, max_storage_buffer_binding_size: 4096, max_uniform_buffer_binding_size: 4096, ..Default::default() };
+    let desc = wgpu::DeviceDescriptor { required_limits, ..Default::default() };
+    let (device, queue) = pollster::block_on(adapter.request_device(&desc)).expect("a device with a small buffer limit");
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::context::buffer_init(&device, &queue, Some("too big"), &[0u8; 8192], wgpu::BufferUsages::STORAGE);
+        crate::context::buffer_init(&device, &queue, Some("unaligned"), &[1u8; 7], wgpu::BufferUsages::UNIFORM);
+    }));
+    let error = pollster::block_on(scope.pop());
+    assert!(made.is_ok(), "a failed allocation must not panic");
+    assert!(error.is_some(), "the failed allocation reaches the error scope");
+}
+
+/// Precomp layers (not collapsed) render their nested comp resident on the GPU
+/// (`walk::draw_precomp`): match the CPU (nested blend modes, effects inside and outside,
+/// transforms, opacity, a blend mode on the precomp layer, half resolution,
+/// two instances at different times of the same nested comp).
+#[test]
+fn nested_precomps_render_resident() {
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        let mut s = Scene::new(depth);
+        let inner = Comp::new(60, 40, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+        let inner_id = s.p.add_item("Inner", Label::Sandstone, None, ItemKind::Comp(inner.clone().into()));
+        {
+            let mut ins = Scene { p: std::mem::take(&mut s.p), cid: inner_id, comp: inner };
+            let mut a = ins.footage(50, 30);
+            ins.effect(&mut a, "ec.blur.gaussian", &[("blurriness", n(3.0))]);
+            ins.push(a);
+            let mut b = ins.solid([0.2, 0.7, 0.4], 30, 20);
+            b.blend_mode = BlendMode::Difference;
+            set(&mut b, "transform/rotation", Value::Scalar(15.0));
+            ins.push(b);
+            s.p = ins.p;
+        }
+        let bg = s.footage(97, 61);
+        s.push(bg);
+        let mut pre = build::layer(&mut s.p, &s.comp, "Inner", LayerSource::Comp { item: inner_id }, (60, 40), None);
+        set(&mut pre, "transform/rotation", Value::Scalar(25.0));
+        set(&mut pre, "transform/opacity", Value::Scalar(80.0));
+        s.effect(&mut pre, "ec.color.levels", &[("gamma", n(1.3))]);
+        pre.blend_mode = BlendMode::Screen;
+        s.push(pre);
+        // A second instance, later in the nested comp's time.
+        let mut pre2 = build::layer(&mut s.p, &s.comp, "Inner 2", LayerSource::Comp { item: inner_id }, (60, 40), None);
+        set(&mut pre2, "transform/position", v3(70.0, 40.0));
+        pre2.start_time = Tick::from_seconds_f64(-0.5);
+        s.push(pre2);
+        check(&format!("nested precomps {depth:?}"), compare_at(&s, opts(), Tick::from_seconds_f64(0.2)), 0.0);
+        let half = RenderOpts { scale: 0.5, ..opts() };
+        check(&format!("nested precomps half {depth:?}"), compare_at(&s, half, Tick::from_seconds_f64(0.2)), 0.0);
+    }
+}
+
+/// #613: an effect kernel the device's shader compiler rejects (FXC on DirectX 12 aborting on
+/// `pointwise`) no longer turns the whole GPU compositor off: the context is built without it,
+/// lists it, and the effects that need it render on the CPU, matching the CPU render.
+#[test]
+fn effects_whose_kernels_failed_render_on_the_cpu() {
+    if gpu().is_none() {
+        return;
+    }
+    let Ok(mut ctx) = pollster::block_on(crate::context::GpuContext::request()) else { return };
+    ctx.drop_kernel("pointwise");
+    ctx.drop_kernel("box_h");
+    let names: Vec<&str> = ctx.unavailable_kernels().iter().map(|(e, _)| *e).collect();
+    assert_eq!(names, ["pointwise", "box_h"]);
+    let g = Gpu::from_context(ctx);
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        let mut s = Scene::new(depth);
+        let mut l = s.footage(80, 50);
+        s.effect(&mut l, "ec.color.exposure", &[("master/exposure", n(0.7))]);
+        s.effect(&mut l, "ec.color.tint", &[("black", c(0.1, 0.0, 0.3)), ("amount", n(80.0))]);
+        s.effect(&mut l, "ec.blur.gaussian", &[("blurriness", n(5.0))]);
+        s.effect(&mut l, "ec.channel.invert", &[("blend", n(50.0))]);
+        s.push(l);
+        let cpu = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Cpu, ..opts() }).comp_frame_cpu(s.cid, Tick::ZERO);
+        let mut r = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..opts() });
+        r.accel = Some(&g);
+        let img = g.render(&r, s.cid, Tick::ZERO).expect("the GPU renders the frame");
+        let mut d = diff(&cpu, &img, tolerance(depth));
+        d.quantized = depth != BitDepth::Bpc32;
+        check(&format!("missing kernels {depth:?}"), Some(d), 0.0);
+    }
+}
+
+/// The GPU Tint gives After Effects 2026's greys for full-frame solids at its defaults (sRGB
+/// working space, not linearised): Rec. 601 weights, as the CPU (`color_fx::luma_601`).
+#[test]
+fn gpu_tint_defaults_match_after_effects_greys() {
+    let Some(g) = gpu() else {
+        // Visible skip (EFFECTCRAFT_REQUIRE_GPU=1 makes a missing adapter fail instead).
+        eprintln!("gpu_tint_defaults_match_after_effects_greys: skipped: no GPU adapter");
+        return;
+    };
+    for (col, want) in [([1.0, 0.0, 0.0], 76.0), ([0.0, 1.0, 0.0], 150.0), ([0.0, 0.0, 1.0], 29.0), ([0.5, 0.5, 0.5], 128.0)] {
+        let mut s = Scene::new(BitDepth::Bpc32);
+        s.p.settings.working_space = Some(ColorSpace::Srgb);
+        let mut l = s.solid(col, 97, 61);
+        s.effect(&mut l, "ec.color.tint", &[]);
+        s.push(l);
+        let mut r = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..opts() });
+        r.accel = Some(g);
+        let o = g.render(&r, s.cid, Tick::ZERO).expect("the GPU renders the frame").get(48, 30);
+        let want = want / 255.0;
+        assert!(o[..3].iter().all(|v| (v - want).abs() <= 1.0 / 255.0), "{col:?}: {o:?} vs {want}");
+    }
+}
+
+/// WGSL has no way to read the CPU's constants, so the kernels repeat them as literals; this
+/// ties each literal to its Rust source (runs without a GPU): Rec. 601 luma for Tint (`pointwise`
+/// op 1), Tritone and Luma Key / Extract, Black & White's tint weights and Exposure's 2.2 power.
+#[test]
+fn shader_constants_match_the_cpu() {
+    use effectcraft_effects::{BW_TINT_LUMA, EXPOSURE_LINEAR_GAMMA, LUMA_601};
+    let kernels = include_str!("shaders/kernels.wgsl");
+    let color = include_str!("shaders/fx_color.wgsl");
+    let key = include_str!("shaders/fx_key.wgsl");
+    let [r, g, b] = LUMA_601;
+    let dot = format!("dot(c, vec3<f32>({r}, {g}, {b}))");
+    assert!(kernels.contains(&format!("clamp({r} * c.x + {g} * c.y + {b} * c.z, 0.0, 1.0)")), "Tint luma in kernels.wgsl is not {LUMA_601:?}");
+    assert!(color.contains(&format!("clamp({dot}, 0.0, 1.0)")), "Tritone luma in fx_color.wgsl is not {LUMA_601:?}");
+    assert!(key.contains(&format!("return {dot};")), "fxk_key_luma in fx_key.wgsl is not {LUMA_601:?}");
+    let [r, g, b] = BW_TINT_LUMA;
+    assert!(color.contains(&format!("let w = vec3<f32>({r}, {g}, {b});")), "fxc_bw_tint weights are not {BW_TINT_LUMA:?}");
+    let gamma = EXPOSURE_LINEAR_GAMMA;
+    assert!(
+        kernels.contains(&format!("powz(abs(c[i]), {gamma})")) && kernels.contains(&format!("1.0 / {gamma})")),
+        "Exposure's power in kernels.wgsl is not {gamma}"
+    );
+}
+
+/// A layer whose bounds change every frame reads back at a new size each time: the staging
+/// buffers kept for reuse stay within budget instead of growing for the whole render (#2081).
+#[test]
+fn readback_staging_stays_bounded_across_sizes() {
+    let Some(g) = gpu() else { return };
+    if !g.ctx.can_wait() {
+        return;
+    }
+    let mut e = crate::context::Enc::new(&g.ctx);
+    // 1024 × (256 + i) RGBA f32: ~4 MiB each, ~480 MiB over all sizes.
+    for i in 0..120 {
+        let img = g.ctx.image(1024, 256 + i);
+        assert!(e.download(&img).is_some(), "readback {i}");
+    }
+    let held = g.ctx.staging_bytes();
+    assert!(held <= (256 << 20) + 2 * 1024 * 16 * 376, "staging buffers hold {held} bytes");
+}
+
+/// A static adjustment layer with a time-dependent effect (Noise) keeps its footprint key
+/// across frames (the footprint is the source through the masks, not the effects), so the GPU
+/// uploads nothing after the first frame; matches the CPU.
+#[test]
+fn adjustment_footprint_uploads_once_under_time_dependent_effects() {
+    let mut s = Scene::new(BitDepth::Bpc8);
+    let bg = s.solid([0.3, 0.5, 0.7], 96, 64);
+    s.push(bg);
+    let mut adj = s.solid([1.0, 1.0, 1.0], 80, 50);
+    adj.switches.adjustment = true;
+    s.effect(&mut adj, "ec.noise.noise", &[("amount", n(30.0))]);
+    s.push(adj);
+    // The key itself (no GPU needed): stable across time.
+    let comp = s.p.comp(s.cid).expect("the scene's comp");
+    let adj = comp.layers.last().expect("the adjustment layer");
+    let key = |k: f64| {
+        effectcraft_render::cache::footprint_key(&effectcraft_render::EvalCtx::new(&s.p, s.cid, comp, Tick::from_seconds_f64(k)), adj, 1.0, false, false)
+    };
+    assert!(key(0.0).is_some());
+    assert_eq!(key(0.0), key(0.5), "the footprint key changes with time");
+    let Some(g) = gpu() else { return };
+    let cache = effectcraft_render::cache::LayerCache::new(64 << 20);
+    let mut r = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..opts() });
+    r.accel = Some(g);
+    r.cache = Some(&cache);
+    let t = |k: u64| Tick::from_seconds_f64(k as f64 / 30.0);
+    let mut prev = None;
+    for k in 0..4 {
+        let before = g.ctx.transfer_stats().upload_bytes;
+        let img = g.render(&r, s.cid, t(k)).expect("the GPU renders the frame");
+        let up = g.ctx.transfer_stats().upload_bytes - before;
+        if k >= 2 {
+            assert_eq!(up, 0, "frame {k} uploaded {up} bytes: the footprint was re-keyed");
+        }
+        // Noise changes every frame: the frames differ.
+        assert!(prev.as_ref() != Some(&img.data), "frame {k} repeats the previous one");
+        prev = Some(img.data);
+        check(&format!("noise adjustment frame {k}"), compare_at(&s, opts(), t(k)), 0.0);
+    }
+}
+
+/// An `Enc` reuses a working texture it released at once (`Pool::owned`); another `Enc` does
+/// not get it while the first is alive.
+#[test]
+fn enc_reuses_its_own_released_textures() {
+    let Some(g) = gpu() else { return };
+    let mut e = crate::context::Enc::new(&g.ctx);
+    let a = e.image(37, 23);
+    let ta = a.texture.clone();
+    drop(a);
+    let mut other = crate::context::Enc::new(&g.ctx);
+    let o = other.image(37, 23);
+    assert!(o.texture != ta, "another Enc got a texture the first may still be using");
+    let b = e.image(37, 23);
+    assert!(b.texture == ta, "the Enc allocated a new texture instead of reusing its own");
+}
+
+/// In-`Enc` texture reuse changes no pixel: a busy frame (layers, effects, adjustment layer,
+/// nested comp) renders bit-identically with reuse on and off, and matches the CPU.
+#[test]
+fn texture_reuse_does_not_change_output() {
+    let Some(g) = gpu() else { return };
+    let mut s = Scene::new(BitDepth::Bpc32);
+    for i in 0..4 {
+        let mut l = s.footage(90 - i * 7, 60 - i * 5);
+        s.effect(&mut l, "ec.blur.gaussian", &[("blurriness", n(2.0 + i as f64))]);
+        set(&mut l, "transform/rotation", Value::Scalar(10.0 * i as f64));
+        l.blend_mode = if i % 2 == 0 { BlendMode::Screen } else { BlendMode::Multiply };
+        s.push(l);
+    }
+    let mut adj = s.solid([1.0, 1.0, 1.0], 80, 50);
+    adj.switches.adjustment = true;
+    s.effect(&mut adj, "ec.color.levels", &[("gamma", n(1.2))]);
+    s.push(adj);
+    let mut r = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..opts() });
+    r.accel = Some(g);
+    let t = Tick::from_seconds_f64(0.3);
+    let on = g.render(&r, s.cid, t).expect("the GPU renders the frame");
+    crate::context::TEXTURE_REUSE.store(false, std::sync::atomic::Ordering::Relaxed);
+    let off = g.render(&r, s.cid, t);
+    crate::context::TEXTURE_REUSE.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(off.is_some_and(|off| off.data == on.data), "texture reuse changed the frame");
+    check("texture reuse vs CPU", compare_at(&s, opts(), t), 0.0);
+}
+
+/// Static layer buffers (here adjustment-layer footprints) upload once while they fit the upload budget, and upload again every frame
+/// when they do not (least recently used first); the frame is the same either way.
+#[test]
+fn upload_budget_bounds_the_layer_textures_kept() {
+    let Some(g) = gpu() else { return };
+    let mut s = Scene::new(BitDepth::Bpc8);
+    for (i, c) in [[0.8, 0.2, 0.1], [0.1, 0.3, 0.9]].into_iter().enumerate() {
+        let mut l = s.solid(c, 200, 200);
+        set(&mut l, "transform/position", v3(60.0 + 30.0 * i as f64, 40.0));
+        // Adjustment layers: their footprints are cached layer buffers the GPU uploads.
+        l.switches.adjustment = true;
+        s.effect(&mut l, "ec.color.levels", &[("gamma", n(1.1 + 0.2 * i as f64))]);
+        s.push(l);
+    }
+    let frame = |cache: &effectcraft_render::cache::LayerCache, k: u64| {
+        let mut r = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..opts() });
+        r.accel = Some(g);
+        r.cache = Some(cache);
+        let before = g.ctx.transfer_stats().upload_bytes;
+        let img = g.render(&r, s.cid, Tick::from_seconds_f64(k as f64 / 30.0)).expect("the GPU renders the frame");
+        (img.data, g.ctx.transfer_stats().upload_bytes - before)
+    };
+    let fits = effectcraft_render::cache::LayerCache::new(64 << 20);
+    let (a, _) = frame(&fits, 0);
+    let (b, up) = frame(&fits, 1);
+    assert_eq!(up, 0, "static layers re-uploaded within the default budget");
+    // A budget smaller than the two 640 KB footprints: each upload evicts the other.
+    let default = g.ctx.upload_budget();
+    g.ctx.set_upload_budget(1 << 20);
+    let tight = effectcraft_render::cache::LayerCache::new(64 << 20);
+    let _ = frame(&tight, 0);
+    let (c, up) = frame(&tight, 1);
+    g.ctx.set_upload_budget(default);
+    assert!(up > 0, "over budget, the footprints must upload again");
+    assert!(a == b && b == c, "the upload budget changed the frame");
+}
+
+/// Layers with effect stacks run them resident on the GPU (`walk::draw_resident_fx`): GPU
+/// effects, a CPU-only effect in the middle (read back, run, upload), opacity and a blend mode,
+/// a shape layer whose effects run in effect space from its bounds' corner; 8 and 32 bpc, full
+/// and half resolution; all match the CPU.
+#[test]
+fn effect_stacks_render_resident() {
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        let mut s = Scene::new(depth);
+        let bg = s.footage(97, 61);
+        s.push(bg);
+        let mut a = s.footage(70, 44);
+        s.effect(&mut a, "ec.blur.gaussian", &[("blurriness", n(4.0))]);
+        s.effect(&mut a, "ec.generate.fractal", &[]);
+        s.effect(&mut a, "ec.color.levels", &[("gamma", n(1.4))]);
+        set(&mut a, "transform/rotation", Value::Scalar(20.0));
+        set(&mut a, "transform/opacity", Value::Scalar(70.0));
+        a.blend_mode = BlendMode::Overlay;
+        s.push(a);
+        let mut l = build::layer(&mut s.p, &s.comp, "Shape", LayerSource::Shape, (97, 61), None);
+        let mut next = s.p.next_id;
+        let mut ids = Ids(&mut next);
+        let rect = build::shape_rect(&mut ids, [50.0, 30.0], [5.0, -4.0], 0.0);
+        let fill = build::shape_fill(&mut ids, [0.2, 0.8, 0.3, 1.0]);
+        let g = build::shape_group(&mut ids, "Rectangle 1", vec![rect, fill]);
+        s.p.next_id = next;
+        l.props.sub_mut("contents").expect("a shape layer has contents").children.push(g.into());
+        s.effect(&mut l, "ec.blur.gaussian", &[("blurriness", n(3.0))]);
+        s.effect(&mut l, "ec.stylize.mosaic", &[]);
+        s.push(l);
+        let t = Tick::from_seconds_f64(0.2);
+        check(&format!("effect stacks {depth:?}"), compare_at(&s, opts(), t), 0.0);
+        check(&format!("effect stacks half {depth:?}"), compare_at(&s, RenderOpts { scale: 0.5, ..opts() }, t), 0.0);
+    }
+}
+
+/// A layer whose effects give the same result as last frame draws from the layer cache (its
+/// processed buffer uploads once) instead of re-running the stack on the GPU every frame.
+#[test]
+fn static_effect_layers_draw_from_the_cache() {
+    let Some(g) = gpu() else { return };
+    let mut s = Scene::new(BitDepth::Bpc8);
+    let mut l = s.solid([0.6, 0.4, 0.2], 80, 50);
+    s.effect(&mut l, "ec.blur.gaussian", &[("blurriness", n(3.0))]);
+    s.push(l);
+    let cache = effectcraft_render::cache::LayerCache::new(64 << 20);
+    let mut r = Renderer::new(&s.p, &Pattern, RenderOpts { backend: Backend::Gpu, ..opts() });
+    r.accel = Some(g);
+    r.cache = Some(&cache);
+    let comp = s.p.comp(s.cid).expect("the scene's comp");
+    let layer = comp.layers.last().expect("the layer");
+    let t = |k: u64| Tick::from_seconds_f64(k as f64 / 30.0);
+    assert!(r.layer_is_static(&effectcraft_render::EvalCtx::new(&s.p, s.cid, comp, t(2)), layer));
+    let mut frames = Vec::new();
+    for k in 0..3 {
+        let before = g.ctx.transfer_stats().upload_bytes;
+        frames.push(g.render(&r, s.cid, t(k)).expect("the GPU renders the frame").data);
+        let up = g.ctx.transfer_stats().upload_bytes - before;
+        if k == 2 {
+            assert_eq!(up, 0, "the cached layer uploaded again");
+        }
+    }
+    assert!(frames[1] == frames[2]);
+    check("static effect layer vs CPU", compare_at(&s, opts(), t(2)), 0.0);
+}
+
+/// The layer upload cache drops the textures of freed buffers when it inserts, not only once
+/// it is over budget (an animated layer makes a new buffer every frame).
+#[test]
+fn upload_cache_drops_textures_of_freed_buffers() {
+    let Some(g) = gpu() else { return };
+    let img = effectcraft_raster::Image::new(256, 256);
+    let before = g.ctx.upload_entries();
+    for _ in 0..6 {
+        let buf = std::sync::Arc::new(effectcraft_effects::Buf { img: img.clone(), offset: [0.0; 2], scale: 1.0 });
+        let up = g.ctx.upload_buf(&buf).expect("upload");
+        drop((up, buf));
+    }
+    let kept = g.ctx.upload_entries();
+    assert!(kept <= before + 1, "the upload cache kept {kept} textures of freed buffers (had {before})");
+}
+
+/// The device the compositor owns asks for `MemoryUsage` so freed textures give
+/// their allocator blocks back, while its label and limits stay as they were.
+#[test]
+fn owned_devices_favour_memory_usage() {
+    let d = crate::context::device_descriptor(wgpu::Limits::default());
+    assert!(matches!(d.memory_hints, wgpu::MemoryHints::MemoryUsage));
+    assert_eq!(d.label, Some("effectcraft gpu"));
+    assert_eq!(d.required_limits.max_texture_dimension_2d, wgpu::Limits::default().max_texture_dimension_2d);
 }

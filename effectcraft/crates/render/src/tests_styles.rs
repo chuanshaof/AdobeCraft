@@ -1,10 +1,10 @@
 //! Layer Styles pixel tests.
 
 use effectcraft_color::Label;
-use effectcraft_keyframe::{Gradient, Keyframe, Value};
+use effectcraft_keyframe::{Gradient, Keyframe, ShapePath, Value};
 use effectcraft_project::build::{self, Ids};
 use effectcraft_project::styles::{self as st, GROUP};
-use effectcraft_project::{Comp, ItemId, ItemKind, Layer, LayerSource, Project, Solid};
+use effectcraft_project::{Comp, ItemId, ItemKind, Layer, LayerSource, MaskMode, Project, Solid};
 use effectcraft_time::{FrameRate, Tick};
 
 use crate::{Image, NoFootage, RenderOpts, Renderer, render_frame};
@@ -180,6 +180,67 @@ fn gradient_overlay_follows_angle() {
     });
     let img = render(&p, cid);
     assert!(img.get(81, 50)[0] > 0.9 && img.get(118, 50)[0] < 0.1);
+}
+
+/// Overlays replace the layer's colour inside its alpha: an anti-aliased edge pixel mixes the
+/// background with the overlay colour only, exactly as a layer of that colour would, with no
+/// fringe of the layer's own colour (#416).
+#[test]
+fn overlays_leave_antialiased_edges_clean() {
+    let (blue, bg) = ([0.2, 0.533, 1.0], [0.25, 0.22, 0.45]);
+    // A mask half a pixel inside the square's left and right sides: in layer space, where the
+    // styles run, columns 80 and 119 are half covered.
+    let edge = |color: [f32; 3], f: &dyn Fn(&mut Project, &Comp, &mut Layer)| {
+        let (p, cid) = scene(color, Some(bg), |p, c, l| {
+            let mut next = p.next_id;
+            let pts = vec![[0.5, 0.0], [39.5, 0.0], [39.5, 40.0], [0.5, 40.0]];
+            let sp = ShapePath { in_tangents: vec![[0.0; 2]; 4], out_tangents: vec![[0.0; 2]; 4], vertices: pts, closed: true, feather: Vec::new() };
+            let m = build::mask(&mut Ids(&mut next), "Mask 1", sp, MaskMode::Add, [255, 255, 0]);
+            p.next_id = next;
+            l.props.group_mut("masks").unwrap().children.push(m.into());
+            f(p, c, l);
+        });
+        let img = render(&p, cid);
+        [img.get(80, 50), img.get(119, 50), img.get(100, 50)]
+    };
+    let plain = edge(blue, &|_, _, _| {});
+    assert!(near(plain[0][0], 0.5 * (blue[0] + bg[0]), 0.01), "half covered: {:?}", plain[0]);
+    let color = Value::Color([blue[0] as f64, blue[1] as f64, blue[2] as f64, 1.0]);
+    let flat =
+        Gradient { colors: vec![(0.0, [blue[0], blue[1], blue[2], 1.0]), (1.0, [blue[0], blue[1], blue[2], 1.0])], opacities: vec![(0.0, 1.0), (1.0, 1.0)] };
+    let styled: [(&str, Box<dyn Fn(&mut Project, &Comp, &mut Layer)>); 3] = [
+        (
+            "Color Overlay",
+            Box::new(|p, c, l| {
+                add(p, c, l, "colorOverlay");
+                set(l, "colorOverlay/color", color.clone());
+            }),
+        ),
+        (
+            "Gradient Overlay",
+            Box::new(|p, c, l| {
+                add(p, c, l, "gradientOverlay");
+                set(l, "gradientOverlay/colors", Value::Gradient(flat.clone()));
+            }),
+        ),
+        (
+            "Stroke (inside)",
+            Box::new(|p, c, l| {
+                add(p, c, l, "stroke");
+                set(l, "stroke/position", Value::Enum(1));
+                set(l, "stroke/size", Value::Scalar(25.0));
+                set(l, "stroke/color", color.clone());
+            }),
+        ),
+    ];
+    for (name, f) in &styled {
+        let px = edge([1.0; 3], f.as_ref());
+        for (a, b) in px.iter().zip(&plain) {
+            for ch in 0..4 {
+                assert!(near(a[ch], b[ch], 0.01), "{name}: {a:?} against the plain layer {b:?}");
+            }
+        }
+    }
 }
 
 fn bevel_scene(angle: f64) -> Image {
@@ -413,4 +474,36 @@ fn gradient_glow_uses_gradient() {
     let img = render(&p, cid);
     let px = img.straight(121, 50);
     assert!(px[0] > px[2], "near the edge the glow takes the gradient's start colour {px:?}");
+}
+
+/// #1812 (review of #1928): a styled layer rendered by several workers at once shares its body and
+/// style passes, as unstyled layers share their buffer.
+#[test]
+fn workers_styling_a_layer_at_once_share_its_buffers() {
+    let (p, cid) = scene([1.0; 3], None, |p, c, l| {
+        add(p, c, l, "dropShadow");
+        add(p, c, l, "stroke");
+    });
+    let cache = crate::LayerCache::default();
+    let start = std::sync::Barrier::new(8);
+    let styled: Vec<_> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..8)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut r = Renderer::new(&p, &NoFootage, RenderOpts::default());
+                    r.cache = Some(&cache);
+                    let ctx = r.eval_ctx(cid, Tick::ZERO).unwrap();
+                    start.wait();
+                    r.styled_layer(&ctx, &p.comp(cid).unwrap().layers[0]).unwrap()
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let first = &styled[0];
+    assert!(!first.passes.is_empty(), "the drop shadow is a pass");
+    for st in &styled {
+        assert!(std::sync::Arc::ptr_eq(&st.body, &first.body), "one body");
+        assert!(st.passes.iter().zip(&first.passes).all(|(a, b)| std::sync::Arc::ptr_eq(&a.0, &b.0)), "one set of passes");
+    }
 }

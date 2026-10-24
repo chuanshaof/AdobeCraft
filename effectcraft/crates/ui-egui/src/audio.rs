@@ -211,23 +211,23 @@ impl AudioPlayback {
         let span = PlaySpan::new(start, wa, wb, looping, rate);
         let feed = Arc::new(AudioFeed::default());
         let stop = Arc::new(AtomicBool::new(false));
-        // Prime ~50 ms so the device does not start on an empty queue.
-        let mut cursor = span.start;
-        let prime = (rate as usize / 20).div_ceil(BLOCK);
-        for _ in 0..prime {
-            cursor = feed_block(&src, comp, &feed, &span, cursor, rate, mix);
-        }
         if cfg!(target_arch = "wasm32") {
-            let mut p = AudioPlayback { feed: feed.clone(), device, stop, thread: None, feeder: Some((src, comp, cursor, mix)), rate, span };
+            // The device takes samples only in `pump`, which fills the queue first.
+            let mut p = AudioPlayback { feed: feed.clone(), device, stop, thread: None, feeder: Some((src, comp, span.start, mix)), rate, span };
             p.device.start(feed)?;
             p.pump();
             return Ok(p);
         }
+        // All mixing happens on the feeder thread, the first block too: reading footage for the
+        // first time opens it (a FLAC or MP3 file decodes whole), which froze the UI for as long
+        // as that took (#408). The device plays silence until the first block arrives, and the
+        // clock doesn't count it.
         let thread = {
             let (feed, stop) = (feed.clone(), stop.clone());
             std::thread::Builder::new()
                 .name("ec-audio-feed".into())
                 .spawn(move || {
+                    let mut cursor = span.start;
                     let target = queue_target(rate);
                     while !stop.load(Ordering::Relaxed) {
                         if feed.queued_frames() < target && !feed.finished.load(Ordering::Relaxed) {
@@ -483,6 +483,80 @@ mod tests {
         assert_eq!(f.consumed(), 2);
         assert_eq!(f.take_peaks(), [0.5, 0.9]);
         assert_eq!(f.take_peaks(), [0.0, 0.0]);
+    }
+
+    /// #408: starting a preview with sound returns at once even when reading the footage takes
+    /// long (the first read of a long FLAC decodes all of it): the first block was mixed on the
+    /// calling (UI) thread. The sound arrives from the feeder thread, and the clock waits for it.
+    #[test]
+    fn starting_audio_does_not_wait_for_slow_footage() {
+        use effectcraft_engine::color::Label;
+        use effectcraft_engine::project::{Comp, Footage, FootageKind, ItemKind, LayerSource, Project, build};
+        use effectcraft_engine::render::FootageSource;
+        use effectcraft_engine::render::cache::LayerCache;
+        use std::time::{Duration, Instant};
+
+        /// Footage audio that takes `delay` to read the first time (then a constant 0.5).
+        struct Slow {
+            delay: Duration,
+            opened: Mutex<bool>,
+        }
+        impl FootageSource for Slow {
+            fn frame(&self, _: ItemId, _: &Footage, _: Tick) -> Option<Arc<effectcraft_engine::raster::Image>> {
+                None
+            }
+            fn audio(&self, _: ItemId, _: &Footage, _: Tick, frames: usize, _: u32) -> Option<Vec<f32>> {
+                let mut opened = self.opened.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !*opened {
+                    std::thread::sleep(self.delay);
+                    *opened = true;
+                }
+                Some(vec![0.5; frames * 2])
+            }
+        }
+        /// An output that only takes the feed.
+        struct Device;
+        impl AudioDevice for Device {
+            fn sample_rate(&self) -> u32 {
+                48000
+            }
+            fn start(&mut self, _: Arc<AudioFeed>) -> Result<(), String> {
+                Ok(())
+            }
+            fn stop(&mut self) {}
+        }
+
+        let mut p = Project::default();
+        let footage =
+            Footage { path: "long.flac".into(), kind: FootageKind::Audio, duration: Tick::from_seconds_f64(600.0), has_audio: true, ..Default::default() };
+        let item = p.add_item("long.flac", Label::SeaFoam, None, ItemKind::Footage(footage));
+        let mut comp = Comp::new(64, 36, FrameRate::new(30, 1), Tick::from_seconds_f64(10.0));
+        let layer = build::layer(&mut p, &comp, "long.flac", LayerSource::Footage { item }, (0, 0), None);
+        comp.layers = vec![layer];
+        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.into()));
+        let src = RenderSource {
+            project: Arc::new(p),
+            footage: Arc::new(Slow { delay: Duration::from_secs(2), opened: Mutex::new(false) }),
+            expr: None,
+            layer_cache: Arc::new(LayerCache::default()),
+            gpu: None,
+            gpu_display: false,
+            disk: None,
+        };
+        let t = Instant::now();
+        let mut playback =
+            AudioPlayback::start(Box::new(Device), src, cid, Tick::ZERO, Tick::ZERO, Tick::from_seconds_f64(10.0), true, 0).expect("the preview starts");
+        assert!(t.elapsed() < Duration::from_secs(1), "start waited {:?} for the footage", t.elapsed());
+        assert_eq!(playback.clock(), 0, "the clock waits for the sound");
+        // The feeder thread delivers it once the footage is open.
+        while playback.feed.queued_frames() == 0 {
+            assert!(t.elapsed() < Duration::from_secs(30), "the feeder never delivered");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut out = [0.0f32; 8];
+        playback.feed.pull(&mut out);
+        assert_eq!(out, [0.5; 8]);
+        playback.stop();
     }
 
     #[test]

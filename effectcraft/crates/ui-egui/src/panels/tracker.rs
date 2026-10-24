@@ -153,7 +153,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
     y += 34.0;
     let Some(comp) = app.session.active_comp_arc() else {
-        p.text(pos2(x0, y + 8.0), Align2::LEFT_CENTER, "Open a composition to track motion.", Tokens::ui(12.0), t.text_faint);
+        p.text(pos2(x0, y + 8.0), Align2::LEFT_CENTER, crate::i18n::tr("Open a composition to track motion."), Tokens::ui(12.0), t.text_faint);
         return;
     };
     // A selected mask switches the panel to mask tracking.
@@ -476,10 +476,10 @@ fn ok_cancel(ui: &mut egui::Ui, app: &mut EffectcraftApp, t: &Tokens, prefix: &s
     let (mut ok, mut cancel) = (false, false);
     ui.add_space(14.0);
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        let r = ui.add(egui::Button::new(egui::RichText::new("   OK   ").color(Color32::WHITE)).fill(t.accent));
+        let r = ui.add(egui::Button::new(egui::RichText::new(crate::i18n::tr("   OK   ")).color(Color32::WHITE)).fill(t.accent));
         app.auto.add(&format!("{prefix}.ok"), r.rect, "OK");
         ok = r.clicked();
-        let r = ui.button("Cancel");
+        let r = ui.button(crate::i18n::tr("Cancel"));
         app.auto.add(&format!("{prefix}.cancel"), r.rect, "Cancel");
         cancel = r.clicked();
     });
@@ -491,12 +491,12 @@ pub fn options_dialog(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens)
     let (mut ok, mut cancel) = (false, false);
     super::dialogs::modal(ctx, "Motion Tracker Options", vec2(460.0, 470.0), t, |ui| {
         ui.horizontal(|ui| {
-            ui.label("Track Name:");
+            ui.label(crate::i18n::tr("Track Name:"));
             let r = ui.text_edit_singleline(&mut d.name);
             app.auto.add("dialog.trackOptions.name", r.rect, "Track Name");
         });
         ui.add_space(8.0);
-        ui.label(egui::RichText::new("Channel").font(Tokens::medium(12.5)));
+        ui.label(egui::RichText::new(crate::i18n::tr("Channel")).font(Tokens::medium(12.5)));
         ui.horizontal(|ui| {
             for (c, l) in [(TrackChannel::Rgb, "RGB"), (TrackChannel::Luminance, "Luminance"), (TrackChannel::Saturation, "Saturation")] {
                 let r = ui.radio_value(&mut d.opts.channel, c, l);
@@ -504,21 +504,22 @@ pub fn options_dialog(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens)
             }
         });
         ui.add_space(8.0);
-        ui.label(egui::RichText::new("Process Before Match").font(Tokens::medium(12.5)));
+        ui.label(egui::RichText::new(crate::i18n::tr("Process Before Match")).font(Tokens::medium(12.5)));
         ui.horizontal(|ui| {
-            let r = ui.checkbox(&mut d.blur_on, "Blur");
+            let r = ui.checkbox(&mut d.blur_on, crate::i18n::tr("Blur"));
             app.auto.add("dialog.trackOptions.blurOn", r.rect, "Blur");
-            let r = ui.add_enabled(d.blur_on, egui::DragValue::new(&mut d.opts.blur).speed(0.1).range(0.5..=50.0).suffix(" pixels"));
+            let r =
+                ui.add_enabled(d.blur_on, crate::widgets::drag_value(egui::DragValue::new(&mut d.opts.blur).speed(0.1).range(0.5..=50.0).suffix(" pixels")));
             app.auto.add("dialog.trackOptions.blur", r.rect, "Blur pixels");
-            let r = ui.checkbox(&mut d.opts.enhance, "Enhance");
+            let r = ui.checkbox(&mut d.opts.enhance, crate::i18n::tr("Enhance"));
             app.auto.add("dialog.trackOptions.enhance", r.rect, "Enhance");
         });
         ui.add_space(8.0);
-        let r = ui.checkbox(&mut d.opts.subpixel, "Subpixel Positioning");
+        let r = ui.checkbox(&mut d.opts.subpixel, crate::i18n::tr("Subpixel Positioning"));
         app.auto.add("dialog.trackOptions.subpixel", r.rect, "Subpixel Positioning");
-        let r = ui.checkbox(&mut d.opts.adapt_every_frame, "Adapt Feature On Every Frame");
+        let r = ui.checkbox(&mut d.opts.adapt_every_frame, crate::i18n::tr("Adapt Feature On Every Frame"));
         app.auto.add("dialog.trackOptions.adaptEveryFrame", r.rect, "Adapt Feature On Every Frame");
-        let r = ui.checkbox(&mut d.opts.track_shape, "Follow Feature Rotation and Scale");
+        let r = ui.checkbox(&mut d.opts.track_shape, crate::i18n::tr("Follow Feature Rotation and Scale"));
         app.auto.add("dialog.trackOptions.trackShape", r.rect, "Follow Feature Rotation and Scale");
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -538,8 +539,8 @@ pub fn options_dialog(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens)
                 })
                 .response;
             app.auto.add("dialog.trackOptions.action", r.rect, "If Confidence is Below action");
-            ui.label("If Confidence is Below");
-            let r = ui.add(egui::DragValue::new(&mut d.opts.threshold).speed(0.5).range(0.0..=100.0).suffix(" %"));
+            ui.label(crate::i18n::tr("If Confidence is Below"));
+            let r = ui.add(crate::widgets::drag_value(egui::DragValue::new(&mut d.opts.threshold).speed(0.5).range(0.0..=100.0).suffix(" %")));
             app.auto.add("dialog.trackOptions.threshold", r.rect, "Confidence threshold");
         });
         (ok, cancel) = ok_cancel(ui, app, t, "dialog.trackOptions");
@@ -578,15 +579,15 @@ pub fn target_dialog(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) 
     let layers: Vec<(u64, String)> =
         app.session.active_comp().map(|c| c.layers.iter().enumerate().map(|(i, l)| (l.id.0, format!("{}. {}", i + 1, l.name))).collect()).unwrap_or_default();
     super::dialogs::modal(ctx, "Motion Target", vec2(400.0, 200.0), t, |ui| {
-        ui.label("Apply Motion To:");
+        ui.label(crate::i18n::tr("Apply Motion To:"));
         ui.horizontal(|ui| {
-            ui.label("Layer:");
+            ui.label(crate::i18n::tr("Layer:"));
             let cur = d.target.and_then(|id| layers.iter().find(|(l, _)| *l == id)).map(|(_, n)| n.clone()).unwrap_or_else(|| "None".into());
             let r = egui::ComboBox::from_id_salt("track-target")
                 .selected_text(cur)
                 .width(240.0)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut d.target, None, "None");
+                    ui.selectable_value(&mut d.target, None, crate::i18n::tr("None"));
                     for (id, n) in &layers {
                         ui.selectable_value(&mut d.target, Some(*id), n);
                     }
@@ -613,7 +614,7 @@ pub fn apply_dialog(app: &mut EffectcraftApp, ctx: &egui::Context, t: &Tokens) {
     let (mut ok, mut cancel) = (false, false);
     super::dialogs::modal(ctx, "Motion Tracker Apply Options", vec2(380.0, 170.0), t, |ui| {
         ui.horizontal(|ui| {
-            ui.label("Apply Dimensions:");
+            ui.label(crate::i18n::tr("Apply Dimensions:"));
             let labels = ["X and Y", "X only", "Y only"];
             let r = egui::ComboBox::from_id_salt("track-apply-dims")
                 .selected_text(labels[d.dims.min(2)])
@@ -748,7 +749,11 @@ pub fn draw_overlay(app: &mut EffectcraftApp, painter: &egui::Painter, map: &Vie
         let fbig = fq[0].distance(fq[2]) > 28.0;
         let sbig = sq[0].distance(sq[2]) > 28.0;
         let n = i + 1;
-        let hr = Rect::from_center_size(a, vec2(12.0, 12.0));
+        // Zoomed out the feature region can be smaller than the attach point's grab area: keep the
+        // grab to the region's inner half so the rest of it still grabs the point.
+        let fr = Rect::from_points(&fq);
+        let grab = if quad_contains(&fq, a) { 12.0f32.min(fr.width().min(fr.height()) * 0.5) } else { 12.0 };
+        let hr = Rect::from_center_size(a, vec2(grab, grab));
         hits.push(Hit { point: n, part: Part::Attach, rect: hr, quad: None });
         app.auto.add(&format!("viewer.track.{n}.attach"), hr, "Attach Point");
         for (k, q) in fq.iter().enumerate() {
@@ -767,7 +772,6 @@ pub fn draw_overlay(app: &mut EffectcraftApp, painter: &egui::Painter, map: &Vie
             hits.push(Hit { point: n, part: Part::SearchCorner(k), rect: r.expand(2.0), quad: None });
             app.auto.add(&format!("viewer.track.{n}.search.{k}"), r, "Search region corner");
         }
-        let fr = Rect::from_points(&fq);
         let sr = Rect::from_points(&sq);
         app.auto.add(&format!("viewer.track.{n}.feature"), fr, "Feature region");
         app.auto.add(&format!("viewer.track.{n}.search"), sr, "Search region");

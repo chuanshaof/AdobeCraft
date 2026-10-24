@@ -84,8 +84,8 @@ fn snap_targets_cover_layers_comp_guides_and_grid() {
 }
 
 /// Tools bar ▸ Snapping options (#253): Snap Edges Extended off keeps a layer's edges to its
-/// extent, each feature family can be turned off, hidden layers are no targets, and with
-/// Snapping off only guides and the grid are left.
+/// extent, every feature of a layer snaps, hidden layers are no targets, and with Snapping off
+/// only guides and the grid are left.
 #[test]
 fn snapping_options_pick_the_targets() {
     use crate::viewer::{SnapFeatures, SnapOptions, layer_features, targets};
@@ -108,35 +108,63 @@ fn snapping_options_pick_the_targets() {
     let own = targets(&ctx, &[], opts(SnapFeatures { edges_extended: false, ..Default::default() }));
     assert!(snap(&[[268.0, 340.0]], &own, 4.0).is_none_or(|h| h.hits.iter().all(|t| t.source != SnapSource::Layer(LayerId(a)))));
     assert_eq!(snap(&[[268.0, 190.0]], &own, 4.0).unwrap().at, [270.0, 190.0]);
-    // Centres (and anchor points, a's sits in its centre) off: nothing at the comp centre, where
-    // a's centre is too; edges off: no edge lines or midpoints, only the comp's centre lines.
-    let no_centres = targets(&ctx, &[], opts(SnapFeatures { centers: false, anchor_points: false, ..Default::default() }));
-    assert!(!no_centres.iter().any(|t| t.pos == [320.0, 180.0]));
-    assert!(no_centres.iter().any(|t| t.pos == [270.0, 155.0]), "corners stay");
-    let no_edges = targets(&ctx, &[], opts(SnapFeatures { edges: false, ..Default::default() }));
-    assert!(!no_edges.iter().any(|t| t.pos == [320.0, 155.0]));
-    assert!(no_edges.iter().filter(|t| t.kind != SnapKind::Point).all(|t| t.source == SnapSource::Comp && (t.pos[0] == 320.0 || t.pos[1] == 180.0)));
-    // The dragged layer's features follow the options too: corners only.
+    // Corners, edge midpoints and the centre of a are targets.
+    for p in [[270.0, 155.0], [320.0, 155.0], [320.0, 180.0]] {
+        assert!(all.iter().any(|t| t.source == SnapSource::Layer(LayerId(a)) && t.pos == p), "{p:?}");
+    }
+    // The dragged layer's features: corners, edge midpoints, centre and anchor point.
     let l = comp.layer(LayerId(a)).unwrap();
-    let corners = SnapFeatures { edges: false, centers: false, anchor_points: false, paths: false, ..Default::default() };
-    assert_eq!(layer_features(&ctx, l, corners), vec![[270.0, 155.0], [370.0, 155.0], [370.0, 205.0], [270.0, 205.0]]);
+    let f = layer_features(&ctx, l);
+    assert_eq!(f[..4], [[270.0, 155.0], [370.0, 155.0], [370.0, 205.0], [270.0, 205.0]]);
+    assert_eq!(f.len(), 10, "{f:?}");
     // Snapping off: guides only.
     let guides = targets(&ctx, &[], SnapOptions { layers: false, guides: true, ..opts(SnapFeatures::default()) });
     assert!(!guides.is_empty() && guides.iter().all(|t| t.source == SnapSource::Guide));
 }
 
+/// Snap to Features in Collapsed Compositions and Text Layers: the layers inside a collapsed
+/// precomp layer are targets (highlighting the precomp layer), only while the option is on and
+/// the precomp layer collapses transformations.
+#[test]
+fn collapsed_precomp_features_snap() {
+    use crate::viewer::{SnapFeatures, SnapOptions, targets};
+    let mut s = comp();
+    // A 40×20 solid at (100, 50) in a 640×360 precomp.
+    let inner = s.execute("layer.newSolid", json!({"color": "#ff0000", "width": 40, "height": 20})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("prop.set", json!({"layer": inner, "path": "transform/position", "value": [100, 50, 0]})).unwrap();
+    s.execute("layer.precompose", json!({"layers": [inner], "name": "Inner"})).unwrap();
+    let pre = s.active_comp().unwrap().layers[0].id;
+    // Moved by (10, 20) in the outer comp: the inner solid's corner (80, 40) lands at (90, 60).
+    s.execute("prop.set", json!({"layer": pre.0, "path": "transform/position", "value": [330, 200, 0]})).unwrap();
+    let cid = s.active_comp_id().unwrap();
+    let at = |s: &Session, f: SnapFeatures| {
+        let comp = s.project.comp(cid).unwrap().clone();
+        let ctx = effectcraft_render::EvalCtx::new(&s.project, cid, &comp, Tick::ZERO);
+        targets(&ctx, &[], SnapOptions { layers: true, features: f, guides: false, grid: false, grid_spacing: 0.0 })
+    };
+    let corner = |t: &[crate::viewer::SnapTarget]| t.iter().any(|t| t.kind == SnapKind::Point && t.pos == [90.0, 60.0] && t.source == SnapSource::Layer(pre));
+    assert!(!corner(&at(&s, SnapFeatures::default())), "not collapsed");
+    s.execute("layer.setSwitch", json!({"layers": [pre.0], "switch": "collapse", "value": true})).unwrap();
+    let on = at(&s, SnapFeatures::default());
+    assert!(corner(&on), "collapsed");
+    assert_eq!(snap(&[[93.0, 63.0]], &on, 5.0).unwrap().at, [90.0, 60.0]);
+    assert!(!corner(&at(&s, SnapFeatures { collapsed_features: false, ..Default::default() })), "option off");
+}
+
 #[test]
 fn snapping_options_command_sets_and_toggles() {
     let mut s = comp();
-    assert!(s.state.snap_features.edges_extended && s.state.snap_features.anchor_points);
-    let r = s.execute("view.snappingOptions", json!({"edgesExtended": false, "anchorPoints": false})).unwrap();
-    assert_eq!(r["edgesExtended"], false);
-    assert!(!s.state.snap_features.edges_extended && !s.state.snap_features.anchor_points && s.state.snap_features.corners);
-    s.execute("view.snappingOptions", json!({"toggle": "paths"})).unwrap();
-    assert!(!s.state.snap_features.paths);
-    s.execute("view.snappingOptions", json!({"toggle": "paths"})).unwrap();
-    assert!(s.state.snap_features.paths);
-    assert!(s.execute("view.snappingOptions", json!({"toggle": "nope"})).is_err());
+    assert_eq!(s.state.snap_features, crate::viewer::SnapFeatures { edges_extended: true, collapsed_features: true });
+    let r = s.execute("view.snappingOptions", json!({"edgesExtended": false})).unwrap();
+    assert_eq!(r, json!({"edgesExtended": false, "collapsedFeatures": true}));
+    s.execute("view.snappingOptions", json!({"toggle": "collapsedFeatures"})).unwrap();
+    assert!(!s.state.snap_features.collapsed_features);
+    s.execute("view.snappingOptions", json!({"toggle": "collapsedFeatures"})).unwrap();
+    assert!(s.state.snap_features.collapsed_features);
+    // The per-feature toggles are gone, as in After Effects' menu.
+    for k in ["nope", "corners", "anchorPoints", "paths"] {
+        assert!(s.execute("view.snappingOptions", json!({"toggle": k})).is_err(), "{k}");
+    }
 }
 
 // ---------------------------------------------------------------- channels, exposure, snapshot
@@ -545,4 +573,127 @@ fn graph_transform_box_scales_key_times_and_values() {
     assert_eq!(p.keys.iter().map(|k| k.time.seconds()).collect::<Vec<_>>(), vec![0.0, 1.0, 2.0]);
     assert_eq!(p.keys[1].value.as_f64(), 50.0);
     assert!(s.execute("keys.transform", json!({"timeScale": 0})).is_err());
+}
+
+// ---------------------------------------------------------------- resolution
+
+#[test]
+fn each_comp_keeps_its_resolution_outside_the_undo_history_and_in_the_file() {
+    use effectcraft_project::Resolution;
+    let mut s = comp();
+    let a = s.active_comp_id().unwrap();
+    s.execute("layer.newSolid", json!({"name": "S", "color": "#ff0000", "width": 10, "height": 10})).unwrap();
+    let path = std::env::temp_dir().join(format!("ec-resolution-{}.ecproj", std::process::id()));
+    s.execute("file.saveAs", json!({"path": path.to_string_lossy()})).unwrap();
+    assert_eq!(s.active_comp().unwrap().resolution, Resolution::Auto);
+    let (steps, pixels) = (s.history.undo.len(), s.active_comp_arc().unwrap());
+    let r = s.execute_checked("view.res.half", json!({})).unwrap();
+    assert_eq!((r["resolution"].clone(), r["factor"].clone()), (json!("Half"), json!(2)));
+    // No undo step, but the project is modified (it's saved with it).
+    assert_eq!(s.history.undo.len(), steps);
+    assert!(s.is_dirty());
+    assert!(s.active_comp().unwrap().same_pixels(&pixels));
+    // Another comp has its own; switching back shows comp A's again.
+    s.execute("comp.new", json!({"name": "B", "width": 320, "height": 180, "frameRate": 30, "duration": 5})).unwrap();
+    let b = s.active_comp_id().unwrap();
+    assert_ne!(a, b);
+    assert_eq!(s.active_comp().unwrap().resolution, Resolution::Auto);
+    s.execute_checked("view.res.custom", json!({"factor": 6})).unwrap();
+    s.open_comp(a);
+    assert_eq!(s.active_comp().unwrap().resolution, Resolution::Half);
+    assert_eq!(s.execute("comp.info", json!({})).unwrap()["resolution"], json!("Half"));
+    assert_eq!(crate::menus::checked(&s, "view.res.half", &json!({})), Some(true));
+    assert_eq!(crate::menus::checked(&s, "view.res.full", &json!({})), Some(false));
+    // Undo and redo restore the comps, not their resolutions.
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(s.project.comp(b).is_none(), "undid New Composition");
+    assert_eq!(s.project.comp(a).unwrap().resolution, Resolution::Half);
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(s.project.comp(b).unwrap().resolution, Resolution::Custom(6));
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(s.active_comp().unwrap().layers.is_empty(), "undid the solid");
+    assert_eq!(s.project.comp(a).unwrap().resolution, Resolution::Half);
+    s.execute("edit.redo", json!({})).unwrap();
+    s.execute("edit.redo", json!({})).unwrap();
+    // The comp's explicit `comp` parameter; the same value again changes nothing.
+    s.execute_checked("view.res.quarter", json!({"comp": b.0})).unwrap();
+    let rev = s.revision;
+    s.execute_checked("view.res.quarter", json!({"comp": b.0})).unwrap();
+    assert_eq!(s.revision, rev);
+    // Saved with the project and read back.
+    s.execute("file.save", json!({})).unwrap();
+    assert!(!s.is_dirty());
+    let mut o = Session::default();
+    o.execute("file.open", json!({"path": path.to_string_lossy()})).unwrap();
+    assert_eq!(o.project.comp(a).unwrap().resolution, Resolution::Half);
+    assert_eq!(o.project.comp(b).unwrap().resolution, Resolution::Quarter);
+    let _ = std::fs::remove_file(path);
+    // Custom without a factor asks the frontend (the Custom Resolution dialog).
+    s.drain_events();
+    s.execute_checked("view.res.custom", json!({})).unwrap();
+    assert!(s.drain_events().iter().any(|e| matches!(e, crate::Event::Frontend { command, .. } if command == "view.res.custom")));
+    assert!(s.execute_checked("view.res.custom", json!({"factor": "big"})).is_err());
+    s.execute_checked("view.res.auto", json!({})).unwrap();
+    assert_eq!(s.active_comp().unwrap().resolution, Resolution::Auto);
+}
+
+/// #1685: changing Type updates the property tree in the same undo step, including when
+/// addressed by uid (as in the UI) rather than by path (scripts/control channel).
+#[test]
+fn polystar_type_switch_updates_inner_controls_and_undoes() {
+    let mut s = comp();
+    let lid = s.execute("layer.newShape", json!({"kind": "polygon"})).unwrap()["layer"].as_u64().unwrap();
+    let group = |s: &Session| layer(s, lid).props.group("contents/group/contents/star").unwrap().clone();
+    let polygon = group(&s);
+    let type_uid = polygon.get("type").unwrap().uid;
+    assert!(polygon.get("innerRadius").is_none());
+    s.execute("prop.set", json!({"layer": lid, "prop": type_uid, "value": 0})).unwrap();
+    let star = group(&s);
+    assert_eq!(star.get("innerRadius").unwrap().value, KV::Scalar(50.0));
+    assert_eq!(star.get("innerRoundness").unwrap().value, KV::Scalar(0.0));
+    assert_eq!(star.get("innerRadius").unwrap().ui, effectcraft_project::ParamUi::Pixels);
+    assert_eq!(star.get("innerRoundness").unwrap().ui, effectcraft_project::ParamUi::Percent);
+    let names: Vec<_> = star.children.iter().filter_map(|n| n.as_prop()).map(|p| p.match_id.as_str()).collect();
+    assert_eq!(names, ["direction", "type", "points", "position", "rotation", "innerRadius", "outerRadius", "innerRoundness", "outerRoundness"]);
+    assert_eq!(star.get("outerRadius"), polygon.get("outerRadius"));
+    assert!(s.undo());
+    assert_eq!(group(&s), polygon);
+    assert!(s.redo());
+    assert_eq!(group(&s), star);
+    // Reapplying the same Type must not reset custom inner values or allocate new ids.
+    s.execute("prop.set", json!({"layer": lid, "path": "contents/group/contents/star/innerRadius", "value": 37})).unwrap();
+    let before = group(&s);
+    let next = s.project.next_id;
+    s.execute("prop.set", json!({"layer": lid, "path": "contents/group/contents/star/type", "value": 0})).unwrap();
+    assert_eq!(group(&s), before);
+    assert_eq!(s.project.next_id, next);
+    let inner_uid = before.get("innerRadius").unwrap().uid;
+    s.state.selected_props = vec![(LayerId(lid), inner_uid)];
+    s.state.selected_keys = vec![crate::KeyRef { layer: LayerId(lid), prop: inner_uid, time: Tick::ZERO }];
+    s.execute("prop.set", json!({"layer": lid, "path": "contents/group/contents/star/type", "value": 1})).unwrap();
+    assert_eq!(group(&s).get("type").unwrap().value, KV::Enum(1));
+    assert!(group(&s).get("innerRadius").is_none());
+    assert!(group(&s).get("innerRoundness").is_none());
+    assert!(s.state.selected_props.is_empty());
+    assert!(s.state.selected_keys.is_empty());
+    assert!(s.undo());
+    assert_eq!(group(&s), before, "undo restores the original inner values and ids");
+    assert!(s.redo());
+    assert!(group(&s).get("innerRadius").is_none());
+    s.execute("prop.set", json!({"layer": lid, "prop": type_uid, "value": 0})).unwrap();
+    assert_eq!(group(&s).get("innerRadius").unwrap().value, KV::Scalar(50.0));
+}
+
+#[test]
+fn polystar_animated_type_keeps_the_inner_controls_needed_by_other_frames() {
+    let mut s = comp();
+    let lid = s.execute("layer.newShape", json!({"kind": "star"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("prop.set", json!({"layer": lid, "path": "contents/group/contents/star/innerRadius", "value": 27})).unwrap();
+    s.execute("prop.toggleAnimation", json!({"layer": lid, "path": "contents/group/contents/star/type", "value": true})).unwrap();
+    s.execute("prop.set", json!({"layer": lid, "path": "contents/group/contents/star/type", "time": 1, "value": 1})).unwrap();
+    let star = layer(&s, lid).props.group("contents/group/contents/star").unwrap().clone();
+    assert_eq!(star.get("type").unwrap().value_at(Tick::ZERO), KV::Enum(0));
+    assert_eq!(star.get("type").unwrap().value_at(Tick::from_seconds_f64(1.0)), KV::Enum(1));
+    assert_eq!(star.get("innerRadius").unwrap().value, KV::Scalar(27.0));
 }

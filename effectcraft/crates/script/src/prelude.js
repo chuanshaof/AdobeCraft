@@ -6,8 +6,16 @@
 
 var __ecGlobal = this;
 
+// The scripting host keeps wrappers stable for each project item and comp/layer id.
+// Clear them when loading a different document, whose IDs may be reused.
+var __itemCache = Object.create(null), __layerCache = Object.create(null);
+function __clearIdentityCache() {
+  __itemCache = Object.create(null);
+  __layerCache = Object.create(null);
+}
 function __call(id, p) {
   var r = __exec(id, JSON.stringify(p || {}));
+  if (id === "file.newProject" || id === "file.open" || id === "file.revert") __clearIdentityCache();
   return r === undefined || r === "" ? null : JSON.parse(r);
 }
 function __get(kind, a) {
@@ -25,6 +33,25 @@ function __str(v) {
   if (v === undefined || v === null) return "";
   if (v instanceof File || v instanceof Folder) return v.fsName;
   return String(v);
+}
+
+// ExtendScript includes the ES3 String.substr(start, length) method, which Boa
+// does not currently provide. Follow its legacy length (not end-index) semantics.
+if (typeof String.prototype.substr !== "function") {
+  Object.defineProperty(String.prototype, "substr", {
+    value: function (start, length) {
+      if (this === null || this === undefined) throw new TypeError("String.substr called on null or undefined");
+      var text = String(this), n = text.length;
+      var from = Number(start);
+      if (isNaN(from)) from = 0;
+      // ToIntegerOrInfinity, then clamp positive or negative offsets.
+      from = from < 0 ? Math.max(n + Math.ceil(from), 0) : Math.min(Math.floor(from), n);
+      var count = length === undefined ? n - from : Number(length);
+      if (isNaN(count) || count <= 0) return "";
+      return text.slice(from, from + count);
+    },
+    writable: true, configurable: true
+  });
 }
 
 // ------------------------------------------------------------------ enums
@@ -67,7 +94,12 @@ var MaskMode = __enum("MaskMode", ["NONE", "ADD", "SUBTRACT", "INTERSECT", "LIGH
 var RQItemStatus = __enum("RQItemStatus", ["WILL_CONTINUE", "NEEDS_OUTPUT", "UNQUEUED", "QUEUED", "RENDERING", "USER_STOPPED", "ERR_STOPPED", "DONE"], 3012);
 var CloseOptions = __enum("CloseOptions", ["DO_NOT_SAVE_CHANGES", "PROMPT_TO_SAVE_CHANGES", "SAVE_CHANGES"], 1212);
 var ImportAsType = __enum("ImportAsType", ["COMP_CROPPED_LAYERS", "FOOTAGE", "COMP", "PROJECT"], 3812);
+// Accept the longer names used by some ExtendScript hosts.
+ImportAsType.COMPOSITION_CROPPED_LAYERS = ImportAsType.COMP_CROPPED_LAYERS;
+ImportAsType.COMPOSITION = ImportAsType.COMP;
 var TimeDisplayType = __enum("TimeDisplayType", ["FRAMES", "TIMECODE"], 2012);
+// After Effects' values (FC_START_0 = 2612), as in docsforadobe/Types-for-Adobe.
+var FramesCountType = __enum("FramesCountType", ["FC_START_0", "FC_START_1", "FC_TIMECODE_CONVERSION"], 2612);
 var LogType = __enum("LogType", ["ERRORS_ONLY", "ERRORS_AND_SETTINGS", "ERRORS_AND_PER_FRAME_INFO"], 3212);
 var KeyframeLabel = __enum("KeyframeLabel", ["NONE"], 0);
 
@@ -111,8 +143,49 @@ var $ = {
   get os() { return "EffectCraft"; },
   get version() { return "EffectCraft scripting"; },
   get locale() { return "en_US"; },
-  evalFile: function () { throw __err("$.evalFile is not supported: scripts can't run scripts"); },
+  // Evaluates the file in the global scope and returns its last value (`timeout` is ignored).
+  evalFile: function (file, timeout) { return __evalFile(__str(file)); },
 };
+
+// ------------------------------------------------------------------ BridgeTalk
+
+// Which application a script runs in, for scripts and frameworks that ask during initialisation.
+// EffectCraft names itself rather than posing as another application; messages to other
+// applications aren't supported.
+function BridgeTalk() {
+  if (!(this instanceof BridgeTalk)) return new BridgeTalk();
+  this.target = "";
+  this.sender = BridgeTalk.appSpecifier;
+  this.body = "";
+  this.type = "ExtendScript";
+  this.headers = {};
+  this.timeout = 0;
+  this.onResult = null;
+  this.onError = null;
+  this.onReceived = null;
+  this.onTimeout = null;
+}
+BridgeTalk.prototype.send = function () {
+  throw __err("BridgeTalk: sending messages to other applications is not supported in EffectCraft");
+};
+BridgeTalk.prototype.sendResult = BridgeTalk.prototype.send;
+BridgeTalk.prototype.toString = function () { return "[object BridgeTalk]"; };
+BridgeTalk.appName = "effectcraft";
+Object.defineProperty(BridgeTalk, "appVersion", { get: function () { return __get("app").buildName; } });
+Object.defineProperty(BridgeTalk, "appSpecifier", { get: function () { return "effectcraft-" + BridgeTalk.appVersion; } });
+BridgeTalk.appLocale = "en_US";
+BridgeTalk.appInstance = "";
+BridgeTalk.appStatus = "idle";
+BridgeTalk.onReceive = null;
+BridgeTalk.__isSelf = function (spec) { return String(spec === undefined || spec === null ? "" : spec).split("-")[0].toLowerCase() === "effectcraft"; };
+BridgeTalk.isRunning = function (spec) { return BridgeTalk.__isSelf(spec); };
+BridgeTalk.launch = function (spec) { return BridgeTalk.__isSelf(spec); };
+BridgeTalk.getSpecifier = function (name) { return BridgeTalk.__isSelf(name) ? BridgeTalk.appSpecifier : null; };
+BridgeTalk.getDisplayName = function (spec) { return BridgeTalk.__isSelf(spec) ? "EffectCraft" : null; };
+BridgeTalk.getTargets = function () { return [BridgeTalk.appName]; };
+BridgeTalk.getStatus = function (spec) { return spec === undefined || BridgeTalk.__isSelf(spec) ? "IDLE" : "ISNOTINSTALLED"; };
+BridgeTalk.bringToFront = function () {};
+BridgeTalk.pump = function () { return false; };
 
 // ------------------------------------------------------------------ File / Folder
 
@@ -138,7 +211,7 @@ File.prototype = {
   get path() { var p = this.__path.split(/[\/\\]/); p.pop(); return p.join("/"); },
   get parent() { return new Folder(this.path); },
   get exists() { return JSON.parse(__file("exists", this.__path)) === true; },
-  get length() { return this.__buf !== null ? this.__buf.length : (this.exists ? JSON.parse(__file("read", this.__path)).length : 0); },
+  get length() { return this.__buf !== null ? this.__buf.length : (this.exists ? JSON.parse(__file(this.encoding.toUpperCase() === "BINARY" ? "readBinary" : "read", this.__path)).length : 0); },
   get eof() { return this.__buf === null || this.__pos >= this.__buf.length; },
   toString: function () { return this.__path; },
   open: function (mode) {
@@ -152,9 +225,9 @@ File.prototype = {
         this.__buf = "";
         return true;
       }
-      this.__buf = JSON.parse(__file("read", this.__path));
+      this.__buf = JSON.parse(__file(this.encoding.toUpperCase() === "BINARY" ? "readBinary" : "read", this.__path));
     } else if (mode === "a") {
-      this.__buf = this.exists ? JSON.parse(__file("read", this.__path)) : "";
+      this.__buf = this.exists ? JSON.parse(__file(this.encoding.toUpperCase() === "BINARY" ? "readBinary" : "read", this.__path)) : "";
       this.__pos = this.__buf.length;
     } else {
       // Check the gate now, like After Effects refusing to open a file for writing.
@@ -191,18 +264,14 @@ File.prototype = {
   tell: function () { return this.__pos; },
   close: function () {
     if ((this.__mode === "w" || this.__mode === "a" || this.__mode === "e") && this.__buf !== null) {
-      __file("write", this.__path, this.__buf);
+      __file(this.encoding.toUpperCase() === "BINARY" ? "writeBinary" : "write", this.__path, this.__buf);
     }
     this.__buf = null;
     this.__mode = null;
     return true;
   },
   remove: function () { return JSON.parse(__file("remove", this.__path)); },
-  copy: function (to) {
-    var data = JSON.parse(__file("read", this.__path));
-    __file("write", __str(to), data);
-    return true;
-  },
+  copy: function (to) { return JSON.parse(__file("copy", this.__path, __str(to))); },
   rename: function () { throw __err("File.rename is not supported"); },
   execute: function () { return JSON.parse(__file("execute", this.__path)); },
   openDlg: function () { return null; },
@@ -339,6 +408,25 @@ var __attr = {
     return c === null ? undefined : c;
   },
 };
+
+// Layers, property groups and properties are callable, like After Effects: `layer("Effects")`,
+// `fx(1)` and `effect("Slider Control")("Slider")` are `.property(...)`. A Proxy is callable
+// only around a function, so the object's state moves onto an arrow function (no `prototype`;
+// its own `name` and `length` are removed so the object's getters show) with the object's
+// prototype; `instanceof` and attribute access are unchanged.
+function __callable(o) {
+  var f = () => undefined;
+  delete f.name;
+  delete f.length;
+  Object.setPrototypeOf(f, Object.getPrototypeOf(o));
+  var keys = Object.keys(o);
+  for (var i = 0; i < keys.length; i++) f[keys[i]] = o[keys[i]];
+  var self = new Proxy(f, {
+    get: __attr.get,
+    apply: function (t, thisArg, args) { return self.property(args[0]); },
+  });
+  return self;
+}
 
 // 1-based collections with `[n]` access.
 var __coll = {
@@ -480,9 +568,16 @@ TextDocument.prototype = {
   get smallCaps() { return this.__style("smallCaps", false); },
   set smallCaps(v) { this.__set("smallCaps", !!v); },
   get superscript() { return this.__style("baseline", "normal") === "superscript"; },
-  set superscript(v) { this.__set("superscript", !!v); },
+  set superscript(v) {
+    // The pending document reads the same canonical baseline that setValue will apply.
+    if (v) this.__set("baseline", "superscript");
+    else if (this.superscript) this.__set("baseline", "normal");
+  },
   get subscript() { return this.__style("baseline", "normal") === "subscript"; },
-  set subscript(v) { this.__set("subscript", !!v); },
+  set subscript(v) {
+    if (v) this.__set("baseline", "subscript");
+    else if (this.subscript) this.__set("baseline", "normal");
+  },
   get tsume() { return this.__style("tsume", 0); },
   set tsume(v) { this.__set("tsume", __num(v)); },
   get boxText() { return !!(this.__base && this.__base.box_size); },
@@ -574,7 +669,9 @@ PropertyBase.prototype = {
     return false;
   },
   set selected(v) {
-    if (v) __call("prop.select", { comp: this.__layer.__comp, layer: this.__layer.__id, prop: this.__uid, add: true });
+    var ref = { comp: this.__layer.__comp, layer: this.__layer.__id, prop: this.__uid };
+    if (v) __call("prop.select", { comp: ref.comp, layer: ref.layer, prop: ref.prop, add: true });
+    else __call("prop.deselect", ref);
   },
   propertyGroup: function (n) {
     var p = this;
@@ -595,7 +692,7 @@ function PropertyGroup(layer, uid) {
   this.__layer = layer;
   this.__uid = uid;
   this.__kind = "PropertyGroup";
-  return new Proxy(this, __attr);
+  return __callable(this);
 }
 PropertyGroup.prototype = Object.create(PropertyBase.prototype);
 PropertyGroup.prototype.constructor = PropertyGroup;
@@ -620,6 +717,15 @@ PropertyGroup.prototype.addProperty = function (name) {
     var p = { comp: L.__comp, layer: L.__id, kind: r.shape };
     if (r.group !== null && r.group !== undefined) p.group = r.group;
     uid = __call("layer.addShapeItem", p).uid;
+  } else if (r.kind === "existing") {
+    uid = r.uid;
+  } else if (r.kind === "dash") {
+    // Dash/Gap 2 and 3 come as a pair: add pairs until the one asked for exists.
+    var dp = { comp: L.__comp, layer: L.__id, prop: r.stroke };
+    for (var n = 0; n < 3 && !this.property(name); n++) __call("shape.dashes.add", dp);
+    var added = this.property(name);
+    if (!added) throw __err("Can not add \"" + name + "\" to Dashes");
+    return added;
   } else if (r.kind === "animator") {
     uid = __call("layer.addTextAnimator", { comp: L.__comp, layer: L.__id, properties: [] }).animator;
   } else if (r.kind === "animatorProperty") {
@@ -638,7 +744,7 @@ function MaskPropertyGroup(layer, uid) {
   this.__layer = layer;
   this.__uid = uid;
   this.__kind = "MaskPropertyGroup";
-  return new Proxy(this, __attr);
+  return __callable(this);
 }
 MaskPropertyGroup.prototype = Object.create(PropertyGroup.prototype);
 MaskPropertyGroup.prototype.constructor = MaskPropertyGroup;
@@ -670,7 +776,7 @@ function Property(layer, uid) {
   this.__layer = layer;
   this.__uid = uid;
   this.__kind = "Property";
-  return new Proxy(this, __attr);
+  return __callable(this);
 }
 Property.prototype = Object.create(PropertyBase.prototype);
 Property.prototype.constructor = Property;
@@ -733,10 +839,11 @@ Property.prototype.property = function () { return null; };
   };
   P.__keys = function () { return __get("keys", { comp: this.__layer.__comp, layer: this.__layer.__id, uid: this.__uid }); };
   P.__key = function (i) {
-    var k = this.__keys();
     i = __num(i, "keyIndex");
-    if (i < 1 || i > k.length || Math.floor(i) !== i) throw __err("keyIndex " + i + " is out of range 1.." + k.length);
-    return k[i - 1];
+    // Only the key asked for: fetching the whole list made every key call linear (#814).
+    var r = i >= 1 && Math.floor(i) === i ? __get("keys", { comp: this.__layer.__comp, layer: this.__layer.__id, uid: this.__uid, index: i - 1 }) : null;
+    if (!r || !r.key) throw __err("keyIndex " + i + " is out of range 1.." + (r ? r.count : this.numKeys));
+    return r.key;
   };
   // Script value → engine JSON for `prop.set` / `prop.addKey`.
   P.__toEngine = function (v, info, time) {
@@ -764,8 +871,11 @@ Property.prototype.property = function () { return null; };
     }
     if (info.dims > 1) {
       if (!(v instanceof Array)) throw __err("value must be an array of " + info.dims + " numbers");
+      // After Effects rejects an array of the wrong length instead of truncating or broadcasting it
+      // (#1936). Two values for a 3-D property stay legal, as they are in After Effects: z is 0.
+      if (v.length !== info.dims && !(info.dims === 3 && v.length === 2)) throw __err("Array is not of the correct dimension");
       var o = [];
-      for (var d = 0; d < info.dims; d++) o.push(d < v.length ? __num(v[d]) : (d === 2 ? 0 : __num(v[v.length - 1])));
+      for (var d = 0; d < info.dims; d++) o.push(d < v.length ? __num(v[d]) : 0);
       return o;
     }
     if (v instanceof Array) throw __err("value must be a number, not an array");
@@ -824,31 +934,43 @@ Property.prototype.property = function () { return null; };
   };
   P.keyTime = function (i) { return this.__key(i).time; };
   P.keyValue = function (i) { return this.__fromEngine(this.__key(i).value, this.__info()); };
-  // Select key `i` (only) so the selection-based keyframe commands act on it.
-  P.__select = function (i) {
-    var k = this.__key(i);
-    __call("keys.select", { comp: this.__layer.__comp, keys: [{ layer: this.__layer.__id, prop: this.__uid, time: k.layerTime }] });
-    return k;
+  // Run a keyframe command that acts on the selected keys on key `i` only; the user's key
+  // selection stays as it was, as with After Effects' per-key methods.
+  P.__keyCmd = function (i, id, params) {
+    this.__key(i);
+    params = params || {};
+    params.comp = this.__layer.__comp;
+    params.__keys = [{ layer: this.__layer.__id, prop: this.__uid, index: __num(i) - 1 }];
+    return __call(id, params);
   };
-  P.removeKey = function (i) {
-    this.__select(i);
-    __call("keys.delete", { comp: this.__layer.__comp });
+  P.removeKey = function (i) { this.__keyCmd(i, "keys.delete"); };
+  // EffectCraft extension: remove an inclusive range with one engine edit instead of
+  // cloning the project for every removed key. Indices are one-based as in removeKey.
+  P.removeKeys = function (first, last) {
+    var keys = this.__keys();
+    first = __num(first, "first key");
+    last = __num(last, "last key");
+    if (!Number.isInteger(first) || !Number.isInteger(last) || first < 1 || last < first || last > keys.length)
+      throw __err("removeKeys: key range is out of bounds");
+    var targets = [];
+    for (var i = first; i <= last; i++)
+      targets.push({ layer: this.__layer.__id, prop: this.__uid, index: i - 1 });
+    return __call("keys.delete", { comp: this.__layer.__comp, __keys: targets });
   };
   P.keyInInterpolationType = function (i) { return KeyframeInterpolationType[this.__key(i).inInterp]; };
   P.keyOutInterpolationType = function (i) { return KeyframeInterpolationType[this.__key(i).outInterp]; };
-  P.isInterpolationTypeValid = function (t) { return t === 6612 || t === 6613 || t === 6614; };
+  // Values that don't interpolate (checkboxes, popups, text) only hold.
+  P.isInterpolationTypeValid = function (t) { return t === 6614 || ((t === 6612 || t === 6613) && this.__info().interpolates !== false); };
   P.setInterpolationTypeAtKey = function (i, inType, outType) {
     if (outType === undefined) outType = inType;
     if (!__interpKey[inType] || !__interpKey[outType]) throw __err("Bad KeyframeInterpolationType");
-    this.__select(i);
-    __call("keys.interpolation", { comp: this.__layer.__comp, "in": __interpKey[inType], out: __interpKey[outType] });
+    this.__keyCmd(i, "keys.interpolation", { "in": __interpKey[inType], out: __interpKey[outType] });
   };
   P.keyInTemporalEase = function (i) { return this.__key(i).inEase.map(function (e) { return new KeyframeEase(e.speed, e.influence); }); };
   P.keyOutTemporalEase = function (i) { return this.__key(i).outEase.map(function (e) { return new KeyframeEase(e.speed, e.influence); }); };
   P.setTemporalEaseAtKey = function (i, inEase, outEase) {
     if (outEase === undefined) outEase = inEase;
     if (!(inEase instanceof Array) || !(outEase instanceof Array)) throw __err("setTemporalEaseAtKey: eases must be arrays of KeyframeEase");
-    this.__select(i);
     function sp(a) { return a.map(function (e) { return __num(e.speed, "speed"); }); }
     function inf(a) {
       return a.map(function (e) {
@@ -857,14 +979,14 @@ Property.prototype.property = function () { return null; };
         return x;
       });
     }
-    __call("keys.velocity", { comp: this.__layer.__comp, inSpeed: sp(inEase), inInfluence: inf(inEase), outSpeed: sp(outEase), outInfluence: inf(outEase) });
+    this.__keyCmd(i, "keys.velocity", { inSpeed: sp(inEase), inInfluence: inf(inEase), outSpeed: sp(outEase), outInfluence: inf(outEase) });
   };
   P.keyTemporalContinuous = function (i) { return !!this.__key(i).continuous; };
-  P.setTemporalContinuousAtKey = function (i, b) { this.__select(i); __call("keys.interpolation", { comp: this.__layer.__comp, continuous: !!b }); };
+  P.setTemporalContinuousAtKey = function (i, b) { this.__keyCmd(i, "keys.interpolation", { continuous: !!b }); };
   P.keyTemporalAutoBezier = function (i) { return !!this.__key(i).autoBezier; };
-  P.setTemporalAutoBezierAtKey = function (i, b) { this.__select(i); __call("keys.interpolation", { comp: this.__layer.__comp, autoBezier: !!b }); };
+  P.setTemporalAutoBezierAtKey = function (i, b) { this.__keyCmd(i, "keys.interpolation", { autoBezier: !!b }); };
   P.keyRoving = function (i) { return !!this.__key(i).roving; };
-  P.setRovingAtKey = function (i, b) { this.__select(i); __call("keys.interpolation", { comp: this.__layer.__comp, roving: !!b }); };
+  P.setRovingAtKey = function (i, b) { this.__keyCmd(i, "keys.interpolation", { roving: !!b }); };
   P.keyInSpatialTangent = function (i) { return this.__key(i).spatialIn.slice(0, this.__info().dims); };
   P.keyOutSpatialTangent = function (i) { return this.__key(i).spatialOut.slice(0, this.__info().dims); };
   P.keySpatialContinuous = function (i) { return !!this.__key(i).spatialContinuous; };
@@ -873,8 +995,8 @@ Property.prototype.property = function () { return null; };
     var k = this.__key(i);
     __call("keys.setSpatialTangents", this.__ref({ time: k.layerTime, "in": inT, out: outT === undefined ? inT : outT }));
   };
-  P.setSpatialContinuousAtKey = function (i, b) { this.__select(i); __call("keys.interpolation", { comp: this.__layer.__comp, spatial: b ? "continuousBezier" : "bezier" }); };
-  P.setSpatialAutoBezierAtKey = function (i, b) { this.__select(i); __call("keys.interpolation", { comp: this.__layer.__comp, spatial: b ? "autoBezier" : "bezier" }); };
+  P.setSpatialContinuousAtKey = function (i, b) { this.__keyCmd(i, "keys.interpolation", { spatial: b ? "continuousBezier" : "bezier" }); };
+  P.setSpatialAutoBezierAtKey = function (i, b) { this.__keyCmd(i, "keys.interpolation", { spatial: b ? "autoBezier" : "bezier" }); };
   P.keySelected = function (i) { return !!this.__key(i).selected; };
   P.setSelectedAtKey = function (i, b) {
     var k = this.__key(i);
@@ -941,7 +1063,7 @@ MarkerProperty.prototype = {
     t = __num(t, "time");
     if (!(mv instanceof MarkerValue)) throw __err("value must be a MarkerValue");
     var p = this.__p({ time: t, duration: mv.duration || 0, comment: mv.comment, chapter: mv.chapter, url: mv.url, frameTarget: mv.frameTarget, protected: !!mv.protectedRegion, label: mv.label || 0 });
-    p.cuePoint = mv.cuePointName ? { name: mv.cuePointName, navigation: !mv.eventCuePoint, params: mv.__params } : null;
+    p.cuePoint = (mv.cuePointName || mv.__params.length) ? { name: mv.cuePointName, navigation: !mv.eventCuePoint, params: mv.__params } : null;
     var l = this.__list(), at = -1;
     for (var i = 0; i < l.length; i++) if (Math.abs(l[i].time - t) < 1e-6) at = i;
     if (at >= 0) p.index = at;
@@ -957,14 +1079,18 @@ MarkerProperty.prototype = {
 
 function __layer(compId, id) {
   if (id === null || id === undefined) return null;
-  var i = __get("layer", { comp: compId, layer: id });
+  var key = compId + ":" + id;
+  if (Object.prototype.hasOwnProperty.call(__layerCache, key)) return __layerCache[key];
+  var i = __get("layer", { comp: compId, layer: id }), layer;
   switch (i.kind) {
-    case "text": return new TextLayer(compId, id);
-    case "shape": return new ShapeLayer(compId, id);
-    case "camera": return new CameraLayer(compId, id);
-    case "light": return new LightLayer(compId, id);
-    default: return new AVLayer(compId, id);
+    case "text": layer = new TextLayer(compId, id); break;
+    case "shape": layer = new ShapeLayer(compId, id); break;
+    case "camera": layer = new CameraLayer(compId, id); break;
+    case "light": layer = new LightLayer(compId, id); break;
+    default: layer = new AVLayer(compId, id);
   }
+  __layerCache[key] = layer;
+  return layer;
 }
 
 function Layer() {}
@@ -973,7 +1099,7 @@ Layer.prototype = {
     this.__comp = comp;
     this.__id = id;
     this.__kind = kind;
-    return new Proxy(this, __attr);
+    return __callable(this);
   },
   __info: function () { return __get("layer", { comp: this.__comp, layer: this.__id }); },
   __p: function (o) {
@@ -1000,7 +1126,7 @@ Layer.prototype = {
   set name(v) { __call("layer.rename", this.__p1({ name: String(v) })); },
   get index() { return this.__info().index; },
   get matchName() { return this.__info().matchName; },
-  get containingComp() { return new CompItem(this.__comp); },
+  get containingComp() { return __item(this.__comp); },
   get propertyDepth() { return 0; },
   get propertyType() { return PropertyType.INDEXED_GROUP; },
   get parentProperty() { return null; },
@@ -1042,6 +1168,7 @@ Layer.prototype = {
     __call("edit.label", this.__p({ label: n }));
   },
   get comment() { return this.__info().comment; },
+  set comment(v) { __call("layer.setComment", this.__p({ comment: String(v) })); },
   get selected() { return this.__info().selected; },
   set selected(v) {
     var sel = this.containingComp.__info().selectedLayers;
@@ -1109,6 +1236,11 @@ AVLayer.prototype.constructor = AVLayer;
   var P = AVLayer.prototype;
   function def(name, get, set) { Object.defineProperty(P, name, { get: get, set: set }); }
   def("source", function () { return __item(this.__info().source); });
+  // After Effects exposes the most common Transform properties directly on AVLayer.
+  // Return the original Property object, not its current value: scripts can keyframe it.
+  ["anchorPoint", "position", "scale", "rotation", "opacity"].forEach(function (name) {
+    def(name, function () { return this.transform[name]; });
+  });
   def("width", function () { return this.__info().width; });
   def("height", function () { return this.__info().height; });
   def("threeDLayer", function () { return this.__info().threeDLayer; }, function (v) { this.__switch("threeD", v); });
@@ -1168,9 +1300,20 @@ AVLayer.prototype.constructor = AVLayer;
   P.sourceRectAtTime = function (t, extents) {
     return __get("sourceRect", { comp: this.__comp, layer: this.__id, time: __num(t, "time"), extents: !!extents });
   };
-  P.sourcePointToComp = function (p) { return p; };
-  P.compPointToSource = function (p) { return p; };
-  P.replaceSource = function () { throw __err("replaceSource is not supported yet"); };
+  // Source ↔ comp points, through the layer's transform and its parents' at the comp's time (#808).
+  function pointIn(layer, p, toComp) {
+    return __get("pointConvert", { comp: layer.__comp, layer: layer.__id, point: [__num(p[0], "point"), __num(p[1], "point")], toComp: toComp, time: layer.containingComp.time });
+  }
+  P.sourcePointToComp = function (p) { return pointIn(this, p, true); };
+  P.compPointToSource = function (p) { return pointIn(this, p, false); };
+  // Replace the layer's source item, keeping every layer property (After Effects'
+  // AVLayer.replaceSource). `fixExpressions` is accepted for compatibility: only AV sources are
+  // replaced, so the property tree and the layer's name stay and expressions keep resolving.
+  P.replaceSource = function (newSource, fixExpressions) {
+    if (!newSource || newSource.__id === undefined) throw __err("replaceSource needs a project item");
+    __call("layer.replaceSource", { comp: this.__comp, layers: [this.__id], item: newSource.__id, fixExpressions: !!fixExpressions });
+    return null;
+  };
   P.openInViewer = function () { __call("layer.openLayer", this.__p1()); return null; };
 })();
 
@@ -1187,6 +1330,14 @@ Object.defineProperty(ShapeLayer.prototype, "source", { get: function () { retur
 function CameraLayer(comp, id) { return this.__init(comp, id, "CameraLayer"); }
 CameraLayer.prototype = Object.create(Layer.prototype);
 CameraLayer.prototype.constructor = CameraLayer;
+// Camera scripts (Google Earth Studio exports among them) key `cameraLayer.position`,
+// `.xRotation` and `.zoom` directly, as on AVLayer: return the live Property objects.
+["pointOfInterest", "position", "orientation", "xRotation", "yRotation", "zRotation"].forEach(function (name) {
+  Object.defineProperty(CameraLayer.prototype, name, { get: function () { return this.transform[name]; } });
+});
+["zoom", "depthOfField", "focusDistance", "aperture", "blurLevel"].forEach(function (name) {
+  Object.defineProperty(CameraLayer.prototype, name, { get: function () { return this.cameraOptions[name]; } });
+});
 
 function LightLayer(comp, id) { return this.__init(comp, id, "LightLayer"); }
 LightLayer.prototype = Object.create(Layer.prototype);
@@ -1229,6 +1380,7 @@ LayerCollection.prototype = {
     if (name !== undefined) p.name = String(name);
     if (width !== undefined) p.width = Math.round(__num(width, "width"));
     if (height !== undefined) p.height = Math.round(__num(height, "height"));
+    if (pixelAspect !== undefined) p.pixelAspect = __num(pixelAspect, "pixelAspect");
     return this.__dur(this.__new(__call("layer.newSolid", p)), duration);
   },
   addNull: function (duration) { return this.__dur(this.__new(__call("layer.newNull", { comp: this.__comp })), duration); },
@@ -1264,7 +1416,7 @@ LayerCollection.prototype = {
     var ids = this.__ids(), sel = [];
     for (var i = 0; i < indices.length; i++) sel.push(ids[indices[i] - 1]);
     var r = __call("layer.precompose", { comp: this.__comp, layers: sel, name: String(name), mode: moveAllAttributes === false ? "leave" : "move" });
-    return new CompItem(r.comp);
+    return __item(r.comp);
   },
   byName: function (name) {
     var ids = this.__ids();
@@ -1312,13 +1464,20 @@ ItemCollection.prototype = {
 
 function __item(id) {
   if (id === null || id === undefined) return null;
-  if (id === 0) return new FolderItem(0);
-  var i = __get("item", { id: id });
-  switch (i.kind) {
-    case "comp": return new CompItem(id);
-    case "folder": return new FolderItem(id);
-    default: return new FootageItem(id);
+  if (Object.prototype.hasOwnProperty.call(__itemCache, id)) return __itemCache[id];
+  var item;
+  if (id === 0) {
+    item = new FolderItem(0);
+  } else {
+    var i = __get("item", { id: id });
+    switch (i.kind) {
+      case "comp": item = new CompItem(id); break;
+      case "folder": item = new FolderItem(id); break;
+      default: item = new FootageItem(id);
+    }
   }
+  __itemCache[id] = item;
+  return item;
 }
 
 function Item() {}
@@ -1336,8 +1495,19 @@ Item.prototype = {
   get parentFolder() { return __item(this.__info().parent); },
   set parentFolder(f) { __call("project.move", { items: [this.__id], folder: f && f.__id ? f.__id : null }); },
   get selected() { return this.__info().selected; },
-  set selected(v) { if (v) __call("project.select", { items: [this.__id], add: true }); },
-  get usedIn() { return this.__info().usedIn.map(function (c) { return new CompItem(c); }); },
+  set selected(v) {
+    var selection = __get("project").selection;
+    var selected = selection.indexOf(this.__id) !== -1;
+    if (!!v === selected) return;
+    if (v) {
+      __call("project.select", { items: [this.__id], add: true });
+    } else {
+      var id = this.__id;
+      // Replace just this item, preserving the other Project panel selections and their order.
+      __call("project.select", { items: selection.filter(function (item) { return item !== id; }) });
+    }
+  },
+  get usedIn() { return this.__info().usedIn.map(function (c) { return __item(c); }); },
   remove: function () { __call("project.delete", { items: [this.__id] }); },
 };
 
@@ -1345,8 +1515,11 @@ function AVItem() {}
 AVItem.prototype = Object.create(Item.prototype);
 (function () {
   function def(name, get, set) { Object.defineProperty(AVItem.prototype, name, { get: get, set: set }); }
-  def("width", function () { return this.__info().width; }, function (v) { this.__settings({ width: Math.round(__num(v, "width")) }); });
-  def("height", function () { return this.__info().height; }, function (v) { this.__settings({ height: Math.round(__num(v, "height")) }); });
+  // `anchor: 0` (top left): After Effects' width and height setters resize the frame and leave the
+  // layers at their coordinates. Re-anchoring the old frame in the new one belongs to the
+  // Composition Settings dialog, which is what `comp.settings` defaults to (#1942).
+  def("width", function () { return this.__info().width; }, function (v) { this.__settings({ width: Math.round(__num(v, "width")), anchor: 0 }); });
+  def("height", function () { return this.__info().height; }, function (v) { this.__settings({ height: Math.round(__num(v, "height")), anchor: 0 }); });
   def("pixelAspect", function () { return this.__info().pixelAspect; }, function (v) { this.__settings({ pixelAspect: __num(v) }); });
   def("duration", function () { return this.__info().duration; }, function (v) { this.__settings({ duration: __num(v, "duration") }); });
   def("frameRate", function () { return this.__info().frameRate; }, function (v) { this.__settings({ frameRate: __num(v, "frameRate") }); });
@@ -1354,8 +1527,14 @@ AVItem.prototype = Object.create(Item.prototype);
   def("hasVideo", function () { return this.__info().hasVideo; });
   def("hasAudio", function () { return this.__info().hasAudio; });
   def("footageMissing", function () { return !!this.__info().footageMissing; });
-  def("useProxy", function () { return false; });
-  def("proxySource", function () { return null; });
+  def("useProxy", function () { var p = this.__info().proxy; return !!(p && p.enabled); }, function (v) {
+    if (!this.__info().proxy) throw __err("\"" + this.name + "\" has no proxy");
+    __call("file.useProxy", { item: this.__id, on: !!v });
+  });
+  def("proxySource", function () {
+    var p = this.__info().proxy;
+    return p ? { isStill: !!p.isStill, file: p.file ? new File(p.file) : null, hasAlpha: false, toString: function () { return "[object FileSource]"; } } : null;
+  });
   def("isMediaReplacementCompatible", function () { return false; });
   def("time", function () { return 0; });
 })();
@@ -1464,6 +1643,14 @@ CompItem.prototype.constructor = CompItem;
     __call("essential.rename", { comp: this.__id, control: c[i - 1].id, name: String(name) });
     return String(name);
   };
+  // After Effects' CompItem.saveFrameToPng(time, file): Composition ▸ Save Frame As ▸ File at
+  // `time` (comp seconds), behind the scripting file gate like other writes (#816).
+  P.saveFrameToPng = function (time, file) {
+    var f = __str(file);
+    if (!f) throw __err("saveFrameToPng: missing file");
+    __file("write", f, "");
+    __call("comp.saveFrameAs", { comp: this.__id, path: f, time: __num(time, "time") });
+  };
   P.openInEssentialGraphics = function () { __call("comp.openInEssentialGraphics", { comp: this.__id }); };
   P.exportAsMotionGraphicsTemplate = function (overwrite, path) {
     var f = __str(path);
@@ -1487,14 +1674,42 @@ FootageItem.prototype.constructor = FootageItem;
 Object.defineProperty(FootageItem.prototype, "file", {
   get: function () { var f = this.__info().file; return f ? new File(f) : null; },
 });
+// The item's FootageSource: one live object per FootageItem, as in After Effects (#813).
+function FootageSource(item) { this.__item = item; }
+FootageSource.prototype = {
+  constructor: FootageSource,
+  __info: function () { return this.__item.__info(); },
+  get isStill() { return !!this.__info().isStill; },
+  get color() { return this.__info().color; },
+  get file() { var i = this.__info(); return i.kind !== "solid" && i.file ? new File(i.file) : null; },
+  get missingFootagePath() { var i = this.__info(); return i.footageMissing ? i.file : ""; },
+  get loop() { return this.__info().loop; },
+  get hasAlpha() { return false; },
+  get nativeFrameRate() { return this.__info().nativeFrameRate || 0; },
+  get displayFrameRate() { return this.__info().frameRate; },
+  // Interpret Footage ▸ Conform to frame rate; 0 uses the file's own rate.
+  get conformFrameRate() { return this.__info().conformFrameRate || 0; },
+  set conformFrameRate(v) {
+    v = __num(v, "conformFrameRate");
+    if (v < 0) throw __err("conformFrameRate must be 0 or a frame rate");
+    __call("file.interpretFootage", { items: [this.__item.__id], frameRate: v === 0 ? "file" : v });
+  },
+  toString: function () { return this.__info().kind === "solid" ? "[object SolidSource]" : "[object FileSource]"; },
+};
 Object.defineProperty(FootageItem.prototype, "mainSource", {
   get: function () {
-    var i = this.__info();
-    if (i.kind === "solid") return { isStill: true, color: i.color, hasAlpha: false, toString: function () { return "[object SolidSource]"; } };
-    return { isStill: !!i.isStill, file: i.file ? new File(i.file) : null, missingFootagePath: i.footageMissing ? i.file : "", loop: i.loop, hasAlpha: false, toString: function () { return "[object FileSource]"; } };
+    if (!this.__mainSource) Object.defineProperty(this, "__mainSource", { value: new FootageSource(this) });
+    return this.__mainSource;
   },
 });
 FootageItem.prototype.replace = function (f) { __call("file.replaceFootage", { item: this.__id, path: __str(f) }); };
+FootageItem.prototype.replaceWithSequence = function (f, forceAlphabetical) {
+  __call("file.replaceFootage", { item: this.__id, path: __str(f), sequence: true, alphabetical: !!forceAlphabetical });
+};
+// Proxies (footage and comps). A numbered still brings its sequence, so the two setters agree.
+AVItem.prototype.setProxy = function (f) { __call("file.setProxy", { item: this.__id, path: __str(f) }); };
+AVItem.prototype.setProxyWithSequence = function (f) { __call("file.setProxy", { item: this.__id, path: __str(f) }); };
+AVItem.prototype.setProxyToNone = function () { __call("file.setProxyNone", { item: this.__id }); };
 FootageItem.prototype.replaceWithSolid = function (color, name, w, h) {
   __call("file.replaceWithSolid", { item: this.__id, color: [color[0], color[1], color[2]], width: w, height: h });
   if (name !== undefined) this.name = name;
@@ -1564,7 +1779,7 @@ RenderQueueItem.prototype = {
     for (var i = 0; i < l.length; i++) if (l[i].id === this.__id) return l[i];
     throw __err("the render queue item no longer exists");
   },
-  get comp() { return new CompItem(this.__info().comp); },
+  get comp() { return __item(this.__info().comp); },
   get status() {
     var s = this.__info().statusLabel;
     for (var k in __rqStatus) if (s.indexOf(k) === 0) return __rqStatus[k];
@@ -1654,7 +1869,11 @@ function ImportOptions(file) {
   this.rangeStart = 0;
   this.rangeEnd = 0;
 }
-ImportOptions.prototype.canImportAs = function (t) { return t === ImportAsType.FOOTAGE; };
+ImportOptions.prototype.canImportAs = function (t) {
+  if (t === ImportAsType.FOOTAGE) return true;
+  return (t === ImportAsType.COMP || t === ImportAsType.COMP_CROPPED_LAYERS) &&
+    /\.(psd|psb|pdf|ai|eps)$/i.test(__str(this.file));
+};
 
 function Project() {}
 Project.prototype = {
@@ -1662,7 +1881,7 @@ Project.prototype = {
   __info: function () { return __get("project"); },
   get items() { return new ItemCollection(0); },
   get numItems() { return this.__info().items.length; },
-  get rootFolder() { return new FolderItem(0); },
+  get rootFolder() { return __item(0); },
   get activeItem() { return __item(this.__info().active); },
   get selection() { return this.__info().selection.map(__item); },
   get file() { var p = this.__info().path; return p ? new File(p) : null; },
@@ -1676,8 +1895,18 @@ Project.prototype = {
   set linearizeWorkingSpace(v) { __call("file.projectSettings", { linearize: !!v }); },
   get workingSpace() { return this.__info().workingSpace; },
   set workingSpace(v) { __call("file.projectSettings", { workingSpace: String(v) || "none" }); },
+  get workingGamma() { return this.__info().workingGamma; },
+  set workingGamma(v) { __call("file.projectSettings", { workingGamma: __num(v) }); },
   get timeDisplayType() { return this.__info().timeDisplayFrames ? TimeDisplayType.FRAMES : TimeDisplayType.TIMECODE; },
   set timeDisplayType(v) { __call("file.projectSettings", { timeDisplay: v === TimeDisplayType.FRAMES ? "frames" : "timecode" }); },
+  get framesCountType() { return this.__info().displayStartFrame === 1 ? FramesCountType.FC_START_1 : FramesCountType.FC_START_0; },
+  set framesCountType(v) {
+    if (v === FramesCountType.FC_TIMECODE_CONVERSION) throw __err("framesCountType: Timecode Conversion is not supported, use FC_START_0 or FC_START_1");
+    if (v !== FramesCountType.FC_START_0 && v !== FramesCountType.FC_START_1) throw __err("Bad framesCountType value " + v);
+    __call("file.projectSettings", { frameStart: v === FramesCountType.FC_START_1 ? 1 : 0 });
+  },
+  get displayStartFrame() { return this.__info().displayStartFrame; },
+  set displayStartFrame(v) { __call("file.projectSettings", { frameStart: __num(v) }); },
   get expressionEngine() { return "javascript-1.0"; },
   set expressionEngine(v) {},
   item: function (i) {
@@ -1704,9 +1933,21 @@ Project.prototype = {
   importFile: function (opts) {
     var f = opts instanceof ImportOptions ? opts.file : opts;
     if (!f) throw __err("importFile(): no file");
-    var r = __call("file.import", { paths: [__str(f)] });
+    var args = { paths: [__str(f)] };
+    // After Effects imports just the picked file unless ImportOptions.sequence is set.
+    if (opts instanceof ImportOptions) {
+      args.sequence = !!opts.sequence;
+      switch (opts.importAs) {
+        case ImportAsType.FOOTAGE: args.importAs = "footage"; break;
+        case ImportAsType.COMP: args.importAs = "composition"; break;
+        case ImportAsType.COMP_CROPPED_LAYERS: args.importAs = "compositionLayerSizes"; break;
+        default: throw __err("importFile(): unsupported ImportOptions.importAs value " + opts.importAs);
+      }
+    }
+    var r = __call("file.import", args);
     if (r.errors && r.errors.length) throw __err(r.errors.join("; "));
-    return __item(r.items[0]);
+    // Composition imports create several footage items, but callers need the comp.
+    return __item(r.comps && r.comps.length ? r.comps[0] : r.items[0]);
   },
   importFileWithDialog: function () { return null; },
   importPlaceholder: function (name, w, h, rate, dur) {
@@ -1743,11 +1984,11 @@ var app = {
   exitCode: 0,
   saveProjectOnCrash: true,
   onError: null,
+  // Kept in the settings folder, so they last between runs (`script.settings.*`).
   settings: {
-    __s: {},
-    haveSetting: function (sec, key) { return (sec + "/" + key) in this.__s; },
-    getSetting: function (sec, key) { return this.__s[sec + "/" + key] || ""; },
-    saveSetting: function (sec, key, v) { this.__s[sec + "/" + key] = String(v); },
+    haveSetting: function (sec, key) { return __call("script.settings.get", { section: String(sec), key: String(key) }).have; },
+    getSetting: function (sec, key) { return __call("script.settings.get", { section: String(sec), key: String(key) }).value; },
+    saveSetting: function (sec, key, v) { __call("script.settings.save", { section: String(sec), key: String(key), value: String(v) }); },
   },
   preferences: {
     havePref: function () { return false; },
@@ -1760,6 +2001,7 @@ var app = {
     savePrefAsBool: function () {},
     savePrefAsFloat: function () {},
     reload: function () {},
+    saveToDisk: function () {},
   },
   newProject: function () { __call("file.newProject", {}); return new Project(); },
   open: function (file) {
@@ -1773,13 +2015,18 @@ var app = {
   beginSuppressDialogs: function () {},
   endSuppressDialogs: function () {},
   purge: function () { __call("edit.purge", { what: "all" }); },
-  findMenuCommandId: function (name) { return __get("menuCommandId", { name: String(name) }); },
+  findMenuCommandId: function (name) {
+    // Well-known After Effects ids must not shift when EffectCraft registers a command.
+    if (String(name) === "Undo") return 16;
+    return __get("menuCommandId", { name: String(name) });
+  },
   executeCommand: function (id) {
+    if (id === 16) return __call("edit.undo", {});
     var cmd = typeof id === "number" ? __get("commandAt", { index: id }) : String(id);
     if (!cmd) throw __err("Unknown command id " + id);
     return __call(cmd, {});
   },
-  scheduleTask: function (code, delay, repeat) { return __task("schedule", String(code), !!repeat); },
+  scheduleTask: function (code, delay, repeat) { return __task("schedule", String(code), Number(delay), !!repeat); },
   cancelTask: function (id) { __task("cancel", id); },
   setMemoryUsageLimits: function () {},
   setMultiFrameRenderingConfig: function () {},

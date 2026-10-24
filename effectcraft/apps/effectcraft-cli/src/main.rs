@@ -6,6 +6,7 @@
 //! effectcraft-cli exec <command-id> [--params JSON]           run one command
 //! effectcraft-cli exec --list [--filter TEXT] [--schemas]     list engine commands (as `commands`)
 //! effectcraft-cli run <id> <json> [<id> <json> …]             run several commands in order
+//! effectcraft-cli run --args-file F                           the same, one argument per line of F
 //! effectcraft-cli props <comp> <layer> [--flat] [--time S]    a layer's property tree (with paths)
 //! effectcraft-cli get <comp> <layer> <path> [--time S]        read a property
 //! effectcraft-cli set <comp> <layer> <path> <value> [--time S] [--expression E]
@@ -16,6 +17,10 @@
 //!     [--profile main|main10] [--level auto|4.1] [--rate-control bitrate|quality] [--video-quality 1-100]
 //!     [--keyint FRAMES] [--webm-codec vp9|av1] [--audio-bitrate KBPS] [--opus-app audio|voice]
 //!     (a relative --out is relative to the working directory; --queue outputs follow the project's own settings)
+//!     [--progress]  report progress on stderr when it is not a terminal, up to four lines a second:
+//!     `progress <frames done> <frames total> <seconds elapsed> <seconds left, or - when unknown>`
+//! effectcraft-cli render --template T.ectemplate [--values V.json] --out FILE
+//! effectcraft-cli render-frame --template T.ectemplate [--values V.json] [--time S] [--out F.png]
 //! effectcraft-cli render F.ecproj --queue                    render the project's Render Queue
 //! effectcraft-cli bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d]]   render timings
 //!     (--gpu: CPU vs GPU ms/frame for every comp at Full and Half)
@@ -38,6 +43,8 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use std::io::Write;
+
+mod template;
 
 use effectcraft_automation::tools::{self, Reply};
 use effectcraft_automation::{Backend, McpServer};
@@ -90,6 +97,7 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
   commands [--filter TEXT] [--enabled]     list engine commands
   exec <command-id> [--params JSON]        run one engine command (exec --list: list them, as `commands`)
   run <id> <json> [<id> <json> ...]        run several commands in order
+  run --args-file F                        the same, one argument per line of F (no command-line length limit)
   props <comp> <layer> [--flat] [--time S] a layer's property tree with paths
   get <comp> <layer> <path> [--time S]     read a property
   set <comp> <layer> <path> <value> [--time S] [--expression E]
@@ -102,6 +110,9 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
                                            (formats h264|hevc|av1|prores|webm|png|jpeg|tiff|exr|gif|wav|aiff;
                                            --profile..--keyint: HEVC / AV1, --audio-bitrate/--opus-app: WebM Opus)
                                            a relative --out is relative to the working directory
+                                           --progress: progress lines on stderr when it is not a terminal
+                                           (progress <frames done> <total> <seconds elapsed> <seconds left|->)
+  render/render-frame --template T.ectemplate [--values V.json]   render one template instance
   bench [--comp C] [--time S] [--scale K] [--n N] [--play N] [--gpu [--adv3d]]   per-layer/effect render timings;
                                            --play N renders N consecutive frames with/without the layer cache;
                                            --gpu compares CPU and GPU ms/frame for every comp at Full and Half
@@ -112,6 +123,9 @@ const USAGE: &str = "usage: effectcraft-cli <info|commands|exec|run|props|get|se
                                            (app.project, comps, layers, properties…); prints writeLn
                                            output and the result; errors exit 1 with file:line:col
   mcp [--autosave | --bridge PORT]         MCP server (JSON-RPC over stdio); --autosave preserves unsaved headless work
+      [--automation-read-root DIR] [--automation-write-root DIR]
+                                           confine the agent's file access: reads under a read or write root,
+                                           writes under a write root (each repeatable); scripts are refused
 options: --project F.ecproj | --demo | --empty   --save | --save-as F   --bridge PORT   --json   --gpu
 <comp>: id or name, '-' = active comp; <layer>: id, '#n' or name; <value>: JSON or bare string";
 
@@ -136,7 +150,10 @@ const VALUED: &[&str] = &[
     "--expression",
     "--depth",
     "--eval",
+    "--args-file",
     // render
+    "--template",
+    "--values",
     "--format",
     "--start",
     "--end",
@@ -156,6 +173,9 @@ const VALUED: &[&str] = &[
     "--webm-codec",
     "--audio-bitrate",
     "--opus-app",
+    // mcp
+    "--automation-read-root",
+    "--automation-write-root",
 ];
 
 /// Options without a value. Any other `--option` is a usage error.
@@ -176,6 +196,7 @@ const FLAGS: &[&str] = &[
     "--small",
     "--adv3d",
     "--autosave",
+    "--progress",
 ];
 
 struct Args {
@@ -225,6 +246,10 @@ impl Args {
     fn flag(&self, k: &str) -> bool {
         self.opts.iter().any(|(o, _)| o == k)
     }
+    /// Every value of a repeatable option, in order.
+    fn opts(&self, k: &str) -> Vec<&str> {
+        self.opts.iter().filter(|(o, _)| o == k).filter_map(|(_, v)| v.as_deref()).collect()
+    }
     fn opt(&self, k: &str) -> Option<&str> {
         self.opts.iter().rev().find(|(o, _)| o == k).and_then(|(_, v)| v.as_deref())
     }
@@ -246,8 +271,18 @@ fn value_arg(s: &str) -> Value {
     serde_json::from_str(s).unwrap_or_else(|_| json!(s))
 }
 
+/// The command line as text. `std::env::args` panics on an argument that is not Unicode (a
+/// Latin-1 file name on Linux). Every argument is used as a string, and a lossy copy would read or
+/// write another file than the one named, so such an argument is a usage error naming it.
+fn utf8_args(raw: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Vec<String>, String> {
+    raw.into_iter().map(|a| a.into_string().map_err(|a| format!("argument `{}` is not valid Unicode", a.to_string_lossy()))).collect()
+}
+
 fn main() {
-    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let raw = match utf8_args(std::env::args_os().skip(1)) {
+        Ok(raw) => raw,
+        Err(e) => fail_usage(&e),
+    };
     if matches!(raw.first().map(String::as_str), Some("--version" | "-V" | "version")) {
         say!("effectcraft-cli {}", env!("CARGO_PKG_VERSION"));
         return;
@@ -419,6 +454,7 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
     if args.flag("--autosave") && cmd != "mcp" {
         return usage_err("--autosave is only supported by mcp");
     }
+    template::validate(cmd, args)?;
     match cmd {
         "render" => render(args, json_out)?,
         "bench" => bench_cmd(args)?,
@@ -475,14 +511,22 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             };
             let mut b = backend(args, true)?;
             let r = b.exec(&id, params)?;
+            if let Some(e) = failed_render(&id, &r) {
+                return Err(Failure::Error(e));
+            }
             let saved = maybe_save(&mut b, args)?;
             emit(&with_saved(r, saved), json_out);
         }
         "run" => {
-            if args.pos.is_empty() {
+            let mut pairs = args.pos.clone();
+            // Windows caps a command line at 32 767 characters: long batches come from a file.
+            if let Some(f) = args.opt("--args-file") {
+                let text = std::fs::read_to_string(f).map_err(|e| Failure::Usage(format!("--args-file {f}: {e}")))?;
+                pairs.extend(text.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from));
+            }
+            if pairs.is_empty() {
                 return usage_err("run needs <command-id> [<json>] pairs");
             }
-            let pairs = args.pos.clone();
             let mut b = backend(args, true)?;
             let mut results = vec![];
             let mut i = 0;
@@ -497,6 +541,9 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
                 };
                 i += 1;
                 let r = b.exec(id, params).map_err(|e| Failure::Error(format!("{id}: {e}")))?;
+                if let Some(e) = failed_render(id, &r) {
+                    return Err(Failure::Error(format!("{id}: {e}")));
+                }
                 if !json_out {
                     emit(&r, false);
                 }
@@ -550,7 +597,13 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             emit(&with_saved(v, saved), json_out);
         }
         "render-frame" | "frame" => {
-            let mut b = backend(args, true)?;
+            let mut b = if args.opt("--template").is_some() {
+                let mut s = session(args)?;
+                template::prepare(&mut s, args)?;
+                Backend::headless(s)
+            } else {
+                backend(args, true)?
+            };
             let comp = args.opt("--comp").and_then(reference);
             let mut time = args.num("--time")?;
             let mut max_side = args.num("--max-side")?.map(|m| m as u32).unwrap_or(0);
@@ -581,7 +634,12 @@ fn run(cmd: &str, args: &Args, json_out: bool) -> Result<(), Failure> {
             if args.flag("--autosave") && args.opt("--bridge").is_some() {
                 return usage_err("--autosave is for headless MCP; the bridged app owns its auto-saves");
             }
-            let b = backend(args, false)?;
+            let mut b = backend(args, false)?;
+            let (read, write) = (args.opts("--automation-read-root"), args.opts("--automation-write-root"));
+            if !read.is_empty() || !write.is_empty() {
+                let roots = |r: Vec<&str>| r.into_iter().map(std::path::PathBuf::from).collect::<Vec<_>>();
+                b.confine(effectcraft_automation::confine::Confinement::new(&roots(read), &roots(write))?);
+            }
             let server = McpServer::new(b);
             let mut server = if args.flag("--autosave") {
                 let root =
@@ -608,6 +666,21 @@ fn positional<const N: usize>(args: &Args, usage: &str) -> Result<[String; N], F
     Ok(std::array::from_fn(|i| args.pos[i].clone()))
 }
 
+/// `renderQueue.render` reports a failed item in its result, not as an error. Under `run`/`exec`
+/// that item fails the command (#1426), as it fails `render --queue`.
+fn failed_render(id: &str, r: &Value) -> Option<String> {
+    if id != "renderQueue.render" {
+        return None;
+    }
+    let failed: Vec<String> = r["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|i| Some(format!("{}: {}", i["compName"].as_str().unwrap_or("?"), i["status"].get("Failed")?.as_str().unwrap_or("failed"))))
+        .collect();
+    (!failed.is_empty()).then(|| failed.join("; "))
+}
+
 fn with_saved(v: Value, saved: Option<String>) -> Value {
     match saved {
         None => v,
@@ -624,15 +697,18 @@ fn from_cwd(path: &str) -> Result<String, Failure> {
 /// `render`: queue `--comp` (or the active comp) with the given settings unless `--queue`, then
 /// render the queue with a progress line on stderr. Fails if any item fails.
 fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
-    use effectcraft_engine::project::render_queue::RenderStatus;
+    use effectcraft_engine::project::render_queue::{OutputFormat, RenderStatus};
     if args.opt("--bridge").is_some() {
         return usage_err("render runs headless; use `exec renderQueue.add` / `renderQueue.render` with --bridge");
     }
     let mut s = session(args)?;
-    match &args.project {
-        Some(p) => s.execute("file.open", json!({"path": p})).map_err(|e| Failure::Error(e.to_string()))?,
-        None => s.execute("file.openDemoProject", json!({})).map_err(|e| Failure::Error(e.to_string()))?,
-    };
+    if args.opt("--template").is_some() {
+        template::prepare(&mut s, args)?;
+    } else if let Some(p) = &args.project {
+        s.execute("file.open", json!({"path": p})).map_err(|e| Failure::Error(e.to_string()))?;
+    } else if args.flag("--demo") || !args.flag("--empty") {
+        s.execute("file.openDemoProject", json!({})).map_err(|e| Failure::Error(e.to_string()))?;
+    }
     let err = |e: effectcraft_engine::EngineError| Failure::Error(e.to_string());
     if !args.flag("--queue") {
         let Some(out) = args.opt("--out") else { return usage_err("render: --out FILE is required (or --queue)") };
@@ -670,6 +746,11 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
         }
         if let Some(v) = args.num("--bitrate")? {
             p["bitrate"] = json!(v);
+            // VP9 WebM encodes by quality unless told to target the bitrate (#440).
+            // The format parser decides what is WebM, so its aliases (`vp9`, `webmvp9opus`) count.
+            if p["format"].as_str().and_then(OutputFormat::from_name) == Some(OutputFormat::WebM) {
+                p["webmBitrate"] = json!(true);
+            }
         }
         for (flag, key) in [
             ("--profile", "profile"),
@@ -704,8 +785,21 @@ fn render(args: &Args, json_out: bool) -> Result<(), Failure> {
     }
     s.execute("renderQueue.render", json!({"wait": false})).map_err(err)?;
     let tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    // `--progress`: one line per update for a program reading stderr (a terminal gets the live line).
+    let lines = args.flag("--progress") && !tty;
+    let (mut last_line, mut last_done) = (std::time::Instant::now(), u64::MAX);
     while s.is_rendering() {
         std::thread::sleep(std::time::Duration::from_millis(100));
+        if lines
+            && last_line.elapsed() >= std::time::Duration::from_millis(250)
+            && let Some(p) = s.render_progress()
+            && p.done != last_done
+        {
+            last_line = std::time::Instant::now();
+            last_done = p.done;
+            let left = p.remaining.map_or_else(|| "-".to_string(), |r| format!("{r:.1}"));
+            note!("progress {} {} {:.1} {left}", p.done, p.total, p.item_elapsed);
+        }
         if tty && let Some(p) = s.render_progress() {
             let left = p.remaining.map(|r| format!(", ~{r:.1}s left")).unwrap_or_default();
             let _ = write!(
@@ -1230,6 +1324,18 @@ mod tests {
         let a = parse(&["render", "t.ecproj", "--comp=Main", "--work-area", "--out", "x.mp4", "--json"]).unwrap();
         assert_eq!((a.project.as_deref(), a.opt("--comp"), a.opt("--out")), (Some("t.ecproj"), Some("Main"), Some("x.mp4")));
         assert!(a.flag("--work-area") && a.flag("--json"));
+    }
+
+    /// `std::env::args` panicked on an argument that is not Unicode; it is a usage error naming
+    /// it, and Unicode arguments pass through unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_arguments_are_refused() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let args = [OsString::from("render-frame"), OsString::from("--out"), OsString::from_vec(b"caf\xe9.png".to_vec())];
+        assert_eq!(utf8_args(args).unwrap_err(), "argument `caf\u{fffd}.png` is not valid Unicode");
+        assert_eq!(utf8_args([OsString::from("info"), OsString::from("caf\u{e9}.png")]).unwrap(), ["info", "caf\u{e9}.png"]);
     }
 
     /// Every `--option` the CLI reads is declared in VALUED or FLAGS, so none is refused.

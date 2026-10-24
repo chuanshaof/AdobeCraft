@@ -1,5 +1,6 @@
 //! Info panel: colour and position under the pointer, plus the current selection.
 
+use crate::i18n::{tr, tr_args};
 use egui::{Align2, Color32, Rect, pos2, vec2};
 
 use crate::theme::Tokens;
@@ -17,16 +18,9 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
     let (rgba, xy) = match (app.pointer_comp, &app.viewer_image) {
         (Some([cx, cy]), Some(img)) => {
-            let comp = app.session.active_comp();
-            let (cw, ch) = comp.map(|c| (c.width as f32, c.height as f32)).unwrap_or((1.0, 1.0));
-            let sx = (cx / cw * img.size[0] as f32) as i64;
-            let sy = (cy / ch * img.size[1] as f32) as i64;
-            let px = if sx >= 0 && sy >= 0 && (sx as usize) < img.size[0] && (sy as usize) < img.size[1] {
-                Some(img.pixels[sy as usize * img.size[0] + sx as usize])
-            } else {
-                None
-            };
-            (px, Some((cx, cy)))
+            let comp = app.session.active_comp().map_or([1.0, 1.0], |c| [c.width as f32, c.height as f32]);
+            let region = super::viewer_tools::shown_region(ui.ctx(), comp);
+            (super::fx_widgets::frame_pixel(img, region, [cx as f64, cy as f64]), Some((cx, cy)))
         }
         _ => (None, None),
     };
@@ -66,8 +60,14 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if let Some(c) = comp {
         let sel: Vec<String> = app.session.state.selected_layers.iter().filter_map(|id| c.layer(*id)).map(|l| l.name.clone()).collect();
         let tc = crate::panels::timecode(&app.session, &c, app.session.time());
-        p.text(pos2(x0, y), Align2::LEFT_CENTER, if sel.is_empty() { "No layer selected".to_string() } else { sel.join(", ") }, Tokens::semibold(12.0), t.text);
-        p.text(pos2(x0, y + 18.0), Align2::LEFT_CENTER, format!("Time: {tc}"), Tokens::ui(12.0), t.text_dim);
+        p.text(
+            pos2(x0, y),
+            Align2::LEFT_CENTER,
+            if sel.is_empty() { tr("No layer selected").to_string() } else { sel.join(", ") },
+            Tokens::semibold(12.0),
+            t.text,
+        );
+        p.text(pos2(x0, y + 18.0), Align2::LEFT_CENTER, tr_args("Time: {}", &[&tc]), Tokens::ui(12.0), t.text_dim);
         // One layer selected: Duration, In and Out like AE's Info panel.
         let mut ly = y + 36.0;
         if let [id] = app.session.state.selected_layers.as_slice()
@@ -100,7 +100,13 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         if app.session.prefs.composition.show_rendering_progress {
             let ms = app.frames.last_ms.lock().map(|v| *v).unwrap_or(0.0);
             let rq = app.session.render_job.as_ref().map(|_| "  •  Rendering queue…").unwrap_or("");
-            p.text(pos2(x0, ly), Align2::LEFT_CENTER, format!("Render: {ms:.0} ms  •  UI {:.0} fps{rq}", app.fps), Tokens::ui(11.5), t.text_faint);
+            p.text(
+                pos2(x0, ly),
+                Align2::LEFT_CENTER,
+                tr_args("Render: {} ms  •  UI {} fps{}", &[&format!("{ms:.0}"), &format!("{:.0}", app.fps), &rq]),
+                Tokens::ui(11.5),
+                t.text_faint,
+            );
         }
         if !app.session.state.selected_keys.is_empty() {
             // One key: its property, time and value (as After Effects' Info panel shows them).

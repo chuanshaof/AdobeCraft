@@ -105,7 +105,10 @@ fn browser_import(s: &mut Session, p: &Value) -> Result<Value> {
         return Ok(json!({"pending": true, "paths": list}));
     }
     let target = s.active_comp_id();
-    let mut r = s.execute("file.import", json!({"paths": paths}))?;
+    // A numbered still picked in the browser still brings its image sequence (`sequence: false`
+    // for the picked stills alone); `file.import` alone imports stills.
+    let sequence = p.get("sequence").and_then(Value::as_bool).unwrap_or(true);
+    let mut r = s.execute("file.import", json!({"paths": paths, "sequence": sequence}))?;
     // Dragged into the Timeline or the Composition viewer: into the comp, where they were dropped.
     let errors = super::file::add_to_comp(s, &r, target, p);
     if !errors.is_empty()
@@ -120,9 +123,8 @@ fn file_info(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").ok_or_else(|| bad("mediaBrowser.fileInfo", "missing `path`"))?;
     let (created, modified, size) = mb::file_dates(path);
     let mut v = json!({"path": path, "kind": mb::kind_of(path), "size": size, "created": created.map(mb::iso_date), "modified": modified.map(mb::iso_date)});
-    if let Some(imp) = s.importer.clone()
-        && matches!(mb::kind_of(path), Some("video" | "image" | "audio" | "model"))
-        && let Ok(f) = imp.probe(path)
+    if matches!(mb::kind_of(path), Some("video" | "image" | "audio" | "model"))
+        && let Ok(f) = s.probe_footage(path)
     {
         v["footage"] = mb::footage_metadata(&f);
     }
@@ -237,7 +239,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Import",
             [],
             None,
-            "{paths, addToComp?, time?, index?, position? (where the layers go, as in layer.addItem)}",
+            "{paths, sequence? (default true: a numbered still brings its image sequence), addToComp?, time?, index?, position? (where the layers go, as in layer.addItem)}",
             browser_enabled,
             browser_import
         ),

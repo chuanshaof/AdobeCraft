@@ -61,6 +61,7 @@ device of their own), `?nosw` (don't register the service worker).
 | config directory: settings, shortcut presets, recent projects, the recovery sentinel | `store::WebConfig` in browser storage |
 | auto-save folder | `/EffectCraft Auto-Save/` in browser storage (`ConfigStore::files`) |
 | media reads (`MediaPool`, `probe`) | `files::WebImporter`: bytes from the file table, handed to `MediaPool::add_bytes` / `probe_bytes` |
+| Memory & CPU cache budgets, scaled to the system's RAM | the page's memory, at most 4 GiB (wasm32), which the caches share with the decoders' own decoded frames (FilmCraft keeps up to 384 MB per open movie): the Layer Cache stays within 512 MB and the Footage Frame Cache within 256 MB (`Prefs::cache_budgets`) |
 | export writes (`effectcraft-export`) | the job's `sink` (`effectcraft_host::FileExporter { sink }`): files land in the table and download after the render; several files (an image sequence) download as one stored `.zip` |
 | rfd file dialogs | `<input type=file>` for File ▸ Open / Import; drop files anywhere on the page (`.ecproj` opens, everything else imports); "Save As" / "Output To" pick a download name |
 | Media Browser on the file system | browser storage and folders opened with the File System Access API (below) |
@@ -155,8 +156,9 @@ of the project:
 
 Frames without effects that the WebGPU compositor can finish alone still render on the page
 (they stay on the GPU, no readback); everything else (frames with effects, 3D runs, the Software
-Only renderer, WebGL2) goes to the workers. If no worker is usable, frames render on the page's
-thread as before. `effectcraft.info().frameWorkers` reports `{workers, alive, busy, rendered,
+Only renderer, WebGL2) goes to the workers. If no worker is usable (one that failed to start, or
+one the browser refused to create, as in a sandboxed iframe), frames render on the page's thread
+as before. `effectcraft.info().frameWorkers` reports `{workers, alive, busy, rendered,
 failed, lastMs, syncs, syncBytes, gpu, gpuFrames, lastPasses, diskHits}` (`gpu`: each worker's
 adapter, `{cpu: why}` without one, `null` until it reported).
 
@@ -171,9 +173,9 @@ the same futures with `passes::block_on`; they never wait there).
 
 - **Render Queue**: `effectcraft_export::export_async` renders each frame in passes (frames
   with deferred readbacks render one by one instead of in parallel batches) and encodes as
-  before (`Exporter::export_async`). Renders use Backend Auto, as on the desktop: per comp
-  the worker warms up both sides (GPU first) and then renders on the faster one, each frame's
-  time measured across all its passes.
+  before (`Exporter::export_async`). As on the desktop, a job renders every frame on the
+  project's renderer (the worker's GPU with Mercury GPU Acceleration), not on whichever
+  compositor measured faster, so runs don't differ by timing.
 - **Analyses** (Warp Stabilizer, 3D Camera Tracker, Track Motion, mask and face tracking, Roto
   Brush freeze and propagation): their work functions are `async`; started with `wait` inside
   a job they are queued and awaited (`offload::run_or_queue`), and each input frame renders in
@@ -412,7 +414,8 @@ no npm packages): load, the GPU path (WebGPU → GPU compositor, viewer on the G
 in the viewer, `render.frame`, Render Queue GIF and PNG sequence (`.zip`) downloads, a background
 render in a worker while measuring the page's event-loop gaps (must stay under 400 ms) and its
 progress, the AudioContext starting on a (simulated) key press and a tone playing through it
-with the meters moving, Save As and re-opening the saved project, persistence across a reload
+with the meters moving, Save As and re-opening the saved project, a script opening a file from
+browser storage and the footage check finding stored media, persistence across a reload
 (session snapshot, a stored project, imported media, a setting, Open Recent) and an offline
 reload through the service worker. It writes screenshots and `report.json`:
 
@@ -423,13 +426,20 @@ node apps/effectcraft-web/tests/smoke.mjs --url http://127.0.0.1:8765/ --out tar
 
 `apps/effectcraft-web/tests/workers.mjs` checks the job-worker plumbing (`js/host.js`,
 `web/worker.js`) under Node with a fake `Worker`, without a build: a replaced file is sent to a
-reused worker again even at the same size, and a worker that fails to start fails its job and is
-terminated (`node apps/effectcraft-web/tests/workers.mjs`).
+reused worker again even at the same size, a worker that fails to start fails its job and is
+terminated, and a `new Worker` that throws (a sandboxed iframe) fails the job and reports the
+frame worker dead instead of stopping startup (`node apps/effectcraft-web/tests/workers.mjs`).
 
 `apps/effectcraft-web/tests/page.mjs` checks page-side helpers of `js/host.js` the same way with
 a fake DOM: a picked file that can't be read is reported while the others are added, and the
 device-lost notice saves, flushes before reloading and reports a failed flush
 (`node apps/effectcraft-web/tests/page.mjs`).
+
+`apps/effectcraft-web/tests/storage.mjs` checks the IndexedDB storage backend of `js/host.js`
+with a fake IndexedDB: a put or delete resolves only once its transaction has committed, and one
+whose transaction aborts after its request succeeded (or whose request fails or throws) rejects
+and leaves the stored entry as it was, so the flush keeps it for a retry (#1242)
+(`node apps/effectcraft-web/tests/storage.mjs`).
 
 It also checks the M13.10 paths: viewer frames rendered in frame workers while scrubbing with the
 CPU renderer (project synced as diffs, event-loop gaps under 400 ms), a `wait: true` render that
@@ -452,19 +462,19 @@ every request and reply, a render through an in-process offload; `tests_roto.rs`
 propagation through an offload streaming segmentations; `tests_mask_warp.rs`: Warp Stabilizer
 plans solved in the job, never by `warp.status` on the page), the frame-worker protocol
 (`crates/engine/src/remote.rs`: diff / patch, a replica following edits renders the same pixels;
-`crates/ui-egui/tests/ui_web_offload.rs`: the frame cache through a remote renderer, `wait: true`
+`crates/ui-egui/tests/it/ui_web_offload.rs`: the frame cache through a remote renderer, `wait: true`
 deferred until the offloaded job ends) and the Media Browser's virtual tree (`media_browser.rs`,
 `tests_panels.rs`). M13.24: deferred readbacks on a real device (`crates/gpu/src/tests_deferred.rs`:
 whole-frame GPU and CPU-composited frames in passes match the CPU, placeholders never reach the
 layer cache; `deferred.rs`: keys, late readbacks of an older frame dropped), the frame server's
 passes and Auto timing (`remote.rs`, a deferred stand-in accelerator), the browser's routing and
-disk cache (`crates/ui-egui/tests/ui_web_gpu_storage.rs`: a GPU frame worker renders effect frames,
+disk cache (`crates/ui-egui/tests/it/ui_web_gpu_storage.rs`: a GPU frame worker renders effect frames,
 the page's GPU keeps frames without effects, frames stored under their disk keys come back after a
 "reload" without rendering, the blue cache bar sees them; the storage manager's widgets and
 commands), the disk index (`disk_cache.rs`), the store's usage by kind and clearing (`store.rs`),
 `storage.*` (`storage.rs`), and every WGSL float literal fitting f32 (browsers reject the whole
 module otherwise; `tests.rs`). M13.30: job workers on a deferred device
-(`crates/ui-egui/tests/ui_web_job_gpu.rs`: a Render Queue job and a Warp Stabilizer analysis
+(`crates/ui-egui/tests/it/ui_web_job_gpu.rs`: a Render Queue job and a Warp Stabilizer analysis
 render their frames in passes on the device, with the CPU worker's pixels / result),
 particles, Advanced 3D and the job pass driver in passes (`crates/gpu/src/tests_deferred_jobs.rs`),
 layer buffers through the disk store and the prefetch plan (`remote.rs`

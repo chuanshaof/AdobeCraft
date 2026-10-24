@@ -58,7 +58,8 @@ pub trait Exporter: Send + Sync {
     /// Formats this build can write.
     fn formats(&self) -> Vec<OutputFormat>;
     /// Render and write one item (blocking). `progress(done, total)` returns `false` to cancel;
-    /// a cancelled export returns `Err("cancelled")`.
+    /// a cancelled export removes the files it opened for that output and returns `Err("cancelled")`.
+    /// Completed earlier queue items and unrelated files must be preserved.
     fn export(&self, job: &ExportJob, progress: &mut dyn FnMut(u64, u64) -> bool) -> Result<ExportResult, String>;
     /// [`Exporter::export`] as a future: renders whose GPU readbacks are deferred (a browser
     /// job worker's WebGPU device) await the device between a frame's passes. The default runs
@@ -156,6 +157,14 @@ struct Work {
     nested_switches: bool,
 }
 
+/// Where a relative render output goes when there is no default folder and the project is unsaved:
+/// `~/Movies` when it exists, else the home folder itself.
+pub(crate) fn default_output_base(home: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    let home = home.filter(|h| !h.as_os_str().is_empty())?;
+    let movies = home.join("Movies");
+    Some(if movies.is_dir() { movies } else { home })
+}
+
 /// Bits per channel an output format writes for a project bit depth (named in the file when
 /// Settings ▸ Export ▸ Append Bit Depth to File Name is on).
 pub fn output_bits(format: OutputFormat, depth: effectcraft_project::BitDepth) -> u32 {
@@ -193,6 +202,11 @@ pub fn bytes_per_frame(om: &OutputModule, w: u32, h: u32, fps: f64) -> f64 {
                 P4444Xq => 500.0,
             };
             mbps(rate) * px / 29.97
+        }
+        // 24-bit RGB rows padded to even bytes, or 32-bit ARGB.
+        OutputFormat::Uncompressed => {
+            let bpp = if om.channels == effectcraft_project::render_queue::Channels::Rgba { 4 } else { 3 };
+            ((w as u64 * bpp).next_multiple_of(2) * h as u64) as f64
         }
         OutputFormat::WebM => mbps(8.0) * px / fps,
         OutputFormat::Gif => w as f64 * h as f64 * 0.5,
@@ -321,8 +335,9 @@ impl Session {
             .unwrap_or_else(|| "Untitled Project".into())
     }
 
-    /// The output path of a queue item: template tokens expanded, relative paths resolved against
-    /// the project's folder (or the working directory). `None` when the comp is gone or the
+    /// The output path of a queue item: template tokens expanded, ending in the format's
+    /// extension exactly once ([`OutputFormat::with_extension`]), relative paths resolved against
+    /// the project's folder (an unsaved project's against ~/Movies or home). `None` when the comp is gone or the
     /// output is empty ("Needs Output").
     pub fn resolve_output(&self, item: &RenderQueueItem) -> Option<String> {
         let comp = self.project.comp(item.comp)?;
@@ -338,7 +353,8 @@ impl Session {
         let pname = self.project_name();
         let vars =
             TemplateVars { comp_name: &name, project_name: &pname, width: w, height: h, frame_rate: rate.as_f64(), start_frame: f0, end_frame: f0 + n - 1 };
-        let p = expand_template(tpl, item.output.format, &vars);
+        // The format's extension exactly once, whatever the name or a save dialog added (#293).
+        let p = item.output.format.with_extension(&expand_template(tpl, item.output.format, &vars));
         let path = std::path::Path::new(&p);
         if path.is_absolute() {
             return Some(p);
@@ -346,8 +362,19 @@ impl Session {
         // Settings ▸ Export ▸ Default Output Folder, else the project's folder.
         let folder = self.prefs.export.default_output_folder.trim();
         let base = (!folder.is_empty()).then(|| std::path::PathBuf::from(folder));
-        let base =
-            base.or_else(|| self.path.as_deref().and_then(|s| std::path::Path::new(s).parent().map(|d| d.to_path_buf())).filter(|d| !d.as_os_str().is_empty()));
+        // A project saved under a bare filename has the empty path as its parent. It sits in the
+        // working directory, so resolve against that rather than falling through to the
+        // unsaved-project default below (#1427).
+        let base = base.or_else(|| {
+            self.path
+                .as_deref()
+                .and_then(|s| std::path::Path::new(s).parent())
+                .map(|d| if d.as_os_str().is_empty() { std::path::PathBuf::from(".") } else { d.to_path_buf() })
+        });
+        // Unsaved project: ~/Movies, else the home folder (as FilmCraft's exports do). The working directory
+        // is `/` for an app started from the macOS Finder, where nothing can be written (#446).
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(std::path::PathBuf::from);
+        let base = base.or_else(|| default_output_base(home));
         // (the web has no working directory: relative outputs land in its virtual root)
         let base = base.or_else(|| std::env::current_dir().ok()).or_else(|| cfg!(target_arch = "wasm32").then(|| "/".into()))?;
         Some(base.join(path).to_string_lossy().to_string())
@@ -494,7 +521,22 @@ impl Session {
             let sh = shared.clone();
             let thread = std::thread::Builder::new()
                 .name("render-queue".into())
-                .spawn(move || effectcraft_render::passes::block_on(run_work(work, &sh, &mut |_| {})))
+                .spawn(move || {
+                    let pending: Vec<u64> = work.items.iter().filter_map(|modules| modules.first().map(|(item, _)| item.id)).collect();
+                    if let Err(error) = crate::guard::guarded("render worker", || {
+                        effectcraft_render::passes::block_on(run_work(work, &sh, &mut |_| {}));
+                        Ok(())
+                    }) {
+                        let completed = lock(&sh.state).items_done;
+                        let mut updates = lock(&sh.updates);
+                        for id in pending.into_iter().skip(completed) {
+                            if !updates.iter().any(|u| matches!(u, ItemUpdate::Finished { id: done, .. } if *done == id)) {
+                                updates.push(ItemUpdate::Finished { id, status: RenderStatus::Failed(error.to_string()), seconds: 0.0, output: None });
+                            }
+                        }
+                        lock(&sh.state).finished = true;
+                    }
+                })
                 .map_err(|e| e.to_string())?;
             self.render_job = Some(RenderJob { shared, thread: Some(thread), remote: None });
         }
@@ -575,10 +617,17 @@ impl Session {
                 let _ = t.join();
             }
             let st = job.shared.snapshot();
-            let failed = updates.iter().filter(|u| matches!(u, ItemUpdate::Finished { status: RenderStatus::Failed(_), .. })).count();
+            let failures: Vec<&str> = updates
+                .iter()
+                .filter_map(|u| if let ItemUpdate::Finished { status: RenderStatus::Failed(e), .. } = u { Some(e.as_str()) } else { None })
+                .collect();
+            let failed = failures.len();
             let stopped = updates.iter().any(|u| matches!(u, ItemUpdate::Finished { status: RenderStatus::UserStopped, .. }));
-            let msg = if failed > 0 {
-                format!("Render finished with {failed} failed item(s)")
+            // The reason is otherwise only in the Status column's tooltip (#568).
+            let msg = if let [only] = failures.as_slice() {
+                format!("Render finished with 1 failed item(s): {only}")
+            } else if let Some(first) = failures.first() {
+                format!("Render finished with {failed} failed item(s), first: {first}")
             } else if stopped {
                 "Render stopped".to_string()
             } else {
@@ -606,8 +655,8 @@ impl Session {
         if item.post_render.is_none() {
             return Ok(None);
         }
-        let importer = self.importer.clone().ok_or("media import is not available in this build")?;
-        let footage = importer.probe(path)?;
+        // A rendered image sequence's first file brings the sequence.
+        let footage = self.probe_footage(path)?;
         if item.post_render == PostRenderAction::SetProxy {
             crate::commands::proxy_set(self, item.comp, footage).map_err(|e| e.to_string())?;
             self.toast(format!("Proxy set from {path}"));

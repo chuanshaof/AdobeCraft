@@ -10,10 +10,12 @@
 //!   3D Camera Tracker / Roto Brush analyses, Content-Aware Fill, Scene Edit Detection) with a
 //!   progress bar and a cancel button, and the recently finished ones.
 
+use crate::i18n::tr;
 use effectcraft_engine::media_browser as mb;
 use effectcraft_engine::project::ItemId;
 use egui::{Align2, Color32, Rect, Sense, Stroke, pos2, vec2};
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 use super::DragPayload;
 use super::panel_kit as kit;
@@ -23,6 +25,7 @@ use crate::{EffectcraftApp, widgets};
 // ---------------------------------------------------------------- Media Browser
 
 type Thumb = Option<(egui::TextureHandle, [u32; 2])>;
+type Listing = (f64, Arc<Result<Vec<mb::Entry>, String>>);
 
 /// Thumbnail of a file (cached per path; `None` while not decoded or not decodable).
 fn thumbnail(app: &EffectcraftApp, ctx: &egui::Context, path: &str, budget: &mut u32) -> Thumb {
@@ -66,7 +69,7 @@ pub fn media_browser(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let p = ui.painter().with_clip_rect(rect);
     p.rect_filled(rect, 0.0, t.panel_bg);
     let Some(b) = app.session.media_browser() else {
-        p.text(rect.center(), Align2::CENTER_CENTER, "The Media Browser is not available here (use File ▸ Import)", Tokens::ui(12.0), t.text_faint);
+        p.text(rect.center(), Align2::CENTER_CENTER, tr("The Media Browser is not available here (use File ▸ Import)"), Tokens::ui(12.0), t.text_faint);
         app.auto.add("mediaBrowser.unavailable", rect, "Media Browser unavailable");
         return;
     };
@@ -75,11 +78,11 @@ pub fn media_browser(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // Listing cached per folder for a second.
     let lid = egui::Id::new(("mb-list", dir.clone(), st.importable_only));
     let now = ctx.input(|i| i.time);
-    let listing: Option<(f64, Result<Vec<mb::Entry>, String>)> = ctx.data(|d| d.get_temp(lid));
+    let listing: Option<Listing> = ctx.data(|d| d.get_temp(lid));
     let entries = match listing {
         Some((at, l)) if now - at < 1.0 => l,
         _ => {
-            let l = b.list(&dir, st.importable_only);
+            let l = Arc::new(b.list(&dir, st.importable_only));
             ctx.data_mut(|d| d.insert_temp(lid, (now, l.clone())));
             l
         }
@@ -114,7 +117,7 @@ pub fn media_browser(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
         if kit::button(app, ui, Rect::from_min_size(pos2(ax, y), vec2(w, 20.0)), &format!("mediaBrowser.action.{id}"), label, false) {
             kit::exec(app, "mediaBrowser.action", json!({"action": id}));
-            ctx.data_mut(|d| d.remove::<(f64, Result<Vec<mb::Entry>, String>)>(lid));
+            ctx.data_mut(|d| d.remove::<Listing>(lid));
         }
         ax -= 6.0;
     }
@@ -126,7 +129,7 @@ pub fn media_browser(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     // Left column: favourites.
     let side = Rect::from_min_max(pos2(rect.min.x, rect.min.y + 54.0), pos2(rect.min.x + 160.0_f32.min(rect.width() * 0.3), rect.max.y));
     p.line_segment([side.right_top(), side.right_bottom()], Stroke::new(1.0, t.separator));
-    p.text(pos2(side.min.x + 10.0, side.min.y + 10.0), Align2::LEFT_CENTER, "Favorites", Tokens::semibold(11.5), t.text_dim);
+    p.text(pos2(side.min.x + 10.0, side.min.y + 10.0), Align2::LEFT_CENTER, tr("Favorites"), Tokens::semibold(11.5), t.text_dim);
     let mut fy = side.min.y + 22.0;
     let mut places: Vec<(String, String)> = b.places();
     places.extend(
@@ -149,7 +152,7 @@ pub fn media_browser(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
     // Files.
     let list = Rect::from_min_max(pos2(side.max.x + 1.0, side.min.y), rect.max);
-    let entries = match entries {
+    let entries = match entries.as_ref() {
         Ok(e) => e,
         Err(e) => {
             p.text(list.center(), Align2::CENTER_CENTER, e, Tokens::ui(12.0), t.danger);
@@ -207,23 +210,31 @@ pub fn media_browser(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         if resp.drag_started() && !e.is_dir && e.kind.is_some() {
             egui::DragAndDrop::set_payload(&ctx, DragPayload::Files(vec![e.path.clone()]));
         }
-        resp.context_menu(|ui| {
-            if !e.is_dir && ui.button("Import").clicked() {
+        crate::widgets::context_menu(&resp, |ui| {
+            let copy = ui.button(tr("Copy Source Path"));
+            app.auto.add(&format!("mediaBrowser.entry.{}.copySourcePath", e.name), copy.rect, "Copy Source Path");
+            if copy.clicked() {
+                if let Err(e) = crate::menus::invoke(app, &ctx, "mediaBrowser.copySourcePath", json!({"path": e.path})) {
+                    app.ui.status = e;
+                }
+                ui.close();
+            }
+            if !e.is_dir && ui.button(tr("Import")).clicked() {
                 actions.push(("mediaBrowser.import", json!({"paths": [e.path]})));
                 ui.close();
             }
-            if !e.is_dir && ui.button("Import and Add to Composition").clicked() {
+            if !e.is_dir && ui.button(tr("Import and Add to Composition")).clicked() {
                 actions.push(("mediaBrowser.import", json!({"paths": [e.path], "addToComp": true})));
                 ui.close();
             }
-            if e.is_dir && ui.button("Add to Favorites").clicked() {
+            if e.is_dir && ui.button(tr("Add to Favorites")).clicked() {
                 actions.push(("mediaBrowser.addFavorite", json!({"path": e.path})));
                 ui.close();
             }
         });
     }
     if entries.is_empty() {
-        lp.text(list.center(), Align2::CENTER_CENTER, "Empty folder", Tokens::ui(12.0), t.text_faint);
+        lp.text(list.center(), Align2::CENTER_CENTER, tr("Empty folder"), Tokens::ui(12.0), t.text_faint);
     }
     scroll.end(ui, &mut app.auto, "mediaBrowser.scroll", entries.len().div_ceil(cols) as f32 * tile.y + 8.0, &t);
     if budget == 0 {
@@ -256,7 +267,7 @@ fn comment_field(ui: &mut egui::Ui, r: Rect, id: &str, text: &str) -> Option<Str
     let key = egui::Id::new(("meta-comment", id));
     let mut buf: String = ui.data(|d| d.get_temp(key)).unwrap_or_else(|| text.to_string());
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(r));
-    let resp = child.add(egui::TextEdit::multiline(&mut buf).desired_width(r.width()).desired_rows(2).hint_text("Add a comment"));
+    let resp = child.add(egui::TextEdit::multiline(&mut buf).desired_width(r.width()).desired_rows(2).hint_text(tr("Add a comment")));
     if resp.has_focus() || resp.changed() {
         ui.data_mut(|d| d.insert_temp(key, buf.clone()));
     } else {
@@ -299,7 +310,7 @@ pub fn metadata(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
         y += 10.0;
     } else {
-        p.text(pos2(x0, y + 8.0), Align2::LEFT_CENTER, "Select an item in the Project panel", Tokens::ui(12.0), t.text_faint);
+        p.text(pos2(x0, y + 8.0), Align2::LEFT_CENTER, tr("Select an item in the Project panel"), Tokens::ui(12.0), t.text_faint);
         y += 28.0;
     }
     let proj = v["project"].clone();
@@ -332,7 +343,7 @@ pub fn progress(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let x0 = rect.min.x + 12.0;
     let w = (rect.width() - 24.0).max(60.0);
     if jobs.is_empty() {
-        p.text(pos2(x0, y + 10.0), Align2::LEFT_CENTER, "No background jobs running", Tokens::ui(12.0), t.text_faint);
+        p.text(pos2(x0, y + 10.0), Align2::LEFT_CENTER, tr("No background jobs running"), Tokens::ui(12.0), t.text_faint);
         y += 28.0;
     } else {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
@@ -354,7 +365,7 @@ pub fn progress(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     if !app.session.job_log.is_empty() {
         p.line_segment([pos2(x0, y), pos2(x0 + w, y)], Stroke::new(1.0, t.separator));
         y += 6.0;
-        p.text(pos2(x0, y + 8.0), Align2::LEFT_CENTER, "Finished", Tokens::semibold(11.5), t.text_dim);
+        p.text(pos2(x0, y + 8.0), Align2::LEFT_CENTER, tr("Finished"), Tokens::semibold(11.5), t.text_dim);
         y += 20.0;
         for r in app.session.job_log.iter().rev().take(20) {
             let col = match r.status.as_str() {
@@ -407,4 +418,53 @@ pub fn import_card(app: &mut EffectcraftApp, ui: &mut egui::Ui, full: Rect) -> f
         bottom = r.min.y - 8.0;
     }
     full.max.y - 16.0 - bottom
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "Media Browser warm listing cache benchmark"]
+    fn listing_cache_benchmark() {
+        let ctx = egui::Context::default();
+        let entries: Vec<_> = (0..1000)
+            .map(|i| mb::Entry {
+                name: format!("Clip {i:04}.mov"),
+                path: format!("/Shoot/作品 Clip {i:04}.mov"),
+                is_dir: false,
+                size: 1,
+                modified: None,
+                kind: Some("video"),
+            })
+            .collect();
+        let old_id = egui::Id::new("old-list");
+        let new_id = egui::Id::new("new-list");
+        ctx.data_mut(|d| {
+            d.insert_temp(old_id, (0.0, Ok::<_, String>(entries.clone())));
+            d.insert_temp(new_id, (0.0, Arc::new(Ok::<_, String>(entries))));
+        });
+        let (_, original) = ctx.data(|d| d.get_temp::<Listing>(new_id)).unwrap();
+        assert_eq!(original.as_ref().as_ref().unwrap()[0].name, "Clip 0000.mov");
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            for _ in 0..1000 {
+                let _ = std::hint::black_box(ctx.data(|d| d.get_temp::<(f64, Result<Vec<mb::Entry>, String>)>(old_id)).unwrap());
+            }
+            before.push(start.elapsed());
+            let start = std::time::Instant::now();
+            for _ in 0..1000 {
+                std::hint::black_box(ctx.data(|d| d.get_temp::<Listing>(new_id)).unwrap());
+            }
+            after.push(start.elapsed());
+        }
+        let (_, cached) = ctx.data(|d| d.get_temp::<Listing>(new_id)).unwrap();
+        assert!(Arc::ptr_eq(&original, &cached));
+        assert_eq!(cached.as_ref().as_ref().unwrap().last().unwrap().name, "Clip 0999.mov");
+        before.sort();
+        after.sort();
+        println!("1,000 Media Browser entries, median per warm cache lookup: {:?} -> {:?}", before[2] / 1000, after[2] / 1000);
+    }
 }

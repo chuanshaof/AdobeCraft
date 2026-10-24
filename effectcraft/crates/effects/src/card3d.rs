@@ -4,7 +4,8 @@
 //!
 //! Pieces live in "buffer world" space: x, y in buffer pixels, z in buffer pixels away from the
 //! viewer (the layer plane is z = 0). A [`Proj`] maps buffer-world points to buffer pixels
-//! (homogeneous), so every camera system reduces to one 3×4 matrix.
+//! (homogeneous), so every camera system reduces to one 3×4 matrix. CC Particle World sees its
+//! particles through the comp camera with the same [`comp_proj`].
 
 use effectcraft_keyframe::Value;
 use effectcraft_project::ParamUi;
@@ -170,6 +171,29 @@ impl Proj {
         (w > self.near).then(|| [r(0) / w, r(1) / w])
     }
 
+    /// How a buffer-world point `p` moving by `v` is seen: its buffer pixel, its depth W, the
+    /// buffer pixels per buffer-world pixel of a camera-facing size there, and its velocity in
+    /// buffer pixels. `None` behind or too close to the camera, or for a degenerate camera.
+    pub fn view(&self, p: [f64; 3], v: [f64; 3]) -> Option<Seen> {
+        let row = |i: usize| [self.m[i][0], self.m[i][1], self.m[i][2]];
+        let (m0, m1, m2) = (row(0), row(1), row(2));
+        let w = dot(m2, p) + self.m[2][3];
+        if !(w > self.near && w.is_finite()) {
+            return None;
+        }
+        let at = [(dot(m0, p) + self.m[0][3]) / w, (dot(m1, p) + self.m[1][3]) / w];
+        // The focal length (pixels per unit at unit depth): |m_i × m2| / |m2|² for K·[R|t]
+        // scaled by |m2|; the geometric mean of the two image axes.
+        let l2 = dot(m2, m2);
+        let scale = (len(cross(m0, m2)) * len(cross(m1, m2))).sqrt() / (l2.sqrt() * w);
+        if !(scale > 0.0 && scale.is_finite() && at.iter().all(|a| a.is_finite())) {
+            return None;
+        }
+        // d(X / W) = (m_i − at_i · m2) · dp / W.
+        let vel = [(dot(m0, v) - at[0] * dot(m2, v)) / w, (dot(m1, v) - at[1] * dot(m2, v)) / w];
+        Some(Seen { at, depth: w, scale, vel })
+    }
+
     /// The camera's centre in buffer-world space (where the projection collapses), or a point
     /// far in front of the layer when it has none (orthographic).
     pub fn eye(&self) -> [f64; 3] {
@@ -182,6 +206,15 @@ impl Proj {
             None => [0.0, 0.0, -1e9],
         }
     }
+}
+
+/// A point seen through a [`Proj`] (see [`Proj::view`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Seen {
+    pub at: [f64; 2],
+    pub depth: f64,
+    pub scale: f64,
+    pub vel: [f64; 2],
 }
 
 pub(crate) fn inv3(m: &M3) -> Option<M3> {
@@ -235,24 +268,10 @@ pub(crate) fn projection(ctx: &EffectCtx, b: &Buf) -> Proj {
                 None => base,
             }
         }
-        2 => {
-            // Comp Camera: the comp's camera looking at this layer (layer px → layer px).
-            let base = Proj::simple(c, size * 2.0);
-            let Some(cam) = ctx.env.host.and_then(|h| h.comp_scene()).and_then(|sc| sc.camera) else { return base };
-            // buffer world → layer: (p − offset) / s; layer → buffer: · s + offset.
-            let mut m = [[0.0; 4]; 3];
-            for i in 0..3 {
-                for j in 0..3 {
-                    m[i][j] = cam[i][j] / s;
-                }
-                m[i][3] = cam[i][3] - (cam[i][0] * b.offset[0] + cam[i][1] * b.offset[1]) / s;
-            }
-            let back: M3 = [[s, 0.0, b.offset[0]], [0.0, s, b.offset[1]], [0.0, 0.0, 1.0]];
-            let p = Proj { m, near: 1e-6 }.then(&back);
-            // W of the layer centre sets the scale of `near`.
-            let wc = p.m[2][0] * c[0] + p.m[2][1] * c[1] + p.m[2][3];
-            Proj { near: (wc.abs() * 0.02).max(1e-9), ..p }
-        }
+        2 => match ctx.env.host.and_then(|h| h.comp_scene()).and_then(|sc| sc.camera) {
+            Some(cam) => comp_proj(&cam, c, b),
+            None => Proj::simple(c, size * 2.0),
+        },
         _ => {
             let zpos = f("cameraPosition/cameraZ", 2.0).max(0.05);
             let focal = f("cameraPosition/focalLength", 70.0).max(1.0);
@@ -282,6 +301,25 @@ pub(crate) fn projection(ctx: &EffectCtx, b: &Buf) -> Proj {
     }
 }
 
+/// The comp camera `cam` ([`CompScene::camera`], layer px → layer px) looking at buffer `b`,
+/// whose layer centre is buffer pixel `c`.
+pub(crate) fn comp_proj(cam: &[[f64; 4]; 3], c: [f64; 2], b: &Buf) -> Proj {
+    let s = b.scale;
+    // buffer world → layer: (p − offset) / s; layer → buffer: · s + offset.
+    let mut m = [[0.0; 4]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            m[i][j] = cam[i][j] / s;
+        }
+        m[i][3] = cam[i][3] - (cam[i][0] * b.offset[0] + cam[i][1] * b.offset[1]) / s;
+    }
+    let back: M3 = [[s, 0.0, b.offset[0]], [0.0, s, b.offset[1]], [0.0, 0.0, 1.0]];
+    let p = Proj { m, near: 1e-6 }.then(&back);
+    // W of the layer centre sets the scale of `near`.
+    let wc = p.m[2][0] * c[0] + p.m[2][1] * c[1] + p.m[2][3];
+    Proj { near: (wc.abs() * 0.02).max(1e-9), ..p }
+}
+
 /// The comp's first light as the effect sees it (layer pixels), from [`crate::EffectHost::comp_scene`].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CompLight {
@@ -298,11 +336,37 @@ pub struct CompLight {
 /// The comp's camera and lights relative to the effect's layer.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CompScene {
-    /// Layer pixels (x, y, z) → layer pixels, homogeneous rows X, Y, W: the comp camera's view
-    /// of the layer brought back into the layer's own pixel grid (identity on the layer plane
-    /// for the default camera).
+    /// Effect-space pixels (x, y, z) → effect-space pixels, homogeneous rows X, Y, W: the comp
+    /// camera's view of the layer brought back into the layer's own pixel grid (identity on the
+    /// layer plane for the default camera).
     pub camera: Option<[[f64; 4]; 3]>,
+    /// `camera` is an active camera layer's, not the comp's default view (CC Particle World
+    /// follows only a camera layer).
+    pub camera_layer: bool,
     pub light: Option<CompLight>,
+}
+
+impl CompScene {
+    /// The scene measured from `origin` (in its current coordinates, as [`crate::Buf::rebase`]):
+    /// a point `p` becomes `p − origin`.
+    pub fn rebased(mut self, origin: [f64; 2]) -> CompScene {
+        if let Some(c) = &mut self.camera {
+            for row in c.iter_mut() {
+                row[3] += row[0] * origin[0] + row[1] * origin[1];
+            }
+            let w = c[2];
+            for (row, o) in c.iter_mut().zip(origin) {
+                for (v, wv) in row.iter_mut().zip(w) {
+                    *v -= o * wv;
+                }
+            }
+        }
+        if let Some(l) = &mut self.light {
+            l.pos[0] -= origin[0];
+            l.pos[1] -= origin[1];
+        }
+        self
+    }
 }
 
 fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
@@ -310,6 +374,12 @@ fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
 }
 fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+}
+fn len(a: [f64; 3]) -> f64 {
+    dot(a, a).sqrt()
 }
 fn norm(a: [f64; 3]) -> [f64; 3] {
     let l = dot(a, a).sqrt();

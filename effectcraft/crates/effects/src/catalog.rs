@@ -86,6 +86,7 @@ const CPU_ONLY_CONTROLS: &[(&str, &[&str])] = &[
     ("ec.blur.cameralens", &["irisProperties/diffractionFringe", "blurMap/blurMapLayer"]),
     ("ec.noise.removegrain", &["temporalFiltering/enabled"]),
     ("ec.distort.liquify", &["viewFreezeAreaMask", "viewMesh"]),
+    ("ec.distort.ccpowerpin", &["unstretch"]),
     ("ec.matte.refinesoft", &["reduceChatter", "useMotionBlur", "invert"]),
     ("ec.matte.refinehard", &["reduceChatter", "useMotionBlur", "invert"]),
 ];
@@ -97,6 +98,9 @@ pub fn gpu_supported(id: &str, ctx: &crate::EffectCtx) -> bool {
     match id {
         "ec.generate.cellpattern" if (6..=10).contains(&ctx.params.e("cellPattern")) => return false,
         "ec.distort.turbulentdisplace" if ctx.params.e("pinning") >= 8 => return false,
+        // #1195: CC Particle World's motion trails (the averaged shutter samples) render on the
+        // CPU kernel until the GPU particle pass supports them.
+        "ec.sim.ccparticleworld" if ctx.env.shutter.filter(|(a, _, _)| *a > 0.0).is_some() => return false,
         _ => {}
     }
     let Some((_, controls)) = CPU_ONLY_CONTROLS.iter().find(|(e, _)| *e == id) else { return true };
@@ -198,9 +202,19 @@ mod tests {
         assert!(ok("ec.color.lumetri", &[]));
         assert!(!ok("ec.color.lumetri", &[("hslSecondary/correction/saturation", Value::Scalar(50.0))]));
         assert!(!ok("ec.noise.addgrain", &[("preset", Value::Enum(2))]));
+        // #1195: CC Particle World's motion trails (shutter samples) render on the CPU.
+        {
+            let params = ctx_with("ec.sim.ccparticleworld", &[]);
+            let env = crate::EffectEnv { frame_rate: 30.0, shutter: Some((180.0, -90.0, 16)), ..Default::default() };
+            let ctx = crate::EffectCtx { params: &params, time: 0.0, layer_size: [64.0, 64.0], seed: 0, adjustment: false, env };
+            assert!(!super::gpu_supported("ec.sim.ccparticleworld", &ctx));
+        }
+        assert!(ok("ec.sim.ccparticleworld", &[]));
         assert!(ok("ec.generate.cellpattern", &[("cellPattern", Value::Enum(3))]));
         assert!(!ok("ec.generate.cellpattern", &[("cellPattern", Value::Enum(9))]));
         assert!(!ok("ec.distort.turbulentdisplace", &[("pinning", Value::Enum(9))]));
+        assert!(ok("ec.distort.ccpowerpin", &[]));
+        assert!(!ok("ec.distort.ccpowerpin", &[("unstretch", Value::Bool(true))]));
         assert!(ok("ec.blur.gaussian", &[]));
     }
 

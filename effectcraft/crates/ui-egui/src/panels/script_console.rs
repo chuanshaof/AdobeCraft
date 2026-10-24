@@ -2,6 +2,7 @@
 //! (`app.project`, comps, layers, properties…). Each run goes through the `script.run` command
 //! in the console's persistent context, so variables survive between runs; edits are undoable.
 
+use crate::i18n::tr;
 use egui::{Align2, Rect, Sense, pos2, vec2};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -113,7 +114,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         .font(Tokens::mono(12.0))
         .desired_width(in_rect.width())
         .desired_rows(4)
-        .hint_text("Script… (⌘/Ctrl+Enter runs)");
+        .hint_text(tr("Script… (⌘/Ctrl+Enter runs)"));
     let resp = child.add_sized(in_rect.size(), te);
     if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.command) {
         run_now = true;
@@ -125,10 +126,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let clear_r = Rect::from_min_size(pos2(bar.max.x - 128.0, bar.min.y + 2.0), vec2(56.0, 20.0));
     let run_resp = ui.interact(run_r, egui::Id::new("script-console-run"), Sense::click());
     p.rect_filled(run_r, 3.0, if run_resp.hovered() { t.accent_hover } else { t.accent });
-    p.text(run_r.center(), Align2::CENTER_CENTER, "Run", Tokens::ui(12.0), egui::Color32::WHITE);
+    p.text(run_r.center(), Align2::CENTER_CENTER, tr("Run"), Tokens::ui(12.0), egui::Color32::WHITE);
     let clear_resp = ui.interact(clear_r, egui::Id::new("script-console-clear"), Sense::click());
     p.rect_stroke(clear_r, 3.0, egui::Stroke::new(1.0, t.field_border), egui::StrokeKind::Inside);
-    p.text(clear_r.center(), Align2::CENTER_CENTER, "Clear", Tokens::ui(12.0), t.text);
+    p.text(clear_r.center(), Align2::CENTER_CENTER, tr("Clear"), Tokens::ui(12.0), t.text);
     app.auto.add("scriptConsole.run", run_r, "Run");
     app.auto.add("scriptConsole.clear", clear_r, "Clear");
     if run_resp.clicked() {

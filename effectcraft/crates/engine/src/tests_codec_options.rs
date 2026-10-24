@@ -110,6 +110,34 @@ fn output_to_keeps_a_format_that_writes_the_extension() {
     assert_eq!((&r["output"]["format"], &r["outputModuleSummary"]), (&json!("Hevc"), &a["outputModuleSummary"]), "{r}");
 }
 
+/// Output To ends in the format's extension exactly once (#293). A name from a save dialog
+/// filtered to projects (`Comp 1.mov.ecproj`; for a PNG sequence every frame got `.png.ecproj`)
+/// loses the `.ecproj` and picks the file type from the extension before it; a comp named
+/// `Comp 2.mov` renders to `Comp 2.mov`, not `Comp 2.mov.mov`.
+#[test]
+fn output_to_ends_in_the_format_extension_once() {
+    let mut s = session();
+    let cases = [
+        ("h264", "/out/Comp 1.mov.ecproj", OutputFormat::ProRes, "/out/Comp 1.mov"),
+        ("png", "/out/Comp 1_[#####].png.ecproj", OutputFormat::PngSequence, "/out/Comp 1_[#####].png"),
+        ("prores", "/out/Comp 2.mov.mov", OutputFormat::ProRes, "/out/Comp 2.mov"),
+        ("prores", "/out/render", OutputFormat::ProRes, "/out/render.mov"),
+    ];
+    for (format, out, want, path) in cases {
+        let a = s.execute("renderQueue.add", json!({"format": format})).unwrap();
+        let r = s.execute("renderQueue.setOutput", json!({"item": a["item"], "path": out})).unwrap();
+        let om = &s.project.render_queue.last().unwrap().output;
+        assert_eq!((om.format, om.output.as_str()), (want, path), "{format} → {out}");
+        assert!(r["outputPath"].as_str().unwrap().ends_with(&path[5..]), "{r}");
+    }
+    s.execute("comp.new", json!({"name": "Comp 2.mov", "width": 64, "height": 36, "frameRate": 30, "duration": 1})).unwrap();
+    for (format, name) in [("prores", "Comp 2.mov"), ("h264", "Comp 2.mov.mp4"), ("png", "Comp 2.mov_[#####].png")] {
+        let a = s.execute("renderQueue.add", json!({"format": format})).unwrap();
+        let path = a["outputPath"].as_str().unwrap();
+        assert_eq!(std::path::Path::new(path).file_name().unwrap().to_string_lossy(), name, "{format}: {path}");
+    }
+}
+
 /// An explicit RGB + Alpha request with the AV1 WebM codec (which has no alpha) is refused, not
 /// silently rendered opaque (#166). Without `channels`, AV1 WebM renders RGB as before.
 #[test]

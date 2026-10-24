@@ -9,8 +9,8 @@
 //! frames every two seconds, inter frames between them: SimpleBlocks carry the key flag, inter
 //! BlockGroups a ReferenceBlock; the alpha stream's key frames line up with the colour stream's),
 //! Opus from `effectcraft-opusenc` (CELT, 48 kHz stereo, 20 ms packets,
-//! `CodecDelay` = pre-skip). WAV (RIFF, 16-bit PCM) and AIFF (big-endian 16-bit, 80-bit
-//! extended sample rate) follow their published file layouts.
+//! `CodecDelay` = pre-skip). WAV (RIFF, PCM or IEEE float) and AIFF (big-endian PCM, 80-bit
+//! extended sample rate; AIFF-C `fl32` for float) follow their published file layouts.
 
 use std::io::{Seek, SeekFrom, Write};
 
@@ -162,7 +162,7 @@ pub(crate) async fn webm(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut Sta
     let duration_ms = frame_ms(total) as f64;
 
     let path = job.place(job.path, 1);
-    let mut file = crate::out::create(job.sink, &path)?;
+    let mut file = job.create(&path)?;
     // EBML header.
     let mut head = vec![];
     let mut eb = vec![];
@@ -322,14 +322,11 @@ fn ieee_extended(v: f64) -> [u8; 10] {
 }
 
 /// WAV or AIFF: the comp's audio over the render span (Audio Output: sample rate, mono/stereo,
-/// 16/24-bit integer or 32-bit float; AIFF has no float in plain AIFF, so it writes 24-bit).
+/// 16/24-bit integer or 32-bit float; plain AIFF has no float, so 32-bit float is AIFF-C `fl32`).
 pub(crate) fn audio_file(job: &Cx, comp: &Comp, aiff: bool, st: &mut State) -> Result<Report> {
     let sr = job.output.audio_sample_rate.clamp(8_000, 192_000);
     let channels = if job.output.audio_channels == 1 { 1u16 } else { 2 };
-    let fmt = match job.output.audio_format {
-        AudioFormat::F32 if aiff => AudioFormat::S24,
-        f => f,
-    };
+    let fmt = job.output.audio_format;
     let bytes_per_sample: u16 = match fmt {
         AudioFormat::S16 => 2,
         AudioFormat::S24 => 3,
@@ -347,7 +344,9 @@ pub(crate) fn audio_file(job: &Cx, comp: &Comp, aiff: bool, st: &mut State) -> R
     let mut reported = 0u64;
     while done < n {
         let k = block.min(n - done);
-        let t = Tick((((start + done as i64) as i128 * TICKS_PER_SECOND as i128) / sr as i128) as i64);
+        let sample = start + done as i64;
+        let t = Tick::from_units(sample, i64::from(sr));
+        let t = if t.to_units_floor(i64::from(sr)) < sample { Tick(t.0.saturating_add(1)) } else { t };
         pcm.extend(pcm_bytes(&mix(job, t, k, sr), fmt, aiff));
         done += k;
         let now = (done as u64 * total_frames / n.max(1) as u64).min(total_frames);
@@ -363,15 +362,33 @@ pub(crate) fn audio_file(job: &Cx, comp: &Comp, aiff: bool, st: &mut State) -> R
     let frames = (pcm.len() / block_align as usize) as u32;
     let mut out = vec![];
     if aiff {
+        // AIFF-C (Apple, 1991) for float: a format version chunk, and the COMM chunk names the
+        // compression type and its Pascal-string name, padded to an even length.
+        let float = fmt == AudioFormat::F32;
         let mut comm = vec![];
         comm.extend_from_slice(&channels.to_be_bytes());
         comm.extend_from_slice(&frames.to_be_bytes());
         comm.extend_from_slice(&(bytes_per_sample * 8).to_be_bytes());
         comm.extend_from_slice(&ieee_extended(sr as f64));
+        let mut fver = vec![];
+        if float {
+            const NAME: &[u8] = b"32-bit floating point";
+            comm.extend_from_slice(b"fl32");
+            comm.push(NAME.len() as u8);
+            comm.extend_from_slice(NAME);
+            if (1 + NAME.len()) % 2 == 1 {
+                comm.push(0);
+            }
+            fver.extend_from_slice(b"FVER");
+            fver.extend_from_slice(&4u32.to_be_bytes());
+            // AIFC Version 1 (May 23, 1990, 2:40 pm).
+            fver.extend_from_slice(&0xA280_5140u32.to_be_bytes());
+        }
         let ssnd_len = 8 + pcm.len();
         out.extend_from_slice(b"FORM");
-        out.extend_from_slice(&((4 + 8 + comm.len() + 8 + ssnd_len + ssnd_len % 2) as u32).to_be_bytes());
-        out.extend_from_slice(b"AIFF");
+        out.extend_from_slice(&((4 + fver.len() + 8 + comm.len() + 8 + ssnd_len + ssnd_len % 2) as u32).to_be_bytes());
+        out.extend_from_slice(if float { b"AIFC" } else { b"AIFF" });
+        out.extend_from_slice(&fver);
         out.extend_from_slice(b"COMM");
         out.extend_from_slice(&(comm.len() as u32).to_be_bytes());
         out.extend_from_slice(&comm);
@@ -403,7 +420,7 @@ pub(crate) fn audio_file(job: &Cx, comp: &Comp, aiff: bool, st: &mut State) -> R
         }
     }
     let path = job.place(job.path, out.len() as u64);
-    let mut file = crate::out::create(job.sink, &path)?;
+    let mut file = job.create(&path)?;
     file.write_all(&out).map_err(io)?;
     let bytes = file.finish()?;
     Ok(Report { path, frames: 0, width: 0, height: 0, seconds: 0.0, bytes, audio: true, log: None, overflow: vec![] })

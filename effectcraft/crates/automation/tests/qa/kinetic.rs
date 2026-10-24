@@ -71,11 +71,17 @@ fn kinetic_typography() {
     // A precomp of everything, time-remapped to play backwards.
     let pre = qa.exec("layer.precompose", json!({"layers": ["Title", "Sub"], "name": "Type Pre", "mode": "move"}));
     assert!(pre["comp"].is_u64() && pre["layer"].is_u64(), "{pre}");
+    // Nested switches pass the precomp layer's blur flag down to the animated title.
+    qa.exec("layer.setSwitch", json!({"layers": [pre["layer"].clone()], "switch": "motionBlur", "value": true}));
     qa.exec("layer.enableTimeRemap", json!({"layers": [pre["layer"].clone()], "value": true}));
     qa.tool("add_keyframe", json!({"layer": pre["layer"].clone(), "path": "timeRemap", "keys": [{"time": 0, "value": 1.9}, {"time": 1.9, "value": 0}]}));
-    let fwd = qa.frame(Some(pre["comp"].clone()), 1.6);
+    // The 1.9 s key sits on frame 23 (1.917 s), so 0.3 s maps to 1.6026 s: compared at that time,
+    // not 1.6 s, where the moving title (and text drawn at its on-screen scale) differs.
+    let at = qa.tool("get_property", json!({"layer": pre["layer"].clone(), "path": "timeRemap", "time": 0.3}))["value"].as_f64().unwrap();
+    assert!((at - 1.6).abs() < 0.01, "time remap 0.3 s → 1.6 s of the precomp: {at}");
+    let fwd = qa.frame(Some(pre["comp"].clone()), at);
     let rev = qa.frame(Some(comp.clone()), 0.3);
-    assert!(mean_diff(&fwd, &rev) < 1.0, "time remap 0.3 s → 1.6 s of the precomp");
+    assert!(mean_diff(&fwd, &rev) < 1.0, "the remapped precomp shows its frame at {at} s: {}", mean_diff(&fwd, &rev));
 
     // Render: H.264 and a PNG sequence through the render queue.
     let mp4 = qa.path("kinetic.mp4");

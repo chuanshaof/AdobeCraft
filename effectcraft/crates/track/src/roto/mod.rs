@@ -59,6 +59,9 @@ pub enum StrokeKind {
     Refine,
     /// Refine Edge tool with Alt: remove from the band.
     RefineErase,
+    /// A box around the object (Object Matte): two opposite corners in `points`. Trained models
+    /// get it as their box prompt; the graph cut ignores it.
+    Box,
 }
 
 impl StrokeKind {
@@ -221,13 +224,19 @@ pub struct FrameSeg {
 
 impl FrameSeg {
     pub fn empty(w: usize, h: usize) -> FrameSeg {
-        FrameSeg { w, h, matte: vec![0; w * h], refine: vec![0; w * h], ..Default::default() }
+        let Some(n) = w.checked_mul(h).filter(|n| *n <= rle::MAX_PLANE_BYTES) else {
+            return FrameSeg::default();
+        };
+        FrameSeg { w, h, matte: vec![0; n], refine: vec![0; n], ..Default::default() }
     }
     pub fn area(&self) -> usize {
         self.matte.iter().filter(|v| **v != 0).count()
     }
     /// Centroid of the matte (pixels), if any.
     pub fn centroid(&self) -> Option<[f64; 2]> {
+        if self.w == 0 || self.w.checked_mul(self.h)? > self.matte.len() {
+            return None;
+        }
         let (mut sx, mut sy, mut n) = (0.0, 0.0, 0.0);
         for (i, v) in self.matte.iter().enumerate() {
             if *v != 0 {
@@ -243,8 +252,18 @@ impl FrameSeg {
     /// Worker to the page): `ECSG`, width, height (u32 LE), the colour models as JSON (length
     /// prefixed), then the matte and the Refine Edge band run-length encoded (u16 LE run, byte).
     pub fn to_bytes(&self) -> Vec<u8> {
+        let Some(pixels) = self.w.checked_mul(self.h).filter(|n| *n <= rle::MAX_PLANE_BYTES) else {
+            return Vec::new();
+        };
+        if self.matte.len() != pixels || self.refine.len() != pixels || self.w > u32::MAX as usize || self.h > u32::MAX as usize {
+            return Vec::new();
+        }
         let models = serde_json::to_vec(&(&self.fg, &self.bg)).unwrap_or_default();
-        let mut out = Vec::with_capacity(16 + models.len() + 64);
+        let Some(header_len) = 16usize.checked_add(models.len()) else { return Vec::new() };
+        let mut out = Vec::new();
+        if out.try_reserve(header_len.saturating_add(64)).is_err() {
+            return Vec::new();
+        }
         out.extend_from_slice(b"ECSG");
         out.extend_from_slice(&(self.w as u32).to_le_bytes());
         out.extend_from_slice(&(self.h as u32).to_le_bytes());
@@ -257,6 +276,9 @@ impl FrameSeg {
                 let mut n = 1;
                 while i + n < plane.len() && plane[i + n] == v && n < u16::MAX as usize {
                     n += 1;
+                }
+                if out.try_reserve(3).is_err() {
+                    return Vec::new();
                 }
                 out.extend_from_slice(&(n as u16).to_le_bytes());
                 out.push(v);
@@ -274,23 +296,40 @@ impl FrameSeg {
         let u = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]) as usize;
         let (w, h, ml) = (u(4), u(8), u(12));
         let n = w.checked_mul(h)?;
-        let models = b.get(16..16 + ml)?;
+        if n > rle::MAX_PLANE_BYTES || w == 0 || h == 0 {
+            return None;
+        }
+        let models_end = 16usize.checked_add(ml)?;
+        let models = b.get(16..models_end)?;
         let (fg, bg): (Gmm, Gmm) = serde_json::from_slice(models).ok()?;
-        let mut rest = &b[16 + ml..];
+        let mut rest = b.get(models_end..)?;
+        // Each run covers at most u16::MAX pixels; refuse before reserving a plane the input can't fill.
+        if rest.len() < n.div_ceil(usize::from(u16::MAX)).saturating_mul(6) {
+            return None;
+        }
         let mut plane = || -> Option<Vec<u8>> {
-            let mut v = Vec::with_capacity(n);
+            let mut v = Vec::new();
+            v.try_reserve_exact(n).ok()?;
             while v.len() < n {
                 if rest.len() < 3 {
                     return None;
                 }
-                let run = u16::from_le_bytes([rest[0], rest[1]]) as usize;
-                v.resize(v.len() + run, rest[2]);
-                rest = &rest[3..];
+                let run = u16::from_le_bytes([*rest.first()?, *rest.get(1)?]) as usize;
+                let next = v.len().checked_add(run)?;
+                if run == 0 || next > n {
+                    return None;
+                }
+                let value = *rest.get(2)?;
+                v.resize(next, value);
+                rest = rest.get(3..)?;
             }
             (v.len() == n).then_some(v)
         };
         let matte = plane()?;
         let refine = plane()?;
+        if !rest.is_empty() {
+            return None;
+        }
         Some(FrameSeg { w, h, matte, refine, fg, bg })
     }
 }
@@ -830,8 +869,9 @@ fn points_along(s: &Stroke, scale: f64, max: usize) -> Vec<[f32; 2]> {
     out
 }
 
-/// A model's prompt from the strokes: points along the foreground and background strokes.
-fn stroke_prompt(strokes: &[&Stroke], scale: f64) -> Prompt {
+/// A model's prompt from the strokes: points along the foreground and background strokes, and
+/// the box of a [`StrokeKind::Box`] stroke (matte pixels).
+pub fn stroke_prompt(strokes: &[&Stroke], scale: f64) -> Prompt {
     let mut points = vec![];
     for (kind, fg) in [(StrokeKind::Fg, true), (StrokeKind::Bg, false)] {
         let ss: Vec<&&Stroke> = strokes.iter().filter(|s| s.kind == kind).collect();
@@ -840,11 +880,20 @@ fn stroke_prompt(strokes: &[&Stroke], scale: f64) -> Prompt {
             points.extend(points_along(s, scale, per).into_iter().map(|p| (p, fg)));
         }
     }
-    Prompt { points, ..Default::default() }
+    let bbox = strokes.iter().filter(|s| s.kind == StrokeKind::Box).find_map(|s| box_of(s, scale));
+    Prompt { points, bbox, ..Default::default() }
 }
 
-/// Add a prior matte to a prompt: its box (a little larger), up to four points spread through
-/// its core, and the matte itself.
+/// The box `[x0, y0, x1, y1]` (matte pixels) of a box stroke: its first two points as opposite
+/// corners; `None` when they are missing, not finite or the box is empty.
+fn box_of(s: &Stroke, scale: f64) -> Option<[f32; 4]> {
+    let (a, c) = (s.points.first()?, s.points.get(1)?);
+    let v = [a[0].min(c[0]), a[1].min(c[1]), a[0].max(c[0]), a[1].max(c[1])].map(|v| (v * scale) as f32);
+    (v.iter().all(|x| x.is_finite()) && v[2] > v[0] && v[3] > v[1]).then_some(v)
+}
+
+/// Add a prior matte to a prompt: its box (a little larger; unless the prompt has one), up to
+/// four points spread through its core, and the matte itself.
 fn add_prior_prompt(prompt: &mut Prompt, soft: &[f32], w: usize, h: usize) -> bool {
     let bin: Vec<u8> = soft.iter().map(|v| (*v >= 0.5) as u8).collect();
     let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0usize, 0usize);
@@ -858,7 +907,10 @@ fn add_prior_prompt(prompt: &mut Prompt, soft: &[f32], w: usize, h: usize) -> bo
         return false;
     }
     let (mx, my) = (((x1 - x0) as f32 * 0.05).max(4.0), ((y1 - y0) as f32 * 0.05).max(4.0));
-    prompt.bbox = Some([(x0 as f32 - mx).max(0.0), (y0 as f32 - my).max(0.0), (x1 as f32 + 1.0 + mx).min(w as f32), (y1 as f32 + 1.0 + my).min(h as f32)]);
+    // A box the user drew on this frame wins over the prior's.
+    if prompt.bbox.is_none() {
+        prompt.bbox = Some([(x0 as f32 - mx).max(0.0), (y0 as f32 - my).max(0.0), (x1 as f32 + 1.0 + mx).min(w as f32), (y1 as f32 + 1.0 + my).min(h as f32)]);
+    }
     // Farthest-point picks among the core (deep inside), starting from the deepest pixel.
     let sd = matting::signed_distance(&bin, w, h);
     let deep = sd.iter().copied().fold(0.0f32, f32::max);

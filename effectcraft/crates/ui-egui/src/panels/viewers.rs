@@ -6,6 +6,7 @@
 //! the active viewer is locked shows it in an unlocked viewer, or in a new one if every viewer is
 //! locked.
 
+use crate::i18n::tr;
 use std::sync::Arc;
 
 use effectcraft_engine::project::ItemId;
@@ -88,7 +89,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: u32, rect: Rect) {
     let ctx = ui.ctx().clone();
     let p = ui.painter().with_clip_rect(rect);
     p.rect_filled(rect, 0.0, t.pasteboard);
-    let resp = ui.interact(rect, egui::Id::new(("passive-viewer", id)), Sense::click()).on_hover_text("Click to make this viewer active");
+    let resp = ui.interact(rect, egui::Id::new(("passive-viewer", id)), Sense::click()).on_hover_text(tr("Click to make this viewer active"));
     app.auto.add(&format!("viewers.{id}"), rect, "Composition viewer (click to make it active)");
     match comp_of(app, id).and_then(|cid| Some((cid, app.session.project.comp(cid)?.clone()))) {
         Some((cid, c)) => {
@@ -100,8 +101,10 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: u32, rect: Rect) {
             let frame = c.frame_rate.frame_at(app.session.time_of(cid));
             app.request_frame(cid, frame, scale);
             let key = app.frame_key(cid, frame, scale);
-            if let Some(img) = app.frames.get(&key) {
-                set_texture(app, &ctx, id, key, img);
+            if let Some((key, img)) = app.frames.get_for_viewer(&key, app.passive_tex.get(&id).map(|(k, _)| k)) {
+                let dc = effectcraft_engine::viewer::DisplayColor::of(&app.session);
+                let dkey = display_hash(&super::viewer_tools::display_key(app, dc.is_some()));
+                set_texture(app, &ctx, id, key, img, dc, dkey);
             }
             match app.passive_tex.get(&id).filter(|(k, _)| k.comp == cid.0) {
                 Some((_, tex)) => {
@@ -116,7 +119,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: u32, rect: Rect) {
             p.rect_stroke(r, 0.0, egui::Stroke::new(1.0, t.separator), egui::StrokeKind::Outside);
         }
         None => {
-            p.text(rect.center(), Align2::CENTER_CENTER, "Click to show the active composition here", Tokens::ui(12.0), t.text_faint);
+            p.text(rect.center(), Align2::CENTER_CENTER, tr("Click to show the active composition here"), Tokens::ui(12.0), t.text_faint);
         }
     }
     if resp.clicked() {
@@ -125,11 +128,38 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, id: u32, rect: Rect) {
 }
 
 /// Keep the frame viewer `id` shows in its texture.
-fn set_texture(app: &mut EffectcraftApp, ctx: &egui::Context, id: u32, key: FrameKey, img: FrameImage) {
-    if app.passive_tex.get(&id).is_some_and(|(k, _)| *k == key) {
+fn set_texture(
+    app: &mut EffectcraftApp,
+    ctx: &egui::Context,
+    id: u32,
+    key: FrameKey,
+    img: FrameImage,
+    dc: Option<effectcraft_engine::viewer::DisplayColor>,
+    dkey: u64,
+) {
+    let dc_id = egui::Id::new(("passive-viewer-display", id));
+    let same_display = ctx.data(|d| d.get_temp::<u64>(dc_id)) == Some(dkey);
+    if let Some((k, _)) = app.passive_tex.get_mut(&id)
+        && *k == key
+        && same_display
+    {
+        // An undo or an edit elsewhere can reuse this content at a newer revision. Keep that
+        // revision as the lower bound for subsequent intermediate edit frames.
+        k.revision = key.revision;
         return;
     }
+    ctx.data_mut(|d| d.insert_temp(dc_id, dkey));
     let opts = super::viewer::zoom_texture_options(app.session.prefs.viewer_zoom_smooth());
+    // The monitor conversion the active viewer applies (Use Display Color Management).
+    let img = match (img, &dc) {
+        (FrameImage::Cpu(img), Some(dc)) => {
+            let mut px: Vec<[u8; 4]> = img.pixels.iter().map(|c| c.to_array()).collect();
+            dc.apply(&mut px);
+            let pixels = px.into_iter().map(|a| Color32::from_rgba_premultiplied(a[0], a[1], a[2], a[3])).collect();
+            FrameImage::Cpu(Arc::new(egui::ColorImage::new(img.size, pixels)))
+        }
+        (img, _) => img,
+    };
     let tex = match (img, app.passive_tex.remove(&id)) {
         (FrameImage::Cpu(img), Some((_, PassiveTexture::Cpu(mut h))))
             if h.size() == crate::frames::fitted_size(img.size, crate::frames::max_texture_side(ctx)) =>
@@ -144,19 +174,27 @@ fn set_texture(app: &mut EffectcraftApp, ctx: &egui::Context, id: u32, key: Fram
         (FrameImage::Gpu(f), old) => {
             let Some(rs) = &app.wgpu else { return };
             let view = f.texture.create_view(&Default::default());
-            let filter = if app.session.prefs.viewer_zoom_smooth() { eframe::wgpu::FilterMode::Linear } else { eframe::wgpu::FilterMode::Nearest };
+            let sampler = || super::viewer::zoom_sampler(app.session.prefs.viewer_zoom_smooth());
             let mut ren = rs.renderer.write();
             let tid = match old {
                 Some((_, PassiveTexture::Gpu(tid, _))) => {
-                    ren.update_egui_texture_from_wgpu_texture(&rs.device, &view, filter, tid);
+                    ren.update_egui_texture_from_wgpu_texture_with_sampler_options(&rs.device, &view, sampler(), tid);
                     tid
                 }
-                _ => ren.register_native_texture(&rs.device, &view, filter),
+                _ => ren.register_native_texture_with_sampler_options(&rs.device, &view, sampler()),
             };
             PassiveTexture::Gpu(tid, f)
         }
     };
     app.passive_tex.insert(id, (key, tex));
+}
+
+/// A hash of the display conversion's inputs (see `viewer_tools::display_key`).
+fn display_hash(key: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish()
 }
 
 /// Give a passive viewer's texture back (GPU textures are registered with the renderer).
@@ -259,5 +297,5 @@ pub fn on_close(app: &mut EffectcraftApp, p: PanelKind) {
 /// The tab label of viewer `id` ("Composition Intro").
 pub fn title(app: &EffectcraftApp, id: u32) -> Option<String> {
     let c = comp_of(app, id)?;
-    Some(format!("Composition {}", app.session.project.item(c)?.name))
+    Some(format!("{} {}", crate::i18n::command_label("window.panel", "Composition"), app.session.project.item(c)?.name))
 }
