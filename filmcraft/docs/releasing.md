@@ -50,6 +50,7 @@ signing jobs are refused, and the draft-release job, which needs them, is skippe
 | Windows on ARM64 | `filmcraft-<v>-windows-arm64.msi`, `filmcraft-<v>-windows-arm64-portable.zip` | `windows-latest` (cross-compiled) |
 | Linux x86_64 | `filmcraft-<v>-linux-x86_64.{AppImage,deb,rpm,tar.gz}` | `ubuntu-22.04` |
 | Linux aarch64 | `filmcraft-<v>-linux-aarch64.{AppImage,deb,rpm,tar.gz}` | `ubuntu-22.04-arm` |
+| Linux riscv64 | `filmcraft-<v>-linux-riscv64.tar.gz` | `ubuntu-24.04`, cross-compiled (glibc 2.39+; CLI smoke-tested under QEMU) |
 | AppImage updates | `filmcraft-<v>-linux-{x86_64,aarch64}.AppImage.zsync` | with the AppImage |
 | Flatpak | `filmcraft-<v>-linux-x86_64.flatpak`, `filmcraft-<v>-linux-aarch64.flatpak` | `ubuntu-24.04`, `ubuntu-24.04-arm` (repackaged Linux tarball) |
 | FreeBSD 14 x86_64 | `filmcraft-<v>-freebsd-x86_64.tar.gz` | FreeBSD 14.3 VM on `ubuntu-latest` |
@@ -58,8 +59,8 @@ signing jobs are refused, and the draft-release job, which needs them, is skippe
 `filmcraft --version` and `filmcraft-cli --version` print the version from `Cargo.toml`.
 
 **Fonts.** Every build job checks out [craft-fonts](https://github.com/storytold/craft-fonts) at a
-pinned commit (the `ref:` of its craft-fonts checkout step, marked `# bump deliberately`) and builds
-with `CRAFT_FONTS_DIR` and `CRAFT_FONTS_REQUIRED=1`, so releases embed its Japanese fonts and fail
+pinned commit (`craft-fonts-ref` in `.github/workflows/release.yml` and `freebsd.yml`) and builds
+with `CRAFT_FONTS_DIR` and `CRAFT_FONTS_REQUIRED=1`, so releases embed its fonts and fail
 rather than ship without them (the web build embeds only the UI font, to stay small). The packages
 carry each embedded font's licence (`copy_font_licences` in `packaging/env.sh`). Bump the pins
 deliberately, in every job at once.
@@ -77,6 +78,9 @@ deliberately, in every job at once.
 - **Notarization:** the app is sent with `xcrun notarytool submit`, then the ticket is stapled
   and checked with `stapler validate`. The app goes on a DMG (`hdiutil makehybrid`), which is
   signed and notarized too. The universal `filmcraft-cli` is signed the same way, zipped, and the zip is notarized.
+  Its Finder window (background, icon size and positions) comes from
+  [`packaging/macos/dmg/`](../packaging/macos/dmg/README.md), and its volume is named `FilmCraft`
+  without the version, which the window's background needs; the DMG file name keeps the version.
 
 Locally, without certificates, the script signs ad hoc and skips notarization, which is enough to
 check the bundle and the DMG on your own Mac (`packaging/macos/package.sh`).
@@ -104,6 +108,15 @@ nor the portable zip needs the Visual C++ redistributable.
 `.tar.gz` tree. The packages install both programs, the desktop entry, the AppStream metainfo, the
 icons and the licence files.
 
+The Linux tarball includes `install.sh`. Extract it, open a terminal in the extracted
+directory and run `./install.sh` to install both programs and their desktop integration
+under `~/.local` (no administrator permissions needed). The application-menu entry uses
+the installed binary's absolute path; add `~/.local/bin` to `PATH` for terminal commands.
+Run the installer again to update. For a system-wide installation, use
+`sudo ./install.sh --prefix /usr/local`. A custom absolute `--prefix` is also supported;
+its `share` directory must be in the desktop's data search path to appear in the menu.
+Prefixes containing `=`, `%` or control characters are rejected for desktop-launcher compatibility.
+
 The jobs run on `ubuntu-22.04`, the oldest GitHub-hosted image, so the binaries only need
 glibc 2.35 or newer: Ubuntu 22.04+, Debian 12+, Fedora 36+ and RHEL 10. The deb (`libc6 (>= 2.35)`)
 and the rpm (`glibc >= 2.35`) both declare that floor, so older systems refuse the install. Moving
@@ -126,7 +139,9 @@ runs `filmcraft-cli --version` in the sandbox. Users install it with
 `flatpak install --user <file>`; the freedesktop runtime comes from Flathub.
 `packaging/linux/flatpak/ai.storyteller.filmcraft.yml` is the from-source manifest for a Flathub
 submission (its header says how to build it). Both manifests must keep the same runtime and
-`finish-args` (packaging-lint checks this).
+`finish-args`, and install the same programs: the app and `filmcraft-cli`, which runs the
+headless commands and the MCP server in the sandbox
+(`flatpak run --command=filmcraft-cli ai.storyteller.filmcraft mcp`). packaging-lint checks this.
 
 ### FreeBSD
 

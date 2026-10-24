@@ -33,6 +33,10 @@ pub const PREFS_VERSION: u32 = 2;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct GeneralPrefs {
+    /// Interface language (persisted independently of projects): `en`, `ja`, `es`, `pt-br`, `uk`,
+    /// `zh-cn`, `de`, `ru`, `fr`, `id`, `it`, or `system` (the default: the operating system's preferred language when the
+    /// interface has it, otherwise English).
+    pub interface_language: String,
     /// "At Startup": `showHome` (FilmCraft: the demo project), `openMostRecent`, `emptyProject`.
     pub at_startup: String,
     /// "When Opening a Project": `showOpenDialog` | `showHome`.
@@ -59,6 +63,7 @@ pub struct GeneralPrefs {
 impl Default for GeneralPrefs {
     fn default() -> Self {
         Self {
+            interface_language: "system".into(),
             at_startup: "showHome".into(),
             when_opening_project: "showOpenDialog".into(),
             bins_double_click: "openInPlace".into(),
@@ -83,17 +88,93 @@ impl Default for GeneralPrefs {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AppearancePrefs {
-    /// "Color Theme": `darkest` (default) | `dark` | `light`.
+    /// Legacy single "Color Theme": `darkest` | `dark` | `light`. Setting it (old settings files,
+    /// automation, View ▸ Appearance) selects that theme and fixes the mode to its family. It is
+    /// kept in line with the fields below ([`AppearancePrefs::sync_color_theme`]): the light or
+    /// dark theme of a fixed mode, and the dark theme in Auto (whose shown theme depends on the
+    /// system; read `appearanceMode` for that).
     pub color_theme: String,
+    /// "Appearance Mode": `auto` (follow the operating system) | `dark` (default) | `light`.
+    pub appearance_mode: String,
+    /// The theme shown in dark mode: `darkest` (default) | `dark`.
+    pub dark_theme: String,
+    /// The theme shown in light mode: `light`.
+    pub light_theme: String,
+    /// Theme shortcuts for the header context menu.
+    pub favorite_themes: Vec<String>,
     /// "Accessible color contrast": brighter secondary text and borders.
     pub accessible_contrast: bool,
     /// Highlight (accent) colour of selections, focus and primary buttons (`#rrggbb`).
     pub highlight_color: String,
+    /// "UI Scale": `auto` (default: the scale the operating system reports) or a fixed
+    /// percentage of [`UI_SCALES`] (`100` = one point per physical pixel).
+    pub ui_scale: String,
+    /// "Animate zoom, scrolling and menus" (#2325): off, the Timeline zooms and scrolls in one
+    /// step and menus, collapsing sections and tooltips appear without a fade.
+    pub animations: bool,
 }
 
 impl Default for AppearancePrefs {
     fn default() -> Self {
-        Self { color_theme: "darkest".into(), accessible_contrast: false, highlight_color: DEFAULT_HIGHLIGHT.into() }
+        Self {
+            color_theme: "darkest".into(),
+            appearance_mode: "dark".into(),
+            dark_theme: "darkest".into(),
+            light_theme: "light".into(),
+            favorite_themes: Vec::new(),
+            accessible_contrast: false,
+            highlight_color: DEFAULT_HIGHLIGHT.into(),
+            ui_scale: "auto".into(),
+            animations: true,
+        }
+    }
+}
+
+impl AppearancePrefs {
+    /// The fixed UI scale (physical pixels per point) "UI Scale" asks for, or `None` for `auto`
+    /// (and for a value outside [`UI_SCALES`]), which keeps the operating system's scale.
+    pub fn ui_scale_factor(&self) -> Option<f32> {
+        // `auto` doesn't parse; every other listed value is a positive whole percentage
+        UI_SCALES.iter().any(|(k, _)| *k == self.ui_scale).then(|| self.ui_scale.parse::<f32>().ok()).flatten().map(|pct| pct / 100.0)
+    }
+
+    /// The theme to show (`darkest` | `dark` | `light`): the light or dark theme of the mode. Auto
+    /// follows `system_light` (the operating system's appearance) and is dark without an answer.
+    pub fn shown_theme(&self, system_light: Option<bool>) -> &str {
+        let light = match self.appearance_mode.as_str() {
+            "light" => true,
+            "auto" => system_light == Some(true),
+            _ => false,
+        };
+        if light { &self.light_theme } else { &self.dark_theme }
+    }
+
+    /// Select `theme` (a Color Theme value) as the theme of its family and fix the mode to that
+    /// family. Unknown names are ignored.
+    pub fn select_theme(&mut self, theme: &str) {
+        if LIGHT_THEMES.iter().any(|(v, _)| *v == theme) {
+            self.light_theme = theme.into();
+            self.appearance_mode = "light".into();
+        } else if DARK_THEMES.iter().any(|(v, _)| *v == theme) {
+            self.dark_theme = theme.into();
+            self.appearance_mode = "dark".into();
+        }
+    }
+
+    /// Bring the legacy `color_theme` in line with the mode and theme choices, so clients that
+    /// still read it get the theme a fixed mode shows (the dark theme in Auto).
+    pub fn sync_color_theme(&mut self) {
+        let theme = self.shown_theme(None).to_string();
+        self.color_theme = theme;
+    }
+
+    /// The mode after this one in the header button's cycle: Auto, Light, Dark, Auto…
+    pub fn next_mode(&self) -> &'static str {
+        match self.appearance_mode.as_str() {
+            "auto" => "light",
+            "light" => "dark",
+            _ => "auto",
+        }
     }
 }
 
@@ -252,11 +333,17 @@ impl Default for LabelDefaults {
 pub struct LabelPrefs {
     pub colors: BTreeMap<String, LabelColor>,
     pub defaults: LabelDefaults,
+    /// Label Color Presets: the preset the names and colours were last taken from.
+    pub preset: String,
 }
 
 impl Default for LabelPrefs {
     fn default() -> Self {
-        Self { colors: Label::ALL.iter().map(|l| (label_id(*l), default_label_color(*l))).collect(), defaults: LabelDefaults::default() }
+        Self {
+            colors: Label::ALL.iter().map(|l| (label_id(*l), default_label_color(*l))).collect(),
+            defaults: LabelDefaults::default(),
+            preset: DEFAULT_LABEL_PRESET.into(),
+        }
     }
 }
 
@@ -312,6 +399,226 @@ impl LabelPrefs {
             c.name = c.name.chars().take(64).collect();
         }
         self.colors.retain(|k, _| Label::ALL.iter().any(|l| label_id(*l) == *k));
+        self.preset = self.preset.chars().take(LABEL_NAME_MAX).collect();
+    }
+}
+
+/// The label colour preset FilmCraft ships with: the labels' own names and colours.
+pub const DEFAULT_LABEL_PRESET: &str = "Default";
+/// The folder of label colour presets, beside `preferences.json`.
+pub const LABEL_PRESETS_DIR: &str = "Label Presets";
+/// Largest label preset file read; a real one is under 2 KiB.
+const LABEL_PRESET_MAX_BYTES: u64 = 64 * 1024;
+/// Longest preset or label name, in characters.
+const LABEL_NAME_MAX: usize = 64;
+/// Most files looked at in the presets folder.
+const LABEL_PRESETS_MAX: usize = 500;
+
+/// A label colour preset (Settings ▸ Labels ▸ Label Color Presets), shared between editors as a
+/// small JSON file: its name and the 16 labels' names and colours, in [`Label::ALL`] order.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LabelPreset {
+    pub name: String,
+    pub labels: Vec<PresetLabel>,
+}
+
+/// One label of a [`LabelPreset`]. A file must give both fields.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PresetLabel {
+    pub name: String,
+    /// `#rrggbb`.
+    pub color: String,
+}
+
+/// The built-in presets after [`DEFAULT_LABEL_PRESET`]: (name, 16 × (label name, colour)) in
+/// [`Label::ALL`] order. "Roles" puts the label defaults (Video, Movie, Audio, Still, Sequence,
+/// Dynamic Link, Bin / Captions on labels 0, 1, 2, 3, 5, 6, 7) on matching roles.
+const BUILTIN_LABEL_PRESETS: [(&str, [(&str, &str); 16]); 2] = [
+    (
+        "Bright",
+        [
+            ("Red", "#e3342f"),
+            ("Orange", "#ec7a24"),
+            ("Amber", "#f0a82a"),
+            ("Yellow", "#e8d422"),
+            ("Lime", "#9ed62a"),
+            ("Green", "#36c24a"),
+            ("Mint", "#2fd69a"),
+            ("Cyan", "#24c9dc"),
+            ("Sky", "#2fa0ec"),
+            ("Blue", "#3d6ff0"),
+            ("Indigo", "#5b5cf0"),
+            ("Violet", "#8452ec"),
+            ("Purple", "#ac46e0"),
+            ("Magenta", "#dc3ccc"),
+            ("Pink", "#ec4f8e"),
+            ("Gray", "#8c8c8c"),
+        ],
+    ),
+    (
+        "Roles",
+        [
+            ("B-Roll", "#5b8fd4"),
+            ("Footage", "#36a9c9"),
+            ("Dialogue", "#4cb87a"),
+            ("Graphics", "#e8913a"),
+            ("Interview", "#d9c040"),
+            ("Sequence", "#7f9e3c"),
+            ("Visual Effects", "#c95bc4"),
+            ("Bin", "#8a94a6"),
+            ("Titles", "#e86f5c"),
+            ("Music", "#8c6fe0"),
+            ("Sound Effects", "#e0609a"),
+            ("Voice-Over", "#5fd1b5"),
+            ("Captions", "#c8b48a"),
+            ("Ambience", "#a8754f"),
+            ("Color Grade", "#d64545"),
+            ("Stock", "#b5d454"),
+        ],
+    ),
+];
+
+/// Whether `name` is a built-in preset's (any case): built-ins can't be deleted or replaced.
+pub fn is_builtin_label_preset(name: &str) -> bool {
+    name.eq_ignore_ascii_case(DEFAULT_LABEL_PRESET) || BUILTIN_LABEL_PRESETS.iter().any(|(n, _)| name.eq_ignore_ascii_case(n))
+}
+
+impl LabelPreset {
+    /// The built-in preset ([`DEFAULT_LABEL_PRESET`]).
+    pub fn builtin() -> Self {
+        Self::from_prefs(DEFAULT_LABEL_PRESET, &LabelPrefs::default())
+    }
+
+    /// Every built-in preset, [`DEFAULT_LABEL_PRESET`] first.
+    pub fn builtins() -> Vec<Self> {
+        let more = BUILTIN_LABEL_PRESETS.iter().map(|(name, labels)| Self {
+            name: (*name).into(),
+            labels: labels.iter().map(|(n, c)| PresetLabel { name: (*n).into(), color: (*c).into() }).collect(),
+        });
+        std::iter::once(Self::builtin()).chain(more).collect()
+    }
+
+    /// `labels`' names and colours as a preset called `name`.
+    pub fn from_prefs(name: &str, labels: &LabelPrefs) -> Self {
+        let entry = |l: Label| labels.colors.get(&label_id(l)).cloned().unwrap_or_else(|| default_label_color(l));
+        Self { name: name.into(), labels: Label::ALL.iter().map(|l| entry(*l)).map(|c| PresetLabel { name: c.name, color: c.color }).collect() }
+    }
+
+    /// Whether `labels` has exactly this preset's names and colours.
+    pub fn matches(&self, labels: &LabelPrefs) -> bool {
+        Self::from_prefs(&self.name, labels) == *self
+    }
+
+    /// Give `labels` this preset's names and colours (the label defaults stay) and select it.
+    pub fn apply(&self, labels: &mut LabelPrefs) {
+        for (l, p) in Label::ALL.iter().zip(&self.labels) {
+            labels.colors.insert(label_id(*l), LabelColor { name: p.name.clone(), color: p.color.clone() });
+        }
+        labels.preset = self.name.clone();
+    }
+
+    /// Check a preset file: at most 64 KiB of JSON with a name and exactly 16 labels, each with a
+    /// name (trimmed, at most 64 characters) and a `#rrggbb` colour.
+    pub fn parse(bytes: &[u8]) -> std::result::Result<Self, String> {
+        if bytes.len() as u64 > LABEL_PRESET_MAX_BYTES {
+            return Err("the file is too large to be a label color preset".into());
+        }
+        let mut p: Self = serde_json::from_slice(bytes).map_err(|e| format!("not a label color preset: {e}"))?;
+        p.name = p.name.trim().to_string();
+        if p.name.is_empty() || p.name.chars().count() > LABEL_NAME_MAX {
+            return Err(format!("the preset needs a name of 1 to {LABEL_NAME_MAX} characters"));
+        }
+        if p.labels.len() != Label::ALL.len() {
+            return Err(format!("a label color preset has {} labels; this file has {}", Label::ALL.len(), p.labels.len()));
+        }
+        for (i, l) in p.labels.iter_mut().enumerate() {
+            l.name = l.name.trim().to_string();
+            if l.name.chars().count() > LABEL_NAME_MAX {
+                return Err(format!("label {}: the name is longer than {LABEL_NAME_MAX} characters", i + 1));
+            }
+            let rgb = l.color.strip_prefix('#').and(parse_hex(&l.color)).ok_or_else(|| format!("label {}: the color is not like #2f6bdf", i + 1))?;
+            l.color = hex(rgb);
+        }
+        Ok(p)
+    }
+
+    /// Read and check a preset file ([`LabelPreset::parse`]).
+    pub fn read(path: &Path) -> std::result::Result<Self, String> {
+        use std::io::Read as _;
+        let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut bytes = Vec::new();
+        file.take(LABEL_PRESET_MAX_BYTES + 1).read_to_end(&mut bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+        Self::parse(&bytes)
+    }
+
+    pub fn write(&self, path: &Path) -> std::result::Result<(), String> {
+        let bytes = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
+        filmcraft_format::atomic_write(path, &bytes).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// Save `labels`' names and colours to `path` as a preset named after the file.
+    pub fn export(path: &Path, labels: &LabelPrefs) -> std::result::Result<Self, String> {
+        let stem = path.file_stem().map(|s| s.to_string_lossy().trim().chars().take(LABEL_NAME_MAX).collect::<String>()).unwrap_or_default();
+        let p = Self::from_prefs(if stem.is_empty() { "Labels" } else { &stem }, labels);
+        p.write(path)?;
+        Ok(p)
+    }
+}
+
+impl Session {
+    /// The label colour presets folder (None without a data directory, e.g. tests and the web).
+    pub fn label_presets_dir(&self) -> Option<PathBuf> {
+        self.prefs_path.as_deref().and_then(Path::parent).map(|d| d.join(LABEL_PRESETS_DIR))
+    }
+
+    /// The built-in presets, then the presets in the folder by name with the file each is in.
+    /// Files that fail [`LabelPreset::parse`] and names already taken are left out.
+    pub fn label_presets(&self) -> Vec<(LabelPreset, Option<PathBuf>)> {
+        let mut found: Vec<(LabelPreset, Option<PathBuf>)> = self
+            .label_presets_dir()
+            .and_then(|d| std::fs::read_dir(d).ok())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .take(LABEL_PRESETS_MAX)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("json")))
+            .filter_map(|p| LabelPreset::read(&p).ok().map(|preset| (preset, Some(p))))
+            .collect();
+        found.sort_by_key(|(p, _)| p.name.to_lowercase());
+        let mut out: Vec<(LabelPreset, Option<PathBuf>)> = LabelPreset::builtins().into_iter().map(|p| (p, None)).collect();
+        for f in found {
+            if !out.iter().any(|(p, _)| p.name.eq_ignore_ascii_case(&f.0.name)) {
+                out.push(f);
+            }
+        }
+        out
+    }
+
+    /// Copy the preset file at `path` into the presets folder, replacing a preset of the same
+    /// name, and return it. One named like a built-in preset becomes "<name> (imported)".
+    pub fn import_label_preset(&self, path: &Path) -> std::result::Result<LabelPreset, String> {
+        let mut p = LabelPreset::read(path)?;
+        if is_builtin_label_preset(&p.name) {
+            p.name = format!("{} (imported)", p.name);
+        }
+        let dir = self.label_presets_dir().ok_or("there is no presets folder in this session")?;
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        for (old, file) in self.label_presets() {
+            if let Some(file) = file.filter(|_| old.name.eq_ignore_ascii_case(&p.name)) {
+                std::fs::remove_file(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+            }
+        }
+        let safe: String = p.name.chars().map(|c| if c.is_alphanumeric() || " -_()".contains(c) { c } else { '_' }).collect();
+        p.write(&dir.join(format!("{}.json", safe.trim())))?;
+        Ok(p)
+    }
+
+    /// Delete a preset from the presets folder (built-in presets can't be deleted).
+    pub fn delete_label_preset(&self, name: &str) -> std::result::Result<(), String> {
+        let (_, file) = self.label_presets().into_iter().find(|(p, _)| p.name == name).ok_or_else(|| format!("there is no label color preset “{name}”"))?;
+        let file = file.ok_or("built-in presets can't be deleted")?;
+        std::fs::remove_file(&file).map_err(|e| format!("{}: {e}", file.display()))
     }
 }
 
@@ -423,6 +730,8 @@ pub struct TimelinePrefs {
     pub match_frame_sets_in: bool,
     pub restore_open_sequences: bool,
     pub add_tracks_automatically: bool,
+    /// Files dropped onto the Timeline are placed directly on it.
+    pub drop_import_to_timeline: bool,
 }
 
 impl Default for TimelinePrefs {
@@ -449,6 +758,7 @@ impl Default for TimelinePrefs {
             match_frame_sets_in: false,
             restore_open_sequences: true,
             add_tracks_automatically: true,
+            drop_import_to_timeline: true,
         }
     }
 }
@@ -602,6 +912,20 @@ const OPENING: &[(&str, &str)] = &[("showOpenDialog", "Show Open Dialog"), ("sho
 const BIN_OPEN: &[(&str, &str)] = &[("openInPlace", "Open in place"), ("openNewTab", "Open new tab"), ("openNewWindow", "Open in new window")];
 const PROJECT_OPEN: &[(&str, &str)] = &[("openNewTab", "Open new tab"), ("openNewWindow", "Open in new window")];
 const THEMES: &[(&str, &str)] = &[("darkest", "Darkest"), ("dark", "Dark"), ("light", "Light")];
+pub const APPEARANCE_MODES: &[(&str, &str)] = &[("auto", "Sync with system"), ("dark", "Dark"), ("light", "Light")];
+pub const UI_SCALES: &[(&str, &str)] = &[
+    ("auto", "Auto (system)"),
+    ("75", "75%"),
+    ("100", "100%"),
+    ("125", "125%"),
+    ("150", "150%"),
+    ("175", "175%"),
+    ("200", "200%"),
+    ("250", "250%"),
+    ("300", "300%"),
+];
+pub const DARK_THEMES: &[(&str, &str)] = &[("darkest", "Darkest"), ("dark", "Dark")];
+pub const LIGHT_THEMES: &[(&str, &str)] = &[("light", "Light")];
 const MIXDOWN: &[(&str, &str)] = &[("front", "Front Only"), ("frontRear", "Front + Rear"), ("frontLfe", "Front + LFE"), ("frontRearLfe", "Front + Rear + LFE")];
 const AUDITION: &[(&str, &str)] = &[("scratch", "Scratch disk location for Captured Audio"), ("nextToMedia", "Next to original media files")];
 const BUFFERS: &[(&str, &str)] = &[("64", "64"), ("128", "128"), ("256", "256"), ("512", "512"), ("1024", "1024"), ("2048", "2048"), ("4096", "4096")];
@@ -672,6 +996,26 @@ static CATEGORIES: &[Category] = &[
         id: "general",
         title: "General",
         rows: &[
+            f(
+                "general.interfaceLanguage",
+                "Interface Language",
+                Kind::Choice(&[
+                    ("system", "System Language"),
+                    ("en", "English"),
+                    ("ja", "日本語"),
+                    ("es", "Español"),
+                    ("pt-br", "Português (Brasil)"),
+                    ("uk", "Українська"),
+                    ("zh-cn", "简体中文"),
+                    ("de", "Deutsch"),
+                    ("ru", "Русский"),
+                    ("fr", "Français"),
+                    ("id", "Bahasa Indonesia"),
+                    ("it", "Italiano"),
+                    ("ko", "한국어"),
+                ]),
+                true,
+            ),
             f("general.atStartup", "At Startup", Kind::Choice(STARTUP), true),
             f("general.whenOpeningProject", "When Opening a Project", Kind::Choice(OPENING), false),
             Row::Group(
@@ -703,9 +1047,17 @@ static CATEGORIES: &[Category] = &[
         id: "appearance",
         title: "Appearance",
         rows: &[
+            // Drawn by the dialog as the Appearance Mode selector above the light and dark theme
+            // cards; the fields below keep their keys, validation and `prefs.schema` entries.
+            Row::Custom("appearanceModes"),
+            f("appearance.appearanceMode", "Appearance Mode", Kind::Choice(APPEARANCE_MODES), true),
+            f("appearance.lightTheme", "Light Theme", Kind::Choice(LIGHT_THEMES), true),
+            f("appearance.darkTheme", "Dark Theme", Kind::Choice(DARK_THEMES), true),
             f("appearance.colorTheme", "Color Theme", Kind::Choice(THEMES), true),
             b("appearance.accessibleContrast", "Accessible color contrast", true),
             f("appearance.highlightColor", "Highlight Color", Kind::Color, true),
+            f("appearance.uiScale", "UI Scale", Kind::Choice(UI_SCALES), true),
+            b("appearance.animations", "Animate zoom, scrolling and menus", true),
         ],
     },
     Category {
@@ -852,6 +1204,7 @@ static CATEGORIES: &[Category] = &[
                     f("labels.defaults.captions", "Captions", Kind::Label, false),
                 ],
             ),
+            Row::Custom("labelPresets"),
         ],
     },
     Category {
@@ -875,9 +1228,9 @@ static CATEGORIES: &[Category] = &[
             Row::Group(
                 "Growing Files",
                 &[
-                    b("media.refreshGrowingFiles", "Automatically refresh growing files", false),
+                    b("media.refreshGrowingFiles", "Automatically refresh growing files", true),
                     b("media.resumeGrowingPlayback", "Automatically resume playback for growing files in Source Monitor", false),
-                    sub("media.growingRefreshSeconds", "Refresh growing Files Every", int(1.0, 3600.0, "seconds"), "media.refreshGrowingFiles", false),
+                    sub("media.growingRefreshSeconds", "Refresh growing Files Every", int(1.0, 3600.0, "seconds"), "media.refreshGrowingFiles", true),
                 ],
             ),
             b("media.hardwareDecoding", "Enable hardware accelerated decoding (requires restart)", false),
@@ -955,7 +1308,7 @@ static CATEGORIES: &[Category] = &[
             b("playback.draftDecode", "Draft decoding at reduced playback resolution (H.264: faster, some frames less filtered)", true),
             f("playback.hardwareDecoding", "Hardware decoding", Kind::Choice(HW_DECODE), true),
             Row::Note(
-                "Hardware decoding: Auto uses the system's video decoder (VideoToolbox on macOS) for the H.264 and HEVC streams it supports, and FilmCraft's own decoder for everything else or if the hardware fails. Media that is already open keeps its decoder until it is reopened.",
+                "Hardware decoding: Auto uses the system's video decoder (VideoToolbox on macOS, Media Foundation on Windows, VA-API or NVDEC for H.264 and HEVC on Linux) for the streams it supports, and FilmCraft's own decoder for everything else or if the hardware fails. Media that is already open keeps its decoder until it is reopened.",
             ),
         ],
     },
@@ -985,15 +1338,16 @@ static CATEGORIES: &[Category] = &[
                     f("timeline.multichannelMonoMediaTracks", "Multichannel Mono Media", Kind::Choice(TRACKS), false),
                 ],
             ),
-            b("timeline.focusTimelineOnEdit", "Set focus on the Timeline when performing Insert/Overwrite edits", true),
+            b("timeline.focusTimelineOnEdit", "Set focus on the Timeline when performing Insert/Overwrite edits", false),
             b("timeline.snapPlayhead", "Snap playhead in Timeline when Snap is enabled", true),
             b("timeline.returnToBeginning", "At playback end, return to beginning when restarting playback", true),
             b("timeline.outOfSyncUnlinked", "Display out of sync indicators for unlinked clips", false),
             b("timeline.playAfterRendering", "Play after rendering previews", true),
             b("timeline.clipMismatchWarning", "Show Clip Mismatch Warning dialog", false),
             b("timeline.matchFrameSetsIn", "Match frame sets in point", false),
-            b("timeline.restoreOpenSequences", "Restore open sequences when opening projects", false),
+            b("timeline.restoreOpenSequences", "Restore open sequences when opening projects", true),
             b("timeline.addTracksAutomatically", "Add tracks automatically when editing source clips onto the Timeline", false),
+            b("timeline.dropImportToTimeline", "Place files dropped onto the Timeline directly on the Timeline", true),
         ],
     },
     Category {
@@ -1036,6 +1390,18 @@ pub fn field(key: &str) -> Option<Field> {
 
 /// Check a value for `key` against the schema (choices, colours). Ranges are clamped later.
 pub fn validate(key: &str, v: &Value) -> std::result::Result<(), String> {
+    if key == "appearance.favoriteThemes" {
+        let items = v.as_array().ok_or("favorite themes must be a list")?;
+        let mut seen = Vec::new();
+        for item in items {
+            let id = item.as_str().ok_or("favorite theme ids must be strings")?;
+            if !LIGHT_THEMES.iter().chain(DARK_THEMES).any(|(theme, _)| *theme == id) || seen.contains(&id) {
+                return Err(format!("unknown or duplicate favorite theme `{id}`"));
+            }
+            seen.push(id);
+        }
+        return Ok(());
+    }
     let kind = match field(key) {
         Some(f) => f.kind,
         None if is_unit_key(key) => Kind::Choice(DURATION_UNITS),
@@ -1068,6 +1434,11 @@ pub fn is_unit_key(key: &str) -> bool {
 /// Repair a preferences value in place against the schema: unknown choices and bad colours go back
 /// to their defaults, numbers are clamped to their ranges.
 pub fn sanitize(v: &mut Value, defaults: &Value) {
+    if let Some(slot) = v.pointer_mut("/appearance/favoriteThemes")
+        && validate("appearance.favoriteThemes", slot).is_err()
+    {
+        *slot = json!([]);
+    }
     for (_, f) in fields() {
         if let Kind::Duration { unit_key } = f.kind {
             let ptr = format!("/{}", unit_key.replace('.', "/"));
@@ -1084,10 +1455,8 @@ pub fn sanitize(v: &mut Value, defaults: &Value) {
         let Some(slot) = path.iter().try_fold(&mut *v, |v, k| v.get_mut(*k)) else { continue };
         let def = path.iter().try_fold(defaults, |v, k| v.get(*k)).cloned().unwrap_or(Value::Null);
         match f.kind {
-            Kind::Choice(_) | Kind::Color => {
-                if validate(f.key, slot).is_err() {
-                    *slot = def;
-                }
+            Kind::Choice(_) | Kind::Color if validate(f.key, slot).is_err() => {
+                *slot = def;
             }
             Kind::Int { min, max, .. } => match slot.as_f64().filter(|x| x.is_finite()) {
                 Some(x) => *slot = json!(x.round().clamp(min, max) as u64),
@@ -1123,6 +1492,18 @@ pub fn migrate(v: &mut Value) {
         // (filled in from defaults by serde). The v1 "Auto Save" dialog wrote integer seconds for
         // pre/postroll; v2 stores them as reals, which serde reads either way.
         m.insert("version".into(), json!(2));
+    }
+    // Files from before appearance modes had one Color Theme: keep showing it, as a fixed Dark or
+    // Light mode, instead of switching established users to another theme or to Auto.
+    if let Some(a) = m.get_mut("appearance").and_then(Value::as_object_mut)
+        && !a.contains_key("appearanceMode")
+        && let Some(theme) = a.get("colorTheme").and_then(Value::as_str).map(str::to_string)
+    {
+        let mut p = AppearancePrefs::default();
+        p.select_theme(&theme);
+        a.insert("appearanceMode".into(), json!(p.appearance_mode));
+        a.insert("darkTheme".into(), json!(p.dark_theme));
+        a.insert("lightTheme".into(), json!(p.light_theme));
     }
 }
 
@@ -1202,17 +1583,18 @@ pub fn map_output(left: &[f32], right: &[f32], out: &mut [f32], ch: usize, map: 
     }
 }
 
-/// Settings ▸ Media ▸ Default Media Scaling for a clip of `src` size placed in a `frame`-sized
-/// sequence: `scaleToFrameSize` turns on Scale to Frame Size (rasterised at frame size),
-/// `setToFrameSize` sets Motion ▸ Scale so the picture fits the frame.
-pub fn apply_media_scaling(ti: &mut filmcraft_project::TrackItem, scaling: &str, frame: (u32, u32), src: (u32, u32)) {
-    if src.0 == 0 || src.1 == 0 {
+/// Settings ▸ Media ▸ Default Media Scaling for a clip placed in a `frame`-sized sequence. `src`
+/// is the clip's size at its display aspect in sequence pixels
+/// ([`filmcraft_project::conformed_size`]): `scaleToFrameSize` turns on Scale to Frame Size
+/// (rasterised at frame size), `setToFrameSize` sets Motion ▸ Scale so the picture fits the frame.
+pub fn apply_media_scaling(ti: &mut filmcraft_project::TrackItem, scaling: &str, frame: (u32, u32), src: (f64, f64)) {
+    if !(src.0 >= 1e-9 && src.1 >= 1e-9 && src.0.is_finite() && src.1.is_finite()) {
         return;
     }
     match scaling {
         "scaleToFrameSize" => ti.scale_to_frame = true,
         "setToFrameSize" => {
-            let fit = (frame.0 as f64 / src.0 as f64).min(frame.1 as f64 / src.1 as f64);
+            let fit = (frame.0 as f64 / src.0).min(frame.1 as f64 / src.1);
             if let Some(m) = ti.effects.iter_mut().find(|e| e.effect == "motion") {
                 m.params.insert("scale".into(), filmcraft_project::Param::new(filmcraft_project::ParamValue::Float((fit * 1000.0).round() / 10.0)));
             }
@@ -1428,10 +1810,41 @@ fn cache_clean(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"files": files, "bytes": bytes, "location": dir.to_string_lossy()}))
 }
 
+fn presets_json(s: &Session) -> Value {
+    let presets: Vec<Value> = s.label_presets().into_iter().map(|(p, file)| json!({"name": p.name, "builtin": file.is_none(), "labels": p.labels})).collect();
+    json!({"dir": s.label_presets_dir(), "selected": s.prefs.labels.preset, "presets": presets})
+}
+
+fn label_presets(s: &mut Session, _: &Value) -> Result<Value> {
+    Ok(presets_json(s))
+}
+
+fn import_label_preset(s: &mut Session, p: &Value) -> Result<Value> {
+    let path = str_p(p, "path").ok_or_else(|| bad("labels.importPreset", "need `path`"))?;
+    let preset = s.import_label_preset(Path::new(path)).map_err(|e| bad("labels.importPreset", e))?;
+    Ok(json!({"name": preset.name, "presets": presets_json(s)}))
+}
+
+fn export_label_preset(s: &mut Session, p: &Value) -> Result<Value> {
+    let path = str_p(p, "path").ok_or_else(|| bad("labels.exportPreset", "need `path`"))?;
+    let preset = LabelPreset::export(Path::new(path), &s.prefs.labels).map_err(|e| bad("labels.exportPreset", e))?;
+    Ok(json!({"name": preset.name, "path": path}))
+}
+
+fn delete_label_preset(s: &mut Session, p: &Value) -> Result<Value> {
+    let name = str_p(p, "name").ok_or_else(|| bad("labels.deletePreset", "need `name`"))?;
+    s.delete_label_preset(name).map_err(|e| bad("labels.deletePreset", e))?;
+    Ok(presets_json(s))
+}
+
 pub fn commands() -> Vec<CommandSpec> {
     vec![
         spec("prefs.schema", "Settings Schema", r#"{"category":str?}"#, schema, false),
         spec("mediaCache.info", "Media Cache Info", "{}", cache_info, false),
         spec("mediaCache.clean", "Delete Media Cache Files", r#"{"all":bool?}"#, cache_clean, true),
+        spec("labels.presets", "Label Color Presets", "{}", label_presets, false),
+        spec("labels.importPreset", "Import Label Color Preset", r#"{"path":str}"#, import_label_preset, true),
+        spec("labels.exportPreset", "Export Label Color Preset", r#"{"path":str}"#, export_label_preset, true),
+        spec("labels.deletePreset", "Delete Label Color Preset", r#"{"name":str}"#, delete_label_preset, true),
     ]
 }

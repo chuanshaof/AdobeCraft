@@ -361,7 +361,7 @@ impl MxfSource {
             kind: if video.is_some() { MediaKind::Movie } else { MediaKind::AudioOnly },
             duration,
             video,
-            audio,
+            audio_streams: audio.into_iter().collect(),
             container: format!("MXF {}", file.operational_pattern.name()),
             start_timecode: None,
             file_size: Some(bytes.0.len()),
@@ -408,10 +408,11 @@ impl VideoSamples for MxfVideo<'_> {
         self.src.vpts[i]
     }
     fn sync_before(&self, i: usize) -> usize {
-        let key = self.src.file.tracks[self.track].sync_before(i);
         // a leading picture of an open GOP (stored after its random-access picture, shown
         // before it) is predicted from the previous GOP too
-        if key > 0 && i < self.src.vpts.len() && self.src.vpts[i] < self.src.vpts[key] { self.sync_before(key - 1) } else { key }
+        let track = &self.src.file.tracks[self.track];
+        let pts = &self.src.vpts;
+        crate::gop::open_gop_sync(i, |i| track.sync_before(i), |i, key| matches!((pts.get(i), pts.get(key)), (Some(a), Some(b)) if a < b))
     }
     fn sample_at(&self, t: i64) -> Option<usize> {
         usize::try_from(t).ok().and_then(|t| self.src.vorder.get(t).copied())
@@ -457,7 +458,7 @@ impl MediaSource for MxfSource {
     }
 
     fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer, MediaError> {
-        let ainfo = self.info.audio.as_ref().ok_or(MediaError::NoStream("audio"))?;
+        let ainfo = self.info.audio().ok_or(MediaError::NoStream("audio"))?;
         let src_rate = ainfo.sample_rate;
         let ch = ainfo.channels.max(1) as usize;
         let mut out = AudioBuffer::silence(sample_rate, ch, frames);

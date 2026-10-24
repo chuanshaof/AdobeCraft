@@ -17,18 +17,24 @@ pub mod clip_ops;
 pub mod color;
 pub mod commands;
 pub mod demo;
+pub mod doc_path;
 pub mod essential_sound;
 pub mod export_tools;
 pub mod graphic_templates;
 pub mod graphics;
 pub mod interchange;
 pub mod keyboard;
+mod keyframe_move;
+mod marker_export;
 pub mod masks;
 pub mod media_browser;
 pub mod media_pool;
+pub mod media_watch;
 pub mod mixer;
 pub mod multicam;
+pub mod narration;
 pub mod panels;
+pub mod paste_media;
 pub mod perf;
 pub mod presets;
 pub mod previews;
@@ -45,6 +51,7 @@ pub mod sequence_tools;
 pub mod settings;
 pub mod shortcut_presets;
 pub mod shortcuts;
+pub mod source_monitor;
 pub mod sync;
 pub mod transcript;
 pub mod trim;
@@ -54,7 +61,7 @@ use std::sync::Arc;
 
 use filmcraft_edit::EditCtx;
 use filmcraft_project::{ClipId, ItemId, Project, Sequence, TrackId, TrackKind};
-use filmcraft_time::{FrameRate, Tick};
+use filmcraft_time::{FrameRate, Tick, TimeRange};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -95,6 +102,14 @@ pub type Result<T> = std::result::Result<T, EngineError>;
 pub trait Services: Send + Sync {
     fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>>;
     fn write_file(&self, path: &str, data: &[u8]) -> std::io::Result<()>;
+    /// Publish a complete new file only when the final path is unoccupied. Publication must
+    /// reject a concurrent collision; a prior existence check alone is insufficient.
+    /// Return `ErrorKind::AlreadyExists` for an occupied final path so the importer can retry
+    /// with a numbered name; return other errors without publishing a partial file.
+    /// Hosts without this operation fail closed.
+    fn write_file_new(&self, _path: &str, _data: &[u8]) -> std::io::Result<()> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "exclusive file creation is unavailable on this host"))
+    }
     /// Size of a file in bytes (an error when it is missing). Hosts should override this: the
     /// default reads the whole file.
     fn file_size(&self, path: &str) -> std::io::Result<u64> {
@@ -152,6 +167,23 @@ impl Services for FsServices {
         // Atomic + durable: temp file in the same directory, fsync, rename, fsync the directory.
         filmcraft_format::atomic_write(std::path::Path::new(path), data)
     }
+    fn write_file_new(&self, path: &str, data: &[u8]) -> std::io::Result<()> {
+        let path = std::path::Path::new(path);
+        let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::create_dir_all(dir).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                std::io::Error::new(std::io::ErrorKind::NotADirectory, format!("{} is not a directory: {error}", dir.display()))
+            } else {
+                error
+            }
+        })?;
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => return Err(std::io::ErrorKind::AlreadyExists.into()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        filmcraft_format::atomic_write_new(path, data)
+    }
     fn file_size(&self, path: &str) -> std::io::Result<u64> {
         let m = std::fs::metadata(path)?;
         if m.is_file() { Ok(m.len()) } else { Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("{path} is not a file"))) }
@@ -187,6 +219,10 @@ impl Services for FsServices {
     }
 }
 
+/// A point in the undo history (its top step), from [`Session::undo_mark`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UndoMark(Option<usize>);
+
 /// Undo history of whole-project snapshots.
 #[derive(Clone, Default)]
 pub struct History {
@@ -218,6 +254,36 @@ pub struct Targeting {
     pub audio_dest: Option<TrackId>,
 }
 
+/// A gap on one track of the active sequence (see [`EditorState::gap_selection`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GapSelection {
+    pub track: TrackId,
+    pub range: TimeRange,
+}
+
+/// An effect of a clip (`effects.select`): its id and which of the clip's effects with that id it
+/// is (0 = the first). Not its index, which applying an effect shifts (standard effects go first).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectSel {
+    pub clip: ClipId,
+    pub effect: String,
+    pub instance: usize,
+}
+
+impl EffectSel {
+    /// The selection of `effects[index]` of `clip`.
+    pub fn of(clip: ClipId, effects: &[filmcraft_project::EffectInstance], index: usize) -> Option<Self> {
+        let id = &effects.get(index)?.effect;
+        let instance = effects.iter().take(index).filter(|e| &e.effect == id).count();
+        Some(Self { clip, effect: id.clone(), instance })
+    }
+
+    /// Where the selected effect is in the clip's `effects`.
+    pub fn index(&self, effects: &[filmcraft_project::EffectInstance]) -> Option<usize> {
+        effects.iter().enumerate().filter(|(_, e)| e.effect == self.effect).nth(self.instance).map(|(i, _)| i)
+    }
+}
+
 /// Editing state that commands depend on (not project data, but headless-relevant).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct EditorState {
@@ -227,6 +293,10 @@ pub struct EditorState {
     /// Item loaded in the Source monitor and its playhead (media time).
     pub source_item: Option<ItemId>,
     pub source_playhead: Tick,
+    /// Clips opened in the Source monitor, most recent first: the Source panel's list of recent
+    /// clips (#313). Kept up to date after every command; items gone from the project drop out.
+    #[serde(default)]
+    pub source_history: Vec<ItemId>,
     /// Selected timeline items.
     pub selection: Vec<ClipId>,
     /// Selected project panel items.
@@ -259,12 +329,27 @@ pub struct EditorState {
     /// Selected captions (caption tracks / Captions panel).
     #[serde(default)]
     pub caption_selection: Vec<ClipId>,
+    /// Selected transitions (clicked in the Timeline): Effect Controls shows one, Delete removes
+    /// them. Selecting clips clears it and selecting transitions clears the clip selection.
+    #[serde(default)]
+    pub transition_selection: Vec<filmcraft_project::TransitionId>,
+    /// The selected gap (#648, #668): empty time on one track, clicked in the Timeline, from the
+    /// end of a clip (or the sequence start) up to the next clip. Delete, Backspace and Ripple
+    /// Delete close it. Selecting clips, transitions or edit points clears it, and so does an edit
+    /// that changes the gap.
+    #[serde(default)]
+    pub gap_selection: Option<GapSelection>,
     /// Selected layers (indices among the graphic layers, 0 = back) of the selected graphic clip.
     #[serde(default)]
     pub graphic_layers: Vec<usize>,
     /// The mask being edited on the Program monitor (Effect Controls selection).
     #[serde(default)]
     pub selected_mask: Option<masks::MaskSel>,
+    /// The effect selected in Effect Controls (its header or one of its properties): Motion and
+    /// Transform show their handles on the Program monitor. Selecting a mask clears it, and
+    /// selecting an effect clears the mask selection.
+    #[serde(default)]
+    pub selected_effect: Option<EffectSel>,
     /// Multi-Camera Audio Follows Video: switching a multi-camera clip's angle switches its linked
     /// audio clips too.
     #[serde(default)]
@@ -331,6 +416,9 @@ pub struct Session {
     pub journal: Vec<(String, Value)>,
     /// Background jobs (exports, render previews…).
     pub jobs: Vec<Job>,
+    /// Export job → the offline items it drew the slate for, filled when the export finishes
+    /// (#1054; `offlineMedia` in `file.exportMedia` and queue results).
+    pub export_offline: std::collections::HashMap<u64, Arc<std::sync::Mutex<Vec<media_pool::OfflineMedia>>>>,
     /// User preferences (`prefs.*` commands) and where they persist (None = not persisted).
     pub prefs: autosave::Preferences,
     pub prefs_path: Option<std::path::PathBuf>,
@@ -347,6 +435,10 @@ pub struct Session {
     pub mcrec: multicam::Recorder,
     /// Voice-over recording: the input device and the take in progress.
     pub voiceover: voiceover::VoiceOver,
+    /// The last `tts.preview` result, for the host to play (Text to Speech ▸ Preview).
+    pub tts_preview: Option<Arc<filmcraft_tts::Audio>>,
+    /// Synthesized narrations (`tts.render` fills it from a background job).
+    pub tts_cache: narration::SynthCache,
     /// Dynamic (J/K/L) trimming and trim-mode loop playback in progress.
     pub trim_play: trim::TrimPlayback,
     /// Keyboard shortcuts (active bindings, presets; `shortcuts.*` commands).
@@ -376,6 +468,11 @@ pub struct Session {
     pub browser: media_browser::BrowserState,
     /// Nesting depth of [`Session::execute`] (commands that run other commands).
     exec_depth: u32,
+    /// Each media file's size and modification time when last seen (Settings ▸ Media ▸
+    /// Automatically refresh growing files, [`media_watch`]).
+    pub media_stamps: std::collections::HashMap<String, media_watch::Stamp>,
+    /// The stamps being taken on a worker thread ([`Session::start_media_scan`]).
+    pub media_scan: Option<media_watch::MediaScan>,
 }
 
 /// An export advanced a batch at a time on the host's thread ([`Session::pump_jobs`]).
@@ -441,6 +538,7 @@ impl Session {
             events: Vec::new(),
             journal: Vec::new(),
             jobs: Vec::new(),
+            export_offline: Default::default(),
             prefs: Default::default(),
             prefs_path: None,
             persistence: None,
@@ -449,6 +547,8 @@ impl Session {
             mixrec: Default::default(),
             mcrec: Default::default(),
             voiceover: Default::default(),
+            tts_preview: None,
+            tts_cache: Default::default(),
             trim_play: Default::default(),
             shortcuts: shortcuts::Shortcuts::new(),
             offline: Default::default(),
@@ -463,6 +563,8 @@ impl Session {
             log: Default::default(),
             browser: Default::default(),
             exec_depth: 0,
+            media_stamps: Default::default(),
+            media_scan: None,
         }
     }
 
@@ -553,10 +655,10 @@ impl Session {
         let Some(p) = self.persistence.as_mut() else { return };
         for ev in p.drain_events() {
             match ev {
-                autosave::WorkerEvent::SavedProject { path, revision } => {
-                    if self.path.as_deref() == Some(path.as_str()) && revision > self.saved_revision && revision <= self.revision {
-                        self.saved_revision = revision;
-                    }
+                autosave::WorkerEvent::SavedProject { path, revision }
+                    if self.path.as_deref() == Some(path.as_str()) && revision > self.saved_revision && revision <= self.revision =>
+                {
+                    self.saved_revision = revision;
                 }
                 autosave::WorkerEvent::Error(m) => {
                     self.log.push(panels::Level::Error, "autosave", m.clone());
@@ -632,6 +734,9 @@ impl Session {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.run)(self, &params)))
             .unwrap_or_else(|_| Err(EngineError::Other(format!("internal error in `{id}` (see the crash log); the command did not complete"))));
         self.exec_depth -= 1;
+        if self.exec_depth == 0 {
+            source_monitor::track_history(self);
+        }
         // source graphics: an edited instance updates the shared layers and the other instances
         if r.is_ok() && spec.journal && id.starts_with("graphics.") && !self.project.source_graphics.is_empty() {
             graphic_templates::sync_source_graphics(self);
@@ -681,8 +786,11 @@ impl Session {
         }
         let clips = commands::named_clips(self, spec, params);
         let items = commands::named_items(self, spec, params);
+        // clips were named but none is one of the active sequence: say which and why, rather
+        // than "no clips selected" to a caller that did not mean the selection (#591)
+        let missing = if clips.is_none() { commands::named_clips_missing(self, spec, params) } else { None };
         if clips.is_none() && items.is_none() {
-            return by_selection;
+            return by_selection.map_err(|why| missing.unwrap_or(why));
         }
         let mut clips = clips.unwrap_or_else(|| self.state.selection.clone());
         let mut items = items.unwrap_or_else(|| self.state.project_selection.clone());
@@ -691,7 +799,7 @@ impl Session {
         let by_params = (spec.enabled)(self);
         self.state.selection = clips;
         self.state.project_selection = items;
-        by_params
+        by_params.map_err(|why| missing.unwrap_or(why))
     }
 
     /// Whether the command can run on the current selection (what the menus show).
@@ -706,14 +814,15 @@ impl Session {
             open_sequences: self.state.open_sequences.iter().copied().filter(is_seq).collect(),
             active_sequence: self.state.active_sequence.filter(is_seq),
             sequences: self.state.timeline_views.iter().filter(|(id, _)| is_seq(id)).map(|(id, v)| (*id, *v)).collect(),
+            playheads: self.state.playheads.iter().filter(|(id, _)| is_seq(id)).map(|(id, t)| (*id, *t)).collect(),
         }
     }
 
     /// Open what was open when the project was saved. Nothing in `view` is trusted: ids that are
     /// not sequences of this project are dropped (also a second mention of the same sequence),
-    /// and numbers are brought into range. A view without any open sequence leaves the project
-    /// on its first sequence: a project saved by a session that never showed one (a script, the
-    /// CLI) should not open on an empty Timeline.
+    /// and numbers are brought into range (a playhead also lands on a frame of its sequence). A
+    /// view without any open sequence leaves the project on its first sequence: a project saved
+    /// by a session that never showed one (a script, the CLI) should not open on an empty Timeline.
     pub fn restore_project_view(&mut self, view: filmcraft_project::ProjectView) {
         let mut open: Vec<ItemId> = Vec::new();
         for id in view.open_sequences {
@@ -727,6 +836,12 @@ impl Session {
         }
         self.state.timeline_views =
             view.sequences.into_iter().filter(|(id, _)| self.project.sequence(*id).is_some()).filter_map(|(id, v)| Some((id, v.checked()?))).collect();
+        for (id, t) in view.playheads {
+            if let Some(seq) = self.project.sequence(id) {
+                let t = t.clamp(Tick::ZERO, filmcraft_project::ProjectView::MAX_PLAYHEAD);
+                self.state.playheads.insert(id, seq.settings.frame_rate.snap(t));
+            }
+        }
     }
 
     /// Every edit passes through here: one that would put a sequence inside itself (directly or
@@ -756,6 +871,7 @@ impl Session {
         self.history.redo.clear();
         self.history.merge_key = None;
         self.state = st;
+        self.drop_stale_gap();
         self.bump();
         Ok(r)
     }
@@ -775,8 +891,80 @@ impl Session {
         self.refuse_self_nesting(&p)?;
         self.project = Arc::new(p);
         self.state = st;
+        self.drop_stale_gap();
         self.bump();
         Ok(r)
+    }
+
+    /// Run several undoable edits as one undo step labelled `label`. If `f` fails, every edit it made
+    /// is rolled back and the history is as before.
+    pub fn edit_group<R>(&mut self, label: &str, f: impl FnOnce(&mut Session) -> Result<R>) -> Result<R> {
+        let (project, state, undo, redo, limit) =
+            (self.project.clone(), self.state.clone(), self.history.undo.len(), self.history.redo.clone(), self.history.limit);
+        // keep every step the group makes, however many, so the first one can be found afterwards
+        self.history.limit = usize::MAX;
+        // a panic inside the group must not leave the history unlimited: restore, then let it go on
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        self.history.limit = limit;
+        let first = self.history.undo.get(undo).map(|e| e.1.clone());
+        let rolled_back = |s: &mut Session| {
+            s.history.undo.truncate(undo);
+            s.history.redo = redo.clone();
+            s.history.merge_key = None;
+            s.project = project.clone();
+            s.state = state.clone();
+            s.bump();
+        };
+        match (r, first) {
+            (Ok(Ok(v)), Some(first)) => {
+                self.history.undo.truncate(undo);
+                self.history.undo.push((label.to_string(), first));
+                if self.history.undo.len() > limit {
+                    self.history.undo.remove(0);
+                }
+                self.history.merge_key = None;
+                Ok(v)
+            }
+            (Ok(Ok(v)), None) => Ok(v),
+            (Ok(Err(e)), _) => {
+                rolled_back(self);
+                Err(e)
+            }
+            (Err(panic), _) => {
+                rolled_back(self);
+                std::panic::resume_unwind(panic)
+            }
+        }
+    }
+
+    /// Where the undo history stands now, for [`Session::revert_to`].
+    pub fn undo_mark(&self) -> UndoMark {
+        UndoMark(self.history.undo.last().map(|u| Arc::as_ptr(&u.1) as usize))
+    }
+
+    /// Take back every edit made since `mark` (a gesture cancelled with Escape, #580), merged or
+    /// not: the project returns to how it was at `mark`, and neither undo nor redo keeps them.
+    /// Nothing happens when `mark` has left the history. Returns how many steps were taken back.
+    pub fn revert_to(&mut self, mark: UndoMark) -> usize {
+        if let UndoMark(Some(p)) = mark
+            && !self.history.undo.iter().any(|u| Arc::as_ptr(&u.1) as usize == p)
+        {
+            return 0;
+        }
+        let mut earliest = None;
+        let mut n = 0;
+        while self.undo_mark() != mark {
+            let Some((_, prev)) = self.history.undo.pop() else { break };
+            earliest = Some(prev);
+            n += 1;
+        }
+        if let Some(prev) = earliest {
+            self.project = prev;
+            self.history.merge_key = None;
+            self.fix_state();
+            self.bump();
+        }
+        n
     }
 
     /// Edit the active sequence with the edit-algebra context.
@@ -848,6 +1036,11 @@ impl Session {
                 self.state.selected_mask = None;
             }
         }
+        if let Some(e) = &self.state.selected_effect
+            && self.active_sequence().and_then(|q| q.find_item(e.clip)).and_then(|(_, it)| e.index(&it.effects)).is_none()
+        {
+            self.state.selected_effect = None;
+        }
         if let Some(s) = self.state.active_sequence
             && p.sequence(s).is_none()
         {
@@ -860,6 +1053,7 @@ impl Session {
         {
             self.state.source_item = None;
         }
+        source_monitor::track_history(self);
         if let Some(seq) = self.state.active_sequence.and_then(|s| p.sequence(s)) {
             self.state.selection.retain(|c| seq.find_item(*c).is_some());
             self.state.caption_selection.retain(|c| seq.find_caption(*c).is_some());
@@ -868,6 +1062,17 @@ impl Session {
             self.state.caption_selection.clear();
         }
         self.state.project_selection.retain(|i| p.item(*i).is_some());
+        self.drop_stale_gap();
+    }
+
+    /// Forget the selected gap when it is no longer a gap of the active sequence (a clip moved
+    /// into it or next to it, its track went, another sequence became the active one).
+    fn drop_stale_gap(&mut self) {
+        if let Some(g) = self.state.gap_selection
+            && !self.active_sequence().and_then(|q| q.track(g.track)).is_some_and(|tr| filmcraft_edit::through::track_gaps(tr).contains(&g.range))
+        {
+            self.state.gap_selection = None;
+        }
     }
 
     fn bump(&mut self) {
@@ -958,11 +1163,22 @@ impl Session {
 
     /// [`Session::render_program_at`], with the reason when nothing can be rendered.
     pub fn try_render_program_at(&self, scale: f32, t: Tick) -> Result<filmcraft_render::Image> {
+        self.render_program_with(scale, t, &self.media.provider(self.project.clone(), self.services.clone()))
+    }
+
+    /// [`Session::try_render_program_at`], also naming the offline items the frame drew the slate
+    /// for (#1054).
+    pub fn try_render_program_with_offline_at(&self, scale: f32, t: Tick) -> Result<(filmcraft_render::Image, Vec<media_pool::OfflineMedia>)> {
+        let provider = self.media.provider(self.project.clone(), self.services.clone()).recording();
+        let img = self.render_program_with(scale, t, &provider)?;
+        Ok((img, provider.offline_used()))
+    }
+
+    fn render_program_with(&self, scale: f32, t: Tick, provider: &dyn filmcraft_render::SourceProvider) -> Result<filmcraft_render::Image> {
         let seq = self.renderable_sequence(scale)?;
         let t = self.sequence_rate().snap(t.max(Tick::ZERO));
-        let provider = self.media.provider(self.project.clone(), self.services.clone());
         let opts = filmcraft_render::RenderOptions { scale, captions: true, ..Default::default() };
-        Ok(filmcraft_render::render_sequence(&self.project, seq, t, opts, &provider))
+        Ok(filmcraft_render::render_sequence(&self.project, seq, t, opts, provider))
     }
 
     /// The active sequence, if a frame of it at `scale` is within the image size limits.
@@ -1020,9 +1236,15 @@ const MAX_SUBCLIP_CHAIN: usize = 16;
 #[cfg(test)]
 mod aaf_omf_tests;
 #[cfg(test)]
+mod animated_image_tests;
+#[cfg(test)]
 mod audio_effects_tests;
 #[cfg(test)]
+mod audio_placement_tests;
+#[cfg(test)]
 mod autosave_tests;
+#[cfg(test)]
+mod avi_import_tests;
 #[cfg(test)]
 mod clip_ops_tests;
 #[cfg(test)]
@@ -1036,7 +1258,11 @@ mod export_tests;
 #[cfg(test)]
 mod file_tests;
 #[cfg(test)]
+mod gap_selection_tests;
+#[cfg(test)]
 mod image_sequence_tests;
+#[cfg(test)]
+mod individual_selection_tests;
 #[cfg(test)]
 mod interchange_auto_points_tests;
 #[cfg(test)]
@@ -1044,15 +1270,21 @@ mod keyboard_tests;
 #[cfg(test)]
 mod linked_speed_tests;
 #[cfg(test)]
+mod locked_clip_edits_tests;
+#[cfg(test)]
 mod masks_tests;
 #[cfg(test)]
 mod media_browser_tests;
 #[cfg(test)]
 mod media_test_util;
 #[cfg(test)]
+mod media_watch_tests;
+#[cfg(test)]
 mod mixer_tests;
 #[cfg(test)]
 mod multicam_tests;
+#[cfg(test)]
+mod narration_tests;
 #[cfg(test)]
 mod nest_editing_tests;
 #[cfg(test)]
@@ -1061,6 +1293,12 @@ mod nest_fidelity_tests;
 mod nesting_tests;
 #[cfg(test)]
 mod panels_tests;
+#[cfg(test)]
+mod par_tests;
+#[cfg(test)]
+mod paste_media_tests;
+#[cfg(test)]
+mod place_items_tests;
 #[cfg(test)]
 mod presets_tests;
 #[cfg(test)]
@@ -1078,6 +1316,10 @@ mod remix_tests;
 #[cfg(test)]
 mod ripple_delete_tests;
 #[cfg(test)]
+mod ripple_head_tests;
+#[cfg(test)]
+mod roll_linked_tests;
+#[cfg(test)]
 mod scopes_tests;
 #[cfg(test)]
 mod sequence_inspect_tests;
@@ -1092,6 +1334,8 @@ mod shortcuts_tests;
 #[cfg(test)]
 mod split_edit_ripple_trim_tests;
 #[cfg(test)]
+mod stored_paths_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod timeline_move_tests;
@@ -1105,3 +1349,11 @@ mod trim_tests;
 mod vfx_tests;
 #[cfg(test)]
 mod voiceover_tests;
+
+#[cfg(test)]
+mod source_placement_tests;
+
+#[cfg(test)]
+mod frame_export_tests;
+#[cfg(test)]
+mod wasm_clock_tests;

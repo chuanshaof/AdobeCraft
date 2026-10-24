@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::commands::{CommandSpec, always, bad, bool_p, str_p, u64_p};
-use crate::{EngineError, Result, Services, Session};
+use crate::{EngineError, MediaPool, Result, Services, Session};
 
 /// Bytes hashed at each end of the file.
 pub const FINGERPRINT_SPAN: usize = 1 << 20;
@@ -100,18 +100,20 @@ fn split_ext(name: &str) -> (&str, &str) {
     }
 }
 
-/// Every media item whose file is missing (or that was made offline), in project order.
-pub fn scan(p: &Project, services: &dyn Services) -> Vec<Missing> {
+/// Every media item whose file is missing (or that was made offline), in project order. A
+/// stored path the media pool does not follow ([`MediaPool::follow`]) counts as missing.
+pub fn scan(p: &Project, pool: &MediaPool, services: &dyn Services) -> Vec<Missing> {
+    let exists = |path: &str| pool.follow(path).is_ok_and(|file| services.file_size(&file).is_ok());
     let mut out = Vec::new();
     for it in p.items.values() {
         let ItemKind::Media(m) = &it.kind else { continue };
         let MediaRef::File { path } = &m.media else { continue };
         let status = if m.offline {
             "offline"
-        } else if services.file_size(path).is_err() {
+        } else if !exists(path) {
             "missing"
         } else if let Some(MediaRef::File { path: pp }) = &m.proxy
-            && services.file_size(pp).is_err()
+            && !exists(pp)
         {
             "proxyMissing"
         } else {
@@ -132,7 +134,7 @@ pub fn scan(p: &Project, services: &dyn Services) -> Vec<Missing> {
 
 /// Rescan and remember the result. Returns the list.
 pub fn refresh(s: &mut Session) -> Vec<Missing> {
-    let list = scan(&s.project, &*s.services);
+    let list = scan(&s.project, &s.media, &*s.services);
     s.offline.missing = list.iter().filter(|m| m.status != "proxyMissing").map(|m| ItemId(m.item)).collect();
     list
 }
@@ -263,7 +265,7 @@ pub fn check_candidate(s: &Session, item: ItemId, path: &str, o: &MatchOptions) 
                     if info.video.is_some() != m.info.video.is_some() {
                         c.problems.push("video stream presence differs".into());
                     }
-                    if let (Some(a), Some(b)) = (&info.audio, &m.info.audio)
+                    if let (Some(a), Some(b)) = (info.audio(), m.info.audio())
                         && a.channels != b.channels
                     {
                         c.problems.push(format!("audio channels differ ({} vs {})", a.channels, b.channels));
@@ -303,8 +305,9 @@ pub fn derive_remap(old: &str, new: &str) -> Option<(String, String)> {
 /// Apply a remap to a path (None when it doesn't start with the old prefix).
 pub fn apply_remap(path: &str, from: &str, to: &str) -> Option<String> {
     let p = path.replace('\\', "/");
-    let from = from.trim_end_matches('/');
-    let rest = p.strip_prefix(from)?;
+    let from = from.replace('\\', "/");
+    let to = to.replace('\\', "/");
+    let rest = p.strip_prefix(from.trim_end_matches('/'))?;
     if !(rest.is_empty() || rest.starts_with('/')) {
         return None;
     }
@@ -351,6 +354,9 @@ fn apply(s: &mut Session, plans: Vec<Plan>, align_timecode: bool, label: &str) -
         }
         Ok(())
     })?;
+    for p in &plans {
+        s.media.allow(&p.cand.path);
+    }
     for (item, path, src) in sources {
         s.media.insert_file(item, &path, src);
     }
@@ -367,7 +373,7 @@ fn others(s: &Session, skip: ItemId, old: &str, new: &str, o: &MatchOptions) -> 
     let remap = derive_remap(old, new);
     let new_dir = Path::new(new).parent().map(Path::to_path_buf);
     let mut out = Vec::new();
-    for m in scan(&s.project, &*s.services) {
+    for m in scan(&s.project, &s.media, &*s.services) {
         let id = ItemId(m.item);
         if id == skip || m.status != "missing" {
             continue;
@@ -406,12 +412,18 @@ pub fn relink(s: &mut Session, p: &Value) -> Result<Value> {
         Some(MediaRef::File { path }) => path,
         _ => return Err(bad("media.relink", format!("item {} is not file media", item.0))),
     };
-    let c = check_candidate(s, item, &path, &o)?;
+    let mut c = check_candidate(s, item, &path, &o)?;
     if !c.ok && !force {
         return Err(EngineError::Other(format!("{} doesn't match {}: {}", file_name(&path), file_name(&old), c.problems.join("; "))));
     }
-    if c.source.is_none() && s.media.open_file(&path, &*s.services).is_err() {
-        return Err(EngineError::Other(format!("{path} can't be opened")));
+    if c.source.is_none() {
+        // Forced past a failed check: the file was never opened for its properties, so do it now
+        // and let the item take the new file's own info instead of keeping the old file's.
+        let Ok(src) = s.media.open_file(&path, &*s.services) else {
+            return Err(EngineError::Other(format!("{path} can't be opened")));
+        };
+        c.info = Some(src.info().clone());
+        c.source = Some(src);
     }
     let mut plans = vec![Plan { item, cand: c }];
     if o.relink_others {
@@ -424,7 +436,7 @@ pub fn relink(s: &mut Session, p: &Value) -> Result<Value> {
 /// `media.autoRelink`: `{from, to}` remaps a folder prefix; `{folder}` searches a folder tree.
 pub fn auto_relink(s: &mut Session, p: &Value) -> Result<Value> {
     let o = MatchOptions::from_params(p);
-    let missing: Vec<Missing> = scan(&s.project, &*s.services).into_iter().filter(|m| m.status == "missing").collect();
+    let missing: Vec<Missing> = scan(&s.project, &s.media, &*s.services).into_iter().filter(|m| m.status == "missing").collect();
     let mut plans = Vec::new();
     let mut failed = Vec::new();
     if let (Some(from), Some(to)) = (str_p(p, "from"), str_p(p, "to")) {
@@ -477,9 +489,14 @@ pub fn index_folder(root: &Path, limit: usize) -> BTreeMap<String, Vec<PathBuf>>
             if name.starts_with('.') {
                 continue;
             }
-            if p.is_dir() {
+            let Ok(file_type) = e.file_type() else { continue };
+            // A relink search must stay within the folder explicitly chosen by the user. In
+            // particular, following a directory symlink can make a small loop defeat the file
+            // budget and walk an unrelated tree. Symlinked files are still candidates.
+            let is_file = if file_type.is_symlink() { std::fs::metadata(&p).is_ok_and(|m| m.is_file()) } else { file_type.is_file() };
+            if file_type.is_dir() {
                 queue.push_back(p);
-            } else {
+            } else if is_file {
                 out.entry(name.to_ascii_lowercase()).or_default().push(p);
                 n += 1;
                 if n >= limit {
@@ -498,7 +515,7 @@ pub fn search(s: &Session, p: &Value) -> Result<Value> {
     let o = MatchOptions::from_params(p);
     let items: Vec<ItemId> = match u64_p(p, "item") {
         Some(i) => vec![ItemId(i)],
-        None => scan(&s.project, &*s.services).into_iter().filter(|m| m.status == "missing").map(|m| ItemId(m.item)).collect(),
+        None => scan(&s.project, &s.media, &*s.services).into_iter().filter(|m| m.status == "missing").map(|m| ItemId(m.item)).collect(),
     };
     let index = index_folder(Path::new(folder), 20_000);
     let mut out = Vec::new();
@@ -552,7 +569,11 @@ pub fn make_offline(s: &mut Session, p: &Value) -> Result<Value> {
     let mut deleted = Vec::new();
     if delete {
         for (_, path) in &files {
-            if std::fs::remove_file(path).is_ok() {
+            // Stored paths in an opened document are not authority to delete arbitrary files.
+            // Delete only the resolved path that the media pool permits opening.
+            if let Ok(path) = s.media.follow(path)
+                && std::fs::remove_file(&path).is_ok()
+            {
                 deleted.push(path.clone());
             }
         }
@@ -571,14 +592,14 @@ fn status_json(s: &Session, id: ItemId) -> Option<Value> {
     let status = match &path {
         None => "generated",
         Some(_) if m.offline => "offline",
-        Some(p) if s.services.file_size(p).is_err() => "missing",
+        Some(p) if s.media.follow(p).ok().is_none_or(|file| s.services.file_size(&file).is_err()) => "missing",
         Some(_) => match s.media.offline_status(id) {
             Some(o) if o.reason == filmcraft_render::offline::OfflineReason::Unreadable => "unreadable",
             _ => "online",
         },
     };
     let proxy = match &m.proxy {
-        Some(MediaRef::File { path }) => json!({"path": path, "online": s.services.file_size(path).is_ok()}),
+        Some(MediaRef::File { path }) => json!({"path": path, "online": s.media.follow(path).is_ok_and(|file| s.services.file_size(&file).is_ok())}),
         _ => Value::Null,
     };
     Some(json!({
@@ -644,6 +665,16 @@ pub fn commands() -> Vec<CommandSpec> {
             params: r#"{"item":id,"path":str,"force":bool=false,"relinkOthers":bool=true,"alignTimecode":bool=false,"match":{"fileName":bool,"extension":bool,"clipId":bool,"duration":bool,"mediaStart":bool,"metadata":bool}?}"#,
             enabled: always,
             run: relink,
+            journal: true,
+        },
+        CommandSpec {
+            id: "media.refreshChanged",
+            label: "Refresh Changed Media",
+            menu: &[],
+            shortcut: None,
+            params: "{}",
+            enabled: always,
+            run: crate::media_watch::refresh_changed,
             journal: true,
         },
         CommandSpec {
@@ -717,6 +748,12 @@ pub fn commands() -> Vec<CommandSpec> {
 /// After a project opens: find missing files and ask for them.
 pub fn on_open(s: &mut Session) -> usize {
     let list = refresh(s);
+    let refused: Vec<String> =
+        list.iter().filter(|m| m.status == "missing").filter_map(|m| s.media.follow(&m.path).err().map(|why| format!("{} ({why})", m.path))).collect();
+    if !refused.is_empty() {
+        log::warn!("media paths stored in the project not opened: {}", refused.join(", "));
+        s.toast(format!("Not opening {} media file(s) the project names on another computer or device; File ▸ Link Media… reconnects them", refused.len()));
+    }
     s.offline.prompt = !s.offline.missing.is_empty();
     if !s.offline.missing.is_empty() {
         s.toast(format!("{} media file(s) are missing; File ▸ Link Media… reconnects them", s.offline.missing.len()));

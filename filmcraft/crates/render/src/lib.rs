@@ -15,6 +15,7 @@ pub mod blend;
 pub mod color_match;
 pub mod colorman;
 pub mod effects;
+pub mod flow;
 pub mod gpufx;
 pub mod graphic_clip;
 pub mod graphics;
@@ -188,14 +189,25 @@ pub(crate) fn render_seq_tracks(project: &Project, seq: &Sequence, t: Tick, opts
         if let Some(tr) = track.transitions.iter().find(|tr| tr.range().contains(t)) {
             let a = tr.from.and_then(|id| track.item(id)).filter(|i| i.enabled);
             let b = tr.to.and_then(|id| track.item(id)).filter(|i| i.enabled);
-            let la = a
-                .and_then(|i| item_layer(project, seq, i, t, opts, sources, &tc))
-                .map(|(img, op, _)| with_opacity(img, op))
-                .unwrap_or_else(|| Image::new(w, h));
-            let lb = b
-                .and_then(|i| item_layer(project, seq, i, t, opts, sources, &tc))
-                .map(|(img, op, _)| with_opacity(img, op))
-                .unwrap_or_else(|| Image::new(w, h));
+            // An adjustment layer has no picture of its own: in a transition it is the frame below
+            // with its effects, so a dissolve fades the effects in or out.
+            let layer = |i: &TrackItem, below: &Image| -> Option<(Image, Blend)> {
+                if is_adjustment(project, i) {
+                    return opts.effects.then(|| adjustment_layer(project, seq, i, t, opts, &tc, below));
+                }
+                item_layer(project, seq, i, t, opts, sources, &tc).map(|(img, op, bl)| (with_opacity(img, op), bl))
+            };
+            let below = canvas.snapshot();
+            let la = a.and_then(|i| layer(i, &below));
+            let lb = b.and_then(|i| layer(i, &below));
+            // a fade from or to nothing keeps the one layer's blend mode (an adjustment layer in
+            // Multiply ends the fade as it carries on); between two layers they mix normally
+            let bl = match (&la, &lb) {
+                (Some((_, x)), None) | (None, Some((_, x))) => *x,
+                _ => Blend::Normal,
+            };
+            let la = la.map(|l| l.0).unwrap_or_else(|| Image::new(w, h));
+            let lb = lb.map(|l| l.0).unwrap_or_else(|| Image::new(w, h));
             let p = tr.progress(t) as f32;
             // Reverse plays the transition backwards (e.g. an iris closing on the outgoing clip)
             // while still going from A to B.
@@ -204,48 +216,27 @@ pub(crate) fn render_seq_tracks(project: &Project, seq: &Sequence, t: Tick, opts
             } else {
                 transitions::apply_scaled(&tr.effect, &la, &lb, p, opts.scale)
             };
-            blend::composite(canvas.get(), &mixed, 1.0, Blend::Normal);
+            blend::composite(canvas.get(), &mixed, 1.0, bl);
             continue;
         }
         let Some(item) = track.item_at(t) else { continue };
         if !item.enabled {
             continue;
         }
-        let pi = project.item(item.item);
-        if let Some(pi) = pi
-            && matches!(pi.kind, ItemKind::AdjustmentLayer { .. })
-        {
+        if is_adjustment(project, item) {
             if !opts.effects {
                 continue;
             }
-            let mt = item.effect_time_at(t);
-            let mut adjusted = canvas.snapshot();
-            let cx = effects::FxCtx {
-                t: mt,
-                px_scale: opts.scale,
-                seconds: (t - item.start).seconds(),
-                timecode: &tc,
-                clip_name: &item.name,
-                project: Some(project),
-                env: None,
-                working: seq.settings.color.working,
-            };
-            for e in item.effects.iter().filter(|e| e.def().is_some_and(|d| !d.intrinsic)) {
-                mask::apply_effect(&mut adjusted, e, &cx);
+            let below = canvas.snapshot();
+            let (adj, bl) = adjustment_layer(project, seq, item, t, opts, &tc, &below);
+            if bl == Blend::Normal {
+                // The adjusted picture already replaces the original (see `adjustment_layer`).
+                canvas.set(adj);
+            } else {
+                let mut out = below;
+                blend::composite(&mut out, &adj, 1.0, bl);
+                canvas.set(out);
             }
-            let (op, bl) = opacity_blend(item, mt);
-            // Adjustment layer opacity (and opacity masks, in sequence pixels) mix adjusted over original.
-            let mut out = canvas.snapshot();
-            let mut adj = adjusted;
-            adj.scale_alpha(op);
-            mask::apply_opacity_masks(&mut adj, item, mt, opts.scale);
-            // Motion moves / scales the adjustment layer's frame: it only applies inside it.
-            if let Some(region) = adjustment_region(seq, item, project, mt, opts.scale, w, h) {
-                let cov: Vec<f32> = region.px.as_chunks::<4>().0.iter().map(|p| p[3]).collect();
-                mask::scale_by(&mut adj, &cov);
-            }
-            blend::composite(&mut out, &adj, 1.0, bl);
-            canvas.set(out);
             continue;
         }
         match item_layer_ex(project, seq, item, t, opts, sources, &tc, true) {
@@ -278,11 +269,56 @@ pub(crate) fn render_seq_tracks(project: &Project, seq: &Sequence, t: Tick, opts
     canvas
 }
 
+fn is_adjustment(project: &Project, item: &TrackItem) -> bool {
+    project.item(item.item).is_some_and(|pi| matches!(pi.kind, ItemKind::AdjustmentLayer { .. }))
+}
+
+/// An adjustment layer as a layer over `below` (the composite of the tracks under it): `below`
+/// with the layer's effects, faded by its opacity and opacity masks and limited to its
+/// (Motion-transformed) frame, and the blend mode it mixes with.
+fn adjustment_layer(project: &Project, seq: &Sequence, item: &TrackItem, t: Tick, opts: RenderOptions, tc: &str, below: &Image) -> (Image, Blend) {
+    let (w, h) = (below.w, below.h);
+    let mt = item.effect_time_at(t);
+    let mut adj = below.clone();
+    let cx = effects::FxCtx {
+        t: mt,
+        px_scale: opts.scale,
+        seconds: (t - item.start).seconds(),
+        timecode: tc,
+        clip_name: &item.name,
+        project: Some(project),
+        env: None,
+        frame_rate: seq.settings.frame_rate.as_f64(),
+        working: seq.settings.color.working,
+    };
+    for e in item.effects.iter().filter(|e| e.def().is_some_and(|d| !d.intrinsic)) {
+        mask::apply_effect(&mut adj, e, &cx);
+    }
+    let (op, bl) = opacity_blend(item, mt);
+    // Adjustment layer opacity (and opacity masks, in sequence pixels) weigh adjusted against original.
+    let mut weight = Image::filled(w, h, [op; 4]);
+    mask::apply_opacity_masks(&mut weight, item, mt, opts.scale);
+    // Motion moves / scales the adjustment layer's frame: it only applies inside it.
+    if let Some(region) = adjustment_region(seq, item, project, mt, opts.scale, w, h) {
+        let cov: Vec<f32> = region.px.as_chunks::<4>().0.iter().map(|p| p[3]).collect();
+        mask::scale_by(&mut weight, &cov);
+    }
+    let cov: Vec<f32> = weight.px.as_chunks::<4>().0.iter().map(|p| p[3]).collect();
+    if bl == Blend::Normal {
+        // The adjusted picture replaces the original instead of being drawn over it: what
+        // Transform or Basic 3D leave empty shows nothing of the untransformed picture (#1524).
+        mask::mix(&mut adj, below, &cov);
+    } else {
+        mask::scale_by(&mut adj, &cov);
+    }
+    (adj, bl)
+}
+
 /// Coverage of an adjustment layer's (Motion-transformed) frame in output pixels, or `None` when
 /// it covers the whole output.
 fn adjustment_region(seq: &Sequence, item: &TrackItem, project: &Project, mt: Tick, scale: f32, w: usize, h: usize) -> Option<Image> {
     let size = source_size(project, item.item).unwrap_or((seq.settings.width, seq.settings.height));
-    let motion = motion_matrix(seq, item, size, mt);
+    let motion = motion_matrix(seq, item, size, source_par(project, item.item), mt);
     let s = scale as f64;
     let (fw, fh) = (((size.0 as f64 * s).round() as usize).max(1), ((size.1 as f64 * s).round() as usize).max(1));
     let m = Affine::scale(s, s).then_apply(&motion).then_apply(&Affine::scale(1.0 / s, 1.0 / s));
@@ -332,10 +368,26 @@ pub fn source_size(project: &Project, item: ItemId) -> Option<(u32, u32)> {
     project.source_size(item)
 }
 
+/// Pixel aspect ratio of an item's source, for [`motion_matrix`]: Interpret Footage's override,
+/// else the media's; `None` for items drawn in sequence pixels (graphics, adjustment layers).
+pub fn source_par(project: &Project, item: ItemId) -> Option<(u32, u32)> {
+    project.source_par(item)
+}
+
 /// The Motion transform of an item at media time `mt`, mapping full-res source pixels to
 /// full-res sequence pixels.
-pub fn motion_matrix(seq: &Sequence, item: &TrackItem, src: (u32, u32), mt: Tick) -> Affine {
+///
+/// `src` is the source's size in its own (storage) pixels and `src_par` their pixel aspect ratio
+/// (`None`: the sequence's, for graphics and adjustment layers). Motion works in square display
+/// units, as Premiere's does: the Anchor Point is in source pixels and the Position in sequence
+/// pixels, but Scale and Rotation see the picture at its display aspect, so a 1440 x 1080 clip with
+/// 4:3 pixels covers a 1920 x 1080 square-pixel frame at 100 %, and a square-pixel clip in a 4:3
+/// sequence is narrowed to its display width. Scale to Frame Size fits the display size too.
+pub fn motion_matrix(seq: &Sequence, item: &TrackItem, src: (u32, u32), src_par: Option<(u32, u32)>, mt: Tick) -> Affine {
     let (sw, sh) = (seq.settings.width as f64, seq.settings.height as f64);
+    let seq_par = filmcraft_project::sane_par(seq.settings.par);
+    let src_par = src_par.map_or(seq_par, filmcraft_project::sane_par);
+    let (p, q) = (filmcraft_project::par_ratio(src_par), filmcraft_project::par_ratio(seq_par));
     let mut pos = Vec2::new(sw / 2.0, sh / 2.0);
     let mut anchor = Vec2::new(src.0 as f64 / 2.0, src.1 as f64 / 2.0);
     let mut scale = Vec2::new(1.0, 1.0);
@@ -356,10 +408,22 @@ pub fn motion_matrix(seq: &Sequence, item: &TrackItem, src: (u32, u32), mt: Tick
         rot = m.f64_at("rotation", mt);
     }
     if item.scale_to_frame {
-        let fit = (sw / src.0 as f64).min(sh / src.1 as f64);
+        // the display size fitted in the frame's display size
+        let fit = (sw * q / (src.0.max(1) as f64 * p)).min(sh / src.1.max(1) as f64);
         scale = scale * fit;
     }
-    Affine::motion(pos, scale, rot, anchor)
+    // source px → (× p) display units → Scale, Rotation → (÷ q) sequence px. Without rotation the
+    // two stretches merge into one horizontal factor, exactly 1 when the ratios are the same.
+    if rot == 0.0 {
+        let r = if src_par == seq_par { 1.0 } else { p / q };
+        return Affine::motion(pos, Vec2::new(scale.x * r, scale.y), rot, anchor);
+    }
+    Affine::translate(pos.x, pos.y).then_apply(&Affine::scale(1.0 / q, 1.0)).then_apply(&Affine::motion(
+        Vec2::ZERO,
+        Vec2::new(scale.x * p, scale.y),
+        rot,
+        anchor,
+    ))
 }
 
 /// Render one track item's layer at timeline time `t` into a canvas-sized image.
@@ -403,7 +467,7 @@ pub(crate) fn item_layer_ex(
     // time inside a frame hold without Hold Filters).
     let mt = item.effect_time_at(t);
     let src_size = source_size(project, item.item)?;
-    let motion = motion_matrix(seq, item, src_size, mt);
+    let motion = motion_matrix(seq, item, src_size, source_par(project, item.item), mt);
     // How many output pixels one source pixel covers → request a reduced frame when possible.
     let lin = ((motion.a * motion.a + motion.b * motion.b).sqrt()).max((motion.c * motion.c + motion.d * motion.d).sqrt());
     let want = (lin * opts.scale as f64).clamp(1.0 / 64.0, 1.0) as f32;
@@ -454,6 +518,7 @@ pub(crate) fn item_layer_ex(
             clip_name: &item.name,
             project: Some(project),
             env: Some(&env),
+            frame_rate: seq.settings.frame_rate.as_f64(),
             working: seq.settings.color.working,
         };
         for e in item.effects.iter().filter(|e| e.def().is_some_and(|d| !d.intrinsic) && !filmcraft_project::graphic::is_layer(e)) {
@@ -489,13 +554,26 @@ fn plain_layer(frame: &VideoFrame, n: usize, opacity: f32, blend: Blend) -> Laye
 /// convert it with.
 fn media_frame(item: &TrackItem, t: Tick, sources: &dyn SourceProvider, want: f32, src_size: (u32, u32)) -> Option<(SharedSource, Arc<VideoFrame>, usize)> {
     let src = sources.source(item.item)?;
-    let frame = src.video_frame(FrameRequest { time: item.source_time_at(t), scale: want }).ok()?;
+    let frame = src.video_frame(FrameRequest { time: video_source_time(item, t, src.info().frame_rate()), scale: want }).ok()?;
     let n = decimation(frame.width as f32, src_size.0 as f32 * want);
     Some((src, frame, n))
 }
 
-/// The linear image of a media clip's `frame`, colour managed, and blended with the next frame when
-/// the clip's speed asks for it.
+/// The media time to ask a source for the video frame a clip shows at timeline `t`. A reversed
+/// clip's source time is the instant just before its mirrored position; readers that round the
+/// request to the nearest unit of a coarse timescale (MP4) land on the next frame from there,
+/// showing one frame past the clip's source range and never its In (#318). Snapped down to the
+/// start of the `media_rate` frame that contains it, every reader shows that frame.
+pub(crate) fn video_source_time(item: &TrackItem, t: Tick, media_rate: filmcraft_time::FrameRate) -> Tick {
+    let ft = item.source_time_at(t);
+    if !item.reverse || item.frame_hold.is_some() || media_rate.frame_duration().0 <= 0 {
+        return ft;
+    }
+    media_rate.tick_of(media_rate.frame_at(ft)).clamp(item.source_in.min(ft), ft)
+}
+
+/// The linear image of a media clip's `frame`, colour managed, and blended (or, with Optical Flow,
+/// motion interpolated) with the next frame when the clip's speed asks for it.
 #[allow(clippy::too_many_arguments)]
 fn media_image(project: &Project, seq: &Sequence, item: &TrackItem, t: Tick, src: &SharedSource, frame: &VideoFrame, n: usize, want: f32) -> Image {
     let img = colorman::decode(project, item.item, frame, n, &seq.settings.color);
@@ -503,7 +581,7 @@ fn media_image(project: &Project, seq: &Sequence, item: &TrackItem, t: Tick, src
         Some((next_time, wgt)) => match src.video_frame(FrameRequest { time: next_time, scale: want }) {
             Ok(f2) if f2.width == frame.width && f2.height == frame.height => {
                 let b = colorman::decode(project, item.item, &f2, n, &seq.settings.color);
-                img.lerp(&b, wgt)
+                if item.time_interpolation == filmcraft_project::TimeInterpolation::OpticalFlow { flow::interpolate(&img, &b, wgt) } else { img.lerp(&b, wgt) }
             }
             _ => img,
         },
@@ -577,9 +655,8 @@ pub fn render_clip(
 
 /// Frame Blending / Optical Flow on a speed-changed clip: the later source frame to mix in and
 /// its weight (0..1) at timeline `t`, or None when the exact media time falls on a source frame
-/// (or the clip plays at 100 %, is frame-held, or uses Frame Sampling).
-///
-/// TODO(optical flow): motion-compensated interpolation; Optical Flow renders as Frame Blending.
+/// (or the clip plays at 100 %, is frame-held, or uses Frame Sampling). Frame Blending cross-fades
+/// the two frames; Optical Flow synthesises the in-between frame from their motion ([`flow`]).
 pub fn interpolation_blend(item: &TrackItem, t: Tick, src_rate: filmcraft_time::FrameRate) -> Option<(Tick, f32)> {
     if item.time_interpolation == filmcraft_project::TimeInterpolation::FrameSampling || item.frame_hold.is_some() {
         return None;
@@ -665,3 +742,7 @@ mod preview_tests;
 #[cfg(test)]
 #[path = "region_tests.rs"]
 mod region_tests;
+
+#[cfg(test)]
+#[path = "par_tests.rs"]
+mod par_tests;

@@ -365,12 +365,24 @@ pub fn instantiate(p: &EffectPreset, target: &TrackItem, size: (u32, u32)) -> Ve
     out
 }
 
-/// Put preset effects on a clip: intrinsic ones replace the clip's instance, others are inserted
-/// before the intrinsic effects.
+/// Keep `old`'s keyframes that lie outside the span `new` animates, so presets keyframing the same
+/// parameter at different times (Fade In, then Fade Out) add up instead of replacing each other.
+fn merge_keyframes(new: &mut EffectInstance, old: &EffectInstance) {
+    for (id, p) in new.params.iter_mut() {
+        let (Some(first), Some(last)) = (p.keyframes.first().map(|k| k.time), p.keyframes.last().map(|k| k.time)) else { continue };
+        let Some(o) = old.params.get(id) else { continue };
+        p.keyframes.extend(o.keyframes.iter().filter(|k| k.time < first || k.time > last).cloned());
+        p.keyframes.sort_by_key(|k| k.time);
+    }
+}
+
+/// Put preset effects on a clip: intrinsic ones replace the clip's instance (keeping its keyframes
+/// outside the span the preset animates), others are inserted before the intrinsic effects.
 pub fn put_effects(it: &mut TrackItem, effects: Vec<EffectInstance>) {
-    for e in effects {
+    for mut e in effects {
         let intrinsic = e.def().is_some_and(|d| d.intrinsic);
         if intrinsic && let Some(slot) = it.effects.iter_mut().find(|x| x.effect == e.effect) {
+            merge_keyframes(&mut e, slot);
             *slot = e;
             continue;
         }
@@ -550,13 +562,14 @@ fn export(s: &mut Session, p: &Value) -> Result<Value> {
     if chosen.is_empty() {
         return Err(bad("presets.export", "no presets to export"));
     }
-    filmcraft_format::atomic_write(Path::new(path), &file_bytes(&chosen)).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    // through the host: atomic on the desktop, a download on the web (no filesystem there)
+    s.services.write_file(path, &file_bytes(&chosen)).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     Ok(json!({"path": path, "count": chosen.len()}))
 }
 
 fn import(s: &mut Session, p: &Value) -> Result<Value> {
     let path = str_p(p, "path").ok_or_else(|| bad("presets.import", "need `path`"))?;
-    let bytes = std::fs::read(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    let bytes = s.services.read_file(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     let presets = parse_file(&bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     let names: Vec<String> = presets.iter().map(|x| x.name.clone()).collect();
     for pr in presets {

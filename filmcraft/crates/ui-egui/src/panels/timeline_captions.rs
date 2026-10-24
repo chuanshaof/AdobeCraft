@@ -21,7 +21,6 @@ pub const ROW_H: f32 = 28.0;
 /// Caption block colours (fill, selected fill).
 const FILL: Color32 = Color32::from_rgb(0x6b, 0x4f, 0x8f);
 const FILL_SEL: Color32 = Color32::from_rgb(0x8c, 0x6c, 0xb4);
-const ROW_BG: Color32 = Color32::from_rgb(0x23, 0x20, 0x2a);
 
 /// Row rects (full width incl. header) for each caption track, top first.
 pub fn rows(area: Rect, n: usize) -> Vec<Rect> {
@@ -73,7 +72,7 @@ pub fn paint(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, area: Re
     let mut actions: Vec<(String, Value)> = Vec::new();
     for (i, (tr, row)) in seq.caption_tracks.iter().zip(rows(area, seq.caption_tracks.len())).enumerate() {
         let lane = Rect::from_min_max(pos2(content.min.x, row.min.y), pos2(content.max.x, row.max.y));
-        painter.rect_filled(lane, 0.0, ROW_BG);
+        painter.rect_filled(lane, 0.0, t.caption_track_bg);
         painter.line_segment([pos2(row.min.x, row.max.y - 0.5), pos2(row.max.x, row.max.y - 0.5)], Stroke::new(1.0, t.tl_bg));
         // header
         let label = format!("C{}", i + 1);
@@ -84,6 +83,23 @@ pub fn paint(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, area: Re
         painter.rect_filled(badge, 3.0, if tr.enabled { FILL } else { t.field_bg });
         painter.text(badge.center(), Align2::CENTER_CENTER, &label, Tokens::semibold(10.5), Color32::WHITE);
         app.auto.add(&format!("timeline.captionTrack.{label}"), badge, &tr.name);
+        // right-click the header: delete this track or every empty caption track (registered
+        // before the lock / eye toggles so those stay on top)
+        let hresp = ui.interact(hrect, egui::Id::new(("cap-header", tr.id.0)), Sense::click());
+        hresp.context_menu(|ui| {
+            for (key, text, cmd, p) in [
+                ("delete", tl!("Delete Caption Track"), "captions.deleteTrack", json!({"track": tr.id.0})),
+                ("deleteEmpty", tl!("Delete Empty Caption Tracks"), "sequence.deleteTracks", json!({"captions": "empty"})),
+            ] {
+                let enabled = key != "deleteEmpty" || seq.caption_tracks.iter().any(|t| t.captions.is_empty());
+                let r = ui.add_enabled(enabled, egui::Button::new(text));
+                app.auto.add(&format!("timeline.captionTrack.{label}.menu.{key}"), r.rect, text);
+                if r.clicked() {
+                    actions.push((cmd.into(), p));
+                    ui.close();
+                }
+            }
+        });
         let lock_r = Rect::from_center_size(pos2(hrect.min.x + 49.0, row.center().y), vec2(18.0, 18.0));
         let lresp = crate::widgets::icon_toggle(
             ui,
@@ -92,7 +108,7 @@ pub fn paint(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, area: Re
             true,
             t,
             egui::Id::new(("cap-lock", tr.id.0)),
-            Some(if tr.locked { Color32::from_rgb(0xd1, 0xd1, 0xd1) } else { t.text_dim }),
+            Some(if tr.locked { t.icon_active } else { t.text_dim }),
         );
         app.auto.add(&format!("timeline.captionTrack.{label}.locked"), lock_r, "Toggle Caption Track Lock");
         if lresp.clicked() {
@@ -112,7 +128,7 @@ pub fn paint(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, area: Re
         if eresp.clicked() {
             actions.push(("captions.setTrack".into(), json!({"track": tr.id.0, "enabled": !tr.enabled})));
         }
-        let name = format!("{} · {}", tr.name, tr.format.label());
+        let name = format!("{} · {}", tr.name, crate::i18n::t(tr.format.label()));
         painter.with_clip_rect(Rect::from_min_max(pos2(hrect.min.x + 86.0, row.min.y), pos2(hrect.max.x - 4.0, row.max.y))).text(
             pos2(hrect.min.x + 90.0, row.center().y),
             Align2::LEFT_CENTER,
@@ -132,10 +148,11 @@ pub fn paint(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, area: Re
             }
             if r.width() > 14.0 {
                 let text = filmcraft_project::plain_text(&c.text).replace('\n', " ");
-                p.with_clip_rect(r.shrink2(vec2(4.0, 0.0)).intersect(lane)).text(
-                    pos2(r.min.x + 5.0, r.center().y),
-                    Align2::LEFT_CENTER,
-                    text,
+                // in reading order; Arabic and Hebrew start at the block's right edge
+                crate::rtl::paint_line(
+                    &p.with_clip_rect(r.shrink2(vec2(4.0, 0.0)).intersect(lane)),
+                    Rect::from_min_max(pos2(r.min.x + 5.0, r.min.y), pos2(r.max.x - 5.0, r.max.y)),
+                    &text,
                     Tokens::ui(11.0),
                     if tr.enabled { Color32::WHITE } else { t.text_dim },
                 );
@@ -213,8 +230,10 @@ fn interact_block(
     if tr.locked {
         return;
     }
+    // decide on what was under the pointer when the button went down, not where egui recognised
+    // the drag (6 pt later, past the 5 px edge zones) (#259)
     if resp.drag_started()
-        && let Some(p) = resp.interact_pointer_pos()
+        && let Some(p) = ctx.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos())
     {
         let g = match gesture_at(p.x) {
             Gesture::Move => 0u8,
@@ -241,7 +260,8 @@ fn interact_block(
         && id == c.id.0
     {
         ctx.data_mut(|dd| dd.remove::<(u64, u8, i64)>(drag_id()));
-        if d != 0 {
+        // egui ends a drag on Escape: that stop abandons it (#580)
+        if d != 0 && !ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             match g {
                 0 => {
                     let sel: Vec<u64> = if app.session.state.caption_selection.contains(&ClipId(id)) {

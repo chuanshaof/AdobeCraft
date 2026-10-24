@@ -13,7 +13,10 @@ kerning and ligatures, bidi, line breaking, all drawn as vectors in linear light
 - Its **layers** are effect instances `graphic_text` / `graphic_shape` in the clip's effect list,
   in paint order (first = back). They are hidden from the Effects panel. Because they are effect
   instances they save with the project, take keyframes on every animatable property (Source Text
-  keyframes hold), appear in Effect Controls and copy with the clip. Standard effects on a graphic
+  keyframes hold), appear in Effect Controls and copy with the clip. The Essential Graphics
+  panel's number and point properties (Tracking, Leading, Font Size, Position, Opacity…) carry
+  the same stopwatch as Effect Controls (`graphics.prop.<id>.stopwatch`, #2358): once a property
+  animates, changing it in the panel adds or updates a keyframe at the playhead. Standard effects on a graphic
   clip apply to the composed graphic; Motion and Opacity apply last.
 - `filmcraft_project::graphic::eval_layer` evaluates a layer at a time into a `LayerSpec`.
 - Projects with graphics need no schema migration: everything is additive (new item kind, new
@@ -24,7 +27,7 @@ kerning and ligatures, bidi, line breaking, all drawn as vectors in linear light
 | Group | Properties (parameter ids) |
 |---|---|
 | Text | `text` (Source Text), `font`, `font_style`, `size` (px), `align` (Left/Center/Right/Justify), `tracking` (1/1000 em), `kerning`, `ligatures`, `leading` (px added to the natural line height), `baseline_shift`, `faux_bold`, `faux_italic`, `caps` (Normal/All Caps/Small Caps), `underline`, `box_width` (0 = point text, else paragraph text wrapped at that width), `box_height` (paragraph text: lines that do not fit are not shown; 0 = as tall as the text) |
-| Shape | `shape` (Rectangle/Ellipse/Polygon/Path), `size` [w, h], `sides`, `corner_radius`, `points` (path vertices relative to the layer origin) |
+| Shape | `shape` (Rectangle/Ellipse/Polygon/Path), `size` [w, h], `sides`, `corner_radius` (one radius for all four corners, at most half the shorter side; on the Program monitor, drag one of the four small circles just inside a selected rectangle's corners), `points` (path vertices relative to the layer origin) |
 | Appearance | `fill`, `fill_color`; `stroke`, `stroke_color`, `stroke_width`, `stroke_type` (Outer/Center/Inner) and the same for `stroke2`; `background`, `background_color`, `background_opacity`, `background_size` (padding), `background_radius`; `shadow`, `shadow_color`, `shadow_opacity`, `shadow_angle` (135° = down-right), `shadow_distance`, `shadow_size`, `shadow_blur` |
 | Transform | `position` (graphic canvas px), `anchor` (layer px), `scale`, `scale_width`, `uniform_scale`, `rotation`, `opacity` |
 
@@ -84,12 +87,12 @@ Timecode and Clip Name effects also draw with the text engine.
 |---|---|---|
 | `graphics.newText` | Graphics and Titles ▸ New Layer ▸ Text (⌘T) | `text`, `position`, `box` (`[w, h]`: paragraph text in a box, `position` is its top-left corner), `clip` (add to this graphic), `vertical`, `size`, `font`, `fontStyle`, `seconds` (5), `track`, `time` |
 | `graphics.newVerticalText` | New Layer ▸ Vertical Text | as `graphics.newText`; characters stack top to bottom, paragraphs are columns right to left |
-| `graphics.newRectangle`, `graphics.newEllipse`, `graphics.newPolygon` | New Layer ▸ Rectangle (⌥⌘R), Ellipse (⌥⌘E), Polygon | `position`, `size`, `clip`; polygon `sides` (6) |
+| `graphics.newRectangle`, `graphics.newEllipse`, `graphics.newPolygon` | New Layer ▸ Rectangle (⌥⌘R), Ellipse (⌥⌘E), Polygon | `position` (the shape's centre), `size`, `clip`, `seconds` (5), `track`, `time`; polygon `sides` (6) |
 | `graphics.newFromFile` | New Layer ▸ From file… | `path` — imports the image or video and places it above the clips at the playhead (a separate clip; graphics have no media layers yet) |
-| `graphics.newShape` | (agents) | `shape` (rectangle/ellipse/polygon/path), `position`, `size`, `points`, `clip` |
+| `graphics.newShape` | (agents) | `shape` (rectangle/ellipse/polygon/path), `position` (the shape's centre), `size`, `points`, `clip` (add to this graphic), `seconds` (5), `track`, `time` |
 | `graphics.setTextType` | Text Properties ▸ Text Layer Type | `clip`, `layer`, `type` (`point` / `paragraph`); the text stays where it is |
 | `graphics.setText` | typing on the monitor | `clip`, `layer`, `text`, `merge` (coalesce one typing session into one undo step) |
-| `graphics.set` | Properties panel | `clip`, `layer`, `props` {parameter id or camelCase alias: value; choices by index or name}, `time` |
+| `graphics.set` | Properties panel | `clip`, `layer`, `props` {parameter id or camelCase alias: value; choices by index or name}, `time`, `merge` + `begin` (a drag is one undo step: send `merge: true` on every change and `begin: true` on the first change of each press) |
 | `graphics.selectLayer` | layer list / monitor click | `clip`, `layers` |
 | `graphics.deleteLayer`, `graphics.arrangeLayer` | layer list | `clip`, `layer`, `to` (front/back/forward/backward/index) |
 | `graphics.align` | Align and Transform | `align` (left/hcenter/right/top/vcenter/bottom), `to` (frame/group/selection), `layers` |
@@ -116,7 +119,7 @@ duration (a track is added if needed).
 | Tool | On the Program monitor |
 |---|---|
 | Type (T) | Click empty picture: new point-text layer with a caret. Drag on empty picture: new paragraph-text layer with that box. Click a text layer: caret there. The box of the text being typed into is red. Type; ←/→ (⌥ word, ⌘ line), ↑/↓, Home/End, Shift to select, ⌘A, ⌘C/⌘X/⌘V, Return = new line, Backspace/Delete, Esc = stop editing. Drag inside the edited text to select. |
-| Selection (V) | Click a layer to select it (box with handles and anchor point; only selected layers have a box, and a layer whose visibility is off has none and cannot be clicked); drag to move; drag the anchor point to move it alone; drag a handle to scale point text about its anchor, resize a paragraph-text box, or stretch a shape away from its opposite side (see *Point text and paragraph text*); double-click a text layer to edit it. |
+| Selection (V) | Click a layer to select it (box with handles and anchor point; only selected layers have a box, and a layer whose visibility is off has none and cannot be clicked); drag to move; drag the anchor point to move it alone; drag a handle to scale point text about its anchor, resize a paragraph-text box (see *Point text and paragraph text*), or change a shape's Size: the dragged side or corner follows the pointer while the opposite one and the anchor point stay, Scale is untouched, and Shift on a corner keeps the proportions (a path, which has no Size, stretches instead); double-click a text layer to edit it with all its text selected, so typing replaces it; while text is edited, Select All (Cmd/Ctrl+A or Edit ▸ Select All) selects all of that text instead of the timeline clips. |
 | Rectangle / Ellipse | Drag to draw a shape layer. |
 | Pen (P) | Click to place points; click the first point (or Return) to close the path; Esc cancels. |
 
@@ -248,7 +251,17 @@ panel state and the Type-tool selection.
 | `file.replaceFonts` | Graphics and Titles ▸ Replace Fonts in Projects… | `from` (family or {family, style}), `to`, `toStyle`: graphic layers, character styles, source graphics and caption tracks |
 | `graphics.fonts.used` | (query) | fonts in use with counts and whether they are missing |
 
+## Gradient fills
+
+Appearance › Fill Type › Linear Gradient paints the shape or the text with a ramp from Gradient
+Start to Gradient End. Stops are blended in linear light. The angle is degrees clockwise on
+screen; 0° runs left to right across the layer's own bounds, and the ramp turns with the layer.
+`graphics.set` accepts `fill_kind` (`solid` or `linear gradient`), `gradient_start`,
+`gradient_end` and `gradient_angle`. A per-character fill colour still paints those characters
+as a solid; the rest of the text keeps the ramp. A singular layer transform falls back to the
+solid fill colour.
+
 ## Not yet
 
-Mask-with-text, gradient fills, per-layer blend modes, Bézier curves in the pen tool (paths are
-polygons), media layers inside graphics, and template controls grouped into folders.
+Mask-with-text, per-layer blend modes, Bézier curves in the pen tool (paths are polygons), media
+layers inside graphics, and template controls grouped into folders.

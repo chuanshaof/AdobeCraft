@@ -9,14 +9,17 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
+pub mod animated;
 pub mod cache;
 pub mod cancel;
 pub mod digits;
+pub mod dpx;
 pub mod generators;
 pub mod pending;
 pub mod reader;
 pub mod sequence;
 pub mod still;
+pub mod tga;
 pub mod wav;
 
 use std::path::Path;
@@ -77,6 +80,9 @@ pub struct VideoStreamInfo {
     pub hdr: Option<filmcraft_color::HdrMetadata>,
 }
 
+/// Most audio streams a source reports (the count comes from the file: never trusted).
+pub const MAX_AUDIO_STREAMS: usize = 64;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AudioStreamInfo {
     pub sample_rate: u32,
@@ -92,11 +98,30 @@ pub struct MediaInfo {
     /// Media duration. Stills report a default duration (the still-image default preference).
     pub duration: Tick,
     pub video: Option<VideoStreamInfo>,
-    pub audio: Option<AudioStreamInfo>,
+    /// Every audio stream the container carries, in file order. Stream 0 is the one
+    /// [`MediaSource::audio`] reads; the others are read with [`MediaSource::audio_stream`].
+    /// Project files written before multi-stream support hold a single `audio` object (or
+    /// `null`): both still load.
+    #[serde(default, alias = "audio", deserialize_with = "deserialize_audio_streams")]
+    pub audio_streams: Vec<AudioStreamInfo>,
     pub container: String,
     /// Timecode of the first frame (in frames at `video.frame_rate`), if the file carries one.
     pub start_timecode: Option<i64>,
     pub file_size: Option<u64>,
+}
+
+/// Reads `audio_streams` from a list, or from the single optional stream older project files wrote.
+fn deserialize_audio_streams<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Vec<AudioStreamInfo>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Streams {
+        Many(Vec<AudioStreamInfo>),
+        One(Option<AudioStreamInfo>),
+    }
+    Ok(match Streams::deserialize(d)? {
+        Streams::Many(v) => v,
+        Streams::One(o) => o.into_iter().collect(),
+    })
 }
 
 impl MediaInfo {
@@ -107,7 +132,11 @@ impl MediaInfo {
         self.video.is_some()
     }
     pub fn has_audio(&self) -> bool {
-        self.audio.is_some()
+        !self.audio_streams.is_empty()
+    }
+    /// The primary audio stream (stream 0), the one [`MediaSource::audio`] reads.
+    pub fn audio(&self) -> Option<&AudioStreamInfo> {
+        self.audio_streams.first()
     }
 }
 
@@ -132,12 +161,18 @@ pub trait MediaSource: Send + Sync {
     fn video_frame(&self, req: FrameRequest) -> Result<Arc<VideoFrame>>;
     /// `frames` audio frames starting at sample index `start` (at `sample_rate`, media time).
     fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer>;
+    /// Like [`audio`](Self::audio) for audio stream `stream` (an index into
+    /// [`MediaInfo::audio_streams`]). Sources with a single audio stream need not override this:
+    /// stream 0 is `audio`, any other index is [`MediaError::NoStream`].
+    fn audio_stream(&self, stream: usize, start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer> {
+        if stream == 0 { self.audio(start, frames, sample_rate) } else { Err(MediaError::NoStream("audio")) }
+    }
 }
 
 pub type SharedSource = Arc<dyn MediaSource>;
 
 /// File extensions we recognise at import (the media browser filters on these).
-pub const STILL_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "tif", "tiff", "bmp"];
+pub const STILL_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "tif", "tiff", "bmp", "tga", "dpx", "exr", "hdr", "dng"];
 pub const AUDIO_EXTENSIONS: &[&str] = &["wav", "wave", "bwf", "aif", "aiff", "mp3", "mp2", "m4a", "aac", "flac", "ogg", "opus"];
 pub const VIDEO_EXTENSIONS: &[&str] = &[
     "mp4", "m4v", "mov", "mkv", "webm", "avi", "mxf", "mts", "m2ts", "m2t", "ts", "mpg", "mpeg", "vob", "mod", "tod", "m2v", "m1v", "mpv", "3gp", "y4m", "apv",
@@ -151,17 +186,28 @@ pub fn is_importable(path: &Path) -> bool {
 /// A pluggable opener (containers/codecs register themselves here from higher-level crates).
 pub type Opener = fn(name: &str, bytes: Arc<[u8]>) -> Option<Result<SharedSource>>;
 
-/// Open media from bytes, trying `extra` openers first, then the built-in ones (stills, WAV).
+/// Open media from bytes, trying `extra` openers first, then the built-in ones (WAV, animated
+/// images, stills).
 pub fn open_bytes(name: &str, bytes: Arc<[u8]>, extra: &[Opener]) -> Result<SharedSource> {
     for o in extra {
         if let Some(r) = o(name, bytes.clone()) {
             return r;
         }
     }
+    if still::exr::sniff(&bytes) {
+        return Ok(Arc::new(still::exr::still(name, &bytes)?));
+    }
+    if still::hdr::sniff(&bytes) {
+        return Ok(Arc::new(still::hdr::still(name, &bytes)?));
+    }
     if wav::sniff(&bytes) {
         return Ok(Arc::new(wav::WavSource::parse(name, bytes)?));
     }
-    if still::sniff(&bytes) {
+    // APNG and animated GIF play as movies (#402); single-frame files fall through to the stills
+    if let Some(r) = animated::open(name, &bytes) {
+        return Ok(Arc::new(r?));
+    }
+    if still::sniff(name, &bytes) {
         return Ok(Arc::new(still::StillSource::decode(name, &bytes)?));
     }
     Err(MediaError::Unsupported(format!("{name}: unrecognised format")))
@@ -195,6 +241,20 @@ impl MediaSource for OfflineSource {
         Ok(Arc::new(VideoFrame::rgba8(w, h, px).with_pts(req.time)))
     }
     fn audio(&self, _start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer> {
-        Ok(AudioBuffer::silence(sample_rate, self.info.audio.as_ref().map_or(2, |a| a.channels as usize), frames))
+        Ok(AudioBuffer::silence(sample_rate, self.info.audio().map_or(2, |a| a.channels as usize), frames))
+    }
+}
+
+#[cfg(test)]
+mod importable_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn camera_extensions_match_regardless_of_case() {
+        for name in ["clip.mov", "clip.MOV", "clip.Mov", "shot.MP4", "IMG_0001.JPG", "sound.WAV", "take.M2TS"] {
+            assert!(is_importable(Path::new(name)), "{name}");
+        }
+        assert!(!is_importable(Path::new("notes.txt")));
     }
 }

@@ -375,7 +375,9 @@ impl Ctx<'_> {
                 }
             }
             let id = ti.id;
-            self.b.ensure_tracks(&mut self.seq, kind, idx + 1);
+            if !self.b.ensure_tracks(&mut self.seq, kind, idx + 1) {
+                continue;
+            }
             let mut next = self.b.p.next_id;
             let track = &mut self.seq.tracks_mut(kind)[idx];
             overwrite(track, ti, &mut || {
@@ -467,7 +469,10 @@ fn import_event(ctx: &mut Ctx, ev: &Event, report: &mut Report) {
             let t0 = ctx.rec(l2.tcs[2], df);
             let t1 = ctx.rec(l2.tcs[3], df);
             let d = ctx.rate.tick_of(l2.dur);
-            let effect = transition_for(l2.trans, ev.effect.as_deref(), report);
+            // Resolve separately for each track kind: named audio dissolves have
+            // different definitions from their video counterparts.
+            let mut video_effect = None;
+            let mut audio_effect = None;
             let to_black = l2.reel.eq_ignore_ascii_case("BL");
             let from_black = l1.reel.eq_ignore_ascii_case("BL");
             // Incoming clip.
@@ -484,7 +489,9 @@ fn import_event(ctx: &mut Ctx, ev: &Event, report: &mut Report) {
             let chans: BTreeSet<Ch> = l2.chans.iter().copied().collect();
             for ch in chans {
                 let (kind, idx) = ctx.track_index(ch, 0);
-                ctx.b.ensure_tracks(&mut ctx.seq, kind, idx + 1);
+                if !ctx.b.ensure_tracks(&mut ctx.seq, kind, idx + 1) {
+                    continue;
+                }
                 let to = placed.iter().find(|(k, i, _)| *k == kind && *i == idx).map(|p| p.2);
                 let track = &mut ctx.seq.tracks_mut(kind)[idx];
                 let from = if from_black { None } else { track.items.iter().find(|i| i.end() == t0).map(|i| i.id) };
@@ -505,10 +512,8 @@ fn import_event(ctx: &mut Ctx, ev: &Event, report: &mut Report) {
                     continue;
                 }
                 let audio = kind == TrackKind::Audio;
-                let mut eff = effect.clone();
-                if audio && eff.def().is_some_and(|d| d.kind != filmcraft_project::EffectKind::AudioTransition) {
-                    eff = find_effect("constant_power").map(|d| d.instance()).unwrap_or(eff);
-                }
+                let cache = if audio { &mut audio_effect } else { &mut video_effect };
+                let eff = cache.get_or_insert_with(|| transition_for(l2.trans, ev.effect.as_deref(), audio, report)).clone();
                 let id = TransitionId(ctx.b.alloc());
                 let track = &mut ctx.seq.tracks_mut(kind)[idx];
                 track.transitions.push(Transition { id, effect: eff, start: t0, duration: d, from, to, align, reverse: false });
@@ -564,9 +569,18 @@ fn lay_cut(ctx: &mut Ctx, ev: &Event, l: &Line, video_base: usize, df: bool, m2:
     ctx.lay(l, item, &name, t0, t1 - t0, src, *m2, video_base);
 }
 
-fn transition_for(t: Trans, effect_name: Option<&str>, report: &mut Report) -> filmcraft_project::EffectInstance {
+fn transition_for(t: Trans, effect_name: Option<&str>, audio: bool, report: &mut Report) -> filmcraft_project::EffectInstance {
     if let Some(n) = effect_name {
-        return transition_effect(n, false, report);
+        let effect = transition_effect(n, audio, report);
+        if audio && effect.def().is_some_and(|d| d.kind != filmcraft_project::EffectKind::AudioTransition) {
+            report.warn(format!("transition \"{n}\" is not an audio transition; imported as Constant Power"));
+            return find_effect("constant_power").map(|d| d.instance()).unwrap_or(effect);
+        }
+        return effect;
+    }
+    if audio {
+        // Unnamed EDL audio dissolves default to constant-power fading.
+        return transition_effect("Constant Power", true, report);
     }
     match t {
         Trans::Wipe(code) => {

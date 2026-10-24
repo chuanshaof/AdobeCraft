@@ -44,6 +44,15 @@ pub fn used_ranges(p: &Project, seqs: &[ItemId]) -> (BTreeMap<ItemId, (Tick, Tic
                     Some(ItemKind::Subclip { parent, .. }) => {
                         used.insert(ti.item);
                         target = *parent;
+                        // Loaded projects can nest subclips; keep every link up to the media (bounded like `resolve_media`).
+                        let mut up = *parent;
+                        for _ in 0..16 {
+                            used.insert(up);
+                            match p.item(up).map(|i| &i.kind) {
+                                Some(ItemKind::Subclip { parent, .. }) => up = *parent,
+                                _ => break,
+                            }
+                        }
                     }
                     Some(_) => {}
                     None => continue,
@@ -128,7 +137,10 @@ pub fn run(s: &mut Session, p: &Value) -> Result<Value> {
     for id in ids {
         let Some(m) = proj.item(id).and_then(|i| i.as_media()).cloned() else { continue };
         let MediaRef::File { path } = &m.media else { continue };
-        let size = s.services.file_size(path).unwrap_or(0);
+        // Project files carry stored paths; use only the media pool's resolved, policy-approved
+        // pathname for filesystem I/O. Keep the stored path in the project itself.
+        let source_path = s.media.follow(path).map_err(|why| EngineError::Other(format!("{path} is not opened: {why}")))?;
+        let size = s.services.file_size(&source_path).unwrap_or(0);
         original_bytes += size;
         let file = Path::new(path);
         let stem = file.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| format!("media-{}", id.0));
@@ -149,20 +161,23 @@ pub fn run(s: &mut Session, p: &Value) -> Result<Value> {
         };
         taken.push(out.clone());
         let proxy = match (&m.proxy, include_proxies) {
-            (Some(MediaRef::File { path: pp }), true) if s.services.file_size(pp).is_ok() => {
-                let pf = Path::new(pp);
-                let ps = pf.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let pe = pf.extension().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let o = unique_path(&dest_dir.join("Proxies"), &ps, "", &pe, &taken).to_string_lossy().into_owned();
-                taken.push(o.clone());
-                let b = s.services.file_size(pp).unwrap_or(0);
-                original_bytes += b;
-                result_bytes += b;
-                Some((pp.clone(), o))
-            }
+            (Some(MediaRef::File { path: pp }), true) => match s.media.follow(pp) {
+                Ok(resolved_proxy) if s.services.file_size(&resolved_proxy).is_ok() => {
+                    let pf = Path::new(&resolved_proxy);
+                    let ps = pf.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let pe = pf.extension().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let o = unique_path(&dest_dir.join("Proxies"), &ps, "", &pe, &taken).to_string_lossy().into_owned();
+                    taken.push(o.clone());
+                    let b = s.services.file_size(&resolved_proxy).unwrap_or(0);
+                    original_bytes += b;
+                    result_bytes += b;
+                    Some((resolved_proxy, o))
+                }
+                _ => None,
+            },
             _ => None,
         };
-        work.push(Work { item: id, src_path: path.clone(), out, range, proxy });
+        work.push(Work { item: id, src_path: source_path, out, range, proxy });
     }
     let previews = s.path.as_deref().map(crate::previews::dir_for_project).filter(|d| include_previews && d.is_dir());
     if let Some(d) = &previews {
@@ -208,7 +223,7 @@ pub fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let prev_dst = crate::previews::dir_for_project(&project_path);
     let services = s.services.clone();
     let run = move || {
-        let t0 = std::time::Instant::now();
+        let t0 = web_time::Instant::now();
         let r = execute(proj, work, sources, previews.map(|d| (d, prev_dst)), &project_path, pr, &prog, &*services);
         let secs = t0.elapsed().as_secs_f64();
         let r = r.map(|bytes| filmcraft_export::Report {
@@ -311,7 +326,7 @@ fn execute(
 
 fn estimate_bytes(m: &filmcraft_project::MediaClip, dur: Tick, pr: &Preset) -> u64 {
     let secs = dur.seconds().max(0.0);
-    let audio = m.info.audio.as_ref().map_or(0.0, |a| a.sample_rate as f64 * 2.0 * 2.0 * secs);
+    let audio = m.info.audio().map_or(0.0, |a| a.sample_rate as f64 * 2.0 * 2.0 * secs);
     let Some(v) = &m.info.video else { return audio as u64 };
     let fps = v.frame_rate.num as f64 / v.frame_rate.den.max(1) as f64;
     let px = (v.width * v.height) as f64 * (pr.scale * pr.scale) as f64;

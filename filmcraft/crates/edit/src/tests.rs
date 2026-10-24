@@ -60,6 +60,7 @@ impl Fx {
             hold_filters: false,
             field_options: None,
             source_channels: Vec::new(),
+            audio_stream: 0,
             graphic: None,
         }
     }
@@ -234,6 +235,27 @@ fn close_gap_works() {
 }
 
 #[test]
+fn reversed_trim_uses_the_handle_its_playback_direction_consumes() {
+    let mut fx = Fx::new();
+    let v1 = fx.v(0);
+    // source frames [5, 15) played backwards; the media is 1000 frames long
+    let a = fx.put(v1, 30, 10, 5);
+    fx.seq.find_item_mut(a).unwrap().1.reverse = true;
+    let mut n = fx.next;
+    // out extends into the 5 frames before source_in, not into the 985 after source_out
+    let d = trim(&mut fx.seq, a, Edge::Out, TrimMode::Regular, f(20), &mut Fx::ctx(&mut n)).unwrap();
+    assert_eq!(d, f(5));
+    let it = fx.seq.find_item(a).unwrap().1;
+    assert_eq!((it.source_in, it.source_out()), (f(0), f(15)));
+    // in extends into the media after source_out
+    let d = trim(&mut fx.seq, a, Edge::In, TrimMode::Regular, -f(10), &mut Fx::ctx(&mut n)).unwrap();
+    assert_eq!(d, -f(10));
+    let it = fx.seq.find_item(a).unwrap().1;
+    assert_eq!((it.source_in, it.source_out()), (f(0), f(25)));
+    fx.seq.check().unwrap();
+}
+
+#[test]
 fn regular_trim_respects_neighbours_and_handles() {
     let mut fx = Fx::new();
     let v1 = fx.v(0);
@@ -249,6 +271,35 @@ fn regular_trim_respects_neighbours_and_handles() {
     let d = trim(&mut fx.seq, a, Edge::In, TrimMode::Regular, f(3), &mut Fx::ctx(&mut n)).unwrap();
     assert_eq!(d, f(3));
     assert_eq!(fx.seq.find_item(a).unwrap().1.source_in, f(8));
+    fx.seq.check().unwrap();
+}
+
+#[test]
+fn trim_on_a_locked_track_is_refused() {
+    let mut fx = Fx::new();
+    let v1 = fx.v(0);
+    let a = fx.put(v1, 0, 100, 0);
+    fx.seq.track_mut(v1).unwrap().locked = true;
+    let mut n = fx.next;
+    assert_eq!(trim(&mut fx.seq, a, Edge::Out, TrimMode::Regular, -f(20), &mut Fx::ctx(&mut n)), Err(EditError::Locked));
+    assert_eq!(fx.spans(v1), vec![(0, 100)]);
+}
+
+#[test]
+fn held_regular_in_trim_stops_at_previous_clip() {
+    let mut fx = Fx::new();
+    let v1 = fx.v(0);
+    fx.put(v1, 0, 10, 0);
+    let b = fx.put(v1, 15, 10, 5);
+    fx.seq.find_item_mut(b).unwrap().1.frame_hold = Some(f(5));
+    let mut n = fx.next;
+    // 5 frames of gap: a 20 frame extension is clamped to 5 instead of overlapping the previous clip
+    let d = trim(&mut fx.seq, b, Edge::In, TrimMode::Regular, -f(20), &mut Fx::ctx(&mut n)).unwrap();
+    assert_eq!(d, -f(5));
+    assert_eq!(fx.spans(v1), vec![(0, 10), (10, 15)]);
+    // no space left: nothing to do, and no error
+    let d = trim(&mut fx.seq, b, Edge::In, TrimMode::Regular, -f(3), &mut Fx::ctx(&mut n)).unwrap();
+    assert_eq!(d, Tick::ZERO);
     fx.seq.check().unwrap();
 }
 
@@ -359,6 +410,25 @@ fn roll_slip_slide() {
 }
 
 #[test]
+fn slide_keeps_reversed_neighbours_content() {
+    let mut fx = Fx::new();
+    let v1 = fx.v(0);
+    let a = fx.put(v1, 0, 30, 20);
+    let b = fx.put(v1, 30, 30, 50);
+    let c = fx.put(v1, 60, 30, 70);
+    for id in [a, c] {
+        fx.seq.find_item_mut(id).unwrap().1.reverse = true;
+    }
+    let mut n = fx.next;
+    slide(&mut fx.seq, b, f(10), &mut Fx::ctx(&mut n)).unwrap();
+    assert_eq!(fx.spans(v1), vec![(0, 40), (40, 30), (70, 20)]);
+    assert_eq!(fx.seq.find_item(a).unwrap().1.source_in, f(10));
+    assert_eq!(fx.seq.find_item(b).unwrap().1.source_in, f(50));
+    assert_eq!(fx.seq.find_item(c).unwrap().1.source_in, f(70));
+    fx.seq.check().unwrap();
+}
+
+#[test]
 fn transitions_stay_on_their_cuts() {
     let mut fx = Fx::new();
     let v1 = fx.v(0);
@@ -406,6 +476,91 @@ fn transitions_stay_on_their_cuts() {
 }
 
 #[test]
+fn fades_follow_a_regular_trim() {
+    let mut fx = Fx::new();
+    let v1 = fx.v(0);
+    let a = fx.put(v1, 10, 20, 10);
+    let fade = |id, start, from, to| Transition {
+        id: TransitionId(id),
+        effect: filmcraft_project::find_effect("cross_dissolve").unwrap().instance(),
+        start: f(start),
+        duration: f(6),
+        from,
+        to,
+        align: Default::default(),
+        reverse: false,
+    };
+    fx.seq.track_mut(v1).unwrap().transitions = vec![fade(1, 10, None, Some(a)), fade(2, 24, Some(a), None)];
+    let spans = |fx: &Fx| fx.seq.track(v1).unwrap().transitions.iter().map(|t| (t.start, t.duration)).collect::<Vec<_>>();
+    let mut n = fx.next;
+    trim(&mut fx.seq, a, Edge::In, TrimMode::Regular, f(2), &mut Fx::ctx(&mut n)).unwrap();
+    trim(&mut fx.seq, a, Edge::Out, TrimMode::Regular, f(4), &mut Fx::ctx(&mut n)).unwrap();
+    // the fade in starts with the clip (12), the fade out ends with it (34)
+    assert_eq!(spans(&fx), vec![(f(12), f(6)), (f(28), f(6))]);
+    // a clip trimmed shorter than its fades keeps them inside it
+    trim(&mut fx.seq, a, Edge::Out, TrimMode::Regular, -f(18), &mut Fx::ctx(&mut n)).unwrap();
+    assert_eq!(spans(&fx), vec![(f(12), f(4)), (f(12), f(4))]);
+    fx.seq.check().unwrap();
+}
+
+#[test]
+fn fades_follow_a_non_ripple_speed_change() {
+    // #918: faster without ripple shortens the clip; the fade-out stays on the new out point.
+    let mut fx = Fx::new();
+    let v1 = fx.v(0);
+    let a = fx.put(v1, 0, 100, 0);
+    fx.seq.track_mut(v1).unwrap().transitions = vec![Transition {
+        id: TransitionId(1),
+        effect: filmcraft_project::find_effect("cross_dissolve").unwrap().instance(),
+        start: f(90),
+        duration: f(10),
+        from: Some(a),
+        to: None,
+        align: Default::default(),
+        reverse: false,
+    }];
+    let mut n = fx.next;
+    set_speed(&mut fx.seq, a, 2.0, false, false, &mut Fx::ctx(&mut n)).unwrap();
+    let tr = &fx.seq.track(v1).unwrap().transitions[0];
+    assert_eq!(fx.spans(v1), vec![(0, 50)]);
+    assert_eq!((tr.start, tr.duration), (f(40), f(10)));
+    fx.seq.check().unwrap();
+}
+
+#[test]
+fn transitions_travel_with_moved_clips() {
+    // V1: a [0,10) fading in, b [10,20), c [20,30); b→c crossfade, c fading out
+    let mut fx = Fx::new();
+    let (v1, v2) = (fx.v(0), fx.v(1));
+    let a = fx.put(v1, 0, 10, 10);
+    let b = fx.put(v1, 10, 10, 10);
+    let c = fx.put(v1, 20, 10, 10);
+    let tr = |id, start, from, to| Transition {
+        id: TransitionId(id),
+        effect: filmcraft_project::find_effect("cross_dissolve").unwrap().instance(),
+        start: f(start),
+        duration: f(4),
+        from,
+        to,
+        align: Default::default(),
+        reverse: false,
+    };
+    fx.seq.track_mut(v1).unwrap().transitions = vec![tr(1, 0, None, Some(a)), tr(2, 18, Some(b), Some(c)), tr(3, 26, Some(c), None)];
+    let at = |fx: &Fx, track: TrackId| -> Vec<(u64, i64)> { fx.seq.track(track).unwrap().transitions.iter().map(|t| (t.id.0, R.frame_at(t.start))).collect() };
+    let mut n = fx.next;
+    // a fade at a clip's edge goes with it, to another track too
+    move_items(&mut fx.seq, &[(a, v2, f(40))], false, &mut Fx::ctx(&mut n)).unwrap();
+    assert_eq!((at(&fx, v1), at(&fx, v2)), (vec![(2, 18), (3, 26)], vec![(1, 40)]));
+    // a cut whose two clips move together keeps its transition, in an insert move as well
+    move_items(&mut fx.seq, &[(b, v1, f(60)), (c, v1, f(70))], true, &mut Fx::ctx(&mut n)).unwrap();
+    assert_eq!(at(&fx, v1), vec![(2, 68), (3, 76)]);
+    // a crossfade whose partner stays behind is dropped; the moving clip's own fade stays with it
+    move_items(&mut fx.seq, &[(c, v1, f(90))], false, &mut Fx::ctx(&mut n)).unwrap();
+    assert_eq!(at(&fx, v1), vec![(3, 96)]);
+    fx.seq.check().unwrap();
+}
+
+#[test]
 fn rate_stretch_and_speed() {
     let mut fx = Fx::new();
     let v1 = fx.v(0);
@@ -415,6 +570,29 @@ fn rate_stretch_and_speed() {
     assert!((s - 0.5).abs() < 1e-9);
     set_speed(&mut fx.seq, a, 2.0, false, true, &mut Fx::ctx(&mut n)).unwrap();
     assert_eq!(fx.spans(v1), vec![(0, 5)]);
+}
+
+#[test]
+fn linked_rate_stretch_uses_the_tighter_neighbour() {
+    // picture and sound are 60 frames; a later clip on A1 starts at 70, so the sound has only 10
+    // frames of room. Stretching the pair +20 must not leave the picture at 80f / 0.75x and the
+    // sound at 70f / 6/7x while still linked.
+    let mut fx = Fx::new();
+    let (v1, a1) = (fx.v(0), fx.a(0));
+    let pic = fx.put(v1, 0, 60, 0);
+    let snd = fx.put(a1, 0, 60, 0);
+    fx.put(a1, 70, 10, 0);
+    for c in [pic, snd] {
+        fx.seq.find_item_mut(c).unwrap().1.link = Some(1);
+    }
+    let mut n = fx.next;
+    let speed = rate_stretch_items(&mut fx.seq, &[pic, snd], Edge::Out, f(20), &mut Fx::ctx(&mut n)).unwrap();
+    assert!((speed - 60.0 / 70.0).abs() < 1e-9);
+    let (p, s) = (fx.seq.find_item(pic).unwrap().1, fx.seq.find_item(snd).unwrap().1);
+    assert_eq!((R.frame_at(p.duration), R.frame_at(s.duration)), (70, 70));
+    assert!((p.speed - s.speed).abs() < 1e-12);
+    assert_eq!(fx.spans(a1), vec![(0, 70), (70, 10)]);
+    fx.seq.check().unwrap();
 }
 
 #[test]
@@ -670,5 +848,60 @@ fn shorter_head_closes_the_stretch_after_the_cut_on_sync_locked_tracks() {
         };
         assert!(matches!(r, Err(EditError::SyncLockConflict(_))), "group {group}");
         assert_eq!(fx.spans(v1), vec![(0, 10), (10, 10), (20, 10)], "unchanged on failure");
+    }
+}
+
+#[test]
+fn roll_reversed_clips_keeps_media_mapping() {
+    let mut fx = Fx::new();
+    let v = fx.v(0);
+    let mut a = fx.item(0, 30, 20);
+    a.reverse = true;
+    let mut b = fx.item(30, 30, 50);
+    b.reverse = true;
+    let (ia, ib) = (a.id, b.id);
+    fx.seq.track_mut(v).unwrap().items.extend([a, b]);
+    let mut n = 0;
+    roll(&mut fx.seq, ia, ib, f(10), &mut Fx::ctx(&mut n)).unwrap();
+    let (_, l) = fx.seq.find_item(ia).unwrap();
+    assert_eq!((l.start, l.duration, l.source_in), (f(0), f(40), f(10)));
+    let (_, r) = fx.seq.find_item(ib).unwrap();
+    assert_eq!((r.start, r.duration, r.source_in), (f(40), f(20), f(50)));
+}
+
+/// #374: moving an edge must not change which media sits under any timeline time the clip still
+/// covers (the timeline's live trim preview draws its waveform from this item), and must leave the
+/// item as the trim itself does.
+#[test]
+fn moving_an_edge_keeps_the_media_under_the_timeline() {
+    let fx = Fx::new();
+    let v1 = fx.v(0);
+    for (speed, reverse, hold) in [(1.0, false, None), (2.0, false, None), (0.5, false, None), (1.0, true, None), (2.0, true, None), (1.0, false, Some(f(50)))]
+    {
+        for (edge, d) in [(Edge::In, f(7)), (Edge::In, -f(4)), (Edge::Out, -f(9)), (Edge::Out, f(3))] {
+            let mut fresh = Fx::new();
+            let c = fresh.put(v1, 100, 40, 200);
+            {
+                let it = fresh.seq.find_item_mut(c).unwrap().1;
+                (it.speed, it.reverse, it.frame_hold) = (speed, reverse, hold);
+            }
+            let before = fresh.seq.find_item(c).unwrap().1.clone();
+            let mut moved = before.clone();
+            move_edge(&mut moved, edge, d, true);
+            let label = format!("speed {speed} reverse {reverse} hold {hold:?} {edge:?} {d:?}");
+            // every frame still covered shows the same media as before the move
+            let mut t = moved.start.max(before.start);
+            while t < moved.end().min(before.end()) {
+                let (a, b) = (before.source_time_at(t), moved.source_time_at(t));
+                assert!((a - b).0.abs() <= 1, "{label}: at {t:?} {a:?} became {b:?}");
+                t += f(1);
+            }
+            // and the item is what the real (unclamped) trim makes of it
+            let mut n = fresh.next;
+            let got = trim(&mut fresh.seq, c, edge, TrimMode::Regular, d, &mut Fx::ctx(&mut n)).unwrap();
+            assert_eq!(got, d, "{label}: not clamped");
+            let trimmed = fresh.seq.find_item(c).unwrap().1;
+            assert_eq!((trimmed.start, trimmed.duration, trimmed.source_in), (moved.start, moved.duration, moved.source_in), "{label}");
+        }
     }
 }

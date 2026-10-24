@@ -21,7 +21,7 @@ panic path, and fix a crash before building on top of it. The cross-app standard
    code alone (a literal that always parses): a single-item `#[allow(clippy::expect_used)]` with the reason.
 3. **No `unsafe`** (`unsafe_code = "forbid"` for the workspace). The single exception is
    `crates/platform`, which needs `unsafe` to call the operating system's media APIs (hardware
-   video decoding through VideoToolbox and Media Foundation / Direct3D 11; later encoding and Linux) and does nothing else. It
+   video decoding through VideoToolbox, Media Foundation / Direct3D 11, VA-API and NVDEC; hardware encoding) and does nothing else. It
    uses `unsafe_code = "deny"` with `#[allow(unsafe_code)]` only on its FFI modules, a
    `// SAFETY:` comment on every `unsafe` block, a safe `Result`-returning public API, and the
    pure-Rust decoder as the tested fallback ([ADR 0001](docs/adr/0001-platform-ffi.md)).
@@ -127,6 +127,8 @@ See [§0](#0-never-crash). It outranks every other engineering rule.
 See `CLAUDE.md`: pure Rust, dependency layering (`cargo xtask layers`), exact `Tick` time, everything is
 a command, everything is agent-drivable, and the quality gates (`cargo xtask ci`) before every commit.
 
+- **Time goes through `chrono`** (workspace dependency). Never hand-roll UTC/calendar conversion (days-to-date algorithms, leap-year math); a crate owns only its output format string. The one exception is range extension: past the years chrono can represent, shift the date by whole 400-year Gregorian cycles (146,097 days, after which the calendar repeats), let chrono compute the month and day, and add the cycles back to the year (splitting seconds into hours, minutes and seconds is plain arithmetic).
+
 
 Shared real-file test corpora (Photoshop-authored PSDs, etc.) live in
 [`storytold/photocraft-corpus`](https://github.com/storytold/photocraft-corpus), explained in
@@ -142,6 +144,7 @@ as PhotoCraft does with `cargo xtask corpus`.
 - [docs/agents.md](docs/agents.md): driving FilmCraft over MCP / the control channel, and the agent work loop
 - [docs/control-protocol.md](docs/control-protocol.md): control-channel method reference
 - [ATTRIBUTION.md](ATTRIBUTION.md): asset index
+- [ROADMAP.md](ROADMAP.md), [docs/target-app-parity.md](docs/target-app-parity.md), [docs/gaps.md](docs/gaps.md): stage, parity with Premiere Pro and the ranked work list (craftrules `standards/progress-docs.md`)
 
 ## Contributor credits (About window)
 

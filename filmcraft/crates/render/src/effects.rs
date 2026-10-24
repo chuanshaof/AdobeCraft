@@ -29,6 +29,8 @@ pub struct FxCtx<'a> {
     /// The clip's surroundings (other frames, other tracks, sequence geometry) for temporal,
     /// track-reading and reframing effects; `None` in isolated tests and adjustment layers.
     pub env: Option<&'a dyn crate::vfx::FxEnv>,
+    /// Sequence frame rate (shutter-angle motion blur); also known where `env` is `None`.
+    pub frame_rate: f64,
     /// The sequence's working colour space: Lumetri grades HDR (PQ / HLG) working spaces in their
     /// own signal, normalised to HDR White ([`filmcraft_color::GradeSpace`]).
     pub working: filmcraft_color::WorkingSpace,
@@ -41,10 +43,10 @@ pub(crate) fn b(e: &EffectInstance, id: &str) -> bool {
     e.param(id).and_then(|p| p.value.as_bool()).unwrap_or(false)
 }
 /// A section switch (missing in older projects = on).
-fn on(e: &EffectInstance, id: &str) -> bool {
+pub(crate) fn on(e: &EffectInstance, id: &str) -> bool {
     e.param(id).and_then(|p| p.value.as_bool()).unwrap_or(true)
 }
-fn text<'e>(e: &'e EffectInstance, id: &str) -> &'e str {
+pub(crate) fn text<'e>(e: &'e EffectInstance, id: &str) -> &'e str {
     match e.param(id).map(|p| &p.value) {
         Some(ParamValue::Text(s)) => s,
         _ => "",
@@ -77,6 +79,13 @@ pub(crate) fn dec(c: [f32; 3]) -> [f32; 3] {
     [srgb_to_linear(c[0].clamp(0.0, 1.0)), srgb_to_linear(c[1].clamp(0.0, 1.0)), srgb_to_linear(c[2].clamp(0.0, 1.0))]
 }
 
+/// Stable seed for the *exact* frame timestamp. A fixed 30 Hz quantizer
+/// would reuse the same noise field at 60/120 fps and can repeat at 30 fps
+/// through floating-point rounding of seconds.
+pub(crate) fn noise_frame_seed(cx: &FxCtx) -> u64 {
+    cx.t.0 as u64
+}
+
 pub(crate) fn hash3(x: usize, y: usize, z: u64) -> f32 {
     let mut h = (x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (y as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F) ^ z.wrapping_mul(0x1656_67B1_9E37_79F9);
     h ^= h >> 31;
@@ -86,6 +95,23 @@ pub(crate) fn hash3(x: usize, y: usize, z: u64) -> f32 {
 }
 
 /// Apply one effect. Unknown/unimplemented ids are a no-op (they still round-trip in the project).
+/// Largest Median radius in source pixels (the parameter's range).
+const MEDIAN_MAX_RADIUS: f32 = 100.0;
+
+/// The Median radius in working-image pixels. Radius is authored in source pixels and `px_scale`
+/// converts to the working image (no cap at 4 working pixels: that made Radius > 4 look the same
+/// at full resolution). It stays within the parameter's range whatever a project file says, since
+/// the filter costs radius² per pixel, and within the image.
+fn median_radius(radius: f32, px_scale: f32, longest_side: usize) -> isize {
+    let scale = if px_scale.is_finite() { px_scale.max(0.0) } else { 1.0 };
+    let r = radius * scale;
+    if !(r.is_finite() && r > 0.0) {
+        return 0;
+    }
+    let cap = (MEDIAN_MAX_RADIUS * scale).min(longest_side.max(1) as f32);
+    r.round().clamp(0.0, cap) as isize
+}
+
 pub fn apply(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
     if !e.enabled || img.w == 0 || img.h == 0 {
         return;
@@ -94,14 +120,14 @@ pub fn apply(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
         return;
     }
     // effects with a GPU implementation: evaluated parameters + CPU reference (`gpufx`)
-    if let Some(op) = crate::gpufx::FxOp::eval(e, cx, img.w, img.h) {
+    if let Some(op) = crate::gpufx::FxOp::eval(e, cx, img.w, img.h).filter(|op| e.effect != "lumetri" || op.gpu_ok()) {
         op.apply(img);
         return;
     }
     match e.effect.as_str() {
         "lumetri" => lumetri(img, e, cx),
         "median" => {
-            let r = (f(e, "radius", cx) * cx.px_scale).round().clamp(0.0, 4.0) as isize;
+            let r = median_radius(f(e, "radius", cx), cx.px_scale, img.w.max(img.h));
             if r > 0 {
                 median(img, r);
             }
@@ -110,7 +136,7 @@ pub fn apply(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
             let amt = f(e, "amount", cx) / 100.0;
             let colored = b(e, "color");
             let clip = b(e, "clip");
-            let frame = (cx.seconds * 30.0) as u64;
+            let frame = noise_frame_seed(cx);
             let w = img.w;
             img.px.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
                 for x in 0..w {
@@ -251,7 +277,8 @@ pub fn apply(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
         "basic_3d" => {
             let sw = (f(e, "swivel", cx) as f64).to_radians();
             let tl = (f(e, "tilt", cx) as f64).to_radians();
-            let dist = f(e, "distance", cx) as f64;
+            // authored in full-resolution pixels; the focal length follows the working image (#1920)
+            let dist = f(e, "distance", cx) as f64 * cx.px_scale as f64;
             let (w, h) = (img.w as f64, img.h as f64);
             let focal = w.max(h) * 1.2;
             // inverse perspective mapping: ray through (x,y) intersected with rotated plane
@@ -577,7 +604,7 @@ pub(crate) fn key(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
 
 /// The grading signal of the effect's section: HDR White (`white_id`) applies in HDR working
 /// spaces only.
-fn grade_space(e: &EffectInstance, cx: &FxCtx, white_id: &str) -> GradeSpace {
+pub(crate) fn grade_space(e: &EffectInstance, cx: &FxCtx, white_id: &str) -> GradeSpace {
     GradeSpace::new(cx.working, f(e, white_id, cx))
 }
 
@@ -679,7 +706,7 @@ fn lumetri(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
         v = v.map(|q| l3 + (q - l3) * s);
         // vignette
         if va.abs() > 1e-4 {
-            let nx = (x as f32 / w - 0.5) * 2.0 * (1.0 + vround * 0.0) * if vround < 0.0 { aspect.powf(-vround) } else { 1.0 };
+            let nx = (x as f32 / w - 0.5) * 2.0 * crate::gpufx::lumetri_vignette_aspect(aspect, vround);
             let ny = (y as f32 / h - 0.5) * 2.0;
             let d = (nx * nx + ny * ny).sqrt() / std::f32::consts::SQRT_2;
             let edge = ((d - vmid * 0.9) / (vfeather.max(0.01) * 0.9)).clamp(0.0, 1.0);
@@ -883,6 +910,21 @@ pub(crate) fn mosaic(img: &mut Image, bx: usize, by: usize) {
 
 #[cfg(test)]
 mod tests {
+    use super::median_radius;
+
+    /// A project file's Median radius stays within the parameter's 0–100 range (scaled to the
+    /// working image) and the image: 1e9 used to run a radius-sized window over every pixel.
+    #[test]
+    fn median_radius_stays_in_the_parameter_range() {
+        assert_eq!(median_radius(1e9, 1.0, 4096), 100);
+        assert_eq!(median_radius(1e9, 0.5, 4096), 50);
+        assert_eq!(median_radius(1e9, 1.0, 40), 40);
+        assert_eq!(median_radius(12.0, 1.0, 4096), 12, "Radius above 4 keeps its full size");
+        assert_eq!(median_radius(f32::NAN, 1.0, 4096), 0);
+        assert_eq!(median_radius(-3.0, 1.0, 4096), 0);
+        assert_eq!(median_radius(8.0, f32::INFINITY, 4096), 8);
+    }
+
     use super::*;
     use filmcraft_project::find_effect;
 
@@ -895,6 +937,7 @@ mod tests {
             clip_name: "x",
             project: None,
             env: None,
+            frame_rate: 24.0,
             working: filmcraft_color::WorkingSpace::Rec709,
         }
     }
@@ -1026,16 +1069,16 @@ fn hue_lut(points: &[[f32; 2]], n: usize) -> Option<Vec<f32>> {
     Some(lut[n..2 * n].to_vec())
 }
 
-fn curve_param(e: &EffectInstance, id: &str) -> Option<Vec<[f32; 2]>> {
+pub(crate) fn curve_param(e: &EffectInstance, id: &str) -> Option<Vec<[f32; 2]>> {
     e.param(id).and_then(|p| p.value.as_curve().map(|c| c.to_vec()))
 }
 
-fn is_identity_curve(c: &[[f32; 2]]) -> bool {
+pub(crate) fn is_identity_curve(c: &[[f32; 2]]) -> bool {
     c.iter().all(|p| (p[0] - p[1]).abs() < 1e-4)
 }
 
 /// Wheel offset (zero-mean RGB direction for a wheel position).
-fn wheel_rgb(v: Vec2) -> [f32; 3] {
+pub(crate) fn wheel_rgb(v: Vec2) -> [f32; 3] {
     let len = (v.x * v.x + v.y * v.y).sqrt().min(1.0) as f32;
     if len < 1e-5 {
         return [0.0; 3];
@@ -1338,5 +1381,236 @@ mod curve_tests {
         assert!(s.windows(2).all(|w| w[1] >= w[0] - 1e-6), "monotone");
         let h = hue_lut(&[[0.0, 0.8], [0.5, 0.2]], 64).unwrap();
         assert!((h[0] - h[63]).abs() < 0.05, "periodic");
+    }
+}
+
+#[cfg(test)]
+mod lumetri_cpu_parity_tests {
+    use super::*;
+    use crate::gpufx::FxOp;
+    use filmcraft_project::{EffectInstance, ParamValue, find_effect};
+    use filmcraft_time::Tick;
+
+    fn test_picture(w: usize, h: usize) -> Image {
+        let mut px = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                let fx = x as f32 / (w.max(2) - 1) as f32;
+                let fy = y as f32 / (h.max(2) - 1) as f32;
+                let c = match x % 11 {
+                    0 => [0.0, 0.0, 0.0],
+                    1 => [1.0, 1.0, 1.0],
+                    2 => [fy, fy, fy],
+                    3 => [1.6 * fy, 1.2 * fy, 0.3],
+                    _ => {
+                        let rgb = filmcraft_color::hsl_to_rgb(fx, 0.25 + 0.75 * ((y % 5) as f32 / 4.0), 0.1 + 0.8 * fy);
+                        rgb.map(filmcraft_color::srgb_to_linear)
+                    }
+                };
+                let a = match y % 7 {
+                    0 => 0.0,
+                    1 | 2 => 0.5 + 0.4 * fx,
+                    3 => 0.25,
+                    _ => 1.0,
+                };
+                px.extend_from_slice(&[c[0] * a, c[1] * a, c[2] * a, a]);
+            }
+        }
+        Image { w, h, px }
+    }
+
+    fn effect(params: &[(&str, ParamValue)]) -> EffectInstance {
+        let mut e = find_effect("lumetri").unwrap().instance();
+        for (k, v) in params {
+            e.params.get_mut(*k).unwrap_or_else(|| panic!("lumetri.{k}")).value = v.clone();
+        }
+        e
+    }
+
+    fn fl(v: f64) -> ParamValue {
+        ParamValue::Float(v)
+    }
+
+    fn col(r: f32, g: f32, b: f32) -> ParamValue {
+        ParamValue::Color([r, g, b, 1.0])
+    }
+
+    #[test]
+    fn lumetri_gpu_op_matches_original_fn_lumetri_cpu() {
+        let cases: &[(&str, Vec<(&str, ParamValue)>)] = &[
+            (
+                "basic",
+                vec![
+                    ("temperature", fl(20.0)),
+                    ("tint", fl(-10.0)),
+                    ("exposure", fl(0.5)),
+                    ("contrast", fl(15.0)),
+                    ("highlights", fl(-20.0)),
+                    ("shadows", fl(25.0)),
+                    ("whites", fl(10.0)),
+                    ("blacks", fl(-15.0)),
+                    ("saturation", fl(110.0)),
+                    ("creative_on", ParamValue::Bool(false)),
+                    ("vignette_on", ParamValue::Bool(false)),
+                ],
+            ),
+            (
+                "creative",
+                vec![
+                    ("basic_on", ParamValue::Bool(false)),
+                    ("creative_sat", fl(120.0)),
+                    ("vibrance", fl(30.0)),
+                    ("faded_film", fl(25.0)),
+                    ("shadow_tint", col(0.4, 0.45, 0.6)),
+                    ("highlight_tint", col(0.6, 0.55, 0.4)),
+                    ("vignette_on", ParamValue::Bool(false)),
+                ],
+            ),
+            (
+                "vignette",
+                vec![
+                    ("basic_on", ParamValue::Bool(false)),
+                    ("creative_on", ParamValue::Bool(false)),
+                    ("vignette_amount", fl(-3.0)),
+                    ("vignette_midpoint", fl(45.0)),
+                    ("vignette_roundness", fl(-30.0)),
+                    ("vignette_feather", fl(60.0)),
+                ],
+            ),
+            (
+                "all_three",
+                vec![
+                    ("temperature", fl(-15.0)),
+                    ("tint", fl(10.0)),
+                    ("exposure", fl(0.3)),
+                    ("contrast", fl(20.0)),
+                    ("highlights", fl(-10.0)),
+                    ("shadows", fl(15.0)),
+                    ("whites", fl(-5.0)),
+                    ("blacks", fl(5.0)),
+                    ("saturation", fl(105.0)),
+                    ("creative_sat", fl(110.0)),
+                    ("vibrance", fl(20.0)),
+                    ("faded_film", fl(15.0)),
+                    ("shadow_tint", col(0.48, 0.5, 0.55)),
+                    ("highlight_tint", col(0.52, 0.5, 0.45)),
+                    ("vignette_amount", fl(2.0)),
+                    ("vignette_midpoint", fl(50.0)),
+                    ("vignette_roundness", fl(20.0)),
+                    ("vignette_feather", fl(50.0)),
+                ],
+            ),
+            (
+                "extreme_pos",
+                vec![
+                    ("exposure", fl(4.0)),
+                    ("contrast", fl(100.0)),
+                    ("temperature", fl(100.0)),
+                    ("tint", fl(100.0)),
+                    ("whites", fl(100.0)),
+                    ("blacks", fl(100.0)),
+                ],
+            ),
+            (
+                "extreme_neg",
+                vec![
+                    ("exposure", fl(-4.0)),
+                    ("contrast", fl(-100.0)),
+                    ("temperature", fl(-100.0)),
+                    ("tint", fl(-100.0)),
+                    ("whites", fl(-100.0)),
+                    ("blacks", fl(-100.0)),
+                ],
+            ),
+        ];
+
+        let (w, h) = (67usize, 41usize);
+        let cx = FxCtx {
+            t: Tick::ZERO,
+            px_scale: 1.0,
+            seconds: 0.0,
+            timecode: "",
+            clip_name: "",
+            project: None,
+            env: None,
+            frame_rate: 24.0,
+            working: filmcraft_color::WorkingSpace::Rec709,
+        };
+
+        for (name, params) in cases {
+            let e = effect(params);
+            let mut img_orig = test_picture(w, h);
+            let mut img_copy = img_orig.clone();
+
+            lumetri(&mut img_orig, &e, &cx);
+
+            let op = FxOp::eval(&e, &cx, w, h).unwrap_or_else(|| panic!("{name}: eval returned None"));
+            assert!(op.gpu_ok(), "{name}: expected gpu_ok == true");
+            op.apply(&mut img_copy);
+
+            let mut max_diff = 0.0f32;
+            for (i, (&orig, &copy)) in img_orig.px.iter().zip(&img_copy.px).enumerate() {
+                let diff = (orig - copy).abs();
+                if diff > max_diff {
+                    max_diff = diff;
+                }
+                assert!(diff <= 1e-6, "{name}: sample {i} differed: orig={orig}, copy={copy}, diff={diff:.2e} > 1e-6");
+            }
+            eprintln!("{name}: max sample diff vs fn lumetri: {max_diff:.2e}");
+        }
+    }
+
+    /// #719: positive Roundness rounds the Lumetri vignette (it used to be ignored), +100
+    /// is a circle and negative values widen the oval, on the CPU path and the GPU op alike.
+    #[test]
+    fn lumetri_vignette_roundness_shapes_the_vignette() {
+        let (w, h) = (80usize, 40usize);
+        let cx = FxCtx {
+            t: Tick::ZERO,
+            px_scale: 1.0,
+            seconds: 0.0,
+            timecode: "",
+            clip_name: "",
+            project: None,
+            env: None,
+            frame_rate: 24.0,
+            working: filmcraft_color::WorkingSpace::Rec709,
+        };
+        let render = |roundness: f64| {
+            let e = effect(&[
+                ("basic_on", ParamValue::Bool(false)),
+                ("creative_on", ParamValue::Bool(false)),
+                ("vignette_amount", fl(-3.0)),
+                ("vignette_roundness", fl(roundness)),
+            ]);
+            let grey = Image { w, h, px: [0.5, 0.5, 0.5, 1.0].repeat(w * h) };
+            let mut cpu = grey.clone();
+            lumetri(&mut cpu, &e, &cx);
+            let mut op_img = grey;
+            let op = FxOp::eval(&e, &cx, w, h).expect("lumetri op");
+            op.apply(&mut op_img);
+            for (a, b) in cpu.px.iter().zip(&op_img.px) {
+                assert!((a - b).abs() <= 1e-6, "roundness {roundness}: CPU and GPU op disagree");
+            }
+            cpu
+        };
+        let red = |img: &Image, x: usize, y: usize| img.px[(y * w + x) * 4];
+        // 16 px right of and 16 px below the centre (40, 20)
+        let (right, below) = ((56, 20), (40, 36));
+
+        let ellipse = render(0.0);
+        assert!(red(&ellipse, right.0, right.1) > red(&ellipse, below.0, below.1) + 0.01, "0 follows the frame");
+
+        let circle = render(100.0);
+        assert_ne!(circle.px, ellipse.px, "positive roundness changes the vignette");
+        let (r, b) = (red(&circle, right.0, right.1), red(&circle, below.0, below.1));
+        assert!((r - b).abs() < 1e-4, "+100 is a circle: {r} vs {b}");
+        assert!(r < red(&ellipse, right.0, right.1), "+100 darkens the sides more than 0");
+        let half = render(50.0);
+        assert!(red(&half, 70, 20) < red(&ellipse, 70, 20), "+50 darkens the sides more than 0");
+        assert!(red(&half, 70, 20) > red(&circle, 70, 20), "+50 darkens the sides less than +100");
+
+        let oval = render(-100.0);
+        assert!(red(&oval, 79, 20) > red(&ellipse, 79, 20), "negative values widen the oval");
     }
 }

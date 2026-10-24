@@ -178,8 +178,20 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
             v.pan = [0.0, 0.0];
             Ok(json!({"zoom": v.zoom}))
         }
-        "playback.inToOutPreroll" => play_range(app, true),
-        "playback.toOut" => play_range(app, false),
+        "playback.inToOutPreroll" => {
+            if crate::menus::targets_source(app, params) {
+                app.play_source_range(false, true).map(|_| Value::Null)
+            } else {
+                play_range(app, true)
+            }
+        }
+        "playback.toOut" => {
+            if crate::menus::targets_source(app, params) {
+                app.play_source_range(true, false).map(|_| Value::Null)
+            } else {
+                play_range(app, false)
+            }
+        }
         "timeline.expandAllTracks" | "timeline.minimizeAllTracks" => Ok(all_heights(app, id == "timeline.expandAllTracks")),
         "timeline.increaseVideoHeight" | "timeline.decreaseVideoHeight" | "timeline.increaseAudioHeight" | "timeline.decreaseAudioHeight" => {
             let d = if id.contains("increase") { HEIGHT_STEP } else { -HEIGHT_STEP };
@@ -198,7 +210,7 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
         }
         "graphics.beginTextEditing" => begin_text_editing(app),
         "help.filmcraftHelp" => {
-            crate::links::open(ctx, HELP_URL);
+            crate::links::open(app, ctx, HELP_URL);
             Ok(json!({"url": HELP_URL}))
         }
         "app.quit" => {
@@ -220,10 +232,13 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
 
 // ------------------------------------------------------------------ frames and panels
 
-fn toggle_maximize(app: &mut FilmcraftApp, p: PanelKind) -> Value {
-    app.ui.keys.maximized = if app.ui.keys.maximized.is_some() { None } else { Some(p) };
+/// Maximize `p`, or restore the layout when a panel is maximized (also the panel menu's Maximize /
+/// Restore Frame). A maximized panel that has since been closed counts as restored.
+pub(crate) fn toggle_maximize(app: &mut FilmcraftApp, p: PanelKind) -> Value {
+    let current = app.ui.keys.maximized.filter(|q| app.ui.dock.contains(*q) || app.ui.floating.iter().any(|g| g.panels.contains(q)));
+    app.ui.keys.maximized = if current.is_some() { None } else { Some(p) };
     if let Some(p) = app.ui.keys.maximized {
-        app.ui.dock.activate(p);
+        let _ = app.apply_dock(craft_ui::docking::Action::Activate { panel: p });
         app.ui.focused = p;
     }
     json!({"maximized": app.ui.keys.maximized.map(|p| p.title())})
@@ -232,7 +247,7 @@ fn toggle_maximize(app: &mut FilmcraftApp, p: PanelKind) -> Value {
 /// The visible panel under the pointer (from last frame's automation rects).
 fn panel_under_pointer(app: &FilmcraftApp, ctx: &egui::Context) -> Option<PanelKind> {
     let pos = ctx.input(|i| i.pointer.latest_pos())?;
-    app.auto.query("panel.").into_iter().find_map(|e| {
+    app.auto.query("panel.").into_iter().rev().find_map(|e| {
         let r = egui::Rect::from_min_size(egui::pos2(e.rect[0], e.rect[1]), egui::vec2(e.rect[2], e.rect[3]));
         r.contains(pos).then(|| PanelKind::from_name(&e.id["panel.".len()..])).flatten()
     })
@@ -242,7 +257,9 @@ fn panel_under_pointer(app: &FilmcraftApp, ctx: &egui::Context) -> Option<PanelK
 fn visible_panels(app: &FilmcraftApp) -> Vec<PanelKind> {
     let mut all = Vec::new();
     app.ui.dock.panels(&mut all);
-    all.into_iter().filter(|p| app.ui.dock.is_visible(*p) && !p.compact()).collect()
+    let mut visible: Vec<_> = all.into_iter().filter(|p| app.ui.dock.is_visible(*p) && !p.compact()).collect();
+    visible.extend(app.ui.floating.iter().filter_map(|group| group.panels.get(group.active).copied()).filter(|panel| !panel.compact()));
+    visible
 }
 
 fn cycle_panel(app: &mut FilmcraftApp, next: bool) -> Value {
@@ -292,9 +309,13 @@ fn play_range(app: &mut FilmcraftApp, preroll: bool) -> Result<Value, String> {
         app.session.playhead()
     };
     let stop = if preroll { end + filmcraft_time::Tick::from_seconds_f64(app.session.prefs.playback.postroll_seconds) } else { end };
+    // Plain marked playback includes Out but stops after its frame. Extended
+    // preroll/postroll playback retains its existing boundary behavior.
+    let rest_at = if preroll { None } else { Some(seq.mark_out.unwrap_or((end - fd).max(filmcraft_time::Tick::ZERO))) };
     app.session.set_playhead(start);
     app.play(1.0);
     app.playback.stop_at = Some(stop);
+    app.playback.rest_at = rest_at;
     Ok(json!({"from": start.0, "to": stop.0}))
 }
 
@@ -466,7 +487,8 @@ fn text_panel(app: &mut FilmcraftApp, op: &str) -> Result<Value, String> {
     let n = words.len();
     let paras = filmcraft_edit::transcript::paragraphs(&words, filmcraft_time::Tick::from_seconds_f64(1.5));
     let para_of = |i: usize| paras.iter().position(|p| p.contains(&i)).unwrap_or(0);
-    let (anchor, cur) = app.ui.transcript_sel.unwrap_or_else(|| {
+    // a selection left over from a longer transcript (e.g. after `transcript.extract` over the control channel) counts as none, as when drawing
+    let (anchor, cur) = app.ui.transcript_sel.filter(|(a, b)| *a < n && *b < n).unwrap_or_else(|| {
         let i = filmcraft_edit::transcript::word_at(&words, app.session.playhead()).unwrap_or(0);
         (i, i)
     });
@@ -500,4 +522,33 @@ fn text_panel(app: &mut FilmcraftApp, op: &str) -> Result<Value, String> {
     // the playhead follows the caret
     app.session.set_playhead(words[to].start);
     Ok(json!({"selection": [anchor.min(to), anchor.max(to)], "word": to}))
+}
+
+#[cfg(test)]
+mod transcript_selection_tests {
+    use serde_json::{Value, json};
+
+    #[test]
+    fn prev_word_after_the_transcript_shrank_under_the_selection_does_not_panic() {
+        let mut session = filmcraft_engine::Session::default();
+        session.execute("file.openDemoProject", json!({})).unwrap();
+        let a = session.active_sequence().unwrap().audio_tracks[0].items[0].clone();
+        let tk = |s: f64| a.source_in.0 + (s * filmcraft_time::TICKS_PER_SECOND as f64) as i64;
+        let words: Vec<Value> = ["one", "two", "three", "four"]
+            .iter()
+            .enumerate()
+            .map(|(i, w)| json!({"text": w, "start": tk(0.5 + i as f64 * 0.5), "end": tk(0.9 + i as f64 * 0.5)}))
+            .collect();
+        session.execute("transcript.set", json!({"item": a.item.0, "transcript": {"language": "en", "words": words}})).unwrap();
+        let mut app = crate::FilmcraftApp::new(session);
+        app.ui.text_tab = "Transcript".into();
+        app.ui.transcript_sel = Some((3, 3));
+        // the transcript shrinks behind the panel's back, as with `transcript.extract` over the control channel
+        app.session.execute("transcript.extract", json!({"from": 0, "to": 1})).unwrap();
+        assert_eq!(filmcraft_engine::transcript::sequence_words(&app.session).len(), 2);
+        let r = super::text_panel(&mut app, "prevWord").unwrap();
+        let (sa, sb) = app.ui.transcript_sel.unwrap();
+        assert!(sa < 2 && sb < 2, "selection {sa}..{sb} outside the 2-word transcript");
+        assert_eq!(r["word"], json!(sb));
+    }
 }

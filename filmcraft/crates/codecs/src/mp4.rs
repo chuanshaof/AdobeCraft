@@ -7,9 +7,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use filmcraft_color::{ColorInfo, Matrix, Primaries, Range, Transfer};
-use filmcraft_frame::{AudioBuffer, VideoFrame};
-use filmcraft_isobmff::{CodecConfig, Mp4File, TrackKind};
+use filmcraft_color::ColorInfo;
+use filmcraft_frame::{AudioBuffer, Region, VideoFrame};
+use filmcraft_isobmff::{ByteSource, CleanAperture, CodecConfig, Mp4File, TrackKind};
 use filmcraft_media::{AudioStreamInfo, FrameRequest, MediaError, MediaInfo, MediaKind, MediaSource, SharedSource, VideoStreamInfo};
 use filmcraft_time::{FrameRate, Tick};
 
@@ -21,12 +21,30 @@ use crate::{CodecError, make_video_decoder};
 /// Most bytes read from one AAC access unit when probing for HE-AAC at open (8 channels × 6144 bits).
 const MAX_AAC_PROBE_UNIT: usize = 8 * 6144 / 8;
 
+struct DecodedAudioPacket {
+    samples: Vec<Vec<f32>>,
+    failed: bool,
+}
+
 struct AudioState {
     decoder: Option<PacketDecoder>,
     /// Decoded packets by sample index.
-    packets: HashMap<usize, Arc<Vec<Vec<f32>>>>,
+    packets: HashMap<usize, Arc<DecodedAudioPacket>>,
     order: Vec<usize>,
     last_decoded: Option<usize>,
+}
+
+/// One playable audio track with its own decoder state and timing tables.
+struct Mp4Audio {
+    /// Index into `Mp4File::tracks`.
+    track: usize,
+    state: Mutex<AudioState>,
+    /// Packet start positions in source sample frames (see [`audio_starts`]).
+    starts: Vec<i64>,
+    /// Presentation offset of the track in its timescale (edit list, or Opus pre-skip).
+    offset: i64,
+    /// Decoder pre-roll after a seek, in source sample frames (0: prime with one packet).
+    preroll: i64,
 }
 
 pub struct Mp4Source {
@@ -34,19 +52,63 @@ pub struct Mp4Source {
     bytes: crate::Src,
     file: Mp4File,
     vtrack: Option<usize>,
-    atrack: Option<usize>,
     video: GopCache,
-    audio: Mutex<AudioState>,
-    /// Cumulative sample start frames for the audio track (for packet lookup).
-    audio_starts: Vec<i64>,
-    /// Presentation offset of the audio track in its timescale (edit list, or Opus pre-skip).
-    audio_offset: i64,
-    /// Decoder pre-roll after a seek, in audio track timescale units (0: prime with one packet).
-    audio_preroll: i64,
+    /// The playable audio tracks in file order: `info.audio_streams[k]` describes `audios[k]`.
+    audios: Vec<Mp4Audio>,
 }
 
 pub fn sniff(b: &[u8]) -> bool {
     b.len() >= 12 && matches!(&b[4..8], b"ftyp" | b"moov" | b"mdat" | b"wide" | b"free" | b"skip")
+}
+
+/// Audio packet start positions in source sample frames at `rate`: the running total of the sample
+/// durations, except that packets which all decode to the same length (AAC, MPEG audio, AC-3,
+/// E-AC-3) run on from one another, resynchronising to the total only across gaps of more than half
+/// a packet.
+/// A remux from Matroska (OBS's) carries the millisecond rounding of its timestamps into the
+/// durations: 1008, 1008, 1056… for 1024-sample AAC frames at 48 kHz (see
+/// [`crate::audio::contiguous_starts`]).
+fn audio_starts(file: &Mp4File, bytes: &crate::Src, ti: usize, rate: u32) -> Vec<i64> {
+    use crate::audio::{FixedFrames, PacketTime, contiguous_starts, fixed_packet_samples};
+    let Some(t) = file.tracks.get(ti) else { return Vec::new() };
+    let ts = i128::from(t.timescale.max(1));
+    let mut total = 0i128;
+    let stamps: Vec<i64> = t
+        .samples
+        .iter()
+        .map(|s| {
+            let at = total * i128::from(rate) / ts;
+            total += i128::from(s.duration);
+            i64::try_from(at).unwrap_or(i64::MAX)
+        })
+        .collect();
+    let first = || file.read_sample(bytes, ti, 0).unwrap_or_default();
+    let frame = match t.entries.first().map(|e| &e.codec) {
+        Some(CodecConfig::Aac(a)) => fixed_packet_samples(FixedFrames::Aac(&a.asc), &[], rate),
+        Some(CodecConfig::Mp3) => fixed_packet_samples(FixedFrames::MpegAudio, &first(), rate),
+        Some(CodecConfig::Ac3 { .. }) => fixed_packet_samples(FixedFrames::Ac3, &first(), rate),
+        Some(CodecConfig::Eac3 { .. }) => fixed_packet_samples(FixedFrames::Eac3, &first(), rate),
+        _ => None,
+    };
+    let Some(frame) = frame else { return stamps };
+    // samples per track timescale unit, rounded up: how coarse the running total is
+    let unit = i64::try_from((i128::from(rate) + ts - 1) / ts).unwrap_or(i64::MAX);
+    let packets = stamps.iter().map(|&stamp| PacketTime { stamp, stamped: true, samples: Some(frame) });
+    contiguous_starts(packets, (frame / 2).max(unit.saturating_mul(2).saturating_add(1)))
+}
+
+/// Return source-rate buffer indices overlapped by a failed packet's concealment span.
+/// Packet positions are audio frames, but duration is raw track-timescale ticks
+/// treated as a frame count here; the span is clipped to the request.
+fn failed_audio_span(packet_start: i64, request_start: i64, duration: u32, request_len: usize) -> std::ops::Range<usize> {
+    let begin = usize::try_from(packet_start.saturating_sub(request_start).max(0)).unwrap_or(usize::MAX).min(request_len);
+    let end = if duration == 0 {
+        begin
+    } else {
+        let last = packet_start.saturating_add(i64::from(duration) - 1).saturating_sub(request_start);
+        usize::try_from((i128::from(last) + 1).max(0)).unwrap_or(usize::MAX).min(request_len)
+    };
+    begin..end
 }
 
 /// HDR static metadata from the sample entry's `mdcv` / `clli` boxes (0 = unknown).
@@ -63,48 +125,104 @@ fn hdr_metadata(md: Option<&filmcraft_isobmff::MasteringDisplay>, cll: Option<(u
     })
 }
 
+/// The clean aperture (`clap`, ISO/IEC 14496-12 / QuickTime) of a `w`×`h` decoded picture as a
+/// pixel rectangle: its size, centred on the picture and moved by its offsets, rounded to whole
+/// samples. `None` (the whole picture is shown) when it is the whole picture or makes no sense: a
+/// zero denominator, an empty or larger-than-the-picture size, a rectangle outside the picture.
+/// [`VideoFrame::cropped`] moves an odd corner onto the chroma grid.
+fn clean_aperture(c: CleanAperture, (w, h): (u32, u32)) -> Option<Region> {
+    let q = |(n, d): (u32, u32)| (d != 0).then(|| f64::from(n) / f64::from(d));
+    let qs = |(n, d): (i32, u32)| (d != 0).then(|| f64::from(n) / f64::from(d));
+    let (cw, ch, dx, dy) = (q(c.width)?.round(), q(c.height)?.round(), qs(c.horiz_offset)?, qs(c.vert_offset)?);
+    let (fw, fh) = (f64::from(w), f64::from(h));
+    if !(cw >= 1.0 && ch >= 1.0 && cw <= fw && ch <= fh) {
+        return None;
+    }
+    let (x, y) = (((fw - cw) / 2.0 + dx).round(), ((fh - ch) / 2.0 + dy).round());
+    // also false for NaN
+    if !(x >= 0.0 && y >= 0.0 && x + cw <= fw && y + ch <= fh) {
+        return None;
+    }
+    let r = Region { x: x as usize, y: y as usize, w: cw as usize, h: ch as usize };
+    (!r.is_full(w as usize, h as usize)).then_some(r)
+}
+
+/// Colour of a video sample entry. The `colr` box (`nclx` / `nclc`) wins; what it leaves
+/// unspecified, or all of it when there is none (ffmpeg writes MP4 without `colr` by default),
+/// comes from the stream's own description: `vpcC` / `apvC`, or the SPS VUI in `avcC` / `hvcC`
+/// and the sequence header in `av1C`. The rest defaults by frame size.
 fn color_from(entry: &filmcraft_isobmff::SampleEntry, w: u32, h: u32) -> ColorInfo {
-    let mut c = ColorInfo { matrix: filmcraft_frame::default_matrix(w, h), transfer: Transfer::Bt709, primaries: Primaries::Bt709, range: Range::Limited };
-    // VP9 and APV carry their colour description in vpcC / apvC (used when there is no colr box).
-    let vpc = match &entry.codec {
-        CodecConfig::Vp9(v) => Some(filmcraft_isobmff::ColorInfo::Nclx {
-            primaries: v.colour_primaries as u16,
-            transfer: v.transfer_characteristics as u16,
-            matrix: v.matrix_coefficients as u16,
-            full_range: v.full_range,
-        }),
-        CodecConfig::Apv(a) if a.color_description_present => Some(filmcraft_isobmff::ColorInfo::Nclx {
-            primaries: a.color_primaries as u16,
-            transfer: a.transfer_characteristics as u16,
-            matrix: a.matrix_coefficients as u16,
-            full_range: a.full_range,
-        }),
+    use crate::stream_color::ColorCodes;
+    use filmcraft_isobmff::ColorInfo as Colr;
+    let colr = match entry.video.as_ref().and_then(|v| v.color.as_ref()) {
+        Some(Colr::Nclx { primaries, transfer, matrix, full_range }) => {
+            Some(ColorCodes::from_wide((*primaries).into(), (*transfer).into(), (*matrix).into(), Some(*full_range)))
+        }
+        // QuickTime `nclc` has no range flag
+        Some(Colr::Nclc { primaries, transfer, matrix }) => Some(ColorCodes::from_wide((*primaries).into(), (*transfer).into(), (*matrix).into(), None)),
+        // an ICC profile, or no `colr`: no code points
         _ => None,
     };
-    if let Some(col) = entry.video.as_ref().and_then(|v| v.color.as_ref()).or(vpc.as_ref()) {
-        let (p, t, m, full) = match col {
-            filmcraft_isobmff::ColorInfo::Nclx { primaries, transfer, matrix, full_range } => (*primaries, *transfer, *matrix, *full_range),
-            filmcraft_isobmff::ColorInfo::Nclc { primaries, transfer, matrix } => (*primaries, *transfer, *matrix, false),
-            _ => return c,
-        };
-        if let Some(m) = Matrix::from_code(m as u8) {
-            c.matrix = m;
-        }
-        if let Some(t) = Transfer::from_code(t as u8) {
-            c.transfer = t;
-        }
-        c.primaries = match p {
-            9 => Primaries::Bt2020,
-            12 => Primaries::P3D65,
-            5 => Primaries::Bt601_625,
-            6 => Primaries::Bt601_525,
-            _ => Primaries::Bt709,
-        };
-        if full {
-            c.range = Range::Full;
-        }
+    let stream = match &entry.codec {
+        CodecConfig::Vp9(v) => Some(ColorCodes {
+            primaries: v.colour_primaries,
+            transfer: v.transfer_characteristics,
+            matrix: v.matrix_coefficients,
+            full_range: Some(v.full_range),
+        }),
+        CodecConfig::Apv(a) if a.color_description_present => Some(ColorCodes {
+            primaries: a.color_primaries,
+            transfer: a.transfer_characteristics,
+            matrix: a.matrix_coefficients,
+            full_range: Some(a.full_range),
+        }),
+        CodecConfig::Apv(_) => None,
+        codec => crate::stream_color::from_codec_config(codec),
+    };
+    let sources: Vec<ColorCodes> = [colr, stream].into_iter().flatten().collect();
+    crate::stream_color::resolve(w, h, &sources)
+}
+
+/// First bytes of a Sony `rtmd` sample needed for the start-timecode block (`frames` is last).
+const RTMD_HEADER_LEN: usize = 0x12;
+
+/// Sony XAVC `rtmd` (real-time metadata) start timecode fields, read from the first sample: hours,
+/// minutes, seconds, a drop-frame flag and frames. Sony stores them as raw decimal bytes in the
+/// sample's fixed header. The layout is proprietary and undocumented, so it is reproduced here from
+/// real footage; it is the same block ffmpeg reports as the `timecode` tag of an `rtmd` stream.
+///
+/// Fields outside SMPTE bounds — including the labels drop-frame counting skips — are rejected
+/// (no fabricated start time from damaged metadata).
+fn rtmd_fields(sample: &[u8], rate: FrameRate) -> Option<(i64, i64, i64, i64, bool)> {
+    let f = sample.get(0x0d..0x12)?;
+    let (h, m, s) = (f[0] as i64, f[1] as i64, f[2] as i64);
+    let frames = f[4] as i64;
+    let drop = f[3] != 0;
+    let base = rate.timecode_base();
+    if h > 23 || m > 59 || s > 59 || frames >= base {
+        return None;
     }
-    c
+    // Drop-frame counting skips the first `base / 15` frame labels of every minute except each
+    // tenth minute, so those labels never occur in valid footage (SMPTE ST 12-1).
+    if drop && rate.supports_drop_frame() && s == 0 && m % 10 != 0 && frames < base / 15 {
+        return None;
+    }
+    Some((h, m, s, frames, drop))
+}
+
+/// Start timecode from a Sony `rtmd` track as a frame count at `rate` (issue #460), used when the
+/// file has no `tmcd` track. `None` if there is no `rtmd` track or it has no usable first sample.
+/// Only the fixed-size header is read (a damaged `stsz` size can't drive a huge allocation).
+fn rtmd_start_timecode(file: &Mp4File, bytes: &crate::Src, rate: FrameRate) -> Option<i64> {
+    let t = file.tracks.iter().find(|t| t.entries.first().is_some_and(|e| e.format.0 == *b"rtmd"))?;
+    let s = t.samples.first()?;
+    if s.size < RTMD_HEADER_LEN as u32 {
+        return None;
+    }
+    let mut buf = [0u8; RTMD_HEADER_LEN];
+    bytes.read_at(s.offset, &mut buf).ok()?;
+    let (h, m, s, f, drop) = rtmd_fields(&buf, rate)?;
+    Some(filmcraft_time::fields_to_frames(h, m, s, f, rate, drop))
 }
 
 impl Mp4Source {
@@ -115,24 +233,36 @@ impl Mp4Source {
     /// Open from a random-access reader: only the index is read now, samples on demand.
     pub fn open_reader(name: &str, reader: filmcraft_media::SharedReader) -> crate::Result<Self> {
         let bytes = crate::Src(reader);
-        let file = filmcraft_isobmff::open(&bytes).map_err(|e| CodecError::Container(e.to_string()))?;
+        let mut file = filmcraft_isobmff::open(&bytes).map_err(|e| CodecError::Container(e.to_string()))?;
         // A track needs samples, a sample description and a timescale to be playable (damaged
         // files can lack them: indexing `entries[0]` or dividing by the timescale used to panic).
         let playable = |t: &&filmcraft_isobmff::Track, kind| t.kind == kind && !t.samples.is_empty() && !t.entries.is_empty() && t.timescale > 0;
         let vtrack = file.tracks.iter().position(|t| playable(&t, TrackKind::Video));
-        let atrack = file.tracks.iter().position(|t| playable(&t, TrackKind::Audio));
-        if vtrack.is_none() && atrack.is_none() {
+        // every audio track is a stream (the track count comes from the file: capped)
+        let atracks: Vec<usize> =
+            file.tracks.iter().enumerate().filter(|(_, t)| playable(t, TrackKind::Audio)).map(|(i, _)| i).take(filmcraft_media::MAX_AUDIO_STREAMS).collect();
+        if vtrack.is_none() && atracks.is_empty() {
             return Err(CodecError::Unsupported("no playable tracks".into()));
         }
         let mut color = ColorInfo::REC709;
         let mut explicit_color = None;
         // display rotation from the track matrix (portrait phone video is stored landscape)
         let rotation = vtrack.and_then(|i| file.tracks[i].display_rotation()).unwrap_or(0);
+        // the clean aperture ('clap') cut from every frame, before the rotation
+        let mut aperture = None;
         let video = vtrack.map(|i| {
             let t = &file.tracks[i];
             let entry = &t.entries[0];
             let vp = entry.video.clone().unwrap_or_default();
             let (w, h) = (if vp.width > 0 { vp.width as u32 } else { t.width }, if vp.height > 0 { vp.height as u32 } else { t.height });
+            // H.264 and HEVC say their own output size (frame cropping / conformance window), which
+            // is what the decoder returns; a sample entry can give the coded size instead (#288)
+            let (w, h) = match crate::hw::NalStreamInfo::from_entry(entry) {
+                Some(Ok(n)) if n.crop.2 > 0 && n.crop.3 > 0 => (n.crop.2, n.crop.3),
+                _ => (w, h),
+            };
+            aperture = vp.clean_aperture.and_then(|c| clean_aperture(c, (w, h)));
+            let (w, h) = aperture.map_or((w, h), |r| (r.w as u32, r.h as u32));
             // frame rate from the median sample duration
             let mut durs: Vec<u32> = t.samples.iter().take(240).map(|s| s.duration).collect();
             durs.sort_unstable();
@@ -195,90 +325,50 @@ impl Mp4Source {
             }
             info
         });
-        let audio = atrack.map(|i| {
-            let t = &file.tracks[i];
-            let entry = &t.entries[0];
-            let ap = entry.audio.clone().unwrap_or_default();
-            let (rate, ch, bits) = match &entry.codec {
-                CodecConfig::Aac(a) => (
-                    {
-                        // HE-AAC plays at twice the core rate the AudioSpecificConfig starts with
-                        // an AAC access unit is at most 6144 bits per channel: a hostile `stsz` can't make us read more
-                        let units = t
-                            .samples
-                            .iter()
-                            .take(8)
-                            .filter_map(|x| filmcraft_media::reader::read_range(&*bytes.0, x.offset, (x.size as usize).min(MAX_AAC_PROBE_UNIT)).ok());
-                        let units: Vec<Vec<u8>> = units.collect();
-                        match crate::audio::aac_output_rate(&a.asc, units.iter().map(Vec::as_slice)) {
-                            Some(r) => r,
-                            None if a.sample_rate > 0 => a.sample_rate,
-                            None => ap.sample_rate as u32,
-                        }
-                    },
-                    if a.channel_config > 0 { a.channel_config as u32 } else { ap.channels },
-                    None,
-                ),
-                CodecConfig::Pcm(p) => (p.sample_rate as u32, p.channels, Some(p.bits as u32)),
-                CodecConfig::Opus(o) => (crate::audio::OPUS_RATE, (o.output_channels as u32).max(1), None),
-                _ => (if ap.sample_rate > 0.0 { ap.sample_rate as u32 } else { t.timescale }, ap.channels.max(1), None),
-            };
-            AudioStreamInfo { sample_rate: rate.max(1), channels: ch.max(1), codec: codec_label(&entry.codec), bits_per_sample: bits }
-        });
-        let duration = vtrack.or(atrack).and_then(|i| file.tracks.get(i)).map(|t| presentation_duration(&file, t)).unwrap_or_default();
+        // one entry per playable audio track (`playable` guarantees a sample description); a track
+        // that somehow has none is dropped so `audio_streams` and `audios` stay index-aligned
+        let (atracks, audio_streams): (Vec<usize>, Vec<AudioStreamInfo>) =
+            atracks.into_iter().filter_map(|i| Some((i, audio_stream_info(file.tracks.get(i)?, &bytes)?))).unzip();
+        let duration = vtrack.or(atracks.first().copied()).and_then(|i| file.tracks.get(i)).map(|t| presentation_duration(&file, t)).unwrap_or_default();
         let start_timecode = file.tracks.iter().find_map(|t| match t.codec() {
             Some(CodecConfig::Timecode(tc)) => tc.start_frame.map(|f| f as i64),
             _ => None,
         });
+        // Sony XAVC files with no `tmcd` track carry the start timecode in an `rtmd` metadata
+        // track; convert its fields to a frame count using the video frame rate.
+        let start_timecode = start_timecode.or_else(|| rtmd_start_timecode(&file, &bytes, video.as_ref()?.frame_rate));
         let info = MediaInfo {
             name: name.to_string(),
             kind: if video.is_some() { MediaKind::Movie } else { MediaKind::AudioOnly },
             duration,
             video,
-            audio,
+            audio_streams,
             container: if file.is_quicktime { "QuickTime".into() } else { "MPEG-4".into() },
             start_timecode,
             file_size: Some(bytes.0.len()),
         };
-        let audio_starts = atrack
-            .map(|i| {
-                let t = &file.tracks[i];
-                let mut acc = 0i64;
-                t.samples
-                    .iter()
-                    .map(|s| {
-                        let st = acc;
-                        acc += s.duration as i64;
-                        st
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        let (audio_offset, audio_preroll) = atrack
-            .map(|i| {
-                let t = &file.tracks[i];
+        let mut audios: Vec<Mp4Audio> = atracks
+            .iter()
+            .zip(&info.audio_streams)
+            .filter_map(|(&i, ainfo)| {
+                let t = file.tracks.get(i)?;
+                let starts = audio_starts(&file, &bytes, i, ainfo.sample_rate);
                 let ts = t.timescale.max(1) as i64;
-                match &t.entries[0].codec {
-                    CodecConfig::Opus(o) => {
+                let (offset, preroll) = match t.entries.first().map(|e| &e.codec) {
+                    Some(CodecConfig::Opus(o)) => {
                         let off = if t.edit_offset != 0 { t.edit_offset } else { -(o.pre_skip as i64) * ts / 48_000 };
-                        (off, (crate::audio::OPUS_PRE_ROLL as u64 * ts as u64).div_ceil(48_000) as i64)
+                        // (Opus plays at 48 kHz: the pre-roll is in its sample frames)
+                        (off, crate::audio::OPUS_PRE_ROLL as i64)
                     }
                     _ => (t.edit_offset, 0),
-                }
+                };
+                let state = Mutex::new(AudioState { decoder: None, packets: HashMap::new(), order: Vec::new(), last_decoded: None });
+                Some(Mp4Audio { track: i, state, starts, offset, preroll })
             })
-            .unwrap_or((0, 0));
-        Ok(Self {
-            info,
-            bytes,
-            file,
-            vtrack,
-            atrack,
-            video: GopCache::new(explicit_color).with_rotation(rotation),
-            audio: Mutex::new(AudioState { decoder: None, packets: HashMap::new(), order: Vec::new(), last_decoded: None }),
-            audio_starts,
-            audio_offset,
-            audio_preroll,
-        })
+            .collect();
+        snap_to_frame_grid(&mut file, vtrack);
+        rebase_unedited_video(&mut file, vtrack, &mut audios);
+        Ok(Self { info, bytes, file, vtrack, video: GopCache::new(explicit_color).with_rotation(rotation).with_crop(aperture), audios })
     }
 
     fn read(&self, track: usize, i: usize) -> crate::Result<Vec<u8>> {
@@ -294,27 +384,30 @@ impl Mp4Source {
         self.video.frame_late(&Mp4Video { src: self, track: ti }, t.to_rational_round(1, ts), late)
     }
 
-    fn audio_packet(&self, st: &mut AudioState, i: usize) -> crate::Result<Arc<Vec<Vec<f32>>>> {
+    /// Decoded packet `i` of audio stream `a` (`ainfo` is its `AudioStreamInfo`; `st` its decoder state).
+    fn audio_packet(&self, a: &Mp4Audio, ainfo: &AudioStreamInfo, st: &mut AudioState, i: usize) -> crate::Result<Arc<DecodedAudioPacket>> {
         if let Some(p) = st.packets.get(&i) {
             return Ok(p.clone());
         }
-        let ti = self.atrack.ok_or_else(|| CodecError::Unsupported("no audio track".into()))?;
-        let track = &self.file.tracks[ti];
+        let ti = a.track;
+        let track = self.file.tracks.get(ti).ok_or_else(|| CodecError::Unsupported("no audio track".into()))?;
         let entry = track.entries.first().ok_or_else(|| CodecError::Container("audio track without a sample description".into()))?;
+        track.samples.get(i).ok_or_else(|| CodecError::Container("audio packet out of range".into()))?;
+        let pk_start = a.starts.get(i).copied().unwrap_or(0);
         let data = self.read(ti, i)?;
-        let decoded = match &entry.codec {
-            CodecConfig::Pcm(p) => decode_pcm(&data, p),
+        let (samples, failed) = match &entry.codec {
+            CodecConfig::Pcm(p) => (decode_pcm(&data, p), false),
             c => {
                 if st.decoder.is_none() {
-                    st.decoder = Some(PacketDecoder::for_isobmff(c, self.info.audio.as_ref().map_or(48_000, |a| a.sample_rate))?);
+                    st.decoder = Some(PacketDecoder::for_isobmff(c, ainfo.sample_rate)?);
                 }
                 // Non-sequential access: reset and prime with the preceding packets (codec pre-roll:
                 // one packet, or `OPUS_PRE_ROLL` worth for Opus).
                 if st.last_decoded.is_none_or(|l| l + 1 != i) {
                     let d = st.decoder.as_mut().ok_or_else(|| CodecError::Decode("no audio decoder".into()))?;
                     d.reset();
-                    let from = if self.audio_preroll > 0 {
-                        self.audio_starts.partition_point(|&x| x <= self.audio_starts[i] - self.audio_preroll).saturating_sub(1)
+                    let from = if a.preroll > 0 {
+                        a.starts.partition_point(|&x| x <= pk_start.saturating_sub(a.preroll)).saturating_sub(1)
                     } else {
                         i.saturating_sub(1)
                     };
@@ -324,15 +417,15 @@ impl Mp4Source {
                         }
                     }
                 }
-                let r = st.decoder.as_mut().ok_or_else(|| CodecError::Decode("no audio decoder".into()))?.decode(&data, self.audio_starts[i].max(0) as u64);
+                let result = st.decoder.as_mut().ok_or_else(|| CodecError::Decode("no audio decoder".into()))?.decode(&data, pk_start.max(0) as u64);
                 st.last_decoded = Some(i);
-                match r {
-                    Ok(v) => v,
-                    Err(_) => vec![vec![0.0; track.samples[i].duration as usize]; self.info.audio.as_ref().map_or(2, |a| a.channels as usize)],
+                match result {
+                    Ok(samples) => (samples, false),
+                    Err(_) => (Vec::new(), true),
                 }
             }
         };
-        let p = Arc::new(decoded);
+        let p = Arc::new(DecodedAudioPacket { samples, failed });
         st.packets.insert(i, p.clone());
         st.order.push(i);
         if st.order.len() > 4096 {
@@ -381,32 +474,45 @@ impl MediaSource for Mp4Source {
     }
 
     fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer, MediaError> {
-        let ti = self.atrack.ok_or(MediaError::NoStream("audio"))?;
-        let track = &self.file.tracks[ti];
-        let ainfo = self.info.audio.as_ref().ok_or(MediaError::NoStream("audio"))?;
+        self.audio_stream(0, start, frames, sample_rate)
+    }
+
+    fn audio_stream(&self, stream: usize, start: i64, frames: usize, sample_rate: u32) -> Result<AudioBuffer, MediaError> {
+        let a = self.audios.get(stream).ok_or(MediaError::NoStream("audio"))?;
+        let ti = a.track;
+        let track = self.file.tracks.get(ti).ok_or(MediaError::NoStream("audio"))?;
+        let ainfo = self.info.audio_streams.get(stream).ok_or(MediaError::NoStream("audio"))?;
         let src_rate = ainfo.sample_rate;
         let ch = ainfo.channels.max(1) as usize;
         // Map the requested window to source samples (edit list offset applied: presentation = pts + edit_offset).
         let ratio = src_rate as f64 / sample_rate as f64;
         let p0 = (start as f64 * ratio).floor() as i64;
         // (in i128: a hostile edit list can make the offset large enough to overflow i64)
-        let offset = i128::from(self.audio_offset) * i128::from(src_rate) / i128::from(track.timescale.max(1));
+        let offset = i128::from(a.offset) * i128::from(src_rate) / i128::from(track.timescale.max(1));
         let s0 = i64::try_from(i128::from(p0) - offset).unwrap_or(if offset > 0 { i64::MIN } else { i64::MAX });
         let need = (frames as f64 * ratio).ceil() as i64 + 2;
-        // Samples-per-unit: the track timescale is usually the sample rate for audio.
-        let unit = src_rate as f64 / track.timescale.max(1) as f64;
         let mut src: Vec<Vec<f32>> = vec![vec![0.0; need.max(0) as usize]; ch];
-        let mut st = self.audio.lock().unwrap_or_else(|e| e.into_inner());
-        let first = self.audio_starts.partition_point(|&x| (x as f64 * unit) as i64 <= s0.max(0)).saturating_sub(1);
+        let mut st = a.state.lock().unwrap_or_else(|e| e.into_inner());
+        let first = a.starts.partition_point(|&x| x <= s0.max(0)).saturating_sub(1);
         let mut i = first;
-        while i < track.samples.len() {
-            let pk_start = (self.audio_starts[i] as f64 * unit) as i64;
+        while let Some(sample) = track.samples.get(i) {
+            let Some(&pk_start) = a.starts.get(i) else { break };
             if pk_start >= s0.saturating_add(need) {
                 break;
             }
-            let pk = self.audio_packet(&mut st, i)?;
+            let pk = self.audio_packet(a, ainfo, &mut st, i)?;
+            if pk.failed {
+                let range = failed_audio_span(pk_start, s0, sample.duration, src.first().map_or(0, Vec::len));
+                for dst in &mut src {
+                    if let Some(span) = dst.get_mut(range.clone()) {
+                        span.fill(0.0);
+                    }
+                }
+                i += 1;
+                continue;
+            }
             for (c, dst) in src.iter_mut().enumerate() {
-                let Some(chan) = pk.get(c.min(pk.len().saturating_sub(1))) else { continue };
+                let Some(chan) = pk.samples.get(c.min(pk.samples.len().saturating_sub(1))) else { continue };
                 for (k, v) in chan.iter().enumerate() {
                     let pos = pk_start.saturating_add(k as i64).saturating_sub(s0);
                     if pos >= 0 && (pos as usize) < dst.len() {
@@ -443,6 +549,49 @@ impl MediaSource for Mp4Source {
     }
 }
 
+/// What the file says about one audio track (`None`: the track has no sample description).
+fn audio_stream_info(t: &filmcraft_isobmff::Track, bytes: &crate::Src) -> Option<AudioStreamInfo> {
+    let entry = t.entries.first()?;
+    let ap = entry.audio.clone().unwrap_or_default();
+    let (rate, ch, bits) = match &entry.codec {
+        CodecConfig::Aac(a) => (
+            {
+                // HE-AAC plays at twice the core rate the AudioSpecificConfig starts with
+                // an AAC access unit is at most 6144 bits per channel: a hostile `stsz` can't make us read more
+                let units = t
+                    .samples
+                    .iter()
+                    .take(8)
+                    .filter_map(|x| filmcraft_media::reader::read_range(&*bytes.0, x.offset, (x.size as usize).min(MAX_AAC_PROBE_UNIT)).ok());
+                let units: Vec<Vec<u8>> = units.collect();
+                match crate::audio::aac_output_rate(&a.asc, units.iter().map(Vec::as_slice)) {
+                    Some(r) => r,
+                    None if a.sample_rate > 0 => a.sample_rate,
+                    None => ap.sample_rate as u32,
+                }
+            },
+            // the configuration is an index (7 and 12 are both eight channels), not a count
+            if a.channels() > 0 { a.channels() } else { ap.channels },
+            None,
+        ),
+        CodecConfig::Pcm(p) => (p.sample_rate as u32, p.channels, Some(p.bits as u32)),
+        CodecConfig::Opus(o) => (crate::audio::OPUS_RATE, (o.output_channels as u32).max(1), None),
+        _ => (if ap.sample_rate > 0.0 { ap.sample_rate as u32 } else { t.timescale }, ap.channels.max(1), None),
+    };
+    let codec = match &entry.codec {
+        // these entries name no layer (ffmpeg stores MP2 as `mp4a` + 0x6B): the first frame does
+        CodecConfig::Mp3 => {
+            let head = t.samples.first().and_then(|s| filmcraft_media::reader::read_range(&*bytes.0, s.offset, (s.size as usize).min(4)).ok());
+            match head.as_deref().and_then(crate::audio::mpeg_audio_layer) {
+                Some(1 | 2) => "MPEG Audio".into(),
+                _ => codec_label(&entry.codec),
+            }
+        }
+        c => codec_label(c),
+    };
+    Some(AudioStreamInfo { sample_rate: rate.max(1), channels: ch.max(1), codec, bits_per_sample: bits })
+}
+
 fn codec_label(c: &CodecConfig) -> String {
     match c {
         CodecConfig::Avc(a) => format!(
@@ -459,6 +608,7 @@ fn codec_label(c: &CodecConfig) -> String {
         ),
         CodecConfig::Hevc(_) => "HEVC".into(),
         CodecConfig::Vp9(c) => format!("VP9 (Profile {})", c.profile),
+        CodecConfig::Unknown { fourcc, .. } if fourcc.0 == *b"vp08" => "VP8".into(),
         CodecConfig::Av1(c) => format!("AV1 ({} Profile)", ["Main", "High", "Professional"].get(c.seq_profile as usize).unwrap_or(&"Main")),
         CodecConfig::Apv(a) => match filmcraft_apv::Profile::from_idc(a.profile_idc) {
             Some(p) => p.name().into(),
@@ -499,10 +649,16 @@ fn yuv_label(chroma_format_idc: u32, bits: u32) -> String {
     format!("YUV {sub} {bits}-bit")
 }
 
-/// `chroma_format_idc` and luma bit depth of an H.264 track: from the `avcC` High-profile extension
-/// (ISO/IEC 14496-15 §5.3.3), else from its first SPS. The profile alone can't say (High 4:2:2 is
-/// 8 or 10-bit, High 10 can be 8-bit).
+/// `chroma_format_idc` and luma bit depth of an H.264 track: from its first SPS, which is what the
+/// decoder decodes, else from the `avcC` High-profile extension (ISO/IEC 14496-15 §5.3.3). The
+/// extension is not trusted over the SPS: muxers have been seen writing `chroma_format` 0 (4:0:0)
+/// into it for 4:2:0 files, which labelled them "4:0:0" (#1959). The profile alone can't say (High
+/// 4:2:2 is 8 or 10-bit, High 10 can be 8-bit).
 fn avc_format(a: &filmcraft_isobmff::AvcConfig) -> Option<(u32, u32)> {
+    let from_sps = a.sps.first().and_then(|n| n.get(1..)).and_then(|rbsp| filmcraft_h264::params::Sps::parse(&filmcraft_bitstream::unescape_rbsp(rbsp)).ok());
+    if let Some(sps) = from_sps {
+        return Some((sps.chroma_format_idc, sps.bit_depth_luma));
+    }
     // reserved bits set: '111111' chroma_format, '11111' bit_depth_luma_minus8 (else not an extension)
     if !matches!(a.profile, 66 | 77 | 88)
         && let &[chroma, depth, ..] = a.ext.as_slice()
@@ -511,14 +667,26 @@ fn avc_format(a: &filmcraft_isobmff::AvcConfig) -> Option<(u32, u32)> {
     {
         return Some(((chroma & 3) as u32, (depth & 7) as u32 + 8));
     }
-    let sps = filmcraft_h264::params::Sps::parse(&filmcraft_bitstream::unescape_rbsp(a.sps.first()?.get(1..)?)).ok()?;
-    Some((sps.chroma_format_idc, sps.bit_depth_luma))
+    None
+}
+
+/// `chroma_format_idc` and luma bit depth of an HEVC track: from its first SPS, which is what the
+/// decoder decodes, else the `hvcC` record's own fields (which a muxer may leave at 0, i.e. "4:0:0").
+fn hevc_format(h: &filmcraft_isobmff::HevcConfig) -> (u32, u32) {
+    let from_sps = h.sps().first().and_then(|n| n.get(2..)).and_then(|rbsp| filmcraft_hevc::params::Sps::parse(&filmcraft_bitstream::unescape_rbsp(rbsp)).ok());
+    match from_sps {
+        Some(sps) => (sps.chroma_format_idc, sps.bit_depth_luma),
+        None => (h.chroma_format_idc as u32, h.bit_depth_luma as u32),
+    }
 }
 
 fn pixfmt_label(c: &CodecConfig) -> String {
     match c {
         CodecConfig::Avc(a) => avc_format(a).map(|(chroma, bits)| yuv_label(chroma, bits)).unwrap_or_default(),
-        CodecConfig::Hevc(h) => yuv_label(h.chroma_format_idc as u32, h.bit_depth_luma as u32),
+        CodecConfig::Hevc(h) => {
+            let (chroma, bits) = hevc_format(h);
+            yuv_label(chroma, bits)
+        }
         CodecConfig::Vp9(c) => {
             let sub = match c.chroma_subsampling {
                 2 => "4:2:2",
@@ -544,6 +712,95 @@ pub fn opener(name: &str, bytes: Arc<[u8]>) -> Option<Result<SharedSource, Media
         return None;
     }
     Some(Mp4Source::open(name, bytes).map(|s| Arc::new(s) as SharedSource).map_err(Into::into))
+}
+
+/// Put the video samples of a constant-rate file whose pictures sit just off its frame grid back
+/// on the grid (#1282). Phone footage stamps frames up to a millisecond after where they belong (a
+/// first frame 34.1 ms long at 30 fps), and the frame shown at a time is the last one that starts at
+/// or before it: a sequence frame asked at the exact grid time got the picture before.
+///
+/// The grid starts at the first picture and steps by the nominal frame duration. A file is snapped
+/// only when every picture is less than a quarter of a frame from its own grid point and no two land
+/// on the same one: a frame that far off was placed there (variable frame rate), so a file with one
+/// such picture keeps all its times. A picture at most one unit off is left where it is: that can't
+/// be told from the timescale's rounding. Snapping keeps the samples' presentation order. Only the video samples move: the first picture, which the audio and
+/// `rebase_unedited_video` go by, is the grid's origin, and the clip's duration comes from the
+/// track header.
+fn snap_to_frame_grid(file: &mut Mp4File, vtrack: Option<usize>) {
+    let Some(t) = vtrack.and_then(|i| file.tracks.get_mut(i)) else { return };
+    let Some(first) = t.samples.iter().map(|s| s.pts).min() else { return };
+    // The nominal duration: the median sample duration, averaged with the durations one unit from
+    // it. Those are the same duration rounded to the timescale (1501 and 1502 at 59.94 fps over
+    // 90 kHz): the median alone drifts half a unit a frame, enough to snap a short clip onto the
+    // wrong points.
+    let mut durs: Vec<u32> = t.samples.iter().map(|s| s.duration).collect();
+    durs.sort_unstable();
+    let Some(&median) = durs.get(durs.len() / 2) else { return };
+    let near: Vec<f64> = durs.iter().filter(|&&d| d.abs_diff(median) <= 1).map(|&d| f64::from(d)).collect();
+    let mean = near.iter().sum::<f64>() / near.len().max(1) as f64;
+    if mean <= 0.0 {
+        return;
+    }
+    let rate = FrameRate::from_f64(f64::from(t.timescale) / mean);
+    // one frame lasts `step_num / step_den` track units
+    let (step_num, step_den) = (i128::from(t.timescale) * i128::from(rate.den), i128::from(rate.num));
+    if step_num <= 0 || step_den <= 0 {
+        return;
+    }
+    // a sample's grid index and its new time
+    let snap = |pts: i64| -> Option<(i128, i64)> {
+        let off = i128::from(pts) - i128::from(first);
+        // the nearest grid index, then its grid point (both rounded half up)
+        let n = (2 * off * step_den + step_num).div_euclid(2 * step_num);
+        let at = i128::from(first) + (2 * n * step_num + step_den).div_euclid(2 * step_den);
+        let off_grid = (i128::from(pts) - at).abs();
+        if off_grid * 4 * step_den >= step_num {
+            return None;
+        }
+        Some((n, if off_grid <= 1 { pts } else { i64::try_from(at).ok()? }))
+    };
+    let Some(snapped) = t.samples.iter().map(|s| snap(s.pts)).collect::<Option<Vec<_>>>() else { return };
+    // Two pictures by one grid point: not a constant rate. Checked on the index, not the new time:
+    // one picture kept a unit after the point and another moved onto it would be distinct times in
+    // the wrong order.
+    let mut points: Vec<i128> = snapped.iter().map(|&(n, _)| n).collect();
+    points.sort_unstable();
+    points.dedup();
+    if points.len() != snapped.len() {
+        return;
+    }
+    for (s, (_, p)) in t.samples.iter_mut().zip(snapped) {
+        s.pts = p;
+    }
+}
+
+/// Start the file at its first picture when its video track has no edit list (#714). Without an
+/// edit list the media timeline is the presentation, so a B-frame stream's first picture sits at its
+/// composition delay (two frames on an x264 MP4 written without `elst`, and on fragmented MP4s):
+/// media time zero repeated it and the clip, which lasts the media duration, lost its last pictures.
+/// Every track moves back by the earliest start among them, video and audio alike, so the streams
+/// stay in sync and a delay between them keeps its meaning; a track with an edit list is never
+/// rebased on its own.
+fn rebase_unedited_video(file: &mut Mp4File, vtrack: Option<usize>, audios: &mut [Mp4Audio]) {
+    let Some(vi) = vtrack else { return };
+    let Some(t) = file.tracks.get(vi).filter(|t| t.edits.is_empty() && t.timescale > 0) else { return };
+    let Some(first) = t.samples.iter().map(|s| s.pts).min().map(|p| p.saturating_add(t.edit_offset)).filter(|&p| p > 0) else { return };
+    let vts = i64::from(t.timescale);
+    let video_start = Tick::from_rational(first, 1, vts);
+    let audio_ts = |a: &Mp4Audio| file.tracks.get(a.track).map_or(1, |t| i64::from(t.timescale.max(1)));
+    // an audio track starts at its offset (a negative one only hides priming before zero)
+    let shift = audios.iter().fold(video_start, |m, a| m.min(Tick::from_rational(a.offset.max(0), 1, audio_ts(a))));
+    if shift <= Tick::ZERO {
+        return;
+    }
+    for a in audios.iter_mut() {
+        let d = shift.to_rational_round(1, audio_ts(a));
+        a.offset = a.offset.saturating_sub(d);
+    }
+    let v = if shift == video_start { first } else { shift.to_rational_round(1, vts) };
+    if let Some(t) = file.tracks.get_mut(vi) {
+        t.edit_offset = t.edit_offset.saturating_sub(v);
+    }
 }
 
 /// How long a track plays. With an edit list that is the sum of its edits (ISO/IEC 14496-12
@@ -641,6 +898,30 @@ mod tests {
         assert_eq!(frames(&Mp4Source::open("zero.mov", mov_with_edits(zero)).expect("open")), 4);
     }
 
+    /// #714: a video track without an edit list whose pictures carry a composition delay (B-frame
+    /// style, as x264 writes them with no `elst`) starts at its first picture. Media time zero
+    /// repeated picture 0 for the length of the delay and the last pictures never showed.
+    #[test]
+    fn unedited_composition_delay_starts_at_the_first_picture() {
+        let mut mux = Mp4Writer::new(std::io::Cursor::new(Vec::new()), WriterOptions::new(Brand::Mov)).expect("writer");
+        let t = mux.add_track(TrackConfig::new(SampleEntry::prores(FourCc(*b"apch"), 64, 32), 25)).expect("track");
+        for k in 0..4u16 {
+            let mut fr = filmcraft_prores::Frame::new(64, 32, filmcraft_prores::ChromaFormat::Yuv422, 10, false);
+            fr.y.fill(100 + 200 * k);
+            let data = filmcraft_prores::Encoder::new(filmcraft_prores::Profile::Hq, 64, 32).encode(&fr).expect("encode");
+            mux.write_sample(t, WriteSample { data: &data, duration: 1, composition_offset: 2, is_sync: true }).expect("sample");
+        }
+        let src = Mp4Source::open("delay.mov", mux.finish().expect("finish").into_inner().into()).expect("open");
+        assert_eq!(src.info().duration, Tick::from_rational(4, 1, 25));
+        let luma = |k: i64| {
+            let f = src.video_frame(FrameRequest::full(Tick::from_rational(k, 1, 25))).expect("frame");
+            let l = f.luma8();
+            l.iter().map(|&v| u32::from(v)).sum::<u32>() / l.len().max(1) as u32
+        };
+        let seen: Vec<u32> = (0..4).map(luma).collect();
+        assert!(seen.windows(2).all(|w| w[0] < w[1]), "one picture per frame, in order: {seen:?}");
+    }
+
     /// Overwrite the big-endian u32 `skip` bytes after the first `fourcc` box type.
     fn patch_u32(b: &mut [u8], fourcc: &[u8; 4], skip: usize, v: u32) {
         let k = b.windows(4).position(|x| x == fourcc).expect("box") + 4 + skip;
@@ -708,6 +989,60 @@ mod tests {
         assert_eq!(s.info().video.as_ref().map(|v| (v.width, v.height)), Some((64, 32)));
     }
 
+    /// A one-frame 25 fps ProRes MOV (64×32, left half bright) with clean aperture `clap`.
+    fn clap_mov(clap: filmcraft_isobmff::CleanAperture) -> Arc<[u8]> {
+        let (w, h) = (64u32, 32u32);
+        let mut fr = filmcraft_prores::Frame::new(w, h, filmcraft_prores::ChromaFormat::Yuv422, 10, false);
+        for (i, y) in fr.y.iter_mut().enumerate() {
+            *y = if (i as u32 % w) < w / 2 { 800 } else { 100 };
+        }
+        let data = filmcraft_prores::Encoder::new(filmcraft_prores::Profile::Hq, w, h).encode(&fr).expect("encode");
+        let mut entry = SampleEntry::prores(FourCc(*b"apch"), w as u16, h as u16);
+        entry.video.as_mut().expect("video").clean_aperture = Some(clap);
+        let mut mux = Mp4Writer::new(std::io::Cursor::new(Vec::new()), WriterOptions::new(Brand::Mov)).expect("writer");
+        let t = mux.add_track(TrackConfig::new(entry, 25)).expect("track");
+        mux.write_sample(t, WriteSample { data: &data, duration: 1, composition_offset: 0, is_sync: true }).expect("sample");
+        mux.finish().expect("finish").into_inner().into()
+    }
+
+    #[test]
+    fn clean_aperture_crops_frames_and_reported_size() {
+        use filmcraft_isobmff::CleanAperture;
+        let clap = |w: (u32, u32), h: (u32, u32), dx: (i32, u32), dy: (i32, u32)| CleanAperture { width: w, height: h, horiz_offset: dx, vert_offset: dy };
+        // 32x16 moved 8 left of centre: columns 8..40 (24 bright, then 8 dark), rows 8..24
+        let s = Mp4Source::open("clap.mov", clap_mov(clap((32, 1), (16, 1), (-8, 1), (0, 1)))).expect("open");
+        assert_eq!(s.info().video.as_ref().map(|v| (v.width, v.height)), Some((32, 16)));
+        let f = s.video_frame(FrameRequest::full(Tick::ZERO)).expect("frame");
+        assert_eq!((f.width, f.height), (32, 16));
+        let l = f.luma8();
+        let col = |x: usize| (0..16).map(|y| u32::from(l[y * 32 + x])).sum::<u32>() / 16;
+        assert!(col(0) > col(31) + 100 && col(23) > col(24) + 100, "bright up to column 23: {} {} {} {}", col(0), col(23), col(24), col(31));
+
+        // rational sizes and offsets (64/2 = 32): the same rectangle
+        let s = Mp4Source::open("clap2.mov", clap_mov(clap((64, 2), (48, 3), (-16, 2), (0, 7)))).expect("open");
+        assert_eq!(s.info().video.as_ref().map(|v| (v.width, v.height)), Some((32, 16)));
+
+        // a clean aperture that makes no sense is ignored (the whole picture), never a panic
+        for c in [
+            clap((0, 1), (16, 1), (0, 1), (0, 1)),
+            clap((32, 0), (16, 1), (0, 1), (0, 1)),
+            clap((32, 1), (16, 1), (0, 0), (0, 1)),
+            clap((65, 1), (16, 1), (0, 1), (0, 1)),
+            clap((32, 1), (33, 1), (0, 1), (0, 1)),
+            clap((32, 1), (16, 1), (17, 1), (0, 1)),
+            clap((32, 1), (16, 1), (0, 1), (-9, 1)),
+            clap((32, 1), (16, 1), (i32::MIN, 1), (i32::MAX, 1)),
+            clap((u32::MAX, 1), (u32::MAX, 1), (0, 1), (0, 1)),
+            clap((1, u32::MAX), (16, 1), (0, u32::MAX), (0, 1)),
+            clap((64, 1), (32, 1), (0, 1), (0, 1)),
+        ] {
+            let s = Mp4Source::open("bad.mov", clap_mov(c)).expect("open");
+            assert_eq!(s.info().video.as_ref().map(|v| (v.width, v.height)), Some((64, 32)), "{c:?}");
+            let f = s.video_frame(FrameRequest::full(Tick::ZERO)).expect("frame");
+            assert_eq!((f.width, f.height), (64, 32), "{c:?}");
+        }
+    }
+
     #[test]
     fn mirrored_or_scaled_matrices_are_not_mistaken_for_rotations() {
         const ONE: i32 = 0x10000;
@@ -773,6 +1108,84 @@ mod tests {
         assert_eq!(pixfmt_label(&avc(244, high_sps(244, 3, 10), Vec::new())), "YUV 4:4:4 10-bit");
         // an unreadable SPS and no extension: unknown, not a guess
         assert_eq!(pixfmt_label(&avc(122, vec![0x67, 122], Vec::new())), "");
+        // the SPS outranks the extension: an avcC claiming 4:0:0 for a 4:2:0 stream labels 4:2:0 (#1959)
+        assert_eq!(pixfmt_label(&avc(100, high_sps(100, 1, 8), vec![0xFC, 0xF8, 0xF8, 0])), "YUV 4:2:0 8-bit");
+        // only without a readable SPS does the extension speak for itself
+        assert_eq!(pixfmt_label(&avc(100, vec![0x67, 100], vec![0xFC, 0xF8, 0xF8, 0])), "YUV 4:0:0 8-bit");
+    }
+
+    /// An HEVC Main SPS NAL unit (ITU-T H.265 §7.3.2.2) with the given chroma format and bit depth, 64×64.
+    fn hevc_sps(chroma: u32, bits: u32) -> Vec<u8> {
+        let mut w = filmcraft_bitstream::BitWriter::new();
+        w.write_bits(0, 4); // vps id
+        w.write_bits(0, 3); // max_sub_layers_minus1
+        w.write_bits(1, 1); // temporal_id_nesting
+        // profile_tier_level: Main, level 3.1
+        w.write_bits(0, 2);
+        w.write_bits(0, 1);
+        w.write_bits(1, 5);
+        w.write_bits(0x6000_0000, 32);
+        w.write_bits(0b1001, 4);
+        w.write_bits(0, 32);
+        w.write_bits(0, 11);
+        w.write_bits(0, 1);
+        w.write_bits(93, 8);
+        w.write_ue(0); // sps id
+        w.write_ue(chroma);
+        if chroma == 3 {
+            w.write_bit(false); // separate_colour_plane
+        }
+        w.write_ue(64);
+        w.write_ue(64);
+        w.write_bits(0, 1); // conformance window
+        w.write_ue(bits - 8); // luma
+        w.write_ue(bits - 8); // chroma
+        w.write_ue(4); // log2_max_poc_lsb_minus4
+        w.write_bits(1, 1); // sub_layer_ordering_info_present
+        w.write_ue(4);
+        w.write_ue(0);
+        w.write_ue(0);
+        w.write_ue(0); // min CB 8
+        w.write_ue(1); // CTB 16
+        w.write_ue(0); // min TB 4
+        w.write_ue(2); // max TB 16
+        w.write_ue(0);
+        w.write_ue(0);
+        w.write_bits(0, 1); // scaling lists
+        w.write_bits(0, 1); // amp
+        w.write_bits(0, 1); // sao
+        w.write_bits(0, 1); // pcm
+        w.write_ue(0); // num_short_term_ref_pic_sets
+        w.write_bits(0, 1); // long_term_ref_pics_present
+        w.write_bits(0, 1); // temporal mvp
+        w.write_bits(0, 1); // strong intra smoothing
+        w.write_bits(0, 1); // vui
+        w.write_bits(0, 1); // extensions
+        w.rbsp_trailing();
+        let mut nal = vec![33 << 1, 1];
+        nal.extend(filmcraft_bitstream::escape_rbsp(&w.finish()));
+        nal
+    }
+
+    /// The hvcC's own chroma/bit-depth fields can be left at 0 by a muxer: the SPS it carries says.
+    #[test]
+    fn hevc_pixel_format_prefers_the_sps_over_the_hvcc_fields() {
+        let with_sps = |chroma: u32, bits: u32, field_chroma: u8, field_bits: u8| {
+            let arrays = vec![filmcraft_isobmff::HevcNalArray { completeness: true, nal_type: 33, nalus: vec![hevc_sps(chroma, bits)] }];
+            CodecConfig::Hevc(filmcraft_isobmff::HevcConfig {
+                general_profile_idc: 1,
+                chroma_format_idc: field_chroma,
+                bit_depth_luma: field_bits,
+                arrays,
+                ..Default::default()
+            })
+        };
+        assert_eq!(pixfmt_label(&with_sps(1, 8, 0, 0)), "YUV 4:2:0 8-bit", "hvcC fields at 0, SPS 4:2:0");
+        assert_eq!(pixfmt_label(&with_sps(2, 10, 1, 8)), "YUV 4:2:2 10-bit", "the SPS outranks the fields");
+        assert_eq!(pixfmt_label(&with_sps(3, 12, 3, 12)), "YUV 4:4:4 12-bit");
+        // no SPS in the record: its fields
+        let bare = CodecConfig::Hevc(filmcraft_isobmff::HevcConfig { general_profile_idc: 1, chroma_format_idc: 1, bit_depth_luma: 10, ..Default::default() });
+        assert_eq!(pixfmt_label(&bare), "YUV 4:2:0 10-bit");
     }
 
     /// A one-frame 32×16 ProRes MOV with the given profile, chroma format and fourcc.
@@ -800,6 +1213,75 @@ mod tests {
             let v = s.info().video.as_ref().expect("video");
             assert_eq!((v.pixel_format.as_str(), v.has_alpha), (want, alpha), "{}", String::from_utf8_lossy(fourcc));
         }
+    }
+
+    #[test]
+    fn rtmd_fields_parse_and_reject_damaged_metadata() {
+        let rate = FrameRate::FPS_59_94;
+        // 03:37:12:34, non-drop (a Sony FX3/a6400 XAVC header).
+        let mut s = [0u8; 24];
+        s[0x0d..0x12].copy_from_slice(&[3, 37, 12, 0, 34]);
+        assert_eq!(rtmd_fields(&s, rate), Some((3, 37, 12, 34, false)));
+        s[0x10] = 1;
+        assert_eq!(rtmd_fields(&s, rate), Some((3, 37, 12, 34, true)));
+        // Too short to hold the block: no fields, no panic.
+        assert_eq!(rtmd_fields(&[0u8; 6], rate), None);
+        // Damaged fields are rejected rather than normalized into a plausible time.
+        for bad in [[3, 37, 12, 0, 60], [3, 60, 0, 0, 0], [24, 0, 0, 0, 0], [0, 0, 60, 0, 0]] {
+            let mut b = [0u8; 24];
+            b[0x0d..0x12].copy_from_slice(&bad);
+            assert_eq!(rtmd_fields(&b, rate), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn rtmd_fields_reject_drop_frame_skipped_labels() {
+        let df = |h, m, s, f| {
+            let mut b = [0u8; 24];
+            b[0x0d..0x12].copy_from_slice(&[h, m, s, 1, f]);
+            rtmd_fields(&b, FrameRate::FPS_59_94)
+        };
+        // At 59.94 DF, frames 00-03 of a non-tenth minute are skipped, so they never occur.
+        assert_eq!(df(0, 1, 0, 0), None);
+        assert_eq!(df(0, 1, 0, 3), None);
+        assert_eq!(df(0, 1, 0, 4), Some((0, 1, 0, 4, true)));
+        assert_eq!(df(0, 10, 0, 0), Some((0, 10, 0, 0, true))); // tenth minute: label exists
+        assert_eq!(df(0, 1, 1, 0), Some((0, 1, 1, 0, true))); // seconds > 0: label exists
+        // At 29.97 DF only frames 00-01 are skipped.
+        let df30 = |m, s, f| {
+            let mut b = [0u8; 24];
+            b[0x0d..0x12].copy_from_slice(&[0, m, s, 1, f]);
+            rtmd_fields(&b, FrameRate::FPS_29_97)
+        };
+        assert_eq!(df30(1, 0, 0), None);
+        assert_eq!(df30(1, 0, 2), Some((0, 1, 0, 2, true)));
+    }
+}
+
+#[cfg(test)]
+mod multi_audio_tests {
+    use filmcraft_isobmff::{Brand, Mp4Writer, PcmConfig, SampleEntry, TrackConfig, WriteSample, WriterOptions};
+    use filmcraft_media::MediaSource;
+
+    /// Two mono PCM tracks with different rates and samples. Stream indices follow file order;
+    /// decoder caches, sample timing and resampling must not cross streams.
+    #[test]
+    fn every_audio_track_is_inspected_and_decoded_independently() {
+        let mut mux = Mp4Writer::new(std::io::Cursor::new(Vec::new()), WriterOptions::new(Brand::Mov)).unwrap();
+        for (rate, value) in [(48_000u32, 8192i16), (24_000, -16384)] {
+            let entry = SampleEntry::pcm(PcmConfig { bits: 16, float: false, big_endian: false, signed: true, channels: 1, sample_rate: rate as f64 });
+            let track = mux.add_track(TrackConfig::new(entry, rate)).unwrap();
+            let data: Vec<u8> = (0..rate / 10).flat_map(|_| value.to_le_bytes()).collect();
+            mux.write_sample(track, WriteSample { data: &data, duration: rate / 10, composition_offset: 0, is_sync: true }).unwrap();
+        }
+        let bytes = mux.finish().unwrap().into_inner();
+        let source = super::Mp4Source::open("two.mov", bytes.into()).unwrap();
+        assert_eq!(source.info().audio_streams.iter().map(|a| a.sample_rate).collect::<Vec<_>>(), vec![48_000, 24_000]);
+        let primary = source.audio(0, 100, 48_000).unwrap();
+        let secondary = source.audio_stream(1, 0, 100, 48_000).unwrap();
+        assert!((primary.channels[0][50] - 0.25).abs() < 0.001);
+        assert!((secondary.channels[0][50] + 0.5).abs() < 0.001);
+        assert!(source.audio_stream(2, 0, 100, 48_000).is_err());
     }
 }
 
@@ -829,7 +1311,7 @@ mod he_aac_tests {
         }
         let b = mux.finish().unwrap().into_inner();
         let src = super::Mp4Source::open("he.mp4", b.into()).unwrap();
-        assert_eq!(src.info().audio.as_ref().unwrap().sample_rate, 44_100);
+        assert_eq!(src.info().audio().unwrap().sample_rate, 44_100);
         // one second from 0.5 s at 44.1 kHz: the 1 kHz tone at its level (not silence, not shifted)
         let buf = src.audio(22_050, 44_100, 44_100).unwrap();
         let x = &buf.channels[0];
@@ -863,5 +1345,83 @@ mod he_aac_tests {
             let buf = src.audio(0, 4800, 48_000).unwrap();
             assert!(buf.channels.iter().flatten().all(|v| v.is_finite() && v.abs() <= 1.0), "media_time {media_time}");
         }
+    }
+}
+
+#[cfg(test)]
+mod corrupt_audio_tests {
+    use filmcraft_isobmff::{Brand, Mp4Writer, SampleEntry, TrackConfig, WriteSample, WriterOptions};
+    use filmcraft_media::MediaSource;
+
+    #[test]
+    fn failed_packet_span_matches_per_sample_silence_at_extreme_timestamps() {
+        let min = i64::MIN;
+        let max = i64::MAX;
+        for start in [min, min + 1, min + 2, -10, -1, 0, 1, 10, max - 2, max - 1, max] {
+            for request in [min, min + 1, min + 2, -10, -1, 0, 1, 10, max - 2, max - 1, max] {
+                for duration in [0, 1, 2, 5, 128] {
+                    let old: Vec<_> = (0..duration)
+                        .map(|k| start.saturating_add(i64::from(k)).saturating_sub(request))
+                        .filter(|&position| (0..8).contains(&position))
+                        .map(|position| position as usize)
+                        .collect();
+                    let range = super::failed_audio_span(start, request, duration, 8);
+                    let actual: Vec<_> = (0..8).filter(|position| range.contains(position)).collect();
+                    let expected: Vec<_> = old.into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+                    assert_eq!(actual, expected, "start={start}, request={request}, duration={duration}");
+                }
+            }
+        }
+        assert_eq!(super::failed_audio_span(0, 0, u32::MAX, 128), 0..128);
+    }
+
+    #[test]
+    fn failed_aac_packet_does_not_materialize_its_hostile_duration() {
+        // AAC-LC, 48 kHz stereo. The empty access unit cannot decode.
+        let asc = vec![0x11, 0x90];
+        let mut mux = Mp4Writer::new(std::io::Cursor::new(Vec::new()), WriterOptions::new(Brand::Mp4)).unwrap();
+        let track = mux.add_track(TrackConfig::new(SampleEntry::aac(asc, 2, 48_000), 48_000)).unwrap();
+        mux.write_sample(track, WriteSample { data: &[], duration: 1_000_000, composition_offset: 0, is_sync: true }).unwrap();
+        let source = super::Mp4Source::open("damaged.m4a", mux.finish().unwrap().into_inner().into()).unwrap();
+        let audio = &source.audios[0];
+        let info = &source.info.audio_streams[0];
+        let mut state = audio.state.lock().unwrap();
+        let packet = source.audio_packet(audio, info, &mut state, 0).unwrap();
+        assert!(packet.failed);
+        assert!(packet.samples.is_empty(), "failed packet must not allocate from its untrusted duration");
+        drop(state);
+
+        let window = source.audio(0, 128, 48_000).unwrap();
+        assert_eq!(window.channels.len(), 2);
+        assert!(window.channels.iter().all(|ch| ch.len() == 128 && ch.iter().all(|&v| v == 0.0)));
+    }
+
+    #[test]
+    fn failed_aac_packet_silences_overlap_independent_of_request_boundary() {
+        let rate = 48_000u32;
+        let tone: Vec<f32> = (0..8192).map(|i| 0.3 * (i as f32 * 0.13).sin()).collect();
+        let mut encoder = filmcraft_aac::Encoder::new(filmcraft_aac::EncoderConfig::cbr(rate, 1, 64_000)).unwrap();
+        let mut units = encoder.encode(&[&tone]);
+        units.extend(encoder.flush());
+        assert!(units.len() >= 2);
+        let mut mux = Mp4Writer::new(std::io::Cursor::new(Vec::new()), WriterOptions::new(Brand::Mp4)).unwrap();
+        let track = mux.add_track(TrackConfig::new(SampleEntry::aac(vec![0x11, 0x88], 1, rate), rate)).unwrap();
+        mux.write_sample(track, WriteSample { data: &units[0], duration: 1024, composition_offset: 0, is_sync: true }).unwrap();
+        mux.write_sample(track, WriteSample { data: &units[1], duration: 400, composition_offset: 0, is_sync: true }).unwrap();
+        mux.write_sample(track, WriteSample { data: &[], duration: 1024, composition_offset: 0, is_sync: true }).unwrap();
+        let source = super::Mp4Source::open("overlap.m4a", mux.finish().unwrap().into_inner().into()).unwrap();
+        // The failed packet starts at 1024 + 400 = 1424, after 124 frames of the crossing read.
+        let crossing = source.audio(1300, 256, rate).unwrap();
+        let isolated = source.audio(1424, 132, rate).unwrap();
+        let prior_packet_len = {
+            let audio = &source.audios[0];
+            let info = &source.info.audio_streams[0];
+            let mut state = audio.state.lock().unwrap();
+            source.audio_packet(audio, info, &mut state, 1).unwrap().samples.first().map_or(0, Vec::len)
+        };
+        assert!(prior_packet_len > 400, "valid packet must overlap the failed packet");
+        assert!(crossing.channels[0][..124].iter().any(|v| v.abs() > 0.001));
+        assert!(isolated.channels[0].iter().all(|&v| v == 0.0));
+        assert_eq!(&crossing.channels[0][124..], &isolated.channels[0]);
     }
 }

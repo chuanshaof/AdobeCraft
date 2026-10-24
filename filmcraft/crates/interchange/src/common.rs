@@ -13,6 +13,11 @@ use filmcraft_time::{FrameRate, Tick};
 
 use crate::{Imported, Report};
 
+/// A timeline import may not materialise an unbounded number of sparse track
+/// labels. This remains well above common editorial timelines while keeping
+/// hostile lane/channel numbers from allocating every intervening track.
+pub(crate) const MAX_IMPORTED_TRACKS: usize = 256;
+
 // ---------------------------------------------------------------------------------------------
 // Paths and URLs
 // ---------------------------------------------------------------------------------------------
@@ -65,7 +70,9 @@ pub fn file_url_to_path(url: &str) -> String {
         return url.to_string();
     }
     let rest = &url[7..];
-    let rest = if rest.len() >= 9 && rest[..9].eq_ignore_ascii_case("localhost") { &rest[9..] } else { rest };
+    let is_localhost =
+        rest.get(..9).is_some_and(|s| s.eq_ignore_ascii_case("localhost")) && rest.get(9..).is_some_and(|after| after.is_empty() || after.starts_with('/'));
+    let rest = if is_localhost { &rest[9..] } else { rest };
     let decoded = percent_decode(rest);
     // file:///C:/x -> C:/x
     if decoded.len() >= 3 && decoded.starts_with('/') && is_windows_abs(&decoded[1..]) {
@@ -81,6 +88,15 @@ pub fn file_url_to_path(url: &str) -> String {
 /// Convert an absolute path to a `file://` URL (`localhost` form for FCP7 XML).
 pub fn path_to_file_url(path: &str, localhost: bool) -> String {
     let p = path.replace('\\', "/");
+    // Windows verbatim paths (`\\?\C:\x`, `\\?\UNC\server\share`, as `canonicalize` returns them)
+    // are not network shares: drop the prefix so `?` doesn't become the URL's host.
+    let p = if let Some(unc) = p.strip_prefix("//?/UNC/") {
+        format!("//{unc}")
+    } else if let Some(local) = p.strip_prefix("//?/") {
+        local.to_string()
+    } else {
+        p
+    };
     let host = if localhost { "localhost" } else { "" };
     if is_windows_abs(&p) {
         format!("file://{host}/{}", percent_encode_path(&p))
@@ -251,7 +267,11 @@ pub(crate) fn media_info(name: &str, spec: &MediaSpec) -> MediaInfo {
             bitrate: None,
             hdr: None,
         }),
-        audio: spec.audio.map(|(sr, ch)| AudioStreamInfo { sample_rate: sr, channels: ch, codec: String::new(), bits_per_sample: None }),
+        audio_streams: spec
+            .audio
+            .map(|(sr, ch)| AudioStreamInfo { sample_rate: sr, channels: ch, codec: String::new(), bits_per_sample: None })
+            .into_iter()
+            .collect(),
         container: String::new(),
         start_timecode: spec.start_tc,
         file_size: None,
@@ -374,7 +394,7 @@ impl Builder {
     /// Add an empty sequence item (filled later with [`Builder::put_sequence`]).
     pub fn reserve_sequence(&mut self, name: &str, settings: SequenceSettings, bin: Option<BinId>) -> ItemId {
         let seq = empty_sequence(settings);
-        self.p.add_item(name, Label::Forest, ItemKind::Sequence(Box::new(seq)), bin)
+        self.p.add_item(name, Label::Forest, ItemKind::Sequence(std::sync::Arc::new(seq)), bin)
     }
 
     pub fn put_sequence(&mut self, id: ItemId, mut seq: Sequence) {
@@ -395,12 +415,18 @@ impl Builder {
         Track::new(id, kind, name)
     }
 
-    pub fn ensure_tracks(&mut self, seq: &mut Sequence, kind: TrackKind, n: usize) {
+    /// Ensure `n` tracks of one kind exist. Returns false when an imported
+    /// label would exceed the supported per-kind track count.
+    pub fn ensure_tracks(&mut self, seq: &mut Sequence, kind: TrackKind, n: usize) -> bool {
+        if n > MAX_IMPORTED_TRACKS {
+            return false;
+        }
         while seq.tracks(kind).len() < n {
             let i = seq.tracks(kind).len();
             let t = self.track(kind, i);
             seq.tracks_mut(kind).push(t);
         }
+        true
     }
 
     pub fn link_id(&mut self) -> u64 {
@@ -443,21 +469,24 @@ impl Builder {
             hold_filters: false,
             field_options: None,
             source_channels: Vec::new(),
+            audio_stream: 0,
             graphic: None,
         }
     }
 
     /// Place `item` on the first track at or after `preferred` where it does not overlap anything,
     /// creating tracks as needed. Returns the track index.
-    pub fn place(&mut self, seq: &mut Sequence, kind: TrackKind, preferred: usize, item: TrackItem) -> usize {
+    pub fn place(&mut self, seq: &mut Sequence, kind: TrackKind, preferred: usize, item: TrackItem) -> Option<usize> {
         let mut i = preferred;
         loop {
-            self.ensure_tracks(seq, kind, i + 1);
+            if i >= MAX_IMPORTED_TRACKS || !self.ensure_tracks(seq, kind, i + 1) {
+                return None;
+            }
             let t = &mut seq.tracks_mut(kind)[i];
             if !t.items.iter().any(|o| o.start < item.end() && item.start < o.end()) {
                 t.items.push(item);
                 t.sort();
-                return i;
+                return Some(i);
             }
             i += 1;
         }
@@ -670,10 +699,20 @@ mod tests {
         assert_eq!(file_url_to_path("/plain/path.mov"), "/plain/path.mov");
         assert_eq!(path_to_file_url("/Users/me/My Clip.mov", true), "file://localhost/Users/me/My%20Clip.mov");
         assert_eq!(path_to_file_url("C:\\Media\\a b.mxf", false), "file:///C:/Media/a%20b.mxf");
+        assert_eq!(path_to_file_url("\\\\?\\C:\\Media\\a.mp4", true), "file://localhost/C:/Media/a.mp4");
+        assert_eq!(path_to_file_url("\\\\?\\UNC\\srv\\share\\a.mp4", false), "file://srv/share/a.mp4");
         for p in ["/a/b c/ü.mov", "C:/x/y.mp4", "/r/%/#?.mov"] {
             assert_eq!(file_url_to_path(&path_to_file_url(p, true)), p);
             assert_eq!(file_url_to_path(&path_to_file_url(p, false)), p);
         }
+    }
+
+    #[test]
+    fn file_url_localhost_prefix_host_is_kept() {
+        assert_eq!(file_url_to_path("file://localhost-nas/share/a.mov"), "//localhost-nas/share/a.mov");
+        assert_eq!(file_url_to_path("file://LOCALHOSTX/a"), "//LOCALHOSTX/a");
+        assert_eq!(file_url_to_path("file://localhost/a/b"), "/a/b");
+        assert_eq!(file_url_to_path("file://LocalHost/a"), "/a");
     }
 
     #[test]
@@ -696,5 +735,15 @@ mod tests {
         assert_eq!(rate_from_f64(23.976), FrameRate::FPS_23_976);
         assert_eq!(rate_from_f64(48000.0), FrameRate::new(48000, 1));
         assert_eq!(frames_round(FrameRate::FPS_24, FrameRate::FPS_24.tick_of(5) + Tick(10)), 5);
+    }
+
+    #[test]
+    fn imported_tracks_are_bounded() {
+        let mut b = Builder::new("tracks");
+        let mut seq = empty_sequence(Default::default());
+        assert!(b.ensure_tracks(&mut seq, TrackKind::Video, MAX_IMPORTED_TRACKS));
+        assert_eq!(seq.video_tracks.len(), MAX_IMPORTED_TRACKS);
+        assert!(!b.ensure_tracks(&mut seq, TrackKind::Video, MAX_IMPORTED_TRACKS + 1));
+        assert_eq!(seq.video_tracks.len(), MAX_IMPORTED_TRACKS);
     }
 }

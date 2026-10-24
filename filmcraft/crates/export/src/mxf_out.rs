@@ -38,7 +38,9 @@ fn picture(settings: &ExportSettings, w: u32, h: u32) -> PictureDesc {
                     Profile::Proxy => 1,
                     Profile::Lt => 2,
                     Profile::Standard => 3,
-                    _ => 4,
+                    Profile::Hq => 4,
+                    Profile::P4444 => 5,
+                    Profile::P4444Xq => 6,
                 },
             }
         }
@@ -53,9 +55,6 @@ fn picture(settings: &ExportSettings, w: u32, h: u32) -> PictureDesc {
         _ => PictureCoding::Vc3 { cid: crate::dnx_profile(&settings.dnx_profile).cid() },
     };
     let mut d = PictureDesc::new(coding, w, h);
-    if matches!(coding, PictureCoding::ProRes { .. }) {
-        d.depth = 10;
-    }
     d.color = match settings.signal {
         s if s == ColorSignal::PQ => ColorSpace::Rec2020Pq,
         s if s == ColorSignal::HLG => ColorSpace::Rec2020Hlg,
@@ -109,7 +108,8 @@ impl MxfMux {
         let now = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
         let seed = format!("{}|{now}", settings.path);
         let ids = PackageIds::from_seed(&seed, &s.name);
-        let bits = if settings.audio.bits >= 24 { 24 } else { 16 };
+        // integers only: `ExportSettings::validate` refuses float PCM in MXF
+        let bits = u32::from(settings.audio.sample_format().bits());
         let mut cfg = WriterConfig::new(if atom { Pattern::OpAtom } else { Pattern::Op1a }, rate, ids.clone());
         cfg.picture = Some(picture(settings, s.width, s.height));
         cfg.modified = Timestamp::from_unix((now / 1_000_000_000) as i64);

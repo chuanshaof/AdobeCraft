@@ -97,22 +97,37 @@ pub fn transcode(
     preset: &Preset,
     progress: &Progress,
 ) -> std::result::Result<Report, String> {
+    transcode_with_file(clip, name, src, range, out, None, preset, progress)
+}
+
+fn transcode_with_file(
+    clip: &MediaClip,
+    name: &str,
+    src: SharedSource,
+    range: Option<TimeRange>,
+    out: &str,
+    output_file: Option<Arc<std::fs::File>>,
+    preset: &Preset,
+    progress: &Progress,
+) -> std::result::Result<Report, String> {
     let info = &clip.info;
     let rate = clip.frame_rate();
     let mut st = SequenceSettings::default();
     if let Some(v) = &info.video {
         st.width = v.width;
         st.height = v.height;
+        // pixels in = pixels out: the sequence has the clip's pixel aspect, so nothing is stretched
+        st.par = clip.pixel_aspect();
     }
     st.frame_rate = rate;
-    st.sample_rate = info.audio.as_ref().map_or(48_000, |a| a.sample_rate.max(8000));
+    st.sample_rate = info.audio().map_or(48_000, |a| a.sample_rate.max(8000));
     let mut p = Project::new("transcode");
     let mut c = clip.clone();
     c.offline = false;
     c.proxy = None;
     let item = p.add_item(name, filmcraft_project::Label::Iris, ItemKind::Media(c), None);
     let has_v = info.video.is_some();
-    let has_a = info.audio.is_some();
+    let has_a = info.has_audio();
     let seq = p.new_sequence("transcode", st, usize::from(has_v), usize::from(has_a), None);
     let range = range.unwrap_or(TimeRange { start: Tick::ZERO, duration: info.duration });
     let mut placed = Vec::new();
@@ -138,11 +153,65 @@ pub fn transcode(
             as u32,
         part_of_batch: true,
         prores_profile: preset.prores.to_string(),
+        output_file,
         ..Default::default()
     };
     let project = Arc::new(p);
     let provider = move |id: ItemId| (id == item).then(|| src.clone());
     filmcraft_export::export(&project, seq, &settings, &provider, progress).map_err(|e| e.to_string())
+}
+
+/// An output created exclusively while choosing its name. Unless kept after a successful
+/// transcode, dropping it removes only that file (including on a cancelled or rejected job).
+struct ReservedOutput {
+    path: PathBuf,
+    file: Option<Arc<std::fs::File>>,
+    keep: bool,
+}
+
+impl ReservedOutput {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn file(&self) -> Option<Arc<std::fs::File>> {
+        self.file.clone()
+    }
+
+    fn preserve(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for ReservedOutput {
+    fn drop(&mut self) {
+        if !self.keep {
+            // Release our handle before removal, which is required on Windows.
+            self.file.take();
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Reserve a numbered output name without following a later replacement of its pathname.
+fn reserve_unique_path(dir: &Path, stem: &str, suffix: &str, ext: &str, taken: &[String]) -> Result<ReservedOutput> {
+    std::fs::create_dir_all(dir).map_err(|e| EngineError::Other(format!("{}: {e}", dir.display())))?;
+    let mut n = 1;
+    loop {
+        let name = if n == 1 { format!("{stem}{suffix}.{ext}") } else { format!("{stem}{suffix} {n}.{ext}") };
+        let path = dir.join(name);
+        if taken.contains(&path.to_string_lossy().into_owned()) {
+            n += 1;
+            continue;
+        }
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => {
+                return Ok(ReservedOutput { path, file: Some(Arc::new(file)), keep: false });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
+            Err(e) => return Err(EngineError::Other(format!("{}: {e}", path.display()))),
+        }
+    }
 }
 
 /// Frames a transcode of `clip` will write (for progress totals).
@@ -182,17 +251,17 @@ fn items_param(s: &Session, p: &Value) -> Vec<ItemId> {
 }
 
 /// Start a background transcode job over `work` (item, output path, preset). Returns the job id.
-pub fn start_job(s: &mut Session, label: String, work: Vec<(ItemId, String, &'static Preset)>, on_done: OnDone, wait: bool) -> Result<u64> {
+fn start_job(s: &mut Session, label: String, work: Vec<(ItemId, ReservedOutput, &'static Preset)>, on_done: OnDone, wait: bool) -> Result<u64> {
     let mut tasks = Vec::new();
     let mut total = 0;
-    for (item, out, pr) in work {
+    for (item, output, pr) in work {
         let (clip, _, name) = media_path(&s.project, item).ok_or_else(|| bad("media.createProxies", format!("item {} is not file media", item.0)))?;
         let src = s.media.full_res_source(&s.project, item, &*s.services).ok_or_else(|| EngineError::Other(format!("{name}: no source")))?;
         if s.media.offline_status(item).is_some() {
             return Err(EngineError::Other(format!("{name} is offline; link it first")));
         }
         total += frame_count(&clip, None);
-        tasks.push((item, clip, name, src, out, pr));
+        tasks.push((item, clip, name, src, output, pr));
     }
     let id = s.jobs.iter().map(|j| j.id).max().unwrap_or(0) + 1;
     let job = crate::Job { id, label, progress: Default::default(), result: Default::default() };
@@ -200,26 +269,24 @@ pub fn start_job(s: &mut Session, label: String, work: Vec<(ItemId, String, &'st
     let outputs: Arc<Mutex<Vec<(ItemId, String)>>> = Arc::default();
     let (prog, res, outs) = (job.progress.clone(), job.result.clone(), outputs.clone());
     let run = move || {
-        let t0 = std::time::Instant::now();
+        let t0 = web_time::Instant::now();
         let mut bytes = 0;
         let mut err = None;
         let n = tasks.len();
-        for (k, (item, clip, name, src, out, pr)) in tasks.into_iter().enumerate() {
+        for (k, (item, clip, name, src, mut output, pr)) in tasks.into_iter().enumerate() {
             if prog.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 err = Some("cancelled".to_string());
                 break;
             }
             *prog.status.lock().unwrap_or_else(|e| e.into_inner()) = format!("{name} ({} of {n})", k + 1);
-            if let Some(d) = Path::new(&out).parent() {
-                let _ = std::fs::create_dir_all(d);
-            }
-            match transcode(&clip, &name, src, None, &out, pr, &prog) {
+            let out = output.path().to_string_lossy().into_owned();
+            match transcode_with_file(&clip, &name, src, None, &out, output.file(), pr, &prog) {
                 Ok(r) => {
                     bytes += r.bytes;
+                    output.preserve();
                     outs.lock().unwrap_or_else(|e| e.into_inner()).push((item, out));
                 }
                 Err(e) => {
-                    let _ = std::fs::remove_file(&out);
                     err = Some(format!("{name}: {e}"));
                     break;
                 }
@@ -345,9 +412,10 @@ pub fn create(s: &mut Session, p: &Value) -> Result<Value> {
     let pr = preset(str_p(p, "preset").unwrap_or(DEFAULT_PROXY_PRESET)).ok_or_else(|| bad("media.createProxies", "unknown preset (see media.proxyPresets)"))?;
     let items = items_param(s, p);
     // default: Project Settings ▸ Scratch Disks ▸ Captured and Generated, else next to the media
-    let dest = str_p(p, "destination")
-        .map(str::to_string)
-        .or_else(|| s.project.settings.scratch.captured.clone().filter(|d| !d.is_empty()).map(|d| format!("{d}/Proxies")));
+    let dest = str_p(p, "destination").map(str::to_string).or_else(|| {
+        crate::project_tools::trusted_scratch(s.project.settings.scratch.captured.as_deref(), s.path.as_deref(), &s.prefs.auto_save.scratch_folders)
+            .map(|d| d.join("Proxies").to_string_lossy().into_owned())
+    });
     let mut work = Vec::new();
     let mut taken = Vec::new();
     let mut skipped = Vec::new();
@@ -360,20 +428,78 @@ pub fn create(s: &mut Session, p: &Value) -> Result<Value> {
             skipped.push(json!({"item": i.0, "reason": format!("{name} has no video to proxy")}));
             continue;
         }
+        let path = match s.media.follow(&path) {
+            Ok(file) => file,
+            Err(why) => {
+                skipped.push(json!({"item": i.0, "reason": format!("{path} is not opened: {why}")}));
+                continue;
+            }
+        };
         let stem = Path::new(&path).file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or(name);
-        let out = unique_path(&proxy_dir(&path, dest.as_deref()), &stem, "_Proxy", pr.extension, &taken).to_string_lossy().into_owned();
+        let output = reserve_unique_path(&proxy_dir(&path, dest.as_deref()), &stem, "_Proxy", pr.extension, &taken)?;
+        let out = output.path().to_string_lossy().into_owned();
         taken.push(out.clone());
-        work.push((i, out, pr));
+        work.push((i, output, pr));
     }
     if work.is_empty() {
         return Err(EngineError::Other(format!("nothing to proxy: {}", skipped.iter().filter_map(|v| v["reason"].as_str()).collect::<Vec<_>>().join("; "))));
     }
-    let outputs: Vec<Value> = work.iter().map(|(i, o, _)| json!({"item": i.0, "path": o})).collect();
+    let outputs: Vec<Value> = work.iter().map(|(i, o, _)| json!({"item": i.0, "path": o.path()})).collect();
     let n = work.len();
     let label = format!("Create Proxies ({n} clip{})", if n == 1 { "" } else { "s" });
     let attach = bool_p(p, "attach").unwrap_or(true);
     let job = start_job(s, label, work, if attach { OnDone::AttachProxies } else { OnDone::Nothing }, bool_p(p, "wait").unwrap_or(false))?;
     Ok(json!({"job": job, "preset": pr.id, "outputs": outputs, "skipped": skipped}))
+}
+
+/// Copy to a new file, numbering collisions without replacing another take. Open the input
+/// first and create the output exclusively, so a failed read or a competing copy cannot replace
+/// an existing destination. Relink only after the copy's identity has been checked.
+fn copy_for_ingest(s: &mut Session, item: ItemId, path: &str, dir: &Path) -> Result<String> {
+    let source = Path::new(path);
+    let name = source.file_name().ok_or_else(|| bad("ingest", "source has no file name"))?;
+    let mut input = std::fs::File::open(source).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    std::fs::create_dir_all(dir).map_err(|e| EngineError::Other(format!("{}: {e}", dir.display())))?;
+    let mut number = 1u64;
+    let (out, mut output) = loop {
+        let mut next = if number == 1 { name.to_os_string() } else { source.file_stem().unwrap_or(name).to_os_string() };
+        if number != 1 {
+            next.push(format!(" {number}"));
+            if let Some(extension) = source.extension() {
+                next.push(".");
+                next.push(extension);
+            }
+        }
+        let out = dir.join(next);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&out) {
+            Ok(output) => break (out, output),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                number = number.checked_add(1).ok_or_else(|| bad("ingest", "no unused destination name"))?;
+            }
+            Err(e) => return Err(EngineError::Other(format!("{}: {e}", out.display()))),
+        }
+    };
+    let copied = std::io::copy(&mut input, &mut output).and_then(|_| output.set_permissions(input.metadata()?.permissions()));
+    drop(output);
+    let out_s = out.to_string_lossy().into_owned();
+    let linked = copied.map_err(|e| EngineError::Other(format!("copying {path}: {e}"))).and_then(|_| {
+        let a = crate::relink::identity_of(&*s.services, path).map_err(|e| EngineError::Other(e.to_string()))?;
+        let b = crate::relink::identity_of(&*s.services, &out_s).map_err(|e| EngineError::Other(e.to_string()))?;
+        if a != b {
+            return Err(EngineError::Other(format!("the copy of {} doesn't match the original", name.to_string_lossy())));
+        }
+        // The generated suffix may change the name; every other relink check still applies.
+        crate::relink::relink(s, &json!({"item": item.0, "path": out_s, "relinkOthers": false, "match": {"fileName": false}}))?;
+        Ok(())
+    });
+    if let Err(error) = linked {
+        // Only this operation's exclusively created file can be removed on failure.
+        if let Err(cleanup) = std::fs::remove_file(&out) {
+            return Err(EngineError::Other(format!("{error}; removing incomplete copy {}: {cleanup}", out.display())));
+        }
+        return Err(error);
+    }
+    Ok(out_s)
 }
 
 /// Ingest freshly imported items per the project's ingest settings.
@@ -391,21 +517,10 @@ pub fn ingest(s: &mut Session, items: &[ItemId]) -> Result<Value> {
                 Some(d) if !d.is_empty() => PathBuf::from(d),
                 _ => Path::new(&path).parent().unwrap_or(Path::new(".")).join("Ingested Media"),
             };
-            let fname = Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let out = dir.join(&fname);
-            if Path::new(&path) == out {
+            if Path::new(&path).file_name().is_some_and(|name| Path::new(&path) == dir.join(name)) {
                 continue;
             }
-            std::fs::create_dir_all(&dir).map_err(|e| EngineError::Other(format!("{}: {e}", dir.display())))?;
-            std::fs::copy(&path, &out).map_err(|e| EngineError::Other(format!("copying {fname}: {e}")))?;
-            let out_s = out.to_string_lossy().into_owned();
-            // verify the copy before switching to it
-            let a = crate::relink::identity_of(&*s.services, &path).map_err(|e| EngineError::Other(e.to_string()))?;
-            let b = crate::relink::identity_of(&*s.services, &out_s).map_err(|e| EngineError::Other(e.to_string()))?;
-            if a != b {
-                return Err(EngineError::Other(format!("the copy of {fname} doesn't match the original")));
-            }
-            crate::relink::relink(s, &json!({"item": i.0, "path": out_s, "relinkOthers": false}))?;
+            let out_s = copy_for_ingest(s, i, &path, &dir)?;
             copied.push(json!({"item": i.0, "path": out_s}));
         }
     }
@@ -421,6 +536,7 @@ pub fn ingest(s: &mut Session, items: &[ItemId]) -> Result<Value> {
             let pr =
                 preset(if ing.preset.is_empty() { DEFAULT_TRANSCODE_PRESET } else { ing.preset.as_str() }).ok_or_else(|| bad("ingest", "unknown preset"))?;
             let mut work = Vec::new();
+            let mut taken = Vec::new();
             for &i in items {
                 let Some((clip, path, name)) = media_path(&s.project, i) else { continue };
                 if clip.info.video.is_none() {
@@ -431,7 +547,10 @@ pub fn ingest(s: &mut Session, items: &[ItemId]) -> Result<Value> {
                     _ => Path::new(&path).parent().unwrap_or(Path::new(".")).join("Ingested Media"),
                 };
                 let stem = Path::new(&path).file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or(name);
-                work.push((i, unique_path(&dir, &stem, "", pr.extension, &[]).to_string_lossy().into_owned(), pr));
+                let output = reserve_unique_path(&dir, &stem, "", pr.extension, &taken)?;
+                let out = output.path().to_string_lossy().into_owned();
+                taken.push(out.clone());
+                work.push((i, output, pr));
             }
             if !work.is_empty() {
                 let id = start_job(s, format!("Ingest: transcode {} clip(s)", work.len()), work, OnDone::ReplaceMedia, false)?;

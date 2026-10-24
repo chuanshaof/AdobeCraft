@@ -54,6 +54,7 @@ struct Fs {
 
 thread_local! {
     static FS: RefCell<Fs> = RefCell::new(Fs::default());
+    static DOWNLOADS: RefCell<crate::download_pacing::Pacer> = RefCell::new(crate::download_pacing::Pacer::default());
 }
 
 /// Wake-up hook for arriving data.
@@ -70,9 +71,8 @@ fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// Register a browser `File` (or `Blob` with a name) and return its virtual path. A file with
-/// the same name and size as an existing entry replaces it (the same file picked again keeps
-/// its path, so projects referencing it come back online); otherwise a numbered name is used.
+/// Register a browser `File` (or named `Blob`) at an unused virtual path; collisions get numbered names.
+/// Name + size do not identify content: replacing an occupied path changes every project item referencing it.
 pub fn register_blob(name: &str, blob: web_sys::Blob) -> String {
     let size = blob.size() as u64;
     let clean: String = name.chars().map(|c| if c == '/' || c == '\\' { '_' } else { c }).collect();
@@ -85,18 +85,11 @@ pub fn register_blob(name: &str, blob: web_sys::Blob) -> String {
         let mut n = 1;
         let path = loop {
             let p = if n == 1 { format!("/files/{clean}") } else { format!("/files/{stem} ({n}){ext}") };
-            match fs.entries.get(&p) {
-                None => break p,
-                Some(Entry::Blob { size: s, .. }) if *s == size => break p,
-                Some(Entry::Mem(b)) if b.len() as u64 == size => break p,
-                _ => n += 1,
+            if !fs.entries.contains_key(&p) {
+                break p;
             }
+            n += 1;
         };
-        if let Some(Entry::Blob { id, .. }) = fs.entries.get(&path) {
-            let id = *id;
-            fs.blobs.remove(&id);
-            fs.chunks.retain(|k, _| k.0 != id);
-        }
         let id = fs.next_id;
         fs.next_id += 1;
         fs.blobs.insert(id, blob);
@@ -359,6 +352,24 @@ impl Services for WebServices {
         Ok(())
     }
 
+    fn write_file_new(&self, path: &str, data: &[u8]) -> io::Result<()> {
+        if path.starts_with("/opfs/") {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "exclusive OPFS writes are unavailable"));
+        }
+        let hook = FS.with(|fs| {
+            let mut fs = fs.borrow_mut();
+            if fs.entries.contains_key(path) {
+                return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+            }
+            fs.entries.insert(path.to_owned(), Entry::Mem(Arc::from(data)));
+            Ok(fs.on_write.clone())
+        })?;
+        if let Some(h) = hook {
+            h(path, data);
+        }
+        Ok(())
+    }
+
     fn file_size(&self, path: &str) -> io::Result<u64> {
         Self::entry_reader(path).map(|r| r.len())
     }
@@ -413,7 +424,8 @@ impl Services for WebServices {
     }
 }
 
-/// Offer bytes as a browser download named `name`.
+/// Offer bytes as a browser download named `name`. Downloads are clicked at least
+/// [`crate::download_pacing::GAP_MS`] apart: Chrome drops a burst of them (#378).
 pub fn download(name: &str, data: &[u8]) -> Result<(), wasm_bindgen::JsValue> {
     let doc = web_sys::window().and_then(|w| w.document()).ok_or("no document")?;
     let blob = bytes_to_blob(data, "application/octet-stream")?;
@@ -422,12 +434,51 @@ pub fn download(name: &str, data: &[u8]) -> Result<(), wasm_bindgen::JsValue> {
     a.set_href(&url);
     a.set_download(file_name(name));
     a.style().set_property("display", "none")?;
-    doc.body().ok_or("no body")?.append_child(&a)?;
-    a.click();
-    a.remove();
+    let delay = DOWNLOADS.with(|d| d.borrow_mut().reserve(js_sys::Date::now()));
+    let name = name.to_owned();
     wasm_bindgen_futures::spawn_local(async move {
+        if delay > 0.0 {
+            sleep(delay as i32).await;
+        }
+        let clicked = match doc.body() {
+            Some(body) => body.append_child(&a).map(|_| a.click()),
+            None => Err("no body".into()),
+        };
+        a.remove();
+        if let Err(e) = clicked {
+            log::warn!("download {name}: {e:?}");
+        }
         sleep(60_000).await;
         let _ = web_sys::Url::revoke_object_url(&url);
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod exclusive_write_tests {
+    use super::*;
+
+    #[test]
+    fn virtual_file_creation_is_exclusive_and_opfs_fails_closed() {
+        let host = WebServices;
+        let existing = "/files/collision-test.wav";
+        let fresh = "/files/new-extraction-test.wav";
+        FS.with(|fs| {
+            let mut fs = fs.borrow_mut();
+            fs.on_write = None;
+            fs.entries.insert(existing.into(), Entry::Mem(Arc::from(&b"original"[..])));
+            fs.entries.remove(fresh);
+        });
+        assert_eq!(host.write_file_new(existing, b"replacement").unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(host.read_file(existing).unwrap(), b"original");
+        host.write_file_new(fresh, b"new").unwrap();
+        assert_eq!(host.read_file(fresh).unwrap(), b"new");
+        assert_eq!(host.write_file_new(fresh, b"again").unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(host.write_file_new("/opfs/media/new.wav", b"new").unwrap_err().kind(), io::ErrorKind::Unsupported);
+        FS.with(|fs| {
+            let mut fs = fs.borrow_mut();
+            fs.entries.remove(existing);
+            fs.entries.remove(fresh);
+        });
+    }
 }

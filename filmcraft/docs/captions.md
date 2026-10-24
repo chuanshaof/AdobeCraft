@@ -52,7 +52,7 @@ Details of each format and the SCC encoder are in [`crates/captions/README.md`](
 | `captions.setStyle` | Text panel style strip | `track`, `size`, `color`, `background`, `backgroundColor`, `outline`, `outlineColor`, `align`, `anchor`, `margin`, `lineSpacing`, `reset` |
 | `captions.deleteTrack` | | `track` |
 | `captions.import` / `captions.export` | File ▸ Export ▸ Captions… | `path`, `format`, `track`, `dropFrame` |
-| `captions.list` | (query) | `track` — tracks, styles and captions with timecodes |
+| `captions.list` | (query) | `track` — tracks, styles and captions with timecodes (a `track` that names no caption track is an error) |
 
 Tracks are addressed by id or `"C1"`, `"C2"`… (top first). Edits are limited by neighbouring
 captions and a one-frame minimum. Sync-locked caption tracks follow insert and extract edits on
@@ -62,12 +62,13 @@ also splits captions.
 ## Timeline and Text panel
 
 - Caption rows: header with `C1…` badge, lock, output eye, name and format; caption blocks in
-  violet showing their text. Click selects (⌘/⇧ adds), drag moves, edge drag trims, double-click
+  violet showing their text (Arabic and Hebrew in reading order from the block's right edge). Click selects (⌘/⇧ adds), drag moves, edge drag trims, double-click
   opens the Text panel. Automation ids: `timeline.caption.<id>`,
   `timeline.captionTrack.C1[.locked|.enabled]`.
 - **Text panel ▸ Captions**: search, track picker (also creates tracks of each format), add /
   split / merge / delete / export buttons, the list of segments with editable in/out timecodes
-  and text (committed when the field loses focus), and the track style strip (size, colour, box,
+  and text (committed when the field loses focus; Arabic and Hebrew show in reading order and are
+  edited in logical order while the field has focus), and the track style strip (size, colour, box,
   alignment, position). Automation ids: `text.tab.Captions`, `text.captions.add|split|merge|delete|export|search|track`,
   `text.captions.<id>.in|out|text|goto|row`, `text.captions.style.*`.
 

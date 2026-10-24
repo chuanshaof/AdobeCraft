@@ -25,6 +25,77 @@ fn text_of(l: &filmcraft_project::graphic::LayerSpec) -> String {
 }
 
 #[test]
+fn graphic_duration_does_not_set_its_timeline_position() {
+    for command in ["graphics.newText", "graphics.newShape"] {
+        for playhead_frame in [0, 72] {
+            for seconds in [1, 2] {
+                let mut s = Session::default();
+                s.execute("file.newSequence", json!({"name": "Placement", "fps": 24, "width": 128, "height": 128, "video": 1, "audio": 1})).unwrap();
+                s.execute("playhead.set", json!({"frame": playhead_frame})).unwrap();
+                let start = s.playhead();
+                let r = s.execute(command, json!({"seconds": seconds})).unwrap();
+                let clip = ClipId(r["clip"].as_u64().unwrap());
+                let q = s.active_sequence().unwrap();
+                let (_, it) = q.find_item(clip).unwrap();
+                assert_eq!(it.start, start, "{command}, duration {seconds}, playhead {playhead_frame}");
+                assert_eq!(it.duration, Tick::from_seconds_f64(f64::from(seconds)));
+                s.execute("edit.undo", json!({})).unwrap();
+                assert!(s.active_sequence().unwrap().find_item(clip).is_none());
+                s.execute("edit.redo", json!({})).unwrap();
+                assert_eq!(s.active_sequence().unwrap().find_item(clip).unwrap().1.start, start);
+            }
+        }
+    }
+}
+
+#[test]
+fn graphic_duration_keeps_explicit_time_frame_and_timecode_placement() {
+    for command in ["graphics.newText", "graphics.newShape"] {
+        for mut params in [json!({"time": 0}), json!({"frame": 0}), json!({"timecode": "00:00:00:00"})] {
+            let mut s = Session::default();
+            s.execute("file.newSequence", json!({"name": "Placement", "fps": 24, "width": 128, "height": 128, "video": 1, "audio": 1})).unwrap();
+            s.execute("playhead.set", json!({"frame": 72})).unwrap();
+            params["seconds"] = json!(2);
+            let r = s.execute(command, params).unwrap();
+            let clip = ClipId(r["clip"].as_u64().unwrap());
+            let (_, it) = s.active_sequence().unwrap().find_item(clip).unwrap();
+            assert_eq!(it.start, Tick::ZERO, "{command}");
+            assert_eq!(it.duration, Tick::from_seconds_f64(2.0));
+        }
+    }
+}
+
+/// A new graphic goes on the track and at the time it is given, for a shape as for text; a track
+/// that is not free there is an error named after the command that asked.
+#[test]
+fn graphic_placement_takes_a_track_and_a_time() {
+    let commands =
+        [("graphics.newText", json!({})), ("graphics.newShape", json!({})), ("graphics.newRectangle", json!({})), ("graphics.newPolygon", json!({"sides": 5}))];
+    for (command, mut params) in commands {
+        let mut s = Session::default();
+        s.execute("file.newSequence", json!({"name": "Placement", "fps": 24, "width": 128, "height": 128, "video": 3, "audio": 1})).unwrap();
+        s.execute("playhead.set", json!({"frame": 72})).unwrap();
+        params["track"] = json!(2);
+        params["frame"] = json!(24);
+        params["seconds"] = json!(1);
+        let r = s.execute(command, params.clone()).unwrap();
+        let clip = ClipId(r["clip"].as_u64().unwrap());
+        let q = s.active_sequence().unwrap();
+        let (track, it) = q.find_item(clip).unwrap();
+        assert_eq!(track, q.video_tracks[2].id, "{command}");
+        assert_eq!((it.start, it.duration), (Tick::from_seconds_f64(1.0), Tick::from_seconds_f64(1.0)), "{command}");
+        // the same place again is taken
+        let e = s.execute(command, params).unwrap_err().to_string();
+        assert!(e.contains("V3 is not free here"), "{command}: {e}");
+        let named = if command == "graphics.newText" { "graphics.newText" } else { "graphics.newShape" };
+        assert!(e.contains(named), "{command}: {e}");
+        assert_eq!(s.active_sequence().unwrap().video_tracks[2].items.len(), 1, "{command}");
+        s.execute("edit.undo", json!({})).unwrap();
+        assert!(s.active_sequence().unwrap().find_item(clip).is_none(), "{command}");
+    }
+}
+
+#[test]
 fn new_text_makes_a_graphic_clip_above_the_footage() {
     let mut s = demo();
     let t = s.playhead();
@@ -82,6 +153,38 @@ fn typing_coalesces_into_one_undo_step_and_props_set() {
     assert_eq!(text_of(&layers(&s, clip)[0]), "");
 }
 
+/// A drag of a property is one undo step: `graphics.set` with `merge` folds consecutive calls
+/// into the step the first change of the press began (`begin`), so one undo restores the
+/// original value (the color picker in Essential Graphics was committing one step per frame).
+#[test]
+fn a_property_drag_is_one_undo_step() {
+    let mut s = demo();
+    let r = s.execute("graphics.newText", json!({"text": "Title"})).unwrap();
+    let clip = ClipId(r["clip"].as_u64().unwrap());
+    s.execute("graphics.set", json!({"clip": clip.0, "layer": 0, "props": {"shadow_color": [0.0, 0.0, 0.0, 1.0]}})).unwrap();
+    let color = |s: &Session| -> [f32; 4] {
+        let q = s.active_sequence().unwrap();
+        let (_, it) = q.find_item(clip).unwrap();
+        let e = it.effects.iter().find(|e| e.effect == "graphic_text").unwrap();
+        e.param("shadow_color").unwrap().value_at(Tick::ZERO).as_color().unwrap()
+    };
+    let before = s.history.undo.len();
+    // the drag: the first change of the press begins the step, the rest fold into it
+    for (i, c) in [[0.1, 0.0, 0.0, 1.0], [0.2, 0.0, 0.0, 1.0], [0.3, 0.0, 0.0, 1.0], [0.4, 0.0, 0.0, 1.0]].iter().enumerate() {
+        s.execute("graphics.set", json!({"clip": clip.0, "layer": 0, "props": {"shadow_color": c}, "merge": true, "begin": i == 0})).unwrap();
+    }
+    assert_eq!(s.history.undo.len(), before + 1, "one undo step for the whole drag");
+    assert_eq!(color(&s)[0], 0.4);
+    // a second drag (a new press) begins its own step
+    s.execute("graphics.set", json!({"clip": clip.0, "layer": 0, "props": {"shadow_color": [1.0, 0.0, 0.0, 1.0]}, "merge": true, "begin": true})).unwrap();
+    s.execute("graphics.set", json!({"clip": clip.0, "layer": 0, "props": {"shadow_color": [0.0, 1.0, 0.0, 1.0]}, "merge": true})).unwrap();
+    assert_eq!(s.history.undo.len(), before + 2, "a new press begins a new step");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(color(&s)[0], 0.4, "undo takes back only the second drag");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(color(&s)[0], 0.0, "and then the first");
+}
+
 #[test]
 fn align_and_distribute_layers() {
     let mut s = demo();
@@ -106,6 +209,24 @@ fn align_and_distribute_layers() {
     let xs: Vec<f64> = l.iter().map(|x| x.transform.position.x).collect();
     assert!(((xs[1] - xs[0]) - (xs[2] - xs[1])).abs() < 1e-6, "{xs:?}");
     let _ = w;
+}
+
+#[test]
+fn linear_gradient_fill_sets_and_evaluates() {
+    let mut s = demo();
+    let r = s.execute("graphics.newShape", json!({"shape": "rectangle", "position": [200, 200], "size": [80, 40]})).unwrap();
+    let clip = ClipId(r["clip"].as_u64().unwrap());
+    s.execute(
+        "graphics.set",
+        json!({"clip": clip.0, "props": {"fill_kind": "linear gradient", "gradient_start": "#ff0000", "gradient_end": "#0000ff", "gradient_angle": 0}}),
+    )
+    .unwrap();
+    let g = layers(&s, clip)[0].appearance.gradient.clone().expect("linear fill");
+    assert_eq!(g.start[0], 1.0);
+    assert!(g.start[1] < 0.01 && g.end[2] > 0.9 && g.end[0] < 0.01, "{g:?}");
+    assert_eq!(g.angle, 0.0);
+    s.execute("graphics.set", json!({"clip": clip.0, "props": {"fill_kind": "solid"}})).unwrap();
+    assert!(layers(&s, clip)[0].appearance.gradient.is_none());
 }
 
 #[test]
@@ -536,4 +657,35 @@ fn a_layer_saved_before_the_box_height_existed_can_still_get_one() {
     assert_eq!(list["layers"][0]["overflow"], false);
     s.execute("graphics.set", json!({"clip": clip.0, "props": {"box_height": 100}})).unwrap();
     assert_eq!(s.execute("graphics.list", json!({"clip": clip.0})).unwrap()["layers"][0]["box"], json!([500.0, 100.0]));
+}
+
+#[test]
+fn align_to_frame_moves_selected_video_clips_by_position_only() {
+    // #1081
+    let mut s = demo();
+    let q = s.active_sequence().unwrap();
+    let (fw, fh) = (q.settings.width as f64, q.settings.height as f64);
+    let it = q.video_tracks[0].items[0].clone();
+    let (sw, _) = s.project.source_size(it.item).unwrap();
+    let c = it.id.0;
+    assert!(!s.is_enabled("graphics.alignFrame.hcenter"), "nothing selected");
+    s.execute("timeline.select", json!({"clips": [c]})).unwrap();
+    s.execute("effects.setParam", json!({"clip": c, "effect": "motion", "param": "scale", "value": 50.0})).unwrap();
+    s.execute("effects.setParam", json!({"clip": c, "effect": "motion", "param": "position", "value": [300.0, 200.0]})).unwrap();
+    let pos = |s: &Session| {
+        let it = s.active_sequence().unwrap().find_item(ClipId(c)).unwrap().1.clone();
+        let m = it.effect("motion").unwrap();
+        (m.vec2_at("position", Tick::ZERO), m.f64_at("scale", Tick::ZERO))
+    };
+    s.execute("graphics.alignFrame.hcenter", json!({})).unwrap();
+    let (p, scale) = pos(&s);
+    assert!((p.x - fw / 2.0).abs() < 1e-6 && (p.y - 200.0).abs() < 1e-6, "{p:?}");
+    assert_eq!(scale, 50.0, "scale untouched");
+    s.execute("graphics.alignFrame.left", json!({})).unwrap();
+    assert!((pos(&s).0.x - sw as f64 * 0.25).abs() < 1e-6, "left edge on the frame's: {:?}", pos(&s).0);
+    s.execute("graphics.alignFrame.bottom", json!({})).unwrap();
+    let h = s.project.source_size(it.item).unwrap().1 as f64;
+    assert!((pos(&s).0.y - (fh - h * 0.25)).abs() < 1e-6, "{:?}", pos(&s).0);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!((pos(&s).0.y - 200.0).abs() < 1e-6, "one undo step per alignment");
 }

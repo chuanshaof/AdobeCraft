@@ -3,8 +3,9 @@
 //!
 //! Supported: `project`/`bin`/`clip`/`sequence` structure, video and audio tracks (enabled,
 //! locked), `clipitem` (start/end/in/out, `pproTicksIn/Out` for tick-exact source times, enabled,
-//! labels, markers, links), `file` (pathurl, rate, duration, timecode, media characteristics,
-//! references by id), nested sequences (inline or by id), `generatoritem` (Slug, Color, …),
+//! labels, markers, links), master-clip `<clip>` media markers, `file` (pathurl, rate, duration,
+//! timecode, media characteristics, references by id), nested sequences (inline or by id),
+//! `generatoritem` (Slug, Color, …),
 //! `transitionitem` (alignment, Cross Dissolve & friends), and the filters Basic Motion (scale,
 //! rotation, center, anchor, anti-flicker), Opacity, Time Remap (constant speed, reverse, freeze),
 //! Audio Levels and Audio Pan, all with keyframes. Other effects are written with our effect ids
@@ -26,9 +27,9 @@ use filmcraft_time::{FrameRate, Tick, format_timecode_frames};
 use roxmltree::Node;
 
 use crate::common::{
-    Builder, MediaSpec, base_item, db_to_gain, empty_sequence, file_name, frames_round, gain_to_db, item_media, item_path, kind_from_ext, label_from, on_frame,
-    param, param_modified, path_to_file_url, rate_from_timebase, resolve_path, set_param, settings_for, standard_effects, timebase, transition_effect,
-    transition_name, unscaled,
+    Builder, MAX_IMPORTED_TRACKS, MediaSpec, base_item, db_to_gain, empty_sequence, file_name, frames_round, gain_to_db, item_media, item_path, kind_from_ext,
+    label_from, on_frame, param, param_modified, path_to_file_url, rate_from_timebase, resolve_path, set_param, settings_for, standard_effects, timebase,
+    transition_effect, transition_name, unscaled,
 };
 use crate::xml::{XmlWriter, bool_str, child, child_bool, child_f64, child_i64, child_text, children, elements, num, path_text};
 use crate::{Error, ExportOptions, Format, ImportOptions, Imported, Report, Result};
@@ -110,6 +111,24 @@ struct Imp<'a, 'i, 'r> {
     in_progress: HashSet<String>,
     links: Vec<PendingLink>,
     xml_clip_ids: HashMap<(ItemId, String), ClipId>,
+    /// `(sequence key, file key)` pairs where some audio clip item of that file uses `sourcetrack/trackindex` > 1,
+    /// i.e. the file's channels are split onto mono tracks in that sequence (#463).
+    split_files: HashSet<(String, String)>,
+}
+
+/// The `(sequence key, file key)` an audio clip item belongs to, if it references a file.
+fn clip_seq_file(c: Node) -> Option<(String, String)> {
+    let seq = c.ancestors().skip(1).find(|a| a.has_tag_name("sequence"))?;
+    Some((node_key(seq), node_key(child(c, "file")?)))
+}
+
+/// The 1-based `sourcetrack/trackindex` of an audio clip item.
+fn audio_track_index(c: Node) -> Option<i64> {
+    let st = child(c, "sourcetrack")?;
+    if child_text(st, "mediatype").is_some_and(|m| m != "audio") {
+        return None;
+    }
+    child_i64(st, "trackindex")
 }
 
 fn node_key(n: Node) -> String {
@@ -136,9 +155,15 @@ pub(crate) fn import(text_in: &str, opts: &ImportOptions, report: &mut Report) -
         in_progress: HashSet::new(),
         links: Vec::new(),
         xml_clip_ids: HashMap::new(),
+        split_files: HashSet::new(),
     };
     for n in root.descendants().filter(|n| n.is_element()) {
         match n.tag_name().name() {
+            "clipitem" if audio_track_index(n).is_some_and(|i| i > 1) => {
+                if let Some(key) = clip_seq_file(n) {
+                    imp.split_files.insert(key);
+                }
+            }
             "file" if elements(n).next().is_some() => {
                 imp.files.entry(node_key(n)).or_insert(n);
             }
@@ -318,7 +343,10 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
         for (kind, tag) in [(TrackKind::Video, "video"), (TrackKind::Audio, "audio")] {
             let Some(m) = media.and_then(|m| child(m, tag)) else { continue };
             for (ti, tn) in children(m, "track").enumerate() {
-                self.b.ensure_tracks(&mut seq, kind, ti + 1);
+                if !self.b.ensure_tracks(&mut seq, kind, ti + 1) {
+                    self.report.warn(format!("FCP7 {kind:?} tracks beyond {MAX_IMPORTED_TRACKS} were skipped"));
+                    break;
+                }
                 self.track(&mut seq, id, kind, ti, tn, rate, (w, h));
             }
         }
@@ -353,7 +381,9 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
                         let t = &mut seq.tracks_mut(kind)[ti];
                         if t.items.iter().any(|o| o.start < ti_item.end() && ti_item.start < o.end()) {
                             self.report.warn("overlapping clip items on one track; the later one was moved to a new track");
-                            self.b.place(seq, kind, ti + 1, ti_item);
+                            if self.b.place(seq, kind, ti + 1, ti_item).is_none() {
+                                self.report.warn(format!("FCP7 {kind:?} track exceeds the {MAX_IMPORTED_TRACKS}-track import limit; clip was skipped"));
+                            }
                         } else {
                             t.items.push(ti_item);
                         }
@@ -481,6 +511,25 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
         ti.enabled = child_bool(c, "enabled").unwrap_or(true);
         if let Some(l) = path_text(c, &["labels", "label2"]).and_then(label_from) {
             ti.label = l;
+        }
+        // `sourcetrack/trackindex` (1-based) picks the source channel of a mono track split off a multichannel file (#463).
+        // Index 1 is also what a stereo clip on a stereo track carries, so it means channel 0 only when another clip
+        // item of the same file in this sequence uses a higher index (the file is split); otherwise it keeps the
+        // default (empty) channel mapping.
+        if kind == TrackKind::Audio
+            && let Some(idx) = audio_track_index(c)
+            && (idx > 1 || (idx == 1 && clip_seq_file(c).is_some_and(|k| self.split_files.contains(&k))))
+            && let Ok(ch) = u16::try_from(idx - 1)
+        {
+            ti.source_channels = vec![ch];
+            // The two halves of a split stereo file play on their own side, as the stereo clip did (#371):
+            // a mono clip is centred (both sides at unity), so the halves would otherwise sum on both
+            // sides, +3 dB for uncorrelated channels, +6 dB for dual mono. An `audiopan` filter
+            // (read below) still overrides this.
+            let stereo = matches!(&self.b.p.item(item).map(|i| &i.kind), Some(ItemKind::Media(m)) if m.info.audio().is_some_and(|a| a.channels == 2));
+            if stereo && ch <= 1 {
+                set_param(&mut ti, "panner", "balance", Param::new(ParamValue::Float(if ch == 0 { -100.0 } else { 100.0 })));
+            }
         }
         if let Some(mode) = child_text(c, "compositemode") {
             match BLEND_XML.iter().find(|(n, _)| n.eq_ignore_ascii_case(mode)) {
@@ -768,6 +817,7 @@ pub(crate) fn export(p: &Project, seq_id: ItemId, opts: &ExportOptions, report: 
     };
     let v = if opts.xmeml_version == 5 { "5" } else { "4" };
     x.w.open("xmeml", &[("version", v)]);
+    x.write_master_clips(seq_id);
     x.write_sequence(seq_id, true);
     x.w.close();
     Ok(x.w.finish())
@@ -916,6 +966,57 @@ impl Exp<'_, '_> {
         self.master_ids.entry(item).or_insert_with(|| format!("masterclip-{n}")).clone()
     }
 
+    /// Source-media (master clip) markers live on `<clip>`, not on timeline `<clipitem>`s.
+    fn write_master_clips(&mut self, seq_id: ItemId) {
+        let mut seen = HashSet::new();
+        let mut items = Vec::new();
+        self.collect_file_media(seq_id, &mut seen, &mut items);
+        for item in items {
+            let Some(m) = item_media(self.p, item) else { continue };
+            if m.markers.is_empty() {
+                continue;
+            }
+            let rate = m
+                .info
+                .video
+                .as_ref()
+                .map(|v| m.interpret.frame_rate.unwrap_or(v.frame_rate))
+                .unwrap_or_else(|| self.p.sequence(seq_id).map(|s| s.settings.frame_rate).unwrap_or_default());
+            let name = self.p.item(item).map(|i| i.name.clone()).unwrap_or_default();
+            let label = self.p.item(item).map(|i| i.label).unwrap_or(Label::Iris);
+            let duration = m.info.duration;
+            let markers = m.markers.clone();
+            let mid = self.master_id(item);
+            self.w.open("clip", &[("id", &mid)]);
+            self.w.text("name", name);
+            self.w.text("duration", frames_round(rate, duration));
+            write_rate(&mut self.w, rate);
+            self.w.open("labels", &[]);
+            self.w.text("label2", label.name());
+            self.w.close();
+            self.write_file(item, rate);
+            write_markers(&mut self.w, &markers, rate);
+            self.w.close();
+        }
+    }
+
+    fn collect_file_media(&self, seq: ItemId, seen: &mut HashSet<ItemId>, out: &mut Vec<ItemId>) {
+        if !seen.insert(seq) {
+            return;
+        }
+        let Some(s) = self.p.sequence(seq) else { return };
+        for t in s.all_tracks() {
+            for c in &t.items {
+                let base = base_item(self.p, c.item);
+                match self.p.item(base).map(|i| &i.kind) {
+                    Some(ItemKind::Sequence(_)) => self.collect_file_media(base, seen, out),
+                    Some(ItemKind::Media(_)) if crate::common::generator_of(self.p, base).is_none() && !out.contains(&base) => out.push(base),
+                    _ => {}
+                }
+            }
+        }
+    }
+
     fn write_clip(&mut self, c: &TrackItem, kind: TrackKind, seq: &Sequence, xid: &str, links: &[(String, TrackKind, usize, usize)]) {
         let rate = seq.settings.frame_rate;
         if !on_frame(rate, c.start) || !on_frame(rate, c.duration) {
@@ -932,6 +1033,10 @@ impl Exp<'_, '_> {
         let hold = c.frame_hold;
         let src_in = hold.unwrap_or(c.source_in);
         let src_out = if hold.is_some() { src_in + c.duration } else { c.source_out() };
+        let (start_f, end_f, in_f) = (frames_round(rate, c.start), frames_round(rate, c.end()), frames_round(rate, src_in));
+        // At normal speed (and on a freeze frame) the source span is the record span. Rounded on its own
+        // it can come out a frame shorter or longer than `end - start` (#340), so derive it from them.
+        let out_f = if hold.is_some() || c.speed.abs() == 1.0 { in_f.saturating_add(end_f.saturating_sub(start_f)) } else { frames_round(rate, src_out) };
         self.w.open(tag, &[("id", xid)]);
         if generator.is_none() && !is_seq {
             let mid = self.master_id(base);
@@ -940,12 +1045,12 @@ impl Exp<'_, '_> {
         self.w.text("name", &c.name);
         self.w.text("enabled", bool_str(c.enabled));
         let media_dur = self.p.item(base).map(|i| i.duration()).unwrap_or(Tick::ZERO).max(src_out);
-        self.w.text("duration", frames_round(rate, media_dur));
+        self.w.text("duration", frames_round(rate, media_dur).max(out_f));
         write_rate(&mut self.w, rate);
-        self.w.text("start", frames_round(rate, c.start));
-        self.w.text("end", frames_round(rate, c.end()));
-        self.w.text("in", frames_round(rate, src_in));
-        self.w.text("out", frames_round(rate, src_out));
+        self.w.text("start", start_f);
+        self.w.text("end", end_f);
+        self.w.text("in", in_f);
+        self.w.text("out", out_f);
         self.w.text("pproTicksIn", src_in.0);
         self.w.text("pproTicksOut", src_out.0);
         if let Some(g) = &generator {
@@ -958,7 +1063,7 @@ impl Exp<'_, '_> {
         if kind == TrackKind::Audio {
             self.w.open("sourcetrack", &[]);
             self.w.text("mediatype", "audio");
-            self.w.text("trackindex", 1);
+            self.w.text("trackindex", c.source_channels.first().map_or(1, |ch| u32::from(*ch).saturating_add(1)));
             self.w.close();
         }
         if let Some(blend) = param(c, "opacity", "blend").and_then(|p| p.value.as_f64()).map(|v| v as u32).filter(|v| *v != 0) {
@@ -1055,7 +1160,7 @@ impl Exp<'_, '_> {
             self.w.close();
             self.w.close();
         }
-        if let Some(a) = &m.info.audio {
+        if let Some(a) = m.info.audio() {
             self.w.open("audio", &[]);
             self.w.open("samplecharacteristics", &[]);
             self.w.text("depth", a.bits_per_sample.unwrap_or(16));
@@ -1120,7 +1225,9 @@ impl Exp<'_, '_> {
                 self.float_param(c, "volume", "level", "Level", 0.0, 3.98109, rate, move |v| db_to_gain(v + g), "level");
                 self.close_effect();
             }
-            if param_modified(c, "panner", "balance") {
+            // A one-channel clip says where it is panned even when centred: without Audio Pan the
+            // importer pans the halves of a split stereo file to their sides (#371).
+            if param_modified(c, "panner", "balance") || c.source_channels.len() == 1 {
                 self.open_effect("Audio Pan", "audiopan", "audiopan", "audiopan", "audio", true);
                 self.float_param(c, "panner", "balance", "Pan", -1.0, 1.0, rate, |v| v / 100.0, "pan");
                 self.close_effect();

@@ -8,7 +8,7 @@ writing them is `crates/format` (`filmcraft-format`); the engine's `file.*` comm
 ```json
 {
   "format": "filmcraft.project",
-  "schema_version": 12,
+  "schema_version": 13,
   "generator": "FilmCraft 0.1.0",
   "project": { "name": "…", "settings": { … }, "root": { … }, "items": { … }, "next_id": 48 },
   "view": { "open_sequences": [21, 50], "active_sequence": 50, "sequences": { "21": { "pps": 40.0, "scroll": 0.0, … } } }
@@ -21,12 +21,12 @@ writing them is `crates/format` (`filmcraft-format`); the engine's `file.*` comm
   clips, effects, keyframes, markers). Media is referenced by path, never embedded.
 - Files are written compact (no indentation). A 2,000-clip project is about 1.4 MB.
 - `view` (optional) is what was open when the project was saved: the Timeline's sequence tabs in
-  order, the active one, and each sequence's zoom, scroll and track heights
-  (`filmcraft_project::ProjectView`). It is beside the project, not in it: it is not part of the
+  order, the active one, each sequence's zoom, scroll and track heights, and each sequence's
+  playhead (`filmcraft_project::ProjectView`). It is beside the project, not in it: it is not part of the
   edit, never an undo step, and changing it does not mark the project as changed. Opening a
   project restores it when the Timeline preference "Restore open sequences when opening projects"
   is on. It is outside the schema version: older builds ignore it, ids that are not sequences and
-  numbers out of range are dropped or clamped, and a `view` that cannot be read is ignored (the
+  numbers out of range are dropped or clamped (a playhead also snaps to a frame of its sequence), and a `view` that cannot be read is ignored (the
   project opens on its first sequence, as it does without one or with no open sequence in it).
 - A coordinate of an effect's point parameter may be `null`. Point parameters use NaN for "auto"
   (the frame centre, or the source centre for `anchor`), and JSON writes NaN as `null`; it reads back
@@ -52,6 +52,7 @@ writing them is `crates/format` (`filmcraft-format`); the engine's `file.*` comm
 | 10 | M3.10 | clip time interpolation, Hold Filters, Field Options, audio source channels, Modify ▸ Audio Channels map, subclip Restrict Trims; no-op step |
 | 11 | M3.11 | search bins (`project.search_bins`), Flash Cue markers, Project Settings safe areas, capture format and scratch disks; no-op step |
 | 12 | M10.7 | graphics design data: `TrackItem::graphic` (roll / crawl, responsive time, template link), `EffectInstance::layer` (layer uid, per-character styles, responsive pins), `project.source_graphics`; no-op step |
+| 13 | Multi-stream audio | `MediaInfo::audio_streams` and `TrackItem::audio_stream`; older `audio` objects load as stream zero, missing clip indices default to zero; no-op step |
 
 ### Migrations
 
@@ -124,11 +125,19 @@ like Premiere's:
 | Update it at least every N second(s) | `autoSave.recoveryIntervalSeconds` | 5 (1–600) |
 
 At each interval, if the project changed since the last auto-save, a copy is written to the
-`Auto-Save` folder next to the project as `<name>-YYYY-MM-DD_HH-MM-SS.fcproj` (local time). An
+`Auto-Save` folder next to the project as `<name>-YYYY-MM-DD_HH-MM-SS-<unix seconds>.fcproj` (local time, then the real time that orders
+the copies, so a clock change at the end of daylight saving time cannot reorder them). An
 unsaved project uses `<data dir>/Auto-Save/`. After each write the oldest copies beyond the limit are
-deleted. Only files named exactly `<name>-<timestamp>.fcproj` are ever deleted. An auto-save is an
+deleted. Only files named exactly `<name>-<timestamp>.fcproj` or `<name>-<timestamp>-<unix seconds>.fcproj` are ever deleted. An auto-save is an
 ordinary project file: open it with File ▸ Open Project. `file.listAutoSaves` lists them, newest
 first.
+
+Project Settings ▸ Scratch Disks can send auto-saves (Project Auto Save), render previews (Video
+Previews), captured and generated media (Captured Audio and Video, also the default for proxies)
+and audio previews to another folder. A folder named in a project file is used only when it is
+inside the project's own folder or was chosen in Scratch Disks on this computer (remembered in
+`autoSave.scratchFolders`). Otherwise FilmCraft uses the default location and says so when the
+project opens. Folders on another computer or a device are never used.
 
 Preferences are stored in `<data dir>/preferences.json`. The `prefs.*` commands read and change them.
 
@@ -151,15 +160,18 @@ Premiere's auto-save can lose up to one interval of work. FilmCraft also keeps a
   over the original file. The recovered state goes into the new session's own journal before the old
   journal is deleted.
 - A normal quit with nothing unsaved removes the session directory. Quitting with unsaved changes
-  keeps the snapshot, marked `cleanExit`, and FilmCraft offers it on the next launch ("FilmCraft was
-  closed while … had unsaved changes"). There is no "Save changes?" prompt on quit yet, so this
-  keeps the work.
+  (Quit, Cmd+Q or the window's close button) first asks *"Save changes to 'X' before closing?"*
+  with **Cancel**, **Don't Save** and **Save** (Save on a never-saved project opens the Save dialog);
+  Don't Save discards the changes and their snapshot. A quit that does not ask (the control
+  channel's `app.quit`, the OS ending the session) keeps the snapshot, marked `cleanExit`, and FilmCraft offers it on the next launch ("FilmCraft was
+  closed while … had unsaved changes").
 
 Desktop flags: `--recover` recovers the newest candidate without asking. `--no-recover` starts
 without asking; the changes stay available through File ▸ Recover Unsaved Changes…. `--data-dir
 <dir>` (or `FILMCRAFT_DATA_DIR`) moves the data directory. The default is `~/Library/Application
 Support/FilmCraft` on macOS, `%APPDATA%\FilmCraft` on Windows, and `$XDG_DATA_HOME/filmcraft` or
-`~/.local/share/filmcraft` elsewhere.
+`~/.local/share/filmcraft` elsewhere. A `portable.txt` file next to the executable (the Windows
+portable zip ships one) makes it `data` next to the executable instead.
 
 ### Cost
 
@@ -213,13 +225,13 @@ opens the dialog on a page.
 | Category | Takes effect |
 |---|---|
 | General | At Startup (Show Home = demo project, Open Most Recent, empty project; recent projects are remembered on open/save), Show Tool Tips |
-| Appearance | Color Theme (Darkest / Dark / Light; View ▸ Appearance writes it too), highlight colour, accessible contrast |
+| Appearance | Appearance Mode `appearanceMode` (`auto` = Sync with system / `dark` (default) / `light`; the header button and View ▸ Appearance ▸ Next Appearance Mode cycle it), Dark Theme `darkTheme` (`darkest` (default) / `dark`), Light Theme `lightTheme` (`light`), highlight colour, accessible contrast. `colorTheme` (Darkest / Dark / Light) is legacy input: setting it (older files and clients, View ▸ Appearance ▸ a theme) selects that theme and fixes the mode to its family; a file without `appearanceMode` migrates to its theme's fixed mode. It is kept in line with the choices: the theme a fixed mode shows, the dark theme in Auto |
 | Audio | Automatch Time, Large Volume Adjustment, automation keyframe thinning (linear, minimum time) |
 | Audio Hardware | device class (cpal host), output device, I/O buffer size, sample rate, force document rate, Output Mapping (programme L/R → device channels) |
 | Auto Save | the auto-save ring and the crash-recovery journal |
 | Color | stored only (display colour management, EDR monitoring, HDR graphics white) |
 | Graphics | new text layers: smart quotes, ligatures, default font |
-| Labels | the 16 label names and colours (timeline, Project panel, Edit ▸ Label), label defaults for imported movies / video / audio / stills and new sequences |
+| Labels | the 16 label names and colours (timeline, Project panel, Edit ▸ Label), label defaults for imported movies / video / audio / stills and new sequences, Label Color Presets: JSON files (`{"name", "labels": [16 × {"name", "color": "#rrggbb"}]}`) in `<data dir>/Label Presets`, built in: "Default" (the labels FilmCraft ships with), "Bright" (16 saturated hues) and "Roles" (B-Roll, Footage, Dialogue… named so the label defaults land on matching roles) (`labels.presets`, `labels.importPreset {path}`, `labels.exportPreset {path}`, `labels.deletePreset {name}`; `labels.preset` is the selected one) |
 | Media | Indeterminate Media Timebase (frame rate of stills), Default Media Scaling (Scale to / Set to frame size when a clip of another size is edited in), Enable proxies |
 | Media Analysis & Transcription | auto-transcribe imported clips (scope "all imported"), speech model, default language / auto-detect, speaker labelling (defaults of `transcript.generate`) |
 | Media Cache | location (`<data dir>/Media Cache` by default; unsaved projects' render previews live there), automatic deletion (older than N days / beyond N GB), Delete… (`mediaCache.clean {all?}`, `mediaCache.info`) |
@@ -258,6 +270,12 @@ have no identity, so relinking them skips the fingerprint check.
   deleted only with `deleteFiles: true`.
 - The media pool caches sources per item **and** per reference (path, offline flag). So relinking,
   Make Offline and undoing either take effect on the next frame.
+- **Stored paths.** Media and proxy paths read from a document (the project file, a project
+  template, an interchange file) are opened only when they name a file on this computer or on
+  the network share the document itself is on (`crates/engine/src/doc_path.rs`, built on
+  `craft-docpath`); a relative path is taken from the document's folder. Other paths (another
+  computer, a device) count as missing: the item shows the offline slate, the open says why, and
+  the Link Media dialog lists it. A file imported or linked in this session is opened as given.
 
 ### Link Media
 
@@ -357,6 +375,11 @@ destination?, preset?}` (Project Settings ▸ Ingest) acts on every `file.import
   clip to the result when it is done;
 - **createProxies** makes proxies in the background and attaches them;
 - **copyAndCreateProxies** does both.
+
+Copied files keep their names when available; collisions receive a numbered suffix before the
+extension (`A001 2.mov`) and never replace an existing file. Transcodes reserve distinct output
+names for every clip in the import batch. Copies keep their source fingerprint, and each proxy
+stays attached to its corresponding take.
 
 `file.import` reports this under `ingest`.
 

@@ -210,3 +210,75 @@ fn trim_monitor_sides_and_shift_counters() {
     let seq = s.execute("sequence.inspect", json!({})).unwrap();
     assert!(!seq["video"][0]["transitions"].as_array().unwrap().is_empty());
 }
+
+#[test]
+fn extend_to_playhead_moves_each_unequal_out_point_to_the_playhead() {
+    let mut s = demo();
+    s.execute("sequence.linkedSelection", json!({"on": false})).unwrap();
+    let rate = s.sequence_rate();
+    let q = s.active_sequence().unwrap();
+    // a clip on V1 and the overlay on V2 that overlap in time but end at different frames
+    let mut found = None;
+    for a in &q.video_tracks[0].items {
+        for b in &q.video_tracks[1].items {
+            let (lo, hi) = (a.start.max(b.start), a.end().min(b.end()));
+            if found.is_none() && a.end() != b.end() && hi - lo > rate.tick_of(2) {
+                found = Some((a.id, b.id, lo + rate.tick_of(1)));
+            }
+        }
+    }
+    let (a, b, ph) = found.expect("demo has overlapping clips on V1 and V2 with different ends");
+    s.execute("playhead.set", json!({"time": ph.0})).unwrap();
+    s.execute("trim.selectEditPoint", json!({"clip": a.0, "edge": "out", "kind": "trim"})).unwrap();
+    s.execute("trim.selectEditPoint", json!({"clip": b.0, "edge": "out", "kind": "trim", "add": true})).unwrap();
+    s.execute("trim.extendToPlayhead", json!({})).unwrap();
+    let q = s.active_sequence().unwrap();
+    assert_eq!(q.find_item(a).unwrap().1.end(), ph);
+    assert_eq!(q.find_item(b).unwrap().1.end(), ph);
+}
+
+/// #914: Trim by Frames on two selected edit points is one undo (and redo) step.
+#[test]
+fn multipoint_trim_by_frames_is_one_undo_step() {
+    let mut s = demo();
+    s.execute("sequence.linkedSelection", json!({"on": false})).unwrap();
+    let c = v1(&s);
+    let (a, b) = (c[0], c[1]);
+    s.execute("trim.selectEditPoint", json!({"clip": a.0, "edge": "out", "kind": "trim"})).unwrap();
+    s.execute("trim.selectEditPoint", json!({"clip": b.0, "edge": "out", "kind": "trim", "add": true})).unwrap();
+    let undo0 = s.history.undo.len();
+    let d = s.sequence_rate().tick_of(-1);
+    s.execute("trim.nudge", json!({"frames": -1})).unwrap();
+    let q = s.active_sequence().unwrap();
+    let a1 = q.find_item(ClipId(a.0)).unwrap().1.end();
+    let b1 = q.find_item(ClipId(b.0)).unwrap().1.end();
+    assert_eq!(a1, a.2 + d);
+    assert_eq!(b1, b.2 + d);
+    assert_eq!(s.history.undo.len(), undo0 + 1, "one undo step for both clips");
+    s.execute("edit.undo", json!({})).unwrap();
+    let q = s.active_sequence().unwrap();
+    assert_eq!(q.find_item(ClipId(a.0)).unwrap().1.end(), a.2);
+    assert_eq!(q.find_item(ClipId(b.0)).unwrap().1.end(), b.2);
+    s.execute("edit.redo", json!({})).unwrap();
+    let q = s.active_sequence().unwrap();
+    assert_eq!(q.find_item(ClipId(a.0)).unwrap().1.end(), a1);
+    assert_eq!(q.find_item(ClipId(b.0)).unwrap().1.end(), b1);
+}
+
+/// #653: the delta the Timeline previews while an edge is dragged is the one `timeline.trim`
+/// applies on release: dragging the last clip's Out edge far past the end of its media stops at
+/// the media's end instead of following the pointer.
+#[test]
+fn trim_delta_stops_at_the_end_of_the_media() {
+    let mut s = demo();
+    let last = *v1(&s).last().unwrap();
+    let clip = ClipId(last.0);
+    let far = Tick(3600 * filmcraft_time::TICKS_PER_SECOND);
+    let shown = commands::trim_delta(&s, clip, filmcraft_edit::Edge::Out, filmcraft_edit::TrimMode::Regular, far).unwrap();
+    assert!(Tick::ZERO < shown && shown < far, "clamped to the media left after the clip: {shown:?}");
+    let r = s.execute("timeline.trim", json!({"clip": last.0, "edge": "out", "mode": "regular", "delta": far.0})).unwrap();
+    assert_eq!(r["delta"], json!(shown.0), "the preview and the trim agree");
+    let small = s.sequence_rate().frame_duration();
+    let back = commands::trim_delta(&s, clip, filmcraft_edit::Edge::Out, filmcraft_edit::TrimMode::Regular, -small).unwrap();
+    assert_eq!(back, -small, "a trim within the media is not clamped");
+}

@@ -12,6 +12,38 @@ fn demo() -> Session {
     s
 }
 
+#[test]
+fn transition_preview_is_read_only_and_matches_apply_and_undo() {
+    use crate::commands::preview_transition;
+    use filmcraft_project::TrackKind;
+    for (kind, effect) in [(TrackKind::Video, "cross_dissolve"), (TrackKind::Audio, "constant_power")] {
+        let mut s = demo();
+        let clips: Vec<_> = s.active_sequence().unwrap().tracks(kind)[0].items.iter().map(|c| c.id).collect();
+        for clip in clips {
+            for edge in ["in", "out"] {
+                let params = json!({"effect": effect, "clip": clip.0, "edge": edge, "frames": 7});
+                let before = s.project.to_json();
+                let revision = s.revision;
+                let (track, planned) = preview_transition(&s, &params, kind).unwrap();
+                assert_eq!(s.project.to_json(), before);
+                assert_eq!(s.revision, revision);
+                let result = s.execute("effects.apply", params).unwrap();
+                let applied =
+                    s.active_sequence().unwrap().track(track).unwrap().transitions.iter().find(|t| Some(t.id.0) == result["transition"].as_u64()).unwrap();
+                assert_eq!((applied.start, applied.duration, applied.from, applied.to), (planned.start, planned.duration, planned.from, planned.to));
+                s.execute("edit.undo", json!({})).unwrap();
+                assert_eq!(s.project.to_json(), before);
+                s.execute("edit.redo", json!({})).unwrap();
+                s.execute("edit.undo", json!({})).unwrap();
+            }
+        }
+        assert!(preview_transition(&s, &json!({"effect": effect, "clip": u64::MAX}), kind).is_err());
+        let track = s.active_sequence().unwrap().tracks(kind)[0].id;
+        std::sync::Arc::make_mut(&mut s.project).sequence_mut(s.state.active_sequence.unwrap()).unwrap().track_mut(track).unwrap().locked = true;
+        assert!(preview_transition(&s, &json!({"effect": effect, "clip": s.active_sequence().unwrap().track(track).unwrap().items[0].id.0}), kind).is_err());
+    }
+}
+
 fn first_v1_clip(s: &Session) -> u64 {
     s.active_sequence().unwrap().video_tracks[0].items[0].id.0
 }
@@ -82,4 +114,41 @@ fn new_effect_params_are_settable_and_keyframable() {
     assert!(matches!(&it.effect("simple_text").unwrap().param("text").unwrap().value, filmcraft_project::ParamValue::Text(t) if t == "Hello"));
     let img = s.render_program(0.125).unwrap();
     assert!(img.px.iter().all(|v| v.is_finite()));
+}
+
+#[test]
+fn ultra_key_setting_writes_aggressive_parameters() {
+    let mut s = demo();
+    let clip = first_v1_clip(&s);
+    s.execute("effects.apply", json!({"clips": [clip], "effect": "ultra_key"})).unwrap();
+    s.execute("effects.setParam", json!({"clip": clip, "effect": "ultra_key", "param": "setting", "value": 2})).unwrap();
+    let e = s.active_sequence().unwrap().find_item(filmcraft_project::ClipId(clip)).unwrap().1.effect("ultra_key").unwrap();
+    assert_eq!(e.param("tolerance").unwrap().value.as_f64(), Some(90.0));
+    assert_eq!(e.param("pedestal").unwrap().value.as_f64(), Some(50.0));
+    assert_eq!(e.param("choke").unwrap().value.as_f64(), Some(10.0));
+    assert_eq!(e.param("contrast").unwrap().value.as_f64(), Some(10.0));
+}
+
+/// #2679: a value outside a parameter's range (the `min`/`max` `effects.list` publishes) is
+/// refused with the range, not saved: gamma 1.1 meant as a factor turned the frame black.
+#[test]
+fn set_param_refuses_values_outside_the_range() {
+    let mut s = demo();
+    let clip = s.active_sequence().unwrap().video_tracks[0].items[0].id.0;
+    s.execute("effects.apply", json!({"clips": [clip], "effect": "levels"})).unwrap();
+    s.execute("effects.apply", json!({"clips": [clip], "effect": "lumetri"})).unwrap();
+    let before = s.project.to_json();
+    let undo = s.history.undo.len();
+    for (effect, param, value) in
+        [("levels", "gamma", 1.1), ("lumetri", "saturation", 500.0), ("lumetri", "vibrance", -300.0), ("opacity", "opacity", 250.0), ("motion", "scale", -50.0)]
+    {
+        let e = s.execute("effects.setParam", json!({"clip": clip, "effect": effect, "param": param, "value": value})).unwrap_err().to_string();
+        assert!(e.contains("must be between"), "{effect}.{param} = {value}: {e}");
+    }
+    assert_eq!(s.project.to_json(), before, "nothing was saved");
+    assert_eq!(s.history.undo.len(), undo);
+    // the ends of the range and values inside it still go in
+    s.execute("effects.setParam", json!({"clip": clip, "effect": "levels", "param": "gamma", "value": 110})).unwrap();
+    s.execute("effects.setParam", json!({"clip": clip, "effect": "opacity", "param": "opacity", "value": 100})).unwrap();
+    s.execute("effects.setParam", json!({"clip": clip, "effect": "opacity", "param": "opacity", "value": 0})).unwrap();
 }

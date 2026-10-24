@@ -22,12 +22,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use filmcraft_format::autosave as names;
 use filmcraft_project::Project;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::settings;
 
@@ -49,11 +50,23 @@ pub struct AutoSavePrefs {
     pub recovery_journal: bool,
     /// Longest time (s) unsaved changes may stay out of the journal while edits keep coming.
     pub recovery_interval_seconds: u32,
+    /// Folders chosen in Project Settings ▸ Scratch Disks on this computer. A project file may
+    /// name these, or folders inside its own folder; see
+    /// [`crate::project_tools::trusted_scratch`].
+    pub scratch_folders: Vec<String>,
 }
 
 impl Default for AutoSavePrefs {
     fn default() -> Self {
-        Self { enabled: true, interval_minutes: 5, max_versions: 20, save_current_project: false, recovery_journal: true, recovery_interval_seconds: 5 }
+        Self {
+            enabled: true,
+            interval_minutes: 5,
+            max_versions: 20,
+            save_current_project: false,
+            recovery_journal: true,
+            recovery_interval_seconds: 5,
+            scratch_folders: Vec::new(),
+        }
     }
 }
 
@@ -391,6 +404,7 @@ impl Preferences {
         self.playback.postroll_seconds = secs(self.playback.postroll_seconds);
         self.trim.large_trim_offset = self.trim.large_trim_offset.clamp(1, 1000);
         self.labels.sanitize_labels();
+        self.appearance.sync_color_theme();
         self.version = settings::PREFS_VERSION;
     }
 
@@ -453,6 +467,12 @@ impl Preferences {
         let _: Preferences = serde_json::from_value(v.clone()).map_err(|e| format!("`{key}`: {e}"))?;
         settings::sanitize(&mut v, &Self::default().to_value());
         let mut p: Preferences = serde_json::from_value(v).map_err(|e| format!("`{key}`: {e}"))?;
+        // Old clients that set the single Color Theme still pick the theme they name (before
+        // `clamp`, which brings `colorTheme` back in line with the mode and theme choices).
+        if key == "appearance.colorTheme" {
+            let theme = p.appearance.color_theme.clone();
+            p.appearance.select_theme(&theme);
+        }
         p.clamp();
         *self = p;
         Ok(())
@@ -470,12 +490,25 @@ impl Preferences {
     }
 }
 
-/// The per-user data directory (`FILMCRAFT_DATA_DIR` overrides):
+/// A file with this name next to the executable makes the install portable: its data directory is
+/// `<exe dir>/data` instead of the per-user one (the Windows portable zip ships it).
+pub const PORTABLE_MARKER: &str = "portable.txt";
+
+/// `<exe_dir>/data` when `exe_dir` holds [`PORTABLE_MARKER`], else `None`.
+pub fn portable_data_dir(exe_dir: &Path) -> Option<PathBuf> {
+    exe_dir.join(PORTABLE_MARKER).is_file().then(|| exe_dir.join("data"))
+}
+
+/// The data directory. `FILMCRAFT_DATA_DIR` overrides; a portable install ([`PORTABLE_MARKER`] next
+/// to the executable) uses `<exe dir>/data`; otherwise the per-user directory:
 /// macOS `~/Library/Application Support/FilmCraft`, Windows `%APPDATA%\FilmCraft`,
 /// elsewhere `$XDG_DATA_HOME/filmcraft` or `~/.local/share/filmcraft`.
 pub fn default_data_dir() -> Option<PathBuf> {
     let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
     if let Some(d) = env("FILMCRAFT_DATA_DIR") {
+        return Some(d);
+    }
+    if let Some(d) = std::env::current_exe().ok().and_then(|exe| exe.parent().and_then(portable_data_dir)) {
         return Some(d);
     }
     if cfg!(target_os = "macos") {
@@ -551,15 +584,16 @@ pub fn scan_candidates(data_dir: &Path, skip: Option<&Path>) -> Vec<RecoveryCand
         if !dir.is_dir() || Some(dir.as_path()) == skip || !lock_is_stale(&dir) {
             continue;
         }
-        let meta = fs::read(dir.join(META)).ok().and_then(|b| serde_json::from_slice::<JournalMeta>(&b).ok());
-        match meta {
-            Some(meta) if dir.join(SNAPSHOT).is_file() => {
-                out.push(RecoveryCandidate { id: e.file_name().to_string_lossy().into_owned(), dir, meta });
-            }
-            _ => {
-                let _ = fs::remove_dir_all(&dir);
-            }
+        let snap = dir.join(SNAPSHOT);
+        if !snap.is_file() {
+            // Empty leftover dirs (clean exit, or a crash before the first snapshot).
+            let _ = fs::remove_dir_all(&dir);
+            continue;
         }
+        // Keep the snapshot even when session.json is missing or unreadable: the project
+        // is still recoverable. Meta fields fall back to defaults.
+        let meta = fs::read(dir.join(META)).ok().and_then(|b| serde_json::from_slice::<JournalMeta>(&b).ok()).unwrap_or_default();
+        out.push(RecoveryCandidate { id: e.file_name().to_string_lossy().into_owned(), dir, meta });
     }
     out.sort_by(|a, b| b.meta.saved_unix.cmp(&a.meta.saved_unix).then(b.id.cmp(&a.id)));
     out
@@ -978,21 +1012,18 @@ impl Worker {
 
     fn auto_save(&mut self) -> Result<PathBuf, String> {
         let Some(s) = &self.latest else { return Err("nothing to save".into()) };
-        let scratch = s.project.settings.scratch.auto_save.clone().filter(|d| !d.is_empty());
-        let (dir, name) = match &s.path {
+        let scratch = crate::project_tools::trusted_scratch(s.project.settings.scratch.auto_save.as_deref(), s.path.as_deref(), &self.prefs.scratch_folders);
+        let (dir, name) = match (&s.path, scratch) {
             // Project Settings ▸ Scratch Disks ▸ Project Auto Save
-            Some(p) if scratch.is_some() => {
+            (Some(p), Some(scratch)) => {
                 let p = Path::new(p);
-                (
-                    PathBuf::from(scratch.clone().unwrap_or_default()),
-                    p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| s.project.name.clone()),
-                )
+                (scratch, p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| s.project.name.clone()))
             }
-            Some(p) => {
+            (Some(p), None) => {
                 let p = Path::new(p);
                 (names::auto_save_dir(p), p.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| s.project.name.clone()))
             }
-            None => (self.data_dir.join(names::AUTO_SAVE_DIR), s.project.name.clone()),
+            (None, _) => (self.data_dir.join(names::AUTO_SAVE_DIR), s.project.name.clone()),
         };
         let t0 = Instant::now();
         let bytes = filmcraft_format::encode(&s.project, false);

@@ -22,6 +22,52 @@ fn set(s: &mut Session, key: &str, value: Value) {
     s.execute("prefs.set", json!({"key": key, "value": value})).unwrap_or_else(|e| panic!("{key}: {e}"));
 }
 
+#[test]
+fn interface_language_persists_and_rejects_hostile_values() {
+    let dir = tmp_dir("interface-language");
+    let path = dir.join("preferences.json");
+    let mut s = Session { prefs_path: Some(path.clone()), ..Session::default() };
+    set(&mut s, "general.interfaceLanguage", json!("es"));
+    assert_eq!(Preferences::load(&path).general.interface_language, "es");
+    for value in [json!("xx"), json!("es-MX"), json!("de-DE"), json!("fr-FR"), json!(null), json!(-1), json!({}), json!("x".repeat(4096))] {
+        assert!(s.execute("prefs.set", json!({"key": "general.interfaceLanguage", "value": value})).is_err());
+        assert_eq!(s.prefs.general.interface_language, "es");
+    }
+    assert_eq!(Preferences::load(&path).general.interface_language, "es");
+    set(&mut s, "general.interfaceLanguage", json!("de"));
+    assert_eq!(Preferences::load(&path).general.interface_language, "de");
+    set(&mut s, "general.interfaceLanguage", json!("fr"));
+    assert_eq!(Preferences::load(&path).general.interface_language, "fr");
+    // Indonesian is stored as `id`, not a locale tag or the legacy `in` code
+    for value in [json!("id-ID"), json!("in"), json!("ID")] {
+        assert!(s.execute("prefs.set", json!({"key": "general.interfaceLanguage", "value": value})).is_err());
+    }
+    set(&mut s, "general.interfaceLanguage", json!("id"));
+    assert_eq!(Preferences::load(&path).general.interface_language, "id");
+    // Italian is stored as `it`, not a locale tag
+    for value in [json!("it-IT"), json!("IT")] {
+        assert!(s.execute("prefs.set", json!({"key": "general.interfaceLanguage", "value": value})).is_err());
+    }
+    set(&mut s, "general.interfaceLanguage", json!("it"));
+    assert_eq!(Preferences::load(&path).general.interface_language, "it");
+    // back to following the operating system (#218)
+    set(&mut s, "general.interfaceLanguage", json!("system"));
+    assert_eq!(Preferences::load(&path).general.interface_language, "system");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A new installation follows the operating system's language (#218); a saved choice is kept.
+#[test]
+fn interface_language_defaults_to_the_system_language() {
+    assert_eq!(Preferences::default().general.interface_language, "system");
+    let dir = tmp_dir("interface-language-default");
+    let path = dir.join("preferences.json");
+    assert_eq!(Preferences::load(&path).general.interface_language, "system", "no preferences file yet");
+    std::fs::write(&path, r#"{"general":{"interfaceLanguage":"en"}}"#).unwrap();
+    assert_eq!(Preferences::load(&path).general.interface_language, "en");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 fn write_png(path: &Path, w: u32, h: u32) {
     image::RgbaImage::from_pixel(w, h, image::Rgba([200, 40, 40, 255])).save(path).unwrap();
 }
@@ -221,6 +267,22 @@ fn schema_command_describes_every_category() {
     assert_eq!(auto["value"], "pageScroll");
     assert_eq!(auto["wired"], true);
     assert!(auto["kind"]["choices"].as_array().unwrap().iter().any(|c| c["value"] == "smoothScroll"));
+
+    // `file.open` restores the saved tabs and views with this on (#928)
+    let restore = tl["fields"].as_array().unwrap().iter().find(|f| f["key"] == "timeline.restoreOpenSequences").unwrap();
+    assert_eq!((restore["wired"].clone(), restore["value"].clone()), (json!(true), json!(true)));
+
+    // This option is stored, but Insert/Overwrite does not yet implement focus transfer.
+    let focus = tl["fields"].as_array().unwrap().iter().find(|f| f["key"] == "timeline.focusTimelineOnEdit").unwrap();
+    assert_eq!(focus["kind"], json!({"type": "bool"}));
+    assert_eq!(focus["wired"], false);
+    assert_eq!(focus["value"], false);
+    set(&mut s, "timeline.focusTimelineOnEdit", json!(true));
+    let updated = s.execute("prefs.schema", json!({"category": "timeline"})).unwrap();
+    let focus = updated["categories"][0]["fields"].as_array().unwrap().iter().find(|f| f["key"] == "timeline.focusTimelineOnEdit").unwrap();
+    assert_eq!(focus["value"], true);
+    assert_eq!(focus["wired"], false);
+
     let one = s.execute("prefs.schema", json!({"category": "trim"})).unwrap();
     assert_eq!(one["categories"].as_array().unwrap().len(), 1);
     assert!(s.execute("prefs.schema", json!({"category": "nope"})).is_err());
@@ -520,4 +582,272 @@ fn hardware_decoding_setting_drives_the_decoder_switch() {
     set(&mut s, "playback.hardwareDecoding", json!("auto"));
     assert!(filmcraft_codecs::hw::hardware_decoding());
     assert!(settings::field("playback.hardwareDecoding").is_some_and(|f| f.wired && matches!(f.kind, Kind::Choice(_))));
+}
+
+/// Settings ▸ Timeline ▸ "Place files dropped onto the Timeline directly on the Timeline": on by default.
+#[test]
+fn drop_import_to_timeline_defaults_to_on() {
+    assert!(settings::TimelinePrefs::default().drop_import_to_timeline);
+    assert!(Preferences::default().timeline.drop_import_to_timeline);
+}
+
+/// The key is saved under `timeline.dropImportToTimeline`, read back by `prefs.get`, and persisted.
+#[test]
+fn drop_import_to_timeline_round_trips_through_prefs() {
+    let dir = tmp_dir("drop-import-to-timeline");
+    let path = dir.join("preferences.json");
+    let mut s = Session { prefs_path: Some(path.clone()), ..Session::default() };
+    set(&mut s, "timeline.dropImportToTimeline", json!(false));
+    assert!(!s.prefs.timeline.drop_import_to_timeline);
+    assert_eq!(s.execute("prefs.get", json!({"key": "timeline.dropImportToTimeline"})).unwrap(), json!(false));
+    assert!(!Preferences::load(&path).timeline.drop_import_to_timeline);
+    // a non-boolean is rejected and the stored value is kept
+    assert!(s.execute("prefs.set", json!({"key": "timeline.dropImportToTimeline", "value": "no"})).is_err());
+    assert!(!s.prefs.timeline.drop_import_to_timeline);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Preferences files written before the key existed load it as on.
+#[test]
+fn drop_import_to_timeline_defaults_to_on_for_older_prefs() {
+    assert!(serde_json::from_value::<settings::TimelinePrefs>(json!({})).unwrap().drop_import_to_timeline);
+    let old = Preferences::from_value(json!({"version": 2, "timeline": {"stillImageDuration": 3}}));
+    assert!(old.timeline.drop_import_to_timeline);
+    assert_eq!(old.timeline.still_image_duration, 3.0);
+}
+
+/// The key is a Boolean field of the Timeline category in the settings registry.
+#[test]
+fn drop_import_to_timeline_is_in_the_settings_registry() {
+    let (cat, f) = settings::fields().into_iter().find(|(_, f)| f.key == "timeline.dropImportToTimeline").expect("registry field");
+    assert_eq!(cat, "timeline");
+    assert!(matches!(f.kind, Kind::Bool));
+    assert_eq!(settings::field("timeline.dropImportToTimeline").map(|f| f.key), Some("timeline.dropImportToTimeline"));
+}
+
+/// New users keep the dark Darkest theme (following the system is opt-in); a file saved before
+/// appearance modes keeps showing its Color Theme as a fixed Dark or Light mode.
+#[test]
+fn appearance_defaults_and_legacy_theme_migrate() {
+    let a = Preferences::default().appearance;
+    assert_eq!((a.appearance_mode.as_str(), a.dark_theme.as_str(), a.light_theme.as_str()), ("dark", "darkest", "light"));
+    assert_eq!(a.shown_theme(Some(true)), "darkest", "Dark mode ignores a light system");
+    let dir = tmp_dir("prefs-appearance-migrate");
+    let path = dir.join("preferences.json");
+    for (theme, mode, dark, light) in [("darkest", "dark", "darkest", "light"), ("dark", "dark", "dark", "light"), ("light", "light", "darkest", "light")] {
+        std::fs::write(&path, json!({"version": 2, "appearance": {"colorTheme": theme}}).to_string()).unwrap();
+        let a = Preferences::load(&path).appearance;
+        assert_eq!((a.appearance_mode.as_str(), a.dark_theme.as_str(), a.light_theme.as_str()), (mode, dark, light), "{theme}");
+        assert_eq!(a.shown_theme(None), theme);
+    }
+    // a v1 file without an appearance section, and a hostile theme, get the defaults
+    std::fs::write(&path, r#"{"autoSave":{"enabled":true}}"#).unwrap();
+    assert_eq!(Preferences::load(&path).appearance, settings::AppearancePrefs::default());
+    std::fs::write(&path, r#"{"appearance":{"colorTheme":"neon","appearanceMode":7,"darkTheme":"light"}}"#).unwrap();
+    assert_eq!(Preferences::load(&path).appearance, settings::AppearancePrefs::default());
+    // a file with a mode keeps it
+    std::fs::write(&path, r#"{"appearance":{"colorTheme":"darkest","appearanceMode":"auto","lightTheme":"light","darkTheme":"dark"}}"#).unwrap();
+    let a = Preferences::load(&path).appearance;
+    assert_eq!((a.appearance_mode.as_str(), a.shown_theme(Some(true)), a.shown_theme(Some(false)), a.shown_theme(None)), ("auto", "light", "dark", "dark"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn appearance_choices_validate_and_legacy_theme_still_selects() {
+    let mut s = Session::default();
+    s.execute("prefs.set", json!({"values": {"appearance.appearanceMode": "auto", "appearance.darkTheme": "dark"}})).unwrap();
+    assert_eq!((s.prefs.appearance.appearance_mode.as_str(), s.prefs.appearance.dark_theme.as_str()), ("auto", "dark"));
+    for (key, value) in [
+        ("appearance.darkTheme", json!("light")),
+        ("appearance.lightTheme", json!("darkest")),
+        ("appearance.appearanceMode", json!("system")),
+        ("appearance.appearanceMode", json!(1)),
+    ] {
+        assert!(s.execute("prefs.set", json!({"key": key, "value": value})).is_err(), "{key} {value}");
+    }
+    // the single Color Theme of older clients selects that theme and fixes the mode to its family
+    set(&mut s, "appearance.colorTheme", json!("light"));
+    assert_eq!((s.prefs.appearance.appearance_mode.as_str(), s.prefs.appearance.light_theme.as_str()), ("light", "light"));
+    assert_eq!(s.prefs.appearance.dark_theme, "dark", "the dark choice is kept");
+    set(&mut s, "appearance.colorTheme", json!("darkest"));
+    assert_eq!((s.prefs.appearance.appearance_mode.as_str(), s.prefs.appearance.dark_theme.as_str()), ("dark", "darkest"));
+    // the legacy Color Theme follows the mode and theme choices, so clients reading it aren't stale
+    assert_eq!(s.prefs.appearance.color_theme, "darkest");
+    set(&mut s, "appearance.appearanceMode", json!("light"));
+    assert_eq!(s.prefs.appearance.color_theme, "light");
+    set(&mut s, "appearance.appearanceMode", json!("dark"));
+    set(&mut s, "appearance.darkTheme", json!("dark"));
+    assert_eq!(s.prefs.appearance.color_theme, "dark");
+    set(&mut s, "appearance.appearanceMode", json!("auto"));
+    assert_eq!(s.prefs.appearance.color_theme, "dark", "Auto: the dark theme");
+    set(&mut s, "appearance.colorTheme", json!("light"));
+    assert_eq!((s.prefs.appearance.appearance_mode.as_str(), s.prefs.appearance.color_theme.as_str()), ("light", "light"));
+    // the header button's cycle
+    let mut a = settings::AppearancePrefs::default();
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        a.appearance_mode = a.next_mode().into();
+        seen.push(a.appearance_mode.clone());
+    }
+    assert_eq!(seen, ["auto", "light", "dark", "auto"]);
+}
+
+#[test]
+fn favorite_themes_validate_and_persist_without_changing_other_settings() {
+    let dir = tmp_dir("theme-favorites");
+    let path = dir.join("preferences.json");
+    let mut s = Session { prefs_path: Some(path.clone()), ..Session::default() };
+    set(&mut s, "appearance.favoriteThemes", json!(["dark", "light"]));
+    assert_eq!(Preferences::load(&path).appearance.favorite_themes, vec!["dark", "light"]);
+    for value in [json!("light"), json!(["unknown"]), json!(["dark", "dark"]), json!([3]), json!(null)] {
+        assert!(s.execute("prefs.set", json!({"key": "appearance.favoriteThemes", "value": value})).is_err());
+        assert_eq!(s.prefs.appearance.favorite_themes, vec!["dark", "light"]);
+    }
+    let mut corrupt = s.prefs.to_value();
+    corrupt["appearance"]["favoriteThemes"] = json!(["invalid", "invalid"]);
+    let repaired = Preferences::from_value(corrupt);
+    assert!(repaired.appearance.favorite_themes.is_empty());
+    assert_eq!(repaired.appearance.dark_theme, s.prefs.appearance.dark_theme);
+}
+
+fn preset_json(name: &str, n: usize, color: &str) -> Vec<u8> {
+    let labels: Vec<Value> = (0..n).map(|i| json!({"name": format!(" Label {i} "), "color": color})).collect();
+    serde_json::to_vec(&json!({"name": name, "labels": labels})).unwrap()
+}
+
+/// Label color preset files are checked strictly: size, exactly 16 labels, names trimmed and
+/// capped, colours `#rrggbb`. A bad file is an error, never a panic or a partial preset.
+#[test]
+fn label_presets_reject_bad_files() {
+    use settings::LabelPreset;
+    let p = LabelPreset::parse(&preset_json("  Team  ", 16, "#A0B0C0")).unwrap();
+    assert_eq!(p.name, "Team");
+    assert_eq!((p.labels[0].name.as_str(), p.labels[0].color.as_str()), ("Label 0", "#a0b0c0"));
+    let builtin = LabelPreset::builtin();
+    assert_eq!(builtin.name, "Default");
+    assert_eq!(builtin.labels.len(), 16);
+    assert!(builtin.matches(&settings::LabelPrefs::default()), "the built-in preset is today's labels");
+    assert_eq!(LabelPreset::parse(&serde_json::to_vec(&builtin).unwrap()).unwrap(), builtin);
+
+    let long = "x".repeat(65);
+    let mut too_big = preset_json("Big", 16, "#000000");
+    too_big.extend(std::iter::repeat_n(b' ', 64 * 1024));
+    for (why, bytes) in [
+        ("15 labels", preset_json("A", 15, "#000000")),
+        ("17 labels", preset_json("A", 17, "#000000")),
+        ("no #", preset_json("A", 16, "000000")),
+        ("not hex", preset_json("A", 16, "#12345g")),
+        ("a colour name", preset_json("A", 16, "red")),
+        ("short", preset_json("A", 16, "#fff")),
+        ("empty name", preset_json("   ", 16, "#000000")),
+        ("long name", preset_json(&long, 16, "#000000")),
+        (
+            "long label",
+            serde_json::to_vec(&json!({"name": "A", "labels": (0..16).map(|_| json!({"name": long, "color": "#000000"})).collect::<Vec<_>>()})).unwrap(),
+        ),
+        ("no colour", serde_json::to_vec(&json!({"name": "A", "labels": (0..16).map(|_| json!({"name": "a"})).collect::<Vec<_>>()})).unwrap()),
+        ("not an object", b"[1,2,3]".to_vec()),
+        ("too big", too_big),
+        ("not utf-8", vec![0xff, 0xfe, 0x00]),
+    ] {
+        assert!(LabelPreset::parse(&bytes).is_err(), "{why} should be refused");
+    }
+    // every truncation of a good file is refused cleanly
+    let good = preset_json("Team", 16, "#102030");
+    for n in 0..good.len() {
+        assert!(LabelPreset::parse(&good[..n]).is_err());
+    }
+}
+
+/// Import copies a preset into `Label Presets` beside the preferences, export writes the current
+/// labels named after the file, and delete removes user presets only. A bad file changes nothing.
+#[test]
+fn label_presets_import_export_and_delete() {
+    let dir = tmp_dir("label-presets");
+    let mut s = Session { prefs_path: Some(dir.join("preferences.json")), ..Session::default() };
+    let names = |s: &mut Session| -> Vec<String> {
+        let v = s.execute("labels.presets", json!({})).unwrap();
+        v["presets"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap().to_string()).collect()
+    };
+    assert_eq!(names(&mut s), ["Default", "Bright", "Roles"]);
+    let src = dir.join("from someone.json");
+    std::fs::write(&src, preset_json("Team", 16, "#102030")).unwrap();
+    let r = s.execute("labels.importPreset", json!({"path": src.to_string_lossy()})).unwrap();
+    assert_eq!(r["name"], "Team");
+    assert!(dir.join("Label Presets").join("Team.json").is_file());
+    assert_eq!(names(&mut s), ["Default", "Bright", "Roles", "Team"]);
+
+    // a bad file: an error, and the folder is as it was
+    let bad = dir.join("bad.json");
+    std::fs::write(&bad, preset_json("Bad", 3, "#102030")).unwrap();
+    assert!(s.execute("labels.importPreset", json!({"path": bad.to_string_lossy()})).is_err());
+    std::fs::write(dir.join("Label Presets").join("junk.json"), b"{not json").unwrap();
+    assert_eq!(names(&mut s), ["Default", "Bright", "Roles", "Team"], "unreadable files in the folder are skipped");
+
+    // a preset named like a built-in one keeps both
+    std::fs::write(&src, preset_json("default", 16, "#405060")).unwrap();
+    assert_eq!(s.execute("labels.importPreset", json!({"path": src.to_string_lossy()})).unwrap()["name"], "default (imported)");
+    std::fs::write(&src, preset_json("ROLES", 16, "#405060")).unwrap();
+    assert_eq!(s.execute("labels.importPreset", json!({"path": src.to_string_lossy()})).unwrap()["name"], "ROLES (imported)");
+
+    // export writes the applied labels, named after the file, and imports back
+    set(&mut s, "labels.colors.rose.color", json!("#123456"));
+    let out = dir.join("Our Labels.json");
+    assert_eq!(s.execute("labels.exportPreset", json!({"path": out.to_string_lossy()})).unwrap()["name"], "Our Labels");
+    let back = settings::LabelPreset::read(&out).unwrap();
+    assert!(back.matches(&s.prefs.labels));
+
+    for builtin in ["Default", "Bright", "Roles"] {
+        assert!(s.execute("labels.deletePreset", json!({"name": builtin})).is_err(), "{builtin} stays");
+    }
+    s.execute("labels.deletePreset", json!({"name": "Team"})).unwrap();
+    assert_eq!(names(&mut s), ["Default", "Bright", "Roles", "default (imported)", "ROLES (imported)"]);
+    assert!(s.execute("labels.deletePreset", json!({"name": "Team"})).is_err());
+}
+
+/// The built-in presets: Default (the labels as shipped), Bright and Roles, each with 16 distinct
+/// names and valid colours (Bright's and Roles' clearly different); Roles puts the label defaults
+/// on matching roles.
+#[test]
+fn builtin_label_presets_are_complete_and_distinct() {
+    use settings::LabelPreset;
+    let all = LabelPreset::builtins();
+    assert_eq!(all.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["Default", "Bright", "Roles"]);
+    for p in &all {
+        assert!(settings::is_builtin_label_preset(&p.name));
+        assert_eq!(&LabelPreset::parse(&serde_json::to_vec(p).unwrap()).unwrap(), p, "{} is a valid preset file", p.name);
+        let mut names: Vec<&str> = p.labels.iter().map(|l| l.name.as_str()).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 16, "{}: names are unique", p.name);
+        let rgb: Vec<[u8; 3]> = p.labels.iter().map(|l| settings::parse_hex(&l.color).unwrap()).collect();
+        if p.name == "Default" {
+            continue; // the colours labels have always had
+        }
+        for (i, a) in rgb.iter().enumerate() {
+            for b in &rgb[i + 1..] {
+                let d: f32 = a.iter().zip(b).map(|(x, y)| (f32::from(*x) - f32::from(*y)).powi(2)).sum::<f32>().sqrt();
+                assert!(d > 30.0, "{}: {a:?} and {b:?} are too close", p.name);
+            }
+        }
+    }
+    let roles = &all[2];
+    let mut labels = settings::LabelPrefs::default();
+    roles.apply(&mut labels);
+    assert!(roles.matches(&labels));
+    let d = labels.defaults.clone();
+    let named = [
+        (d.video, "B-Roll"),
+        (d.movie, "Footage"),
+        (d.audio, "Dialogue"),
+        (d.still, "Graphics"),
+        (d.sequence, "Sequence"),
+        (d.dynamic_link, "Visual Effects"),
+        (d.bin, "Bin"),
+        (d.captions, "Bin"),
+    ];
+    for (label, role) in named {
+        assert_eq!(labels.name(label), role);
+    }
+    assert!(!settings::is_builtin_label_preset("Team"));
 }

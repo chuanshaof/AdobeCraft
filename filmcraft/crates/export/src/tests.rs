@@ -89,6 +89,31 @@ fn wav_png_gif() {
     assert!(std::path::Path::new(&tmp("seq005.png")).exists());
 }
 
+/// GIF delays are whole centiseconds (#854): at 24 fps they alternate 4/4/5 cs so a second of
+/// frames lasts 1000 ms, not 24 × 40 ms = 960 ms.
+#[test]
+fn gif_frame_delays_add_up_to_the_duration() {
+    let d: Vec<u16> = (0..6).map(|i| gif_delay_cs(FrameRate::FPS_24, i)).collect();
+    assert_eq!(d, [4, 4, 5, 4, 4, 4]);
+    let ntsc: u64 = (0..30).map(|i| u64::from(gif_delay_cs(FrameRate::FPS_29_97, i))).sum();
+    assert_eq!(ntsc, 100, "30 frames at 29.97 fps last 1.001 s");
+    // hostile rates neither panic nor overflow
+    assert_eq!(gif_delay_cs(FrameRate { num: 0, den: 0 }, 3), 0);
+    let _ = gif_delay_cs(FrameRate { num: 1, den: i64::MAX }, i64::MAX);
+
+    let (p, seq, m) = project();
+    let path = tmp("timing.gif");
+    let mut s = ExportSettings { format: Format::Gif, path: path.clone(), scale: 0.25, ..Default::default() };
+    s.range = Some(TimeRange::new(Tick::ZERO, FrameRate::FPS_24.tick_of(24)));
+    export(&p, seq, &s, &m, &Progress::default()).unwrap();
+    use image::AnimationDecoder;
+    let dec = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(std::fs::read(&path).unwrap())).unwrap();
+    let frames = dec.into_frames().collect_frames().unwrap();
+    assert_eq!(frames.len(), 24);
+    let ms: u32 = frames.iter().map(|f| f.delay().numer_denom_ms()).map(|(n, d)| n / d.max(1)).sum();
+    assert_eq!(ms, 1000);
+}
+
 #[test]
 fn prores_export_roundtrip() {
     let (p, seq, m) = project();
@@ -99,6 +124,76 @@ fn prores_export_roundtrip() {
     assert!(src.info().video.as_ref().unwrap().codec.contains("ProRes 422 HQ"));
     let f = src.video_frame(FrameRequest::full(Tick(TICKS_PER_SECOND / 3))).unwrap().to_rgba8();
     assert!(f[0] > 240 && f[1] < 15 && f[2] < 15, "{:?}", &f[..4]);
+}
+
+/// #2142: SDR ProRes, DNxHR and APV (MOV) and H.264 (MP4) exports carry a `colr` box with the
+/// export's BT.709 colour: Apple's media stack reads the colour of the MOV codecs only from there.
+#[test]
+fn sdr_exports_carry_a_colr_box() {
+    use filmcraft_isobmff::ColorInfo;
+    let (p, seq, m) = project();
+    let nclc = ColorInfo::Nclc { primaries: 1, transfer: 1, matrix: 1 };
+    let nclx = ColorInfo::Nclx { primaries: 1, transfer: 1, matrix: 1, full_range: false };
+    for (format, name, want) in [
+        (Format::ProRes, "colr-prores.mov", nclc.clone()),
+        (Format::DnxHr, "colr-dnxhr.mov", nclc.clone()),
+        (Format::Apv, "colr-apv.mov", nclc.clone()),
+        (Format::H264, "colr-h264.mp4", nclx),
+    ] {
+        let path = tmp(name);
+        export(&p, seq, &ExportSettings { format, path: path.clone(), include_audio: false, ..Default::default() }, &m, &Progress::default()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let file = filmcraft_isobmff::open(bytes).unwrap();
+        let t = file.track_of_kind(filmcraft_isobmff::TrackKind::Video).unwrap();
+        let v = file.tracks[t].entries[0].video.as_ref().unwrap();
+        assert_eq!(v.color.as_ref(), Some(&want), "{name}");
+        assert!(v.mastering_display.is_none() && v.content_light.is_none(), "{name}: no HDR metadata on SDR");
+    }
+}
+
+/// ProRes 4444 / 4444 XQ export (#342): 4:4:4 frames under the `ap4h` / `ap4x` codes, and with
+/// Include Alpha Channel the picture's alpha survives instead of being flattened over black.
+#[test]
+fn prores_4444_export_roundtrip() {
+    let (p, seq, m) = project();
+    for (profile, label) in [("4444", "ProRes 4444"), ("4444xq", "ProRes 4444 XQ")] {
+        let path = tmp(&format!("pr_{profile}.mov"));
+        let s = ExportSettings { format: Format::ProRes, path: path.clone(), prores_profile: profile.into(), ..Default::default() };
+        export(&p, seq, &s, &m, &Progress::default()).unwrap();
+        let bytes: Arc<[u8]> = std::fs::read(&path).unwrap().into();
+        let src = filmcraft_codecs::open_bytes("pr.mov", bytes).unwrap();
+        let codec = src.info().video.as_ref().unwrap().codec.clone();
+        assert!(codec.contains(label), "{profile}: {codec}");
+        let f = src.video_frame(FrameRequest::full(Tick(TICKS_PER_SECOND / 3))).unwrap();
+        assert!(f.format_label().contains("4:4:4"), "{profile}: {}", f.format_label());
+        let px = f.to_rgba8();
+        assert!(px[0] > 240 && px[1] < 15 && px[2] < 15 && px[3] == 255, "{profile}: {:?}", &px[..4]);
+    }
+
+    // a half-transparent matte keeps its alpha with Include Alpha Channel, and only then
+    let mut p = (*p).clone();
+    let half = GeneratorSource::new(Generator::ColorMatte { color: [1.0, 0.0, 0.0, 0.5] }, 320, 180, FrameRate::FPS_24, Tick(2 * TICKS_PER_SECOND));
+    let item = p.sequence(seq).unwrap().video_tracks[0].items[0].item;
+    if let ItemKind::Media(mc) = &mut p.item_mut(item).unwrap().kind {
+        mc.media = MediaRef::Generator(half.generator.clone());
+    }
+    let mut m = m;
+    m.0.insert(item, Arc::new(half));
+    let p = Arc::new(p);
+    for alpha in [true, false] {
+        let path = tmp(&format!("pr_4444_alpha_{alpha}.mov"));
+        let s = ExportSettings { format: Format::ProRes, path: path.clone(), prores_profile: "4444".into(), alpha, ..Default::default() };
+        assert!(s.keeps_alpha() == alpha);
+        export(&p, seq, &s, &m, &Progress::default()).unwrap();
+        let bytes: Arc<[u8]> = std::fs::read(&path).unwrap().into();
+        let src = filmcraft_codecs::open_bytes("pr.mov", bytes).unwrap();
+        let px = src.video_frame(FrameRequest::full(Tick(TICKS_PER_SECOND / 3))).unwrap().to_rgba8();
+        if alpha {
+            assert!((px[3] as i32 - 128).abs() <= 3, "alpha kept: {:?}", &px[..4]);
+        } else {
+            assert_eq!(px[3], 255, "flattened: {:?}", &px[..4]);
+        }
+    }
 }
 
 #[test]
@@ -258,5 +353,167 @@ fn hdr_exports_signal_pq_and_hlg() {
             assert!(txt.contains("Content light level metadata"), "{path}: {txt}");
         }
         eprintln!("{path}:\n{txt}");
+    }
+}
+
+/// Scenario runner for the GPU hook: everything in one test because the renderer registry is
+/// process-global and parallel tests would see each other's factories.
+#[test]
+fn gpu_hook_scenarios() {
+    // 1. Declining renderer: byte-equal to Off, and an empty registry too.
+    crate::reset_frame_renderers_for_tests();
+    crate::register_frame_renderer(|| None);
+    let (p, seq, m) = project();
+    let mk = |path: &String, gpu: Option<bool>| {
+        let mut s = ExportSettings { format: Format::PngSequence, path: path.clone(), ..Default::default() };
+        s.range = Some(TimeRange::new(Tick::ZERO, FrameRate::FPS_24.tick_of(2)));
+        s.gpu_rendering = match gpu {
+            Some(true) | None => crate::GpuRendering::Auto,
+            Some(false) => crate::GpuRendering::Off,
+        };
+        export(&p, seq, &s, &m, &Progress::default()).unwrap()
+    };
+    mk(&tmp("off.png"), Some(false));
+    mk(&tmp("auto-declined.png"), Some(true));
+    assert_eq!(std::fs::read(tmp("off000.png")).unwrap(), std::fs::read(tmp("auto-declined000.png")).unwrap(), "declined GPU export must be byte-equal to Off");
+    crate::reset_frame_renderers_for_tests();
+    mk(&tmp("auto-empty.png"), Some(true));
+    assert_eq!(std::fs::read(tmp("off000.png")).unwrap(), std::fs::read(tmp("auto-empty000.png")).unwrap(), "empty registry must behave like Off");
+
+    // 2. Producing renderer: counters up and its picture reaches the export.
+    crate::reset_frame_renderers_for_tests();
+    crate::register_frame_renderer(|| Some(Box::new(FakeRenderer) as Box<dyn FrameRenderer>));
+    mk(&tmp("fake-gpu.png"), Some(true));
+    assert!(gpu_render_stats().frames >= 2, "gpu frames counted: {:?}", gpu_render_stats());
+    assert_eq!(gpu_render_stats().fallbacks, 0);
+    mk(&tmp("fake-off.png"), Some(false));
+    assert_eq!(gpu_render_stats().fallbacks, 0, "Off must not count as fallback");
+    assert_ne!(std::fs::read(tmp("fake-gpu000.png")).unwrap(), std::fs::read(tmp("fake-off000.png")).unwrap(), "the fake GPU picture must reach the export");
+
+    // 3. Hostile and degenerate frame sizes must not panic with a renderer attached.
+    crate::reset_frame_renderers_for_tests();
+    crate::register_frame_renderer(|| None);
+    for (w, h) in [(1, 1), (17, 13), (4096, 1)] {
+        let mut p = Project::new("x");
+        let g = GeneratorSource::new(Generator::ColorMatte { color: [0.5, 0.5, 0.5, 1.0] }, 320, 180, FrameRate::FPS_24, Tick(2 * TICKS_PER_SECOND));
+        let info = g.info().clone();
+        let red = p.add_item(
+            &info.name.clone(),
+            Label::Iris,
+            ItemKind::Media(MediaClip {
+                media: MediaRef::Generator(g.generator.clone()),
+                info,
+                interpret: Default::default(),
+                mark_in: None,
+                mark_out: None,
+                markers: vec![],
+                offline: false,
+                proxy: None,
+                identity: None,
+            }),
+            None,
+        );
+        let seq = p.new_sequence("s", SequenceSettings { width: w, height: h, frame_rate: FrameRate::FPS_24, ..Default::default() }, 1, 1, None);
+        let v = p.make_track_item(red, TrackKind::Video, Tick::ZERO, TimeRange::new(Tick::ZERO, FrameRate::FPS_24.tick_of(2)), FrameRate::FPS_24).unwrap();
+        p.sequence_mut(seq).unwrap().video_tracks[0].items.push(v);
+        let mut m = SourceMap::default();
+        m.0.insert(red, Arc::new(g));
+        let mut s = ExportSettings { format: Format::PngSequence, path: tmp("hostile.png"), ..Default::default() };
+        s.range = Some(TimeRange::new(Tick::ZERO, FrameRate::FPS_24.tick_of(1)));
+        s.gpu_rendering = crate::GpuRendering::Auto;
+        let r = export(&Arc::new(p), seq, &s, &m, &Progress::default());
+        if r.is_err() {
+            continue; // sizes the exporter rejects are fine too — as long as nothing panics
+        }
+        let bytes = std::fs::read(tmp("hostile000.png")).unwrap_or_default();
+        assert!(!bytes.is_empty(), "{w}x{h}: PNG written");
+    }
+
+    // 4. A renderer that panics is dropped, not put back: the export still completes, every
+    //    frame comes from the CPU (byte-equal to Off), and no renderer is used after its panic.
+    crate::reset_frame_renderers_for_tests();
+    PANICS.store(0, std::sync::atomic::Ordering::SeqCst);
+    crate::register_frame_renderer(|| Some(Box::new(PanickingRenderer) as Box<dyn FrameRenderer>));
+    let (p, seq, m) = project();
+    let mk12 = |path: &String, gpu: crate::GpuRendering| {
+        let mut s = ExportSettings { format: Format::PngSequence, path: path.clone(), ..Default::default() };
+        s.range = Some(TimeRange::new(Tick::ZERO, FrameRate::FPS_24.tick_of(12)));
+        s.gpu_rendering = gpu;
+        export(&p, seq, &s, &m, &Progress::default()).unwrap()
+    };
+    mk12(&tmp("panic-off.png"), crate::GpuRendering::Off);
+    mk12(&tmp("panic-auto.png"), crate::GpuRendering::Auto);
+    for f in ["000", "005", "011"] {
+        assert_eq!(
+            std::fs::read(tmp(&format!("panic-off{f}.png"))).unwrap(),
+            std::fs::read(tmp(&format!("panic-auto{f}.png"))).unwrap(),
+            "frame {f}: a panicking GPU renderer falls back to the CPU"
+        );
+    }
+    // at most one panic per pooled renderer (4): none is used again after it panicked
+    assert!(PANICS.load(std::sync::atomic::Ordering::SeqCst) <= 4, "renderer reused after a panic: {}", PANICS.load(std::sync::atomic::Ordering::SeqCst));
+
+    // 5. A frame the planner hands back as one CPU image (an adjustment layer over the clip from
+    //    frame 12) is rendered by the CPU without taking a pooled renderer: it counts as a
+    //    fallback, and the renderer's picture reaches only the frames before it.
+    crate::reset_frame_renderers_for_tests();
+    crate::register_frame_renderer(|| Some(Box::new(FakeRenderer) as Box<dyn FrameRenderer>));
+    let (p, seq, m) = project();
+    let mut p = Arc::unwrap_or_clone(p);
+    let r = FrameRate::FPS_24;
+    let adj = p.add_item("adj", Label::Iris, ItemKind::AdjustmentLayer { width: 320, height: 180, rate: r, duration: Tick(TICKS_PER_SECOND) }, None);
+    let over = p.make_track_item(adj, TrackKind::Video, r.tick_of(12), TimeRange::new(Tick::ZERO, r.tick_of(12)), r).unwrap();
+    let v2 = filmcraft_project::TrackId(p.alloc_id());
+    let q = p.sequence_mut(seq).unwrap();
+    q.video_tracks.push(filmcraft_project::Track::new(v2, TrackKind::Video, "Video 2".into()));
+    q.video_tracks[1].items.push(over);
+    let p = Arc::new(p);
+    let mk24 = |path: &String, gpu: crate::GpuRendering| {
+        let mut s = ExportSettings { format: Format::PngSequence, path: path.clone(), ..Default::default() };
+        s.range = Some(TimeRange::new(Tick::ZERO, r.tick_of(24)));
+        s.gpu_rendering = gpu;
+        export(&p, seq, &s, &m, &Progress::default()).unwrap()
+    };
+    mk24(&tmp("adj-off.png"), crate::GpuRendering::Off);
+    mk24(&tmp("adj-auto.png"), crate::GpuRendering::Auto);
+    let frame = |name: &str, f: &str| std::fs::read(tmp(&format!("{name}{f}.png"))).unwrap();
+    assert_ne!(frame("adj-off", "011"), frame("adj-auto", "011"), "a layered frame goes to the renderer");
+    for f in ["012", "023"] {
+        assert_eq!(frame("adj-off", f), frame("adj-auto", f), "frame {f}: an adjustment layer frame is the CPU's");
+    }
+    assert_eq!((gpu_render_stats().frames, gpu_render_stats().fallbacks), (12, 12), "{:?}", gpu_render_stats());
+    crate::reset_frame_renderers_for_tests();
+}
+
+static PANICS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct PanickingRenderer;
+
+impl FrameRenderer for PanickingRenderer {
+    fn render(
+        &mut self,
+        _project: &Project,
+        _seq: ItemId,
+        _t: Tick,
+        _opts: filmcraft_render::RenderOptions,
+        _sources: &dyn SourceProvider,
+    ) -> Option<filmcraft_render::Image> {
+        PANICS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        panic!("GPU renderer failure (test)");
+    }
+}
+
+struct FakeRenderer;
+
+impl FrameRenderer for FakeRenderer {
+    fn render(
+        &mut self,
+        _project: &Project,
+        _seq: ItemId,
+        _t: Tick,
+        _opts: filmcraft_render::RenderOptions,
+        _sources: &dyn SourceProvider,
+    ) -> Option<filmcraft_render::Image> {
+        Some(filmcraft_render::Image::new(320, 180))
     }
 }
