@@ -27,6 +27,23 @@ pub fn sanitize(path: Option<&Path>) {
     }
 }
 
+/// Whether `path` holds a window position from an earlier session, which eframe restores. Then
+/// `NativeOptions::centered` must be off: eframe applies it after restoring the saved geometry,
+/// so it moved the window back to the centre of the main monitor on every launch (#4826).
+pub fn has_saved_position(path: Option<&Path>) -> bool {
+    let Some(text) = path.and_then(|p| std::fs::read_to_string(p).ok()) else { return false };
+    saved_position(&text)
+}
+
+fn saved_position(text: &str) -> bool {
+    let Ok(kv) = ron::from_str::<std::collections::HashMap<String, String>>(text) else { return false };
+    let Some(window) = kv.get("window").and_then(|w| ron::from_str::<ron::Value>(w).ok()) else { return false };
+    // eframe restores the inner position on macOS and the outer position elsewhere
+    // (`egui_winit::WindowSettings::initialize_viewport_builder`).
+    let key = if cfg!(target_os = "macos") { "inner_position_pixels" } else { "outer_position_pixels" };
+    matches!(field(&window, key), Some(ron::Value::Option(Some(_))))
+}
+
 /// `Err` names the first value that would crash startup.
 fn check(text: &str) -> Result<(), String> {
     // eframe stores a map of key → RON string; a file that doesn't parse is ignored by eframe.
@@ -78,7 +95,7 @@ fn field<'a>(v: &'a ron::Value, name: &str) -> Option<&'a ron::Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::check;
+    use super::{check, saved_position};
 
     fn file(window: &str, zoom: &str) -> String {
         let egui = format!("(options:(zoom_factor:{zoom},max_passes:2),data:([(18446744073709551615,(ron:\"(x:1.0)\"))]))");
@@ -103,6 +120,21 @@ mod tests {
             let w = WINDOW.replace("(x:1100.0,y:760.0)", size);
             assert!(check(&file(&w, "1.0")).is_err(), "size {size}");
         }
+    }
+
+    #[test]
+    fn a_saved_window_position_is_detected() {
+        // #4826: the position from the report (Linux Mint, window moved to the third monitor).
+        let window = "(inner_position_pixels:Some((x:2048.0,y:1265.0)),outer_position_pixels:Some((x:2048.0,y:1228.0)),fullscreen:false,maximized:false,inner_size_points:Some((x:880.0,y:480.0)))";
+        assert!(saved_position(&file(window, "1.0")));
+        let no_position = "(inner_position_pixels:None,outer_position_pixels:None,fullscreen:false,maximized:false,inner_size_points:Some((x:880.0,y:480.0)))";
+        assert!(!saved_position(&file(no_position, "1.0")));
+        assert!(!saved_position(&format!("{{\"egui\":{:?}}}", "()")), "no window entry");
+        for text in ["", "not ron {{{", "{\"window\":\"(((\"}"] {
+            assert!(!saved_position(text), "{text:?}");
+        }
+        assert!(!super::has_saved_position(None));
+        assert!(!super::has_saved_position(Some(&std::env::temp_dir().join("photocraft-missing-ui.ron"))));
     }
 
     #[test]

@@ -59,13 +59,13 @@ pub struct SnapOptions {
     pub layers: bool,
     pub document: bool,
     pub selection: bool,
-    /// Grid spacing (document px) used when `grid` is on: the subdivision step.
-    pub grid_step: f64,
+    /// Grid subdivision spacing in document pixels, independently for x and y.
+    pub grid_step: [f64; 2],
 }
 
 impl Default for SnapOptions {
     fn default() -> Self {
-        Self { guides: true, grid: false, layers: true, document: true, selection: true, grid_step: 18.0 }
+        Self { guides: true, grid: false, layers: true, document: true, selection: true, grid_step: [18.0; 2] }
     }
 }
 
@@ -76,8 +76,8 @@ pub struct SnapTargets {
     pub x: Vec<Target>,
     /// Horizontal lines (y positions).
     pub y: Vec<Target>,
-    /// Regular grid step (document px), when snapping to the grid.
-    pub grid: Option<f64>,
+    /// Grid subdivision spacing on the x and y axes (document px).
+    pub grid: Option<[f64; 2]>,
     /// Extent used for grid lines and guides ([x0, y0, x1, y1]).
     pub extent: [f64; 4],
 }
@@ -89,10 +89,21 @@ pub fn layer_rect(doc: &Document, id: LayerId) -> Option<[f64; 4]> {
 }
 
 fn rect_of(doc: &Document, l: &photocraft_doc::Layer) -> Option<[f64; 4]> {
-    if l.is_group() || (matches!(l.content, LayerContent::Adjustment(_)) && l.mask.is_none()) {
-        return None;
-    }
-    let b = crate::transform_cmds::transform_bounds(doc, l);
+    snappable(l).then(|| crate::transform_cmds::transform_bounds(doc, l)).and_then(to_rect)
+}
+
+/// Bounds of a layer as a Snap To Layers target: all of its content, whatever the selection
+/// holds of it (#6290: clipped to the selection, every layer's edges and centre were the
+/// selection's, so a moved selection snapped back to where it started).
+fn target_rect_of(doc: &Document, l: &photocraft_doc::Layer) -> Option<[f64; 4]> {
+    snappable(l).then(|| crate::transform_cmds::whole_layer_bounds(doc, l)).and_then(to_rect)
+}
+
+fn snappable(l: &photocraft_doc::Layer) -> bool {
+    !(l.is_group() || (matches!(l.content, LayerContent::Adjustment(_)) && l.mask.is_none()))
+}
+
+fn to_rect(b: photocraft_geom::Rect) -> Option<[f64; 4]> {
     (!b.is_empty()).then_some([b.x0 as f64, b.y0 as f64, b.x1 as f64, b.y1 as f64])
 }
 
@@ -107,13 +118,13 @@ impl SnapTargets {
         }
         if opts.guides {
             for g in &doc.guides.vertical {
-                t.x.push(Target { pos: *g as f64, kind: SnapKind::Guide, span: (0.0, h) });
+                t.x.push(Target { pos: *g, kind: SnapKind::Guide, span: (0.0, h) });
             }
             for g in &doc.guides.horizontal {
-                t.y.push(Target { pos: *g as f64, kind: SnapKind::Guide, span: (0.0, w) });
+                t.y.push(Target { pos: *g, kind: SnapKind::Guide, span: (0.0, w) });
             }
         }
-        if opts.grid && opts.grid_step > 0.0 {
+        if opts.grid && opts.grid_step.iter().all(|step| step.is_finite() && *step > 0.0) {
             t.grid = Some(opts.grid_step);
         }
         if opts.layers {
@@ -121,7 +132,14 @@ impl SnapTargets {
                 if !l.visible || exclude.contains(&l.id) {
                     continue;
                 }
-                if let Some(r) = rect_of(doc, l) {
+                // An artboard is a group, but its edges and centre are the board's own.
+                if let Some(a) = l.artboard() {
+                    if let Some(r) = to_rect(a.rect) {
+                        t.add_rect(r, SnapKind::LayerEdge, SnapKind::LayerCenter);
+                    }
+                    continue;
+                }
+                if let Some(r) = target_rect_of(doc, l) {
                     t.add_rect(r, SnapKind::LayerEdge, SnapKind::LayerCenter);
                 }
             }
@@ -185,7 +203,8 @@ impl SnapTargets {
             }
         };
         list.iter().copied().for_each(&mut consider);
-        if let Some(step) = self.grid {
+        if let Some(steps) = self.grid {
+            let step = steps[usize::from(!vertical)];
             let g = (v / step).round() * step;
             let span = if vertical { (self.extent[1], self.extent[3]) } else { (self.extent[0], self.extent[2]) };
             consider(Target { pos: g, kind: SnapKind::Grid, span });
@@ -234,7 +253,12 @@ impl SnapTargets {
                 let list = if vertical { &self.x } else { &self.y };
                 let hit = list.iter().copied().filter(|t| (t.pos - moved).abs() < 1e-6).min_by_key(|t| u8::from(t.kind != SnapKind::Guide));
                 let hit = hit.or_else(|| {
-                    self.grid.filter(|s| ((moved / s).round() * s - moved).abs() < 1e-6).map(|_| Target { pos: moved, kind: SnapKind::Grid, span: other })
+                    self.grid
+                        .filter(|steps| {
+                            let step = steps[axis];
+                            ((moved / step).round() * step - moved).abs() < 1e-6
+                        })
+                        .map(|_| Target { pos: moved, kind: SnapKind::Grid, span: other })
                 });
                 if let Some(t) = hit {
                     lines.push(line(vertical, t, other.0, other.1));
@@ -297,9 +321,23 @@ mod tests {
 
     #[test]
     fn grid_snaps_to_nearest_line() {
-        let t = SnapTargets { grid: Some(25.0), extent: [0.0, 0.0, 100.0, 100.0], ..Default::default() };
+        let t = SnapTargets { grid: Some([25.0; 2]), extent: [0.0, 0.0, 100.0, 100.0], ..Default::default() };
         assert_eq!(t.snap_point([48.0, 61.0], 3.0).0, [50.0, 61.0]);
         assert_eq!(t.nearest(false, 74.0, 3.0).unwrap().kind, SnapKind::Grid);
+    }
+
+    #[test]
+    fn rectangular_grid_snaps_independently_on_both_axes() {
+        // A 1280×720 document, 20% major spacing and two subdivisions:
+        // vertical lines every 128 px, horizontal lines every 72 px.
+        let t = SnapTargets { grid: Some([128.0, 72.0]), extent: [0.0, 0.0, 1280.0, 720.0], ..Default::default() };
+        assert_eq!(t.snap_point([127.0, 71.0], 2.0).0, [128.0, 72.0]);
+        assert_eq!(t.nearest(true, 255.0, 2.0).map(|t| t.pos), Some(256.0));
+        assert_eq!(t.nearest(false, 143.0, 2.0).map(|t| t.pos), Some(144.0));
+        let (delta, lines) = t.snap_rect([126.0, 70.0, 160.0, 100.0], 3.0);
+        assert_eq!(delta, [2.0, 2.0]);
+        assert!(lines.iter().any(|l| l.vertical && l.pos == 128.0 && l.kind == SnapKind::Grid));
+        assert!(lines.iter().any(|l| !l.vertical && l.pos == 72.0 && l.kind == SnapKind::Grid));
     }
 
     #[test]
@@ -345,6 +383,42 @@ mod tests {
         let t = SnapTargets::from_document(&doc, &SnapOptions { guides: false, ..opts }, &[id]);
         assert!(!t.x.iter().any(|t| t.kind == SnapKind::Guide || (t.kind == SnapKind::LayerEdge && t.pos == 30.0)));
         assert_eq!(layer_rect(&doc, id), Some([10.0, 20.0, 30.0, 60.0]));
+        // #6290: a selection doesn't move the layers' targets onto its own bounds.
+        let mut sel = photocraft_raster::Surface::new(photocraft_color::PixelFormat::GRAY8);
+        sel.fill_rect(photocraft_geom::Rect::new(64, 66, 124, 86), &[1.0]);
+        doc.selection = Some(sel);
+        let t = SnapTargets::from_document(&doc, &SnapOptions { selection: false, ..opts }, &[]);
+        assert!(t.x.iter().any(|t| t.kind == SnapKind::LayerEdge && t.pos == 30.0));
+        assert!(
+            !t.x.iter()
+                .chain(&t.y)
+                .any(|t| matches!(t.kind, SnapKind::LayerEdge | SnapKind::LayerCenter) && [64.0, 66.0, 76.0, 86.0, 94.0, 124.0].contains(&t.pos))
+        );
         assert_eq!(union([[0.0, 0.0, 1.0, 1.0], [2.0, -1.0, 3.0, 0.5]]), Some([0.0, -1.0, 3.0, 1.0]));
+    }
+
+    /// An artboard (a group) offers the board's own edges and centre, so other layers, boards and
+    /// tools can snap to it; the board being moved doesn't snap to itself.
+    #[test]
+    fn an_artboard_offers_its_own_edges() {
+        let mut doc = Document::with_background("s", Size::new(200, 100), ColorMode::Rgb, SampleType::U8, Color::WHITE);
+        let mut board = Layer::group("Artboard 1", vec![]);
+        if let photocraft_doc::LayerContent::Group(g) = &mut board.content {
+            g.artboard =
+                Some(photocraft_doc::Artboard { rect: photocraft_geom::Rect::new(20, 10, 120, 90), background: Default::default(), preset: String::new() });
+        }
+        let id = doc.insert_above(None, board);
+        let opts = SnapOptions::default();
+        let t = SnapTargets::from_document(&doc, &opts, &[]);
+        let has = |ts: &[Target], kind: SnapKind, pos: f64| ts.iter().any(|t| t.kind == kind && t.pos == pos);
+        for x in [20.0, 120.0] {
+            assert!(has(&t.x, SnapKind::LayerEdge, x), "x = {x}");
+        }
+        for y in [10.0, 90.0] {
+            assert!(has(&t.y, SnapKind::LayerEdge, y), "y = {y}");
+        }
+        assert!(has(&t.x, SnapKind::LayerCenter, 70.0) && has(&t.y, SnapKind::LayerCenter, 50.0));
+        let t = SnapTargets::from_document(&doc, &opts, &[id]);
+        assert!(!has(&t.x, SnapKind::LayerEdge, 120.0) && !has(&t.x, SnapKind::LayerCenter, 70.0));
     }
 }

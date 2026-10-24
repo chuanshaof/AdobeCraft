@@ -1,9 +1,10 @@
 //! Rotate View tool: turn the canvas camera around its centre without rewriting pixels.
 //!
-//! Drag around the view centre (clockwise increases the angle). Shift snaps to 15°. Reset View,
+//! Drag around the view centre: the image follows the pointer (clockwise increases the angle, or
+//! decreases it in a flipped view). Shift snaps to 15°. Reset View,
 //! Escape, a double-click, or the on-canvas compass put the angle back to 0. History is not
 //! recorded. Trackpad rotate is gated by Preferences › Enhanced Controls › Rotate View with
-//! Trackpad.
+//! Trackpad; a two-finger twist on a touch screen also needs Enable Gestures (#204).
 
 use egui::{Align2, Pos2, Rect, Stroke, pos2, vec2};
 use serde_json::{Value, json};
@@ -59,6 +60,14 @@ pub fn snap_deg(a: f32, step: f32) -> f32 {
     wrap_deg((a / step).round() * step)
 }
 
+/// Turn a pointer or trackpad angle change (screen degrees, clockwise positive) into a change of
+/// `View::rotation`. [`ViewXform::to_screen`] mirrors x after rotating, so in a flipped view a
+/// larger angle turns the image the other way on screen; negating keeps it under the pointer.
+pub fn screen_delta(delta: f32, flip: bool) -> f32 {
+    let d = wrap_deg(delta);
+    if flip { wrap_deg(-d) } else { d }
+}
+
 /// Pointer angle in degrees around `pivot` (Y-down, so clockwise is positive).
 pub fn pointer_deg(p: Pos2, pivot: Pos2) -> f32 {
     let d = p - pivot;
@@ -71,7 +80,11 @@ pub fn pointer_deg(p: Pos2, pivot: Pos2) -> f32 {
 fn finite_number(p: &Value, key: &str) -> Result<Option<f32>, String> {
     match p.get(key) {
         None => Ok(None),
-        Some(v) => v.as_f64().filter(|n| n.is_finite()).map(|n| Some(n as f32)).ok_or_else(|| format!("{key} must be a finite number")),
+        Some(v) => v
+            .as_f64()
+            .filter(|n| n.is_finite() && n.abs() <= f64::from(f32::MAX))
+            .map(|n| Some(n as f32))
+            .ok_or_else(|| format!("{key} must be a finite number representable as f32")),
     }
 }
 
@@ -124,7 +137,9 @@ pub fn apply_trackpad(current: f32, enabled: bool, delta_rad: f32) -> Option<f32
 }
 
 /// This frame's trackpad rotation in degrees, if the preference is on and egui reported a delta.
-pub fn trackpad_delta(ctx: &egui::Context, enabled: bool) -> Option<f32> {
+/// The trackpad's own `Rotate` events always count; a touch screen's two-finger twist (egui's
+/// multi-touch rotation) only while `touch_gestures` (Enhanced Controls › Enable Gestures) is on.
+pub fn trackpad_delta(ctx: &egui::Context, enabled: bool, touch_gestures: bool) -> Option<f32> {
     if !enabled {
         return None;
     }
@@ -137,7 +152,13 @@ pub fn trackpad_delta(ctx: &egui::Context, enabled: bool) -> Option<f32> {
                 _ => None,
             })
             .sum();
-        if from_events != 0.0 { from_events } else { i.rotation_delta() }
+        if from_events != 0.0 {
+            from_events
+        } else if touch_gestures {
+            i.rotation_delta()
+        } else {
+            0.0
+        }
     });
     apply_trackpad(0.0, true, rad).filter(|_| rad != 0.0)
 }
@@ -176,7 +197,7 @@ pub fn drag(ctx: &egui::Context, view: &mut View, xf: &ViewXform, b: &Buttons, p
         return b.started || b.dragged || b.stopped;
     };
     if let Some(p) = pointer.filter(|_| b.dragged || b.stopped) {
-        let delta = wrap_deg(pointer_deg(p, z.pivot) - z.start_pointer);
+        let delta = screen_delta(pointer_deg(p, z.pivot) - z.start_pointer, xf.flip);
         let mut angle = z.start_rotation + delta;
         if !angle.is_finite() {
             angle = z.start_rotation;
@@ -294,10 +315,60 @@ mod tests {
         assert!(apply_params(0.0, &json!({"angle": f64::NAN})).is_err());
         assert!(apply_params(0.0, &json!({"angle": f64::INFINITY})).is_err());
         assert!(apply_params(0.0, &json!({"delta": f64::INFINITY})).is_err());
+        // JSON can contain finite f64 values whose f32 conversion overflows to infinity.
+        // Silently wrapping infinity to 0 would reset a rotated view.
+        assert!(apply_params(32.0, &json!({"angle": 1.0e100})).is_err());
+        assert!(apply_params(32.0, &json!({"delta": -1.0e100})).is_err());
         assert!(apply_params(0.0, &json!({"reset": "yes"})).is_err());
         assert!(apply_params(0.0, &json!({"zoom": 1})).is_err());
         let huge = apply_params(0.0, &json!({"angle": 1.0e20})).unwrap();
         assert!(huge.is_finite() && huge.abs() <= 180.0);
+    }
+
+    #[test]
+    fn native_rotate_event_reaches_canvas_when_trackpad_rotation_is_enabled() {
+        let ctx = egui::Context::default();
+        let mut enabled = None;
+        let mut disabled = None;
+        let raw = egui::RawInput { events: vec![Event::Rotate(std::f32::consts::FRAC_PI_6)], ..Default::default() };
+        let mut output = ctx.run_ui(raw, |ui| {
+            enabled = trackpad_delta(ui.ctx(), true, true);
+            disabled = trackpad_delta(ui.ctx(), false, true);
+        });
+        output.textures_delta.clear();
+
+        assert!(enabled.is_some_and(|degrees| (degrees - 30.0).abs() < 1e-3), "{enabled:?}");
+        assert_eq!(disabled, None);
+    }
+
+    /// Preferences › Enhanced Controls › Enable Gestures (#204): off, a two-finger twist on a
+    /// touch screen doesn't turn the view; the trackpad's `Rotate` event still does.
+    #[test]
+    fn enable_gestures_switches_touch_screen_rotation() {
+        use egui::TouchPhase::{Move, Start};
+        let touch = |id: u64, phase, pos| Event::Touch { device_id: egui::TouchDeviceId(1), id: egui::TouchId(id), phase, pos, force: None };
+        let twist = |touch_gestures: bool, extra: Vec<Event>| {
+            let ctx = egui::Context::default();
+            let frames = [
+                // egui only starts a multi-touch gesture once it knows where the pointer is.
+                vec![Event::PointerMoved(pos2(50.0, 50.0))],
+                vec![touch(1, Start, pos2(40.0, 50.0)), touch(2, Start, pos2(60.0, 50.0))],
+                // A quarter turn about the centre between the fingers.
+                [vec![touch(1, Move, pos2(50.0, 40.0)), touch(2, Move, pos2(50.0, 60.0))], extra].concat(),
+            ];
+            let mut last = None;
+            for (n, events) in (0u32..).zip(frames) {
+                let raw = egui::RawInput { time: Some(f64::from(n) / 60.0), events, ..Default::default() };
+                let mut out = ctx.run_ui(raw, |ui| last = trackpad_delta(ui.ctx(), true, touch_gestures));
+                out.textures_delta.clear();
+            }
+            last
+        };
+        let on = twist(true, Vec::new());
+        assert!(on.is_some_and(|d| (d.abs() - 90.0).abs() < 1e-3), "on: the fingers turn the view: {on:?}");
+        assert_eq!(twist(false, Vec::new()), None, "off: the fingers don't");
+        let trackpad = twist(false, vec![Event::Rotate(std::f32::consts::FRAC_PI_6)]);
+        assert!(trackpad.is_some_and(|d| (d - 30.0).abs() < 1e-3), "off: a trackpad rotate still turns: {trackpad:?}");
     }
 
     #[test]
@@ -316,7 +387,7 @@ mod tests {
             for center in [[0.0, 0.0], [320.0, 240.0], [10.0, -4.0]] {
                 for flip in [false, true] {
                     let rect = Rect::from_min_size(pos2(100.0, 50.0), vec2(800.0, 600.0));
-                    let a = ViewXform { rect, zoom, center, flip, rotation: 0.0 };
+                    let a = ViewXform { rect, zoom, center, flip, rotation: 0.0, aspect: 1.0 };
                     let sx = if flip { -1.0 } else { 1.0 };
                     let want = rect.center() + vec2((10.0 - center[0]) * zoom * sx, (20.0 - center[1]) * zoom);
                     let got = a.to_screen(10.0, 20.0);
@@ -331,23 +402,66 @@ mod tests {
         let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 300.0));
         for rot in [15.0, 90.0, -45.0, 180.0] {
             for flip in [false, true] {
-                let xf = ViewXform { rect, zoom: 2.0, center: [80.0, 40.0], flip, rotation: rot };
+                let xf = ViewXform { rect, zoom: 2.0, center: [80.0, 40.0], flip, rotation: rot, aspect: 1.0 };
                 let s = xf.to_screen(10.0, 20.0);
                 let d = xf.to_doc(s);
                 assert!((d[0] - 10.0).abs() < 1e-3 && (d[1] - 20.0).abs() < 1e-3, "rot={rot} flip={flip} {d:?}");
             }
         }
         // 90°: a point on +X in document space lands on +Y on screen (Y-down = clockwise).
-        let xf = ViewXform { rect, zoom: 1.0, center: [0.0, 0.0], flip: false, rotation: 90.0 };
+        let xf = ViewXform { rect, zoom: 1.0, center: [0.0, 0.0], flip: false, rotation: 90.0, aspect: 1.0 };
         let s = xf.to_screen(1.0, 0.0);
         let c = rect.center();
         assert!((s.x - c.x).abs() < 1e-3 && (s.y - (c.y + 1.0)).abs() < 1e-3, "{s:?} vs {c:?}");
         // Flip after rotate: 0° +X goes left.
-        let xf = ViewXform { rect, zoom: 1.0, center: [0.0, 0.0], flip: true, rotation: 0.0 };
+        let xf = ViewXform { rect, zoom: 1.0, center: [0.0, 0.0], flip: true, rotation: 0.0, aspect: 1.0 };
         assert!(xf.to_screen(1.0, 0.0).x < rect.center().x);
-        let xf = ViewXform { rect, zoom: 1.0, center: [0.0, 0.0], flip: true, rotation: 90.0 };
+        let xf = ViewXform { rect, zoom: 1.0, center: [0.0, 0.0], flip: true, rotation: 90.0, aspect: 1.0 };
         let s = xf.to_screen(1.0, 0.0);
         assert!((s.x - c.x).abs() < 1e-3 && (s.y - (c.y + 1.0)).abs() < 1e-3, "flip then rotate {s:?}");
+    }
+
+    /// Screen angle, about the canvas centre, of the document point that was under `p0` at the press.
+    fn followed_angle(h: &Harness<'static, PhotocraftApp>, p0: Pos2, start_rotation: f32) -> f32 {
+        let st = h.state();
+        let (rect, v, flip) = (st.last_canvas_rect, &st.ui.views[0], st.ui.view.flip_horizontal);
+        let before = ViewXform { rect, zoom: 1.0, center: v.center, flip, rotation: start_rotation, aspect: 1.0 };
+        let d = before.to_doc(p0);
+        let after = ViewXform { rotation: v.rotation, ..before };
+        let s = after.to_screen(d[0] as f32, d[1] as f32) - rect.center();
+        wrap_deg(s.y.atan2(s.x).to_degrees() - pointer_deg(p0, rect.center()))
+    }
+
+    #[test]
+    fn drag_follows_the_pointer_in_a_flipped_view() {
+        for flip in [false, true] {
+            let mut h = harness();
+            h.state_mut().ui.view.flip_horizontal = flip;
+            h.run_steps(2);
+            let c = h.state().last_canvas_rect.center();
+            let p0 = c + vec2(120.0, 0.0);
+            h.event(Event::PointerMoved(p0));
+            h.step();
+            press(&mut h, p0, true, false);
+            // 30° clockwise about the pivot: the image turns 30° clockwise on screen.
+            let p1 = c + vec2(120.0 * 30f32.to_radians().cos(), 120.0 * 30f32.to_radians().sin());
+            h.event(Event::PointerMoved(p1));
+            h.step();
+            let got = followed_angle(&h, p0, 0.0);
+            assert!((got - 30.0).abs() < 0.75, "flip={flip}: the image turned {got}°, the pointer 30°");
+            press(&mut h, p1, false, false);
+        }
+    }
+
+    #[test]
+    fn screen_delta_mirrors_only_in_a_flipped_view() {
+        assert_eq!(screen_delta(12.5, false), 12.5);
+        assert_eq!(screen_delta(12.5, true), -12.5);
+        assert_eq!(screen_delta(-180.0, true), 180.0);
+        assert_eq!(screen_delta(f32::NAN, true), 0.0);
+        assert_eq!(screen_delta(f32::INFINITY, false), 0.0);
+        // A flipped view still lands on the snapped angle with Shift.
+        assert_eq!(snap_deg(0.0 + screen_delta(-40.0, true), SNAP_DEG), 45.0);
     }
 
     fn app_docs(n: usize) -> PhotocraftApp {
@@ -509,7 +623,8 @@ mod tests {
         let b = st.doc.selection.as_ref().and_then(|s| photocraft_compose::bounds::content_bounds(s).into()).expect("selection");
         // Axis-aligned in the file: the outline is drawn rotated via ViewXform.
         assert!(b.width() >= 40 && b.height() >= 10, "{b:?}");
-        let xf = ViewXform { rect: Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0)), zoom: 1.0, center: [100.0, 50.0], flip: false, rotation: 30.0 };
+        let xf =
+            ViewXform { rect: Rect::from_min_size(Pos2::ZERO, vec2(400.0, 300.0)), zoom: 1.0, center: [100.0, 50.0], flip: false, rotation: 30.0, aspect: 1.0 };
         let a = xf.to_screen(10.0, 20.0);
         let c = xf.to_screen(50.0, 20.0);
         let v = c - a;
@@ -521,8 +636,8 @@ mod tests {
     #[test]
     fn gpu_path_stays_on_with_rotation() {
         // Flip is the only CPU-blit fallback; rotation is a shader uniform.
-        assert!(crate::gpu_canvas::gpu_view_ok(false, 45.0));
-        assert!(!crate::gpu_canvas::gpu_view_ok(true, 45.0));
-        assert!(crate::gpu_canvas::gpu_view_ok(false, 0.0));
+        assert!(crate::gpu_canvas::gpu_view_ok(false, 45.0, 1.0));
+        assert!(!crate::gpu_canvas::gpu_view_ok(true, 45.0, 1.0));
+        assert!(crate::gpu_canvas::gpu_view_ok(false, 0.0, 1.0));
     }
 }

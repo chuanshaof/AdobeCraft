@@ -8,6 +8,7 @@
 //! blobs/<blake3>.zst       content-addressed binary data (ICC, EXIF, PSD blocks, smart objects)
 //! thumb.png                optional thumbnail (caller-rendered)
 //! composite/preview.png    optional flattened preview (caller-rendered)
+//! save.lock                directory bundles only: held while a save runs (empty)
 //! ```
 //!
 //! A bundle is either a ZIP archive (STORE entries) or a directory with the
@@ -15,7 +16,9 @@
 //! already compressed/wrote, so only new tiles are encoded. Directory saves
 //! verify existing content-addressed objects once per writer and folder,
 //! rechecking files whose size or modification time changes; they replace
-//! damaged or missing objects and garbage-collect unreferenced ones.
+//! damaged or missing objects and garbage-collect unreferenced ones. A directory
+//! save holds an OS file lock on `save.lock` throughout, so two writers (or two
+//! processes) saving one bundle take turns instead of removing each other's objects.
 //!
 //! This crate sits at L3 next to the compositor, so it does not render.
 //! Callers pass previews in [`SaveOptions`]; `photocraft-io` does that.
@@ -37,14 +40,14 @@ use std::path::Path;
 use photocraft_doc::Document;
 use photocraft_raster::Rgba8Image;
 
-pub use atomic::atomic_write;
+pub use atomic::{atomic_write, atomic_write_progress};
 #[cfg(not(target_arch = "wasm32"))]
 pub use autosave::RecoveryStore;
 pub use autosave::{Autosaver, RecoveryEntry, discard_recovery, list_recovery, recover};
 pub use convert::MAX_GROUP_DEPTH;
 pub use manifest::{FORMAT_VERSION, Manifest};
 pub use read::read_file;
-pub use store::{DEFAULT_REVERIFY_BUDGET, PcraftWriter, SaveStats};
+pub use store::{ByteSource, DEFAULT_REVERIFY_BUDGET, PcraftWriter, SaveStats, read_entry};
 
 /// File extension of the native format.
 pub const EXTENSION: &str = "pcraft";
@@ -95,11 +98,35 @@ pub struct LoadOptions {
     /// Keep document and layer ids from the file (the id counter is advanced
     /// past them). When `false`, fresh ids are assigned.
     pub preserve_ids: bool,
+    /// Longest canvas side the manifest may declare (Photoshop's PSB limit, as for PSD and
+    /// `file.new`).
+    pub max_canvas_side: u32,
+    /// Most canvas pixels the manifest may declare. A canvas is a few bytes of JSON, but the
+    /// compositor, thumbnails and display textures work in proportion to its area, so a caller
+    /// handling untrusted files (a previewer, a batch job) may lower it. The default admits every
+    /// canvas the app lets a user create.
+    pub max_canvas_pixels: u64,
 }
+
+/// Default [`LoadOptions::max_canvas_side`].
+pub const MAX_CANVAS_SIDE: u32 = 300_000;
+/// Default [`LoadOptions::max_canvas_pixels`]: the full 300000 × 300000 PSB canvas. `file.new`,
+/// Canvas Size, Image Size (Resample off) and PSB import all reach it, and a document that can be
+/// created and saved must reopen. Loading itself stays proportional to the file: layers, masks
+/// and channels are sparse tiles read from the bundle under the byte budgets, so a huge declared
+/// canvas with no content allocates nothing for its area.
+pub const MAX_CANVAS_PIXELS: u64 = MAX_CANVAS_SIDE as u64 * MAX_CANVAS_SIDE as u64;
 
 impl Default for LoadOptions {
     fn default() -> Self {
-        LoadOptions { max_manifest_bytes: 256 << 20, max_blob_bytes: 1 << 30, max_total_bytes: 16 << 30, preserve_ids: true }
+        LoadOptions {
+            max_manifest_bytes: 256 << 20,
+            max_blob_bytes: 1 << 30,
+            max_total_bytes: 16 << 30,
+            preserve_ids: true,
+            max_canvas_side: MAX_CANVAS_SIDE,
+            max_canvas_pixels: MAX_CANVAS_PIXELS,
+        }
     }
 }
 
@@ -140,6 +167,12 @@ pub fn load_path(path: &Path) -> Result<Document> {
     load_path_with(path, &LoadOptions::default())
 }
 
+/// Load from any byte source — a directory behind a capability handle, an archive, a test
+/// fixture — the same migration and limits as the path loads.
+pub fn load_bytes_source(src: &dyn ByteSource, opts: &LoadOptions) -> Result<Document> {
+    store::load(src, opts)
+}
+
 pub fn load_path_with(path: &Path, opts: &LoadOptions) -> Result<Document> {
     if path.is_dir() {
         store::load(&store::DirSource { root: path.to_path_buf() }, opts)
@@ -160,7 +193,7 @@ pub fn read_thumbnail(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
     let src = store::ZipSource::new(bytes)?;
     let m = store::read_manifest(&src, &LoadOptions::default())?;
     match m.thumbnail {
-        Some(p) => Ok(Some(store::Source::get(&src, &p, 64 << 20)?)),
+        Some(p) => Ok(Some(src.get(&p, 64 << 20)?)),
         None => Ok(None),
     }
 }

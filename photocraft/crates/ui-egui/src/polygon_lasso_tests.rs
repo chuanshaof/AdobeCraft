@@ -49,6 +49,7 @@ fn screen(h: &Harness<'static, PhotocraftApp>, x: f32, y: f32) -> Pos2 {
         center: v.center,
         flip: app.ui.view.flip_horizontal,
         rotation: v.rotation,
+        aspect: app.ui.view.display_aspect(),
     };
     xf.to_screen(x, y)
 }
@@ -82,6 +83,32 @@ fn near(r: Rect, x0: i32, y0: i32, x1: i32, y1: i32) -> bool {
 }
 
 #[test]
+fn switching_tools_discards_unfinished_polygon_without_changing_selection() {
+    let mut app = polygon_app();
+    app.run("select.rect", json!({"x": 200, "y": 150, "width": 50, "height": 50})).unwrap();
+    let before = app.session.active().unwrap().doc.selection.as_ref().unwrap().content_bounds();
+    let history = app.session.active().unwrap().history.past_len();
+
+    ev(&mut app, "down", 20.0, 20.0, Modifiers::NONE);
+    ev(&mut app, "up", 20.0, 20.0, Modifiers::NONE);
+    assert_eq!(app.ui.polygon.len(), 1);
+    assert_eq!(app.ui.polygon_mode, "replace");
+    assert!(crate::canvas::polygon_replaces_selection(&app));
+
+    app.ui.tool = Tool::QuickSelection;
+    app.sync_views();
+    assert!(app.ui.polygon.is_empty());
+    assert!(app.ui.polygon_mode.is_empty());
+    assert!(!crate::canvas::polygon_replaces_selection(&app));
+    assert_eq!(app.session.active().unwrap().doc.selection.as_ref().unwrap().content_bounds(), before);
+    assert_eq!(app.session.active().unwrap().history.past_len(), history);
+
+    app.ui.tool = Tool::PolygonLasso;
+    app.sync_views();
+    assert!(app.ui.polygon.is_empty(), "returning to the tool must start a fresh outline");
+}
+
+#[test]
 fn double_click_closes_the_polygon_at_the_last_point() {
     let mut h = harness();
     click(&mut h, 50.0, 50.0, Modifiers::NONE);
@@ -109,6 +136,45 @@ fn double_click_closes_the_polygon_after_quickly_placed_vertices() {
     double_click(&mut h, 150.0, 150.0);
     assert!(h.state().ui.polygon.is_empty(), "{:?}", h.state().ui.polygon);
     assert!(selection(&h).is_some_and(|r| near(r, 50, 50, 150, 150)), "{:?}", selection(&h));
+}
+
+/// The Lasso's ⌥ (straight-segment) mode could not draw a segment shorter than the radius for
+/// grabbing the first vertex: the click that should have placed the next vertex counted as the
+/// last one clicked again and closed the outline, so a small outline could not be traced at all
+/// (#7629). Clicking the same point again still closes it, within a jitter of where it is.
+#[test]
+fn a_short_alt_lasso_segment_places_a_vertex_instead_of_closing() {
+    let mut app = polygon_app();
+    app.ui.tool = Tool::Lasso;
+    let alt = Modifiers::ALT;
+    let click = |app: &mut PhotocraftApp, x: f64, y: f64| {
+        ev(app, "down", x, y, alt);
+        ev(app, "up", x, y, alt);
+    };
+    for (x, y) in [(50.0, 50.0), (90.0, 50.0), (90.0, 90.0)] {
+        click(&mut app, x, y);
+    }
+    // 5 document units from the last vertex, inside the 8-unit reach at 100 %.
+    click(&mut app, 85.0, 91.0);
+    let points = app.drag.as_ref().map(|d| d.points.len());
+    assert_eq!(points, Some(4), "the short segment placed a vertex: {:?}", app.drag.as_ref().map(|d| d.points.clone()));
+    assert!(app.session.active().unwrap().doc.selection.is_none(), "and the outline is still being drawn");
+
+    // Clicking the last vertex again, within a jitter of it, still closes the outline.
+    click(&mut app, 86.0, 92.0);
+    assert!(app.drag.is_none(), "the same point clicked again closes it");
+    let r = app.session.active().unwrap().doc.selection.as_ref().map(|s| s.content_bounds());
+    assert!(r.is_some_and(|r| near(r, 50, 50, 90, 91)), "{r:?}");
+
+    // And so does a click on the first vertex, which is a grab rather than a repeat.
+    let mut app = polygon_app();
+    app.ui.tool = Tool::Lasso;
+    for (x, y) in [(50.0, 50.0), (90.0, 50.0), (90.0, 90.0), (85.0, 91.0)] {
+        click(&mut app, x, y);
+    }
+    click(&mut app, 54.0, 53.0);
+    assert!(app.drag.is_none(), "the first vertex closes it from a few points away");
+    assert!(app.session.active().unwrap().doc.selection.is_some());
 }
 
 /// Double-clicking on the first vertex: the first click closes the polygon, and the second must
@@ -343,4 +409,133 @@ fn alt_drags_draw_freehand_and_releasing_alt_keeps_the_polygon_open() {
     assert!(!app.ui.polygon.is_empty() && app.session.active().unwrap().doc.selection.is_none());
     crate::canvas::commit_polygon(&mut app);
     assert!(app.session.active().unwrap().doc.selection.as_ref().unwrap().sample_channel(110, 100, 0) > 0.5);
+}
+
+#[test]
+fn shift_constrains_polygonal_lasso_segments_but_unmodified_clicks_remain_free() {
+    let mut app = polygon_app();
+    ev(&mut app, "down", 100.0, 100.0, Modifiers::NONE);
+    ev(&mut app, "up", 100.0, 100.0, Modifiers::NONE);
+    assert_eq!(app.ui.polygon, vec![[100.0, 100.0]]);
+
+    // Near a diagonal: Shift constrains to exactly 45° from the previous fixed point.
+    ev(&mut app, "down", 140.0, 120.0, Modifiers::SHIFT);
+    ev(&mut app, "up", 140.0, 120.0, Modifiers::SHIFT);
+    let diagonal = app.ui.polygon[1];
+    assert!((diagonal[0] - diagonal[1]).abs() < 1e-8, "45-degree direction: {diagonal:?}");
+    assert!((diagonal[0] - 100.0 - 40.0_f64.hypot(20.0) / 2.0_f64.sqrt()).abs() < 1e-8);
+    // Releasing Shift restores free placement rather than constraining subsequent points.
+    ev(&mut app, "down", 155.0, 175.0, Modifiers::NONE);
+    ev(&mut app, "up", 155.0, 175.0, Modifiers::NONE);
+    assert_eq!(app.ui.polygon[2], [155.0, 175.0]);
+}
+
+#[test]
+fn shift_polygonal_lasso_snap_has_all_eight_directions_and_handles_zero_length() {
+    let origin = [200.0, 150.0];
+    let directions = [[40.0, 1.0], [40.0, 25.0], [1.0, 40.0], [-40.0, 25.0], [-40.0, -1.0], [-40.0, -25.0], [-1.0, -40.0], [40.0, -25.0]];
+    for delta in directions {
+        let end = crate::canvas::constrained_polygon_point(origin, [origin[0] + delta[0], origin[1] + delta[1]]);
+        let dx = end[0] - origin[0];
+        let dy = end[1] - origin[1];
+        let angle = dy.atan2(dx) / std::f64::consts::FRAC_PI_4;
+        assert!((angle - angle.round()).abs() < 1e-9, "{delta:?} → {end:?}");
+        assert!((dx.hypot(dy) - delta[0].hypot(delta[1])).abs() < 1e-8);
+    }
+    assert_eq!(crate::canvas::constrained_polygon_point(origin, origin), origin);
+}
+
+/// Two vertices placed with the Polygonal Lasso, well apart in time so they aren't a double-click.
+fn two_vertices(h: &mut Harness<'static, PhotocraftApp>) {
+    click(h, 50.0, 50.0, Modifiers::NONE);
+    h.run_steps(30);
+    click(h, 150.0, 50.0, Modifiers::NONE);
+    h.run_steps(30);
+    assert_eq!(h.state().ui.polygon.len(), 2);
+}
+
+/// The polygon, its mode and its document are all gone, and the selection it would have replaced
+/// is shown again.
+fn assert_polygon_dropped(h: &Harness<'static, PhotocraftApp>, what: &str) {
+    let app = h.state();
+    assert!(app.ui.polygon.is_empty(), "{what}: the outline is gone: {:?}", app.ui.polygon);
+    assert!(app.ui.polygon_mode.is_empty(), "{what}: the mode is gone");
+    assert!(app.ui.polygon_doc.is_none(), "{what}: the document is forgotten");
+    assert!(!crate::canvas::polygon_replaces_selection(app), "{what}: the old outline is shown again");
+}
+
+/// Every other tool drops the polygon in progress, not just the Quick Selection tool, and coming
+/// back to the Polygonal Lasso starts a new one.
+#[test]
+fn every_other_tool_drops_the_polygon_in_progress() {
+    let tools = [
+        Tool::QuickSelection,
+        Tool::ObjectSelection,
+        Tool::MagicWand,
+        Tool::RectMarquee,
+        Tool::EllipseMarquee,
+        Tool::Lasso,
+        Tool::MagneticLasso,
+        Tool::Move,
+        Tool::Brush,
+    ];
+    for tool in tools {
+        let mut h = harness();
+        h.state_mut().run("select.rect", json!({"x": 200, "y": 150, "width": 100, "height": 100})).unwrap();
+        h.run_steps(1);
+        let before = steps(&h);
+        two_vertices(&mut h);
+        assert!(crate::canvas::polygon_replaces_selection(h.state()), "{tool:?}: the old outline is hidden while drawing");
+        h.state_mut().ui.tool = tool;
+        h.state_mut().sync_views();
+        assert_polygon_dropped(&h, &format!("{tool:?}"));
+        assert!(selection(&h).is_some_and(|r| near(r, 200, 150, 300, 250)), "{tool:?}: {:?}", selection(&h));
+        assert_eq!(steps(&h), before, "{tool:?}: nothing was recorded");
+        h.state_mut().ui.tool = Tool::PolygonLasso;
+        h.state_mut().sync_views();
+        assert!(h.state().ui.polygon.is_empty(), "{tool:?}: coming back starts a new polygon");
+    }
+}
+
+/// The polygon belongs to the document it was started on: another document becoming active drops
+/// it, while the tool stays the Polygonal Lasso (its outline would otherwise show on the other
+/// document).
+#[test]
+fn switching_documents_drops_the_polygon_in_progress() {
+    let mut h = harness();
+    two_vertices(&mut h);
+    let first = h.state().session.active().map(|st| st.doc.id);
+    assert!(first.is_some());
+    assert_eq!(h.state().ui.polygon_doc, first, "the polygon remembers its document");
+    h.state_mut().run("file.new", json!({"width": 200, "height": 100})).unwrap();
+    assert_ne!(h.state().session.active().map(|st| st.doc.id), first, "another document is active");
+    assert_polygon_dropped(&h, "new document");
+    assert_eq!(h.state().ui.tool, Tool::PolygonLasso, "the tool stays");
+    // Back on the first document, nothing is left of it.
+    h.state_mut().run("document.activate", json!({"document": 0})).unwrap();
+    h.state_mut().sync_views();
+    assert!(h.state().ui.polygon.is_empty());
+}
+
+/// A held temporary tool (Space is the Hand, ⌘ the Move tool) doesn't change the selected tool, so
+/// the polygon being drawn stays.
+#[test]
+fn a_held_temporary_tool_keeps_the_polygon() {
+    let mut h = harness();
+    two_vertices(&mut h);
+    h.event(egui::Event::Key { key: egui::Key::Space, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE });
+    h.run_steps(3);
+    h.state_mut().sync_views();
+    assert_eq!(h.state().ui.tool, Tool::PolygonLasso);
+    assert_eq!(h.state().ui.polygon.len(), 2, "Space held");
+    h.event(egui::Event::Key { key: egui::Key::Space, physical_key: None, pressed: false, repeat: false, modifiers: Modifiers::NONE });
+    h.run_steps(3);
+    h.event(egui::Event::ModifiersChanged(Modifiers::COMMAND));
+    h.run_steps(3);
+    h.state_mut().sync_views();
+    assert_eq!(h.state().ui.tool, Tool::PolygonLasso);
+    assert_eq!(h.state().ui.polygon.len(), 2, "⌘ held");
+    h.event(egui::Event::ModifiersChanged(Modifiers::NONE));
+    h.run_steps(3);
+    assert_eq!(h.state().ui.polygon.len(), 2, "released");
 }

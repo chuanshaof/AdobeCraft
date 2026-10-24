@@ -11,6 +11,52 @@ const DISPLAYS: [(f32, f32, f32); 4] = [(1280.0, 720.0, 1.0), (1024.0, 600.0, 1.
 /// The tallest menus.
 const LONGEST: [&str; 4] = ["Filter", "Layer", "Image", "Edit"];
 
+/// #3737: on Wayland egui knows the monitor's size but never where the window is (no
+/// `inner_rect`). A window taller than the monitor less its taskbar or panel runs under it, so
+/// Layer, View and Window (and every other long menu) must end above it and scroll to their last
+/// row, at 1× and 1.5×.
+#[test]
+fn reported_menus_stay_above_the_panel_when_the_window_position_is_unknown() {
+    for scale in [1.0, 1.5] {
+        for top in ["Layer", "View", "Window", "Filter", "Image", "Edit"] {
+            let mut h = harness((1366.0 * scale, 740.0 * scale, scale));
+            let v = h.input_mut().viewports.entry(egui::ViewportId::ROOT).or_default();
+            v.monitor_size = Some(egui::vec2(1366.0, 768.0));
+            v.inner_rect = None;
+            v.outer_rect = None;
+            v.maximized = Some(false);
+            h.run_steps(3);
+            let bottom = 768.0 - crate::work_area::TASKBAR;
+            let what = format!("{scale}x {top}");
+            open(&mut h, top);
+            for r in popups(&h) {
+                assert!(r.bottom() <= bottom + 0.5, "{what}: popup {r:?} runs under the panel (from {bottom})");
+            }
+            check_bar_clear(&h, &what);
+            let last = rows(&h, 0).len() - 1;
+            let in_view = |h: &Harness<'static, PhotocraftApp>| {
+                let nav = Nav::current(&h.ctx);
+                nav.views[0].expand(0.5).contains_rect(nav.rows[0][last].rect) && nav.views[0].bottom() <= bottom + 0.5
+            };
+            let view = Nav::current(&h.ctx).views[0];
+            h.hover_at(view.center());
+            for _ in 0..80 {
+                if in_view(&h) {
+                    break;
+                }
+                h.event(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -60.0),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                });
+                h.run_steps(2);
+            }
+            assert!(in_view(&h), "{what}: the wheel reaches the last row, above the panel");
+        }
+    }
+}
+
 fn app() -> PhotocraftApp {
     let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
     app.run("file.new", json!({"width": 64, "height": 48})).unwrap();
@@ -217,6 +263,44 @@ fn left_and_right_switch_menus_and_shortcuts_wait_while_one_is_open() {
     h.run_steps(2);
     assert!(h.query_by_label_contains("Open…").is_none(), "Esc closes the menu");
     assert!(!is_open(&h.ctx), "shortcuts work again");
+}
+
+/// In Help › Search, ← / → move the field's cursor instead of switching to Window / File, and
+/// Space types a space instead of running the lit row.
+#[test]
+fn help_search_keeps_the_arrows_and_space_that_edit_it() {
+    let mut h = harness((1280.0, 720.0, 1.0));
+    open(&mut h, "Help");
+    let field = egui::Id::new("help-menu-search").with("field");
+    assert_eq!(h.ctx.memory(|m| m.focused()), Some(field), "the search field has the keyboard");
+    let text = |h: &Harness<'static, PhotocraftApp>| h.ctx.data(|d| d.get_temp::<String>(egui::Id::new("help-menu-search"))).unwrap_or_default();
+    let typing = |h: &mut Harness<'static, PhotocraftApp>, s: &str| {
+        h.event(egui::Event::Text(s.to_string()));
+        h.run_steps(3);
+    };
+    typing(&mut h, "levls");
+    key(&mut h, egui::Key::ArrowLeft);
+    assert!(h.query_by_label_contains("About PhotoCraft").is_some(), "← keeps Help open");
+    key(&mut h, egui::Key::ArrowLeft);
+    typing(&mut h, "e");
+    assert_eq!(text(&h), "levels", "← moved the cursor");
+    // The cursor sits at `leve|ls`: two → take it to the end.
+    key(&mut h, egui::Key::ArrowRight);
+    assert!(h.query_by_label_contains("About PhotoCraft").is_some(), "→ keeps Help open");
+    key(&mut h, egui::Key::ArrowRight);
+    // The pointer resting on a result lights it; a space typed then is text, not a click.
+    // "levels" finds both Image › Adjustments › Levels… and the Levels adjustment layer.
+    let levels = h.get_all_by_label_contains("› Levels").next().expect("a Levels result").rect().center();
+    h.hover_at(levels);
+    h.run_steps(3);
+    assert!(Nav::current(&h.ctx).highlighted(0).is_some(), "a result is lit");
+    h.event(egui::Event::Key { key: egui::Key::Space, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE });
+    h.event(egui::Event::Text(" ".into()));
+    h.event(egui::Event::Key { key: egui::Key::Space, physical_key: None, pressed: false, repeat: false, modifiers: egui::Modifiers::NONE });
+    h.run_steps(3);
+    assert!(is_open(&h.ctx) && h.query_by_label_contains("About PhotoCraft").is_some(), "Space keeps Help open");
+    assert!(h.state().ui.dialogs.is_empty(), "Space ran no command: {:?}", h.state().ui.dialogs);
+    assert_eq!(text(&h), "levels ");
 }
 
 /// A level's visible height (its view) and the full height of its rows: equal means no scrolling.
@@ -517,9 +601,61 @@ fn submenus_stay_above_the_taskbar() {
     }
 }
 
+/// #3737 on X11 (Linux Mint, 1920 × 1080 px): the window manager maximized the window to the whole
+/// monitor without keeping it clear of the bottom panel, so the window's position is known but the
+/// panel covers its bottom. At 1× and at a 150% UI scale (1280 × 720 pt).
+fn maximized_under_a_panel(scale: f32) -> Harness<'static, PhotocraftApp> {
+    let size = egui::vec2(1920.0, 1080.0) / scale;
+    let mut h = harness((1920.0, 1080.0, scale));
+    let v = h.input_mut().viewports.entry(egui::ViewportId::ROOT).or_default();
+    v.monitor_size = Some(size);
+    v.inner_rect = Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), size));
+    v.maximized = Some(true);
+    h.run_steps(3);
+    h
+}
+
+#[test]
+fn menus_of_a_maximized_window_stay_above_a_panel_it_runs_under() {
+    let mut scrolled = 0;
+    for scale in [1.0_f32, 1.5] {
+        for menu in LONGEST.iter().copied().chain(["View", "Window"]) {
+            let mut h = maximized_under_a_panel(scale);
+            let bottom = taskbar_bottom(&h);
+            let what = format!("{scale}x {menu}");
+            assert!((bottom - (1080.0 / scale - crate::work_area::TASKBAR)).abs() < 1.0, "{what}: visible bottom {bottom}");
+            open(&mut h, menu);
+            for r in popups(&h) {
+                assert!(r.bottom() <= bottom + 0.5, "{what}: popup {r:?} runs under the panel (from {bottom})");
+            }
+            let last = rows(&h, 0).len() - 1;
+            let in_view = |h: &Harness<'static, PhotocraftApp>| {
+                let nav = Nav::current(&h.ctx);
+                nav.views[0].expand(0.5).contains_rect(nav.rows[0][last].rect) && nav.views[0].bottom() <= bottom + 0.5
+            };
+            let Some(down) = h.query_by_label("Scroll menu down").map(|n| n.rect()) else {
+                assert!(in_view(&h), "{what}: fits, so its last row is in view");
+                continue;
+            };
+            scrolled += 1;
+            assert!(down.bottom() <= bottom, "{what}: ▼ at {down:?} is under the panel");
+            h.hover_at(down.center());
+            for _ in 0..400 {
+                h.run_steps(1);
+                if in_view(&h) {
+                    break;
+                }
+            }
+            assert!(in_view(&h), "{what}: ▼ scrolls to the last row, above the panel");
+        }
+    }
+    assert!(scrolled >= 3, "at 150% the long menus overflow above the panel: {scrolled}");
+}
+
 #[test]
 fn a_maximized_window_or_an_unknown_monitor_uses_the_whole_window() {
-    let mut h = taskbar_harness((1366.0, 728.0), 0.0, 1.0);
+    // Maximized inside the work area (the window manager kept it clear of the taskbar).
+    let mut h = taskbar_harness((1366.0, 720.0), 0.0, 1.0);
     h.input_mut().viewports.entry(egui::ViewportId::ROOT).or_default().maximized = Some(true);
     h.run_steps(2);
     assert_eq!(crate::work_area::visible_rect(&h.ctx), h.ctx.content_rect());
@@ -589,4 +725,219 @@ fn press_drag_release_reaches_other_menus_and_submenus() {
     let proofing = crate::menus::menu_items(h.state()).into_iter().find(|i| i.id == "view.proofColors").and_then(|i| i.checked);
     assert_eq!(proofing, Some(true), "releasing on Working CMYK ran it");
     assert!(Nav::current(&h.ctx).rows.first().is_none_or(|r| r.is_empty()), "and closed the menus");
+}
+
+/// A menu bar whose frames are `dt` seconds apart, as with a real pointer sending moves.
+fn harness_dt(dt: f32) -> Harness<'static, PhotocraftApp> {
+    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 720.0)).with_step_dt(dt).build_ui_state(
+        |ui, app| {
+            crate::menus::menu_bar(app, ui);
+        },
+        app(),
+    );
+    PhotocraftApp::setup_context(&h.ctx, crate::theme::ThemeKind::ALL[0]);
+    h.ctx.all_styles_mut(|s| s.scroll_animation = egui::style::ScrollAnimation::none());
+    h.run_steps(3);
+    h
+}
+
+/// Which of Image › Mode and Image › Adjustments has its submenu open.
+fn image_submenu(h: &Harness<'static, PhotocraftApp>) -> &'static str {
+    match (h.query_by_label_contains("16 Bits/Channel").is_some(), h.query_by_label_contains("Brightness/Contrast").is_some()) {
+        (true, false) => "Mode",
+        (false, true) => "Adjustments",
+        (false, false) => "none",
+        (true, true) => "both",
+    }
+}
+
+/// Open Image › Mode with the pointer resting on it, at 120 frames a second; returns where the
+/// pointer is, the Adjustments row below it, and Mode's 16 Bits/Channel row.
+fn rest_on_mode(h: &mut Harness<'static, PhotocraftApp>) -> (egui::Pos2, egui::Rect, egui::Rect) {
+    open(h, "Image");
+    let mode = h.get_by_label_contains("Mode").rect();
+    let from = egui::pos2(mode.right() - 40.0, mode.center().y);
+    for k in 0..=12 {
+        h.event(egui::Event::PointerMoved(from - egui::vec2(30.0 * (1.0 - k as f32 / 12.0), 0.0)));
+        h.run_steps(1);
+    }
+    h.run_steps(30);
+    assert_eq!(image_submenu(h), "Mode", "resting on Mode opens it");
+    (from, h.get_by_label_contains("Adjustments").rect(), h.get_by_label_contains("16 Bits/Channel").rect())
+}
+
+/// Move the pointer along `path` (0…1) in `frames` frames; `pause` holds it still for that many
+/// frames at that fraction of the way.
+fn glide(h: &mut Harness<'static, PhotocraftApp>, frames: usize, pause: Option<(f32, usize)>, mut path: impl FnMut(f32) -> egui::Pos2) {
+    let mut paused = false;
+    for k in 0..=frames {
+        let t = k as f32 / frames as f32;
+        h.event(egui::Event::PointerMoved(path(t)));
+        h.run_steps(1);
+        if let Some((_, n)) = pause.filter(|(at, _)| !paused && t >= *at) {
+            paused = true;
+            h.run_steps(n);
+        }
+    }
+}
+
+/// A person's path from `a` to `b`: it bows, down first and then across, by `bow`.
+fn bowed(a: egui::Pos2, b: egui::Pos2, bow: f32) -> impl Fn(f32) -> egui::Pos2 {
+    let c = egui::pos2(a.x + (b.x - a.x) * (0.5 - bow), a.y + (b.y - a.y) * (0.5 + bow));
+    move |t| {
+        let u = 1.0 - t;
+        egui::pos2(u * u * a.x + 2.0 * u * t * c.x + t * t * b.x, u * u * a.y + 2.0 * u * t * c.y + t * t * b.y)
+    }
+}
+
+/// #1218: heading from Image › Mode for a row low in its submenu, the pointer crosses the
+/// Adjustments row. On a diagonal, a bowed path or with a short pause on the way, Mode's submenu
+/// stays open and Adjustments' doesn't open; the crossed row isn't highlighted.
+#[test]
+fn a_submenu_stays_open_while_the_pointer_heads_for_it() {
+    struct Path {
+        name: &'static str,
+        /// Frames at 120 a second.
+        frames: usize,
+        /// Hold still this many frames at this fraction of the way.
+        pause: Option<(f32, usize)>,
+        bow: f32,
+    }
+    let paths = [
+        Path { name: "straight", frames: 36, pause: None, bow: 0.0 },
+        Path { name: "hesitate", frames: 36, pause: Some((0.3, 18)), bow: 0.0 },
+        Path { name: "bowed", frames: 42, pause: None, bow: 0.2 },
+        Path { name: "slow and bowed", frames: 96, pause: None, bow: 0.2 },
+    ];
+    let mut wrong = Vec::new();
+    for Path { name, frames, pause, bow } in paths {
+        let mut h = harness_dt(1.0 / 120.0);
+        let (from, adjustments, target) = rest_on_mode(&mut h);
+        let to = egui::pos2(target.left() + 40.0, target.center().y);
+        let path = bowed(from, to, bow);
+        let mode_row = rows(&h, 0).iter().position(|r| r.command.is_none() && r.rect.contains(from)).expect("the Mode row");
+        let mut crossed = false;
+        glide(&mut h, frames, pause, |t| {
+            let p = path(t);
+            crossed |= adjustments.contains(p);
+            p
+        });
+        assert!(crossed, "{name}: the path crosses the Adjustments row");
+        // Once Mode's submenu closes on the way, the pointer arrives over Adjustments' instead.
+        let open = image_submenu(&h);
+        if open != "Mode" {
+            wrong.push(format!("{name}: arrived with {open} open, not Mode"));
+        }
+        if let Some(row) = Nav::current(&h.ctx).highlighted(0).filter(|&row| row != mode_row) {
+            wrong.push(format!("{name}: row {row} is highlighted, not Mode"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Resting on the row crossed, or moving away from the submenu onto it, still opens its submenu,
+/// and the highlight moves to it (only it is lit).
+#[test]
+fn resting_on_another_row_or_moving_away_switches_submenus() {
+    let only_adjustments_lit = |h: &Harness<'static, PhotocraftApp>, adjustments: egui::Rect, what: &str| {
+        let row = rows(h, 0).iter().position(|r| r.rect.contains(adjustments.center()));
+        assert_eq!(Nav::current(&h.ctx).highlighted(0), row, "{what}: Adjustments is the highlighted row, not Mode");
+    };
+    let mut h = harness_dt(1.0 / 120.0);
+    let (from, adjustments, _) = rest_on_mode(&mut h);
+    // Head for the submenu, but stop on Adjustments on the way.
+    let stop = egui::pos2(from.x + 15.0, adjustments.center().y);
+    glide(&mut h, 12, None, |t| from + (stop - from) * t);
+    assert_eq!(image_submenu(&h), "Mode", "just arrived on Adjustments, still heading for Mode's submenu");
+    h.run_steps((super::AIM_REST * 120.0) as usize + 12);
+    assert_eq!(image_submenu(&h), "Adjustments", "resting on Adjustments opens it");
+    only_adjustments_lit(&h, adjustments, "resting");
+
+    // Moving away from Mode's submenu switches (as soon as egui does): straight down, or down and
+    // to the left.
+    for dx in [0.0, -60.0] {
+        let mut h = harness_dt(1.0 / 120.0);
+        let (from, adjustments, _) = rest_on_mode(&mut h);
+        let to = egui::pos2(from.x + dx, adjustments.center().y);
+        glide(&mut h, 10, None, |t| from + (to - from) * t);
+        h.run_steps(30);
+        assert_eq!(image_submenu(&h), "Adjustments", "moving away ({dx}) from Mode's submenu opens Adjustments'");
+        only_adjustments_lit(&h, adjustments, "moving away");
+    }
+}
+
+#[test]
+fn heading_is_the_triangle_to_the_submenus_near_edge() {
+    let sub = egui::Rect::from_min_max(egui::pos2(200.0, 100.0), egui::pos2(400.0, 400.0));
+    let from = egui::pos2(150.0, 110.0);
+    assert!(heading(from, from, sub));
+    assert!(heading(from, egui::pos2(170.0, 160.0), sub), "down and right, toward the submenu");
+    assert!(heading(from, egui::pos2(190.0, 105.0), sub), "straight across");
+    assert!(!heading(from, egui::pos2(150.0, 160.0), sub), "straight down");
+    assert!(!heading(from, egui::pos2(120.0, 140.0), sub), "away to the left");
+    assert!(!heading(from, egui::pos2(170.0, 60.0), sub), "up past the submenu's top");
+    // A submenu that opened to the left.
+    let left = egui::Rect::from_min_max(egui::pos2(0.0, 100.0), egui::pos2(100.0, 400.0));
+    assert!(heading(egui::pos2(150.0, 110.0), egui::pos2(130.0, 160.0), left));
+    assert!(!heading(egui::pos2(150.0, 110.0), egui::pos2(170.0, 160.0), left));
+    assert!(!heading(from, from, egui::Rect::NOTHING));
+}
+
+/// #5896, #6225: a menu scrolled down (to reach Edit › Preferences or Window › Theme) reopens
+/// scrolled, with the rows above its view lying over the menu bar. egui opens a submenu when the
+/// pointer is over its row even where the row is scrolled out of sight, so a hidden submenu row
+/// under the title opened on the press and the click on the title then closed the whole menu.
+/// Rows out of view must not open their submenus: the menu stays open.
+#[test]
+fn a_scrolled_menu_reopens_and_stays_open_with_a_hidden_submenu_row_under_its_title() {
+    use egui::{Modifiers, PointerButton};
+    for top in ["Edit", "Window"] {
+        let mut h = harness((1280.0, 420.0, 1.0));
+        open(&mut h, top);
+        let title = h.get_by_label(top).rect().center();
+        let view = Nav::current(&h.ctx).views[0];
+        assert!(Nav::current(&h.ctx).contents[0] > view.height() + 1.0, "{top} must overflow for this test to mean anything");
+        // Scroll to the end, then back up until a submenu row is out of view right under the title.
+        h.hover_at(egui::pos2(view.center().x, view.bottom() - 2.0));
+        let wheel = |h: &mut Harness<'static, PhotocraftApp>, dy: f32| {
+            h.event(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, dy),
+                modifiers: Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+            });
+            h.run_steps(1);
+        };
+        for _ in 0..60 {
+            wheel(&mut h, -60.0);
+        }
+        let under = |h: &Harness<'static, PhotocraftApp>| {
+            rows(h, 0).iter().any(|r| r.command.is_none() && r.enabled && r.rect.x_range().contains(title.x) && r.rect.y_range().contains(title.y))
+        };
+        for _ in 0..400 {
+            if under(&h) {
+                break;
+            }
+            wheel(&mut h, 8.0);
+        }
+        assert!(under(&h), "{top}: a submenu row scrolled under the title");
+        key(&mut h, egui::Key::Escape);
+        assert!(!is_open(&h.ctx), "{top}: Esc closed it");
+        // Click the title again: press, release, as a mouse does.
+        h.hover_at(title);
+        h.run_steps(1);
+        h.event(egui::Event::PointerButton { pos: title, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+        h.run_steps(1);
+        h.event(egui::Event::PointerButton { pos: title, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+        // Per frame after the click: is the menu open, and how many levels are drawn?
+        let frames: Vec<(bool, usize)> = (0..6)
+            .map(|_| {
+                h.run_steps(1);
+                let nav = Nav::current(&h.ctx);
+                (nav.rows.first().is_some_and(|r| !r.is_empty()), nav.rows.len())
+            })
+            .collect();
+        assert!(frames.iter().all(|f| f.0), "{top}: the menu closed again right after the click: {frames:?}");
+        assert!(frames.iter().all(|f| f.1 == 1), "{top}: a submenu scrolled out of view opened under the title: {frames:?}");
+    }
 }

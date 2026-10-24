@@ -3,7 +3,7 @@
 
 use egui::{Modifiers, PointerButton, Pos2, Rect, pos2, vec2};
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use photocraft_doc::{Effect, LayerContent};
 use serde_json::json;
 
@@ -23,8 +23,8 @@ fn busy() -> photocraft_engine::Session {
         s.execute("layer.layerStyle.dropShadow", json!({"layer": a})).unwrap();
         // #153: the vector mask thumbnail and both link chains take row width too.
         s.execute("layer.vectorMask.revealAll", json!({"layer": a})).unwrap();
-        s.execute("layer.setProps", json!({"layer": a, "blend": "Multiply", "locks": {"all": true}})).unwrap();
         s.execute("layer.layerMask.revealAll", json!({"layer": a})).unwrap();
+        s.execute("layer.setProps", json!({"layer": a, "blend": "Multiply", "locks": {"all": true}})).unwrap();
         let b = s.execute("layer.new.layer", json!({"name": format!("{LONG} b{depth}")})).unwrap()["layer"].as_u64().unwrap();
         s.execute("layer.setProps", json!({"layer": b, "clipped": true})).unwrap();
         s.execute("layer.select", json!({"layer": a})).unwrap();
@@ -37,6 +37,8 @@ fn busy() -> photocraft_engine::Session {
         s.execute("layer.layerStyle.dropShadow", json!({"layer": g})).unwrap();
         prev = Some(g);
     }
+    // Group Layers creates collapsed groups (#5571); these tests start with every group open.
+    s.execute("layer.setExpanded", json!({"all": true, "expanded": true})).unwrap();
     s
 }
 
@@ -106,6 +108,26 @@ fn long_names_never_run_under_the_indicators() {
     }
 }
 
+/// A layer inside a group sits one step right of the group's row, so the hierarchy shows: its
+/// name used to start where the group's did. Top-level layers stay where they were.
+#[test]
+fn a_groups_layers_indent_past_the_group() {
+    let mut s = photocraft_engine::Session::new();
+    s.execute("file.new", json!({"width": 64, "height": 48})).unwrap();
+    let child = s.execute("layer.new.layer", json!({"name": "Child"})).unwrap()["layer"].as_u64().unwrap();
+    let group = s.execute("layer.groupLayers", json!({"name": "Group"})).unwrap()["layer"].as_u64().unwrap();
+    // Group Layers creates the group collapsed; open it so the panel lists its layers.
+    s.execute("layer.setExpanded", json!({"layer": group, "expanded": true})).unwrap();
+    let top = s.execute("layer.new.layer", json!({"name": "Top"})).unwrap()["layer"].as_u64().unwrap();
+    let h = harness(s, 1.0, "promedium", 290.0);
+    let rows = recorded(&h.ctx);
+    let left = |id: u64| rows.iter().find(|r| r.layer == id).and_then(|r| r.name).map(|n| n.left()).unwrap_or_else(|| panic!("layer {id} drawn"));
+    let step = crate::layer_tree_ui::TRIANGLE_W;
+    assert!((left(child) - left(group) - step).abs() < 0.5, "child {} vs group {}", left(child), left(group));
+    assert!((left(group) - left(top) - step).abs() < 0.5, "a top-level layer keeps its place: {} vs group {}", left(top), left(group));
+}
+
+/// A primary click at `at`: hover, press and release a frame apart, then let the panel settle.
 fn click(h: &mut Harness<'_, PhotocraftApp>, at: Pos2) {
     h.hover_at(at);
     h.run_steps(1);
@@ -150,6 +172,53 @@ fn a_configured_but_disabled_effect_stays_discoverable_in_the_panel() {
     let h = harness(session, 1.0, "promedium", 290.0);
     let effect_row = h.get_by_label("Drop Shadow").rect();
     assert!(effect_row.is_positive(), "a configured disabled effect remains visible for discovery");
+}
+
+/// #1622: the eyes on the effects rows work. The "Effects" eye hides and shows the whole list, an
+/// effect's eye only that effect; each click is one history step, keeps the effect's settings and
+/// never opens the Layer Style dialog.
+#[test]
+fn the_eyes_on_the_effects_rows_hide_and_show_effects() {
+    let mut s = photocraft_engine::Session::new();
+    s.execute("file.new", json!({"width": 64, "height": 48})).unwrap();
+    let id = s.execute("layer.new.layer", json!({"name": "Styled"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.layerStyle.dropShadow", json!({"layer": id})).unwrap();
+    s.execute("layer.layerStyle.colorOverlay", json!({"layer": id})).unwrap();
+    let mut h = harness(s, 1.0, "promedium", 290.0);
+    // (the whole list is on, each effect is on).
+    let fx = |h: &Harness<'_, PhotocraftApp>| {
+        let fx = &h.state().session.active().unwrap().doc.layer(photocraft_doc::LayerId(id)).unwrap().effects;
+        (fx.enabled, fx.items.iter().map(Effect::enabled).collect::<Vec<_>>())
+    };
+    let steps = |h: &Harness<'_, PhotocraftApp>| h.state().session.active().unwrap().history.past_len();
+    let eye = |h: &Harness<'_, PhotocraftApp>, row: &str| {
+        let r = h.get_by_label(row).rect();
+        pos2(r.left() + 45.0, r.center().y)
+    };
+    let (settings, n) = (h.state().session.active().unwrap().doc.layer(photocraft_doc::LayerId(id)).unwrap().effects.items.clone(), steps(&h));
+    assert_eq!(fx(&h), (true, vec![true, true]));
+
+    let p = eye(&h, "Color Overlay");
+    click(&mut h, p);
+    assert_eq!(fx(&h), (true, vec![true, false]), "only the clicked effect is hidden");
+    assert_eq!(steps(&h), n + 1, "one history step");
+    assert_eq!(h.state().session.active().unwrap().history.undo_label(), Some("Hide Color Overlay"));
+    // The row stays (its eye box empty), and a click there shows the effect again.
+    let p = eye(&h, "Color Overlay");
+    click(&mut h, p);
+    assert_eq!(fx(&h), (true, vec![true, true]));
+
+    let p = eye(&h, "Effects");
+    click(&mut h, p);
+    assert_eq!(fx(&h), (false, vec![true, true]), "the Effects eye hides the list; each effect keeps its own eye");
+    assert_eq!(h.state().session.active().unwrap().history.undo_label(), Some("Hide Layer Effects"));
+    let p = eye(&h, "Effects");
+    click(&mut h, p);
+    assert_eq!(fx(&h), (true, vec![true, true]));
+
+    assert_eq!(h.state().session.active().unwrap().doc.layer(photocraft_doc::LayerId(id)).unwrap().effects.items, settings, "settings survive");
+    assert_eq!(steps(&h), n + 4);
+    assert!(h.state().ui.dialogs.is_empty(), "an eye click never opens the Layer Style dialog");
 }
 
 fn groups_open(s: &photocraft_engine::Session) -> Vec<bool> {
@@ -310,4 +379,346 @@ fn alt_dragging_a_row_drops_a_copy_and_a_plain_drag_moves() {
     drag(&mut h, 2, 0, Modifiers::NONE);
     assert_eq!(names(&h), ["Background", "L0", "L2", "L0 copy", "L1"]);
     assert_eq!(h.state().session.active().unwrap().history.undo_label(), Some("Reorder Layers"));
+}
+
+/// #1721: a press-move-release from `from` to `to`, with `release` held only when the row is
+/// dropped.
+fn drag_from_to(h: &mut Harness<'static, PhotocraftApp>, from: Pos2, to: Pos2, release: Modifiers) {
+    h.event(egui::Event::PointerMoved(from));
+    h.run_steps(1);
+    h.event(egui::Event::PointerButton { pos: from, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+    h.run_steps(1);
+    for k in 1..=8 {
+        h.event(egui::Event::PointerMoved(from + (to - from) * (k as f32 / 8.0)));
+        h.run_steps(1);
+    }
+    h.event(egui::Event::ModifiersChanged(release));
+    h.run_steps(1);
+    h.event(egui::Event::PointerButton { pos: to, button: PointerButton::Primary, pressed: false, modifiers: release });
+    h.run_steps(1);
+    h.event(egui::Event::ModifiersChanged(Modifiers::NONE));
+    h.run_steps(3);
+}
+
+/// #1721: with a single layer there is no other row to drop on, so with ⌥ held the dragged row
+/// accepts the drop onto itself and the copy lands above it. Without ⌥ the drop on itself does
+/// nothing.
+#[test]
+fn alt_dragging_the_only_layer_drops_a_copy_on_itself() {
+    let mut s = photocraft_engine::Session::new();
+    s.execute("file.new", json!({"width": 64, "height": 48})).unwrap();
+    let mut h = harness(s, 1.0, "promedium", 290.0);
+    let names = |h: &Harness<'_, PhotocraftApp>| h.state().session.active().unwrap().doc.layers.iter().map(|l| l.name.clone()).collect::<Vec<_>>();
+    let steps = |h: &Harness<'_, PhotocraftApp>| h.state().session.active().unwrap().history.past_len();
+    assert_eq!(names(&h), ["Background"]);
+    let row = recorded(&h.ctx)[0].row;
+    let from = pos2(row.center().x, row.bottom() - 4.0);
+    let before = steps(&h);
+    drag_from_to(&mut h, from, pos2(row.center().x, row.top() + row.height() * 0.25), Modifiers::ALT);
+    assert_eq!(names(&h), ["Background", "Background copy"]);
+    assert_eq!(steps(&h), before + 1, "one undo step");
+    assert_eq!(h.state().session.active().unwrap().history.undo_label(), Some("Duplicate Layer"));
+    // A plain drop back on the same layer leaves everything as it is.
+    let row = recorded(&h.ctx)[0].row;
+    let before = steps(&h);
+    drag_from_to(&mut h, from, pos2(row.center().x, row.top() + row.height() * 0.75), Modifiers::NONE);
+    assert_eq!(names(&h), ["Background", "Background copy"], "a plain drop on itself does nothing");
+    assert_eq!(steps(&h), before);
+}
+
+/// #1721: the empty space below the bottom-most row is a drop target too (Photoshop): ⌥ copies
+/// the layer to the very bottom of the stack, a plain drag moves it there.
+#[test]
+fn dropping_below_the_bottom_row_lands_at_the_bottom_of_the_stack() {
+    let mut s = photocraft_engine::Session::new();
+    s.execute("file.new", json!({"width": 64, "height": 48})).unwrap();
+    // Nothing can go below a Background (#2626), so the bottom layer is a normal one here.
+    s.execute("layer.new.layerFromBackground", json!({})).unwrap();
+    for i in 0..2 {
+        s.execute("layer.new.layer", json!({"name": format!("L{i}")})).unwrap();
+    }
+    let mut h = harness(s, 1.0, "promedium", 290.0);
+    let names = |h: &Harness<'_, PhotocraftApp>| h.state().session.active().unwrap().doc.layers.iter().map(|l| l.name.clone()).collect::<Vec<_>>();
+    // Rows top to bottom: L1, L0, Layer 0. The empty space starts under Layer 0.
+    let top = recorded(&h.ctx)[0].row.center();
+    let bottom = recorded(&h.ctx)[2].row;
+    drag_from_to(&mut h, top, pos2(bottom.center().x, bottom.bottom() + 10.0), Modifiers::ALT);
+    assert_eq!(names(&h), ["L1 copy", "Layer 0", "L0", "L1"]);
+    assert_eq!(h.state().session.active().unwrap().history.undo_label(), Some("Duplicate Layer"));
+    // Rows: L1, L0, Layer 0, L1 copy. A plain drag of L0 to the empty space moves it to the
+    // very bottom.
+    let grabbed = recorded(&h.ctx)[1].row.center();
+    let bottom = recorded(&h.ctx)[3].row;
+    drag_from_to(&mut h, grabbed, pos2(bottom.center().x, bottom.bottom() + 10.0), Modifiers::NONE);
+    assert_eq!(names(&h), ["L0", "L1 copy", "Layer 0", "L1"]);
+    assert_eq!(h.state().session.active().unwrap().history.undo_label(), Some("Reorder Layers"));
+}
+
+/// Photoshop's Layers footer is a bar along the panel's bottom edge: its buttons sit in the middle
+/// of the bar's height, from the right. They used to hang under the line with twice the gap below.
+#[test]
+fn the_footer_is_a_bar_along_the_panel_bottom_with_its_buttons_centred() {
+    for theme in ["promedium", "studio"] {
+        let mut s = photocraft_engine::Session::new();
+        s.execute("file.new", json!({"width": 64, "height": 48})).unwrap();
+        s.execute("layer.new.layer", json!({})).unwrap();
+        let h = harness(s, 1.0, theme, 290.0);
+        let group = crate::dock::last_rects(&h.ctx).into_iter().find(|(g, _)| *g == crate::dock::Group::Layers).unwrap().1;
+        let delete = h.get_by_label("Delete layer").rect();
+        let bar_middle = group.bottom() - crate::widgets::FOOTER_BAR / 2.0;
+        assert!((delete.center().y - bar_middle).abs() <= 1.5, "{theme}: button at {delete:?}, bar middle {bar_middle}, group {group:?}");
+        assert!(group.right() - delete.right() <= 10.0, "{theme}: laid out from the right: {delete:?} in {group:?}");
+        let new_layer = h.get_by_label("Create a new layer").rect();
+        assert_eq!(new_layer.center().y, delete.center().y, "{theme}: one row");
+        assert!(new_layer.right() <= delete.left(), "{theme}: New Layer left of Delete");
+    }
+}
+
+/// #2071: like Photoshop, the "Create new fill or adjustment layer" button opens its menu on the
+/// press, so one gesture can press it, drag onto an item and release to add that layer. A plain
+/// click leaves the menu open, and a release on nothing adds nothing.
+#[test]
+fn press_drag_release_on_the_adjustment_button_adds_that_layer() {
+    let mut s = photocraft_engine::Session::new();
+    s.execute("file.new", json!({"width": 64, "height": 48})).unwrap();
+    let mut h = harness(s, 1.0, "promedium", 290.0);
+    let count = |h: &Harness<'_, PhotocraftApp>| h.state().session.active().unwrap().doc.layers.len();
+    let press = |h: &mut Harness<'static, PhotocraftApp>, pos: Pos2, pressed: bool| {
+        h.event(egui::Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE });
+        h.run_steps(2);
+    };
+    let drag = |h: &mut Harness<'static, PhotocraftApp>, from: Pos2, to: Pos2| {
+        for k in 1..=8 {
+            h.event(egui::Event::PointerMoved(from + (to - from) * (k as f32 / 8.0)));
+            h.run_steps(1);
+        }
+    };
+    let button = h.get_by_label("Create new fill or adjustment layer").rect().center();
+    let before = count(&h);
+
+    // Press, drag onto Curves, release: one Curves adjustment layer.
+    h.event(egui::Event::PointerMoved(button));
+    h.run_steps(1);
+    press(&mut h, button, true);
+    let curves = h.get_by_label("Curves").rect().center();
+    drag(&mut h, button, curves);
+    press(&mut h, curves, false);
+    h.run_steps(2);
+    assert_eq!(count(&h), before + 1, "releasing on Curves added a layer");
+    let doc = &h.state().session.active().unwrap().doc;
+    let top = doc.layers.last().unwrap();
+    assert!(matches!(top.content, LayerContent::Adjustment(_)), "an adjustment layer: {:?}", top.name);
+    assert!(h.query_by_label("Curves").is_none(), "and the menu closed");
+
+    // A plain click opens the menu and leaves it open; releasing off the items adds nothing.
+    drag(&mut h, curves, button);
+    press(&mut h, button, true);
+    press(&mut h, button, false);
+    h.run_steps(2);
+    assert!(h.query_by_label("Curves").is_some(), "a click leaves the menu open");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert!(h.query_by_label("Curves").is_none(), "Esc closed it");
+
+    // Press, drag off the button to an empty spot, release: nothing is added, the menu stays open.
+    press(&mut h, button, true);
+    let away = pos2(button.x - 120.0, button.y - 4.0);
+    drag(&mut h, button, away);
+    press(&mut h, away, false);
+    h.run_steps(2);
+    assert_eq!(count(&h), before + 1, "a release on nothing adds no layer");
+    assert!(h.query_by_label("Curves").is_some(), "and keeps the menu open");
+}
+
+/// #2071: the fx (Add a layer style) footer button is the same kind of menu, and runs after the
+/// adjustment button's in the frame: press it, drag to Drop Shadow… and release to open Layer
+/// Style on Drop Shadow.
+#[test]
+fn press_drag_release_on_the_fx_button_opens_that_style() {
+    let mut s = photocraft_engine::Session::new();
+    s.execute("file.new", json!({"width": 64, "height": 48})).unwrap();
+    s.execute("layer.new.layer", json!({})).unwrap();
+    let mut h = harness(s, 1.0, "promedium", 290.0);
+    let styles =
+        |h: &Harness<'_, PhotocraftApp>| h.state().ui.dialogs.iter().filter(|d| d.kind == crate::state::DialogKind::LayerStyle).cloned().collect::<Vec<_>>();
+    let button = h.get_by_label("Add a layer style").rect().center();
+    h.event(egui::Event::PointerMoved(button));
+    h.run_steps(1);
+    h.event(egui::Event::PointerButton { pos: button, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+    h.run_steps(2);
+    let item = h.get_by_label("Drop Shadow…").rect().center();
+    for k in 1..=8 {
+        h.event(egui::Event::PointerMoved(button + (item - button) * (k as f32 / 8.0)));
+        h.run_steps(1);
+    }
+    h.event(egui::Event::PointerButton { pos: item, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+    h.run_steps(2);
+    let open = styles(&h);
+    assert_eq!(open.len(), 1, "releasing on Drop Shadow… opened Layer Style");
+    let effects = open[0].fields["effects"].as_array().unwrap();
+    assert!(effects.iter().any(|e| e["kind"] == json!("dropShadow")), "on Drop Shadow: {effects:?}");
+}
+
+/// Integration regression: a display preference must resize the *actual painted*
+/// thumbnails and row hitboxes, not only its Preview dialog.
+#[test]
+fn panel_thumbnail_sizes_change_real_row_geometry() {
+    use crate::state::LayerThumbnailSize;
+    let mut session = photocraft_engine::Session::new();
+    session.execute("file.new", json!({"width": 64, "height": 48})).unwrap();
+    session.execute("layer.new.layer", json!({"name": "Photo"})).unwrap();
+    session.execute("edit.fill", json!({"color": "#9acb32"})).unwrap();
+    let layer = session.active().unwrap().active_layer.unwrap();
+    let mut h = harness(session, 1.0, "promedium", 290.0);
+    for (size, expected_thumb, expected_row) in [
+        (LayerThumbnailSize::None, 0.0, 23.0),
+        (LayerThumbnailSize::Small, 18.0, 32.0),
+        (LayerThumbnailSize::Medium, 24.0, 32.0),
+        (LayerThumbnailSize::Large, 48.0, 56.0),
+    ] {
+        h.state_mut().ui.layers_panel_options.thumbnail_size = size;
+        h.run_steps(5);
+        let found = recorded(&h.ctx).into_iter().find(|r| r.layer == layer.0).expect("visible layer row");
+        assert!((found.row.height() - expected_row).abs() < 0.1, "{size:?}: row {}", found.row.height());
+        match found.thumbnail {
+            Some(rect) => assert!((rect.width() - expected_thumb).abs() < 0.1, "{size:?}: thumbnail {}", rect.width()),
+            None => assert_eq!(expected_thumb, 0.0, "{size:?} should display a thumbnail"),
+        }
+        assert!(found.name.is_some(), "{size:?}: layer name still visible");
+    }
+}
+
+/// One layer per lock, each with only that lock set (#4158).
+fn one_lock_each() -> (photocraft_engine::Session, Vec<(&'static str, u64)>) {
+    let mut s = photocraft_engine::Session::new();
+    s.execute("file.new", json!({"width": 64, "height": 48})).unwrap();
+    let mut ids = Vec::new();
+    for key in ["transparency", "pixels", "position", "artboard", "all"] {
+        let id = s.execute("layer.new.layer", json!({"name": key})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("layer.setProps", json!({"layer": id, "locks": {key: true}})).unwrap();
+        ids.push((key, id));
+    }
+    (s, ids)
+}
+
+#[test]
+fn every_lock_shows_the_lock_icon_on_the_row() {
+    // #4158: "Lock image pixels" and the artboard lock left the row without its lock icon.
+    // Photoshop shows it whenever any lock is set.
+    let (s, ids) = one_lock_each();
+    let doc = &s.active().unwrap().doc;
+    for &(key, id) in &ids {
+        let l = doc.layers.iter().find(|l| l.id.0 == id).unwrap();
+        assert_eq!(super::reserved_width(l), super::RIGHT_PAD + super::ICON_W + super::GAP, "{key}: room for the lock icon");
+    }
+    let h = harness(s, 1.0, "promedium", 290.0);
+    let rows = recorded(&h.ctx);
+    for &(key, id) in &ids {
+        let r = rows.iter().find(|r| r.layer == id).unwrap_or_else(|| panic!("{key}: row drawn"));
+        assert!(r.indicators.iter().any(|(k, _)| *k == Indicator::Lock), "{key}: lock icon drawn ({:?})", r.indicators);
+    }
+}
+
+#[test]
+fn the_studio_lock_button_shows_every_lock() {
+    // #4158: the simple themes' lock button drew "unlocked" for a pixels or artboard lock, though
+    // clicking it then unlocked the layer.
+    for key in ["transparency", "pixels", "position", "artboard", "all"] {
+        let mut s = photocraft_engine::Session::new();
+        s.execute("file.new", json!({"width": 64, "height": 48})).unwrap();
+        s.execute("layer.new.layer", json!({"name": key})).unwrap();
+        s.execute("layer.setProps", json!({"locks": {key: true}})).unwrap();
+        let h = harness(s, 1.0, "studio", 290.0);
+        assert_eq!(h.get_by_label("Lock layer").accesskit_node().toggled(), Some(egui::accesskit::Toggled::True), "{key}");
+    }
+}
+
+#[test]
+fn clicking_the_lock_icon_on_a_row_unlocks_the_layer() {
+    // #4723: the row's lock icon was only painted. In Photoshop a click on it clears every lock,
+    // and on the Background makes it a normal layer.
+    let (s, ids) = one_lock_each();
+    let bg = s.active().unwrap().doc.background().unwrap().id;
+    let mut h = harness(s, 1.0, "promedium", 290.0);
+    let active = h.state().session.active().unwrap().active_layer;
+    let lock_icon = |h: &Harness<'_, PhotocraftApp>, id: u64| {
+        let row = recorded(&h.ctx).into_iter().find(|r| r.layer == id).unwrap();
+        row.indicators.into_iter().find(|(k, _)| *k == Indicator::Lock).unwrap_or_else(|| panic!("lock icon on {id}")).1.center()
+    };
+    for &(key, id) in &ids {
+        let p = lock_icon(&h, id);
+        click(&mut h, p);
+        let d = h.state().session.active().unwrap();
+        assert!(!d.doc.layer(photocraft_doc::LayerId(id)).unwrap().locks.any(), "{key}: unlocked");
+        assert_eq!(d.active_layer, active, "{key}: the lock icon doesn't select");
+    }
+    let p = lock_icon(&h, bg.0);
+    click(&mut h, p);
+    let doc = &h.state().session.active().unwrap().doc;
+    assert!(doc.background().is_none(), "the Background became a normal layer");
+    assert!(!doc.layer(bg).unwrap().locks.any());
+}
+
+#[test]
+fn eye_column_edges_toggle_visibility_without_selecting_layer() {
+    // #8467: clicks at the far left or right edge of the eye column must toggle visibility
+    // rather than falling through to select the row.
+    let mut s = photocraft_engine::Session::new();
+    s.execute("file.new", json!({"width": 64, "height": 48})).unwrap();
+    let l1 = s.execute("layer.new.layer", json!({"name": "Top"})).unwrap()["layer"].as_u64().unwrap();
+    let l0 = s.execute("layer.new.layer", json!({"name": "Bottom"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.select", json!({"layer": l0})).unwrap();
+
+    let mut h = harness(s, 1.0, "promedium", 290.0);
+    let visible = |h: &Harness<'_, PhotocraftApp>, id: u64| h.state().session.active().unwrap().doc.layer(photocraft_doc::LayerId(id)).unwrap().visible;
+    let selected = |h: &Harness<'_, PhotocraftApp>| h.state().session.active().unwrap().active_layer.unwrap().0;
+
+    let row_for = |h: &Harness<'_, PhotocraftApp>, id: u64| recorded(&h.ctx).into_iter().find(|r| r.layer == id).unwrap().row;
+
+    let top_row = row_for(&h, l1);
+    // Click at the far left edge of the eye column (left + 1.0, top + 1.0)
+    let left_edge = pos2(top_row.left() + 1.0, top_row.top() + 1.0);
+    click(&mut h, left_edge);
+
+    assert!(!visible(&h, l1), "click on left edge of eye column should hide layer");
+    assert_eq!(selected(&h), l0, "click on eye column must not select the layer");
+
+    // Click at the right edge of the eye column (left + 29.0, bottom - 1.0)
+    let right_edge = pos2(top_row.left() + 29.0, top_row.bottom() - 1.0);
+    click(&mut h, right_edge);
+
+    assert!(visible(&h, l1), "click on right edge of eye column should show layer again");
+    assert_eq!(selected(&h), l0, "click on eye column must not select the layer");
+}
+
+/// #1662: a hidden layer's eye box stays empty, as in Photoshop (only a visible layer paints its
+/// eye), in every theme; the widened hit area (#8467) changes nothing that is drawn.
+#[test]
+fn a_hidden_layers_eye_box_paints_nothing() {
+    fn bounds(shape: &egui::Shape, out: &mut Vec<Rect>) {
+        match shape {
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| bounds(s, out)),
+            s => out.push(s.visual_bounding_rect()),
+        }
+    }
+    for theme in ["promedium", "pro", "studio", "studiolight", "classic"] {
+        let mut s = photocraft_engine::Session::new();
+        s.execute("file.new", json!({"width": 64, "height": 48})).unwrap();
+        let hidden = s.execute("layer.new.layer", json!({"name": "Hidden"})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("layer.setProps", json!({"layer": hidden, "visible": false})).unwrap();
+        let shown = s.execute("layer.new.layer", json!({"name": "Shown"})).unwrap()["layer"].as_u64().unwrap();
+        let h = harness(s, 1.0, theme, 290.0);
+        let mut drawn = Vec::new();
+        for clipped in &h.output().shapes {
+            bounds(&clipped.shape, &mut drawn);
+        }
+        let rows = recorded(&h.ctx);
+        let in_eye_box = |id: u64| {
+            let row = rows.iter().find(|r| r.layer == id).unwrap().row;
+            let cell = Rect::from_min_max(row.left_top(), pos2(row.left() + 30.0, row.bottom())).shrink(1.0);
+            drawn.iter().filter(|b| b.is_positive() && cell.contains_rect(**b)).count()
+        };
+        assert!(in_eye_box(shown) > 0, "{theme}: a visible layer paints its eye");
+        assert_eq!(in_eye_box(hidden), 0, "{theme}: a hidden layer's eye box is left empty");
+    }
 }

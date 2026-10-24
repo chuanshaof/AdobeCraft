@@ -147,6 +147,93 @@ pub(crate) fn register(images: &[(&Surface, Rect)], layout: Layout, reference: O
     Some(Alignment { placements: a.placements.iter().map(|p| p.as_ref().map(|p| p.scaled(kf))).collect(), focal: a.focal * kf, rms: a.rms * kf, ..a })
 }
 
+/// The intensity registration searches planes at most this many pixels across: the pose is
+/// resolution independent, so the fit still applies at full resolution.
+pub(crate) const DIRECT_SIDE: usize = 2048;
+
+/// A layer and its neighbour must share at least this fraction of the plane at the pose found.
+const DIRECT_MIN_OVERLAP: f64 = 0.25;
+/// The reference and the warped layer must correlate at least this much: a bracket of one scene
+/// correlates near 1 whatever the exposure; unrelated pictures, or a pose that ran into the
+/// search box, do not.
+const DIRECT_MIN_CORRELATION: f64 = 0.5;
+
+/// The error of either registration when the layers have no detail in common.
+pub(crate) const NO_DETAIL: &str = "Auto-Align couldn't find enough matching detail between the layers";
+
+/// Registers `images` (surface, content area, all of one size) by intensity
+/// ([`photocraft_algo::direct`]), for layers that nearly coincide (a focus or exposure bracket,
+/// a burst): outward from the reference, each layer to the previous one aligned, starting from
+/// its pose. The luminance planes are built at the search scale (≤ [`DIRECT_SIDE`] across), so
+/// nothing full-resolution is held or warped. A layer whose best pose overlaps its neighbour
+/// too little or explains too little of it is no fit, and fails with [`NO_DETAIL`]. Planar
+/// layouts only; Auto means a similarity (Collage).
+pub(crate) fn register_direct(images: &[(&Surface, Rect)], layout: Layout, reference: usize) -> std::result::Result<Alignment, String> {
+    use photocraft_algo::direct::{self, Plane, Pose};
+    use photocraft_algo::transform::Homography;
+    let (motion, layout) = match layout {
+        Layout::Reposition => (panorama::Motion::Translation, Layout::Reposition),
+        Layout::Auto | Layout::Collage => (panorama::Motion::Similarity, Layout::Collage),
+        Layout::Perspective => (panorama::Motion::Homography, Layout::Perspective),
+        Layout::Cylindrical | Layout::Spherical => {
+            return Err("the intensity registration supports the auto, perspective, collage and reposition projections".into());
+        }
+    };
+    let n = images.len();
+    let Some(&(_, area)) = images.get(reference) else { return Err("no layers to align".into()) };
+    let (fw, fh) = (area.width().max(1) as usize, area.height().max(1) as usize);
+    if images.iter().any(|(_, r)| (r.width(), r.height()) != (area.width(), area.height())) {
+        return Err("the layers to align have different sizes".into());
+    }
+    // Luminance at the search scale: the box average over k×k pixels, read row by row.
+    let k = fw.max(fh).div_ceil(DIRECT_SIDE).max(1);
+    let planes: Vec<(Vec<f32>, Option<Vec<bool>>)> = images
+        .iter()
+        .map(|(s, r)| {
+            let (_, _, l, a) = luma_alpha(s, *r, k);
+            let valid = a.iter().any(|v| *v < 0.5).then(|| a.iter().map(|v| *v > 0.5).collect());
+            (l, valid)
+        })
+        .collect();
+    let (w, h) = (fw.div_ceil(k).max(1), fh.div_ceil(k).max(1));
+    let min_overlap = (DIRECT_MIN_OVERLAP * (w * h) as f64) as usize;
+    let mut poses: Vec<Option<Pose>> = vec![None; n];
+    let mut rmss = Vec::new();
+    let mut pairs = Vec::new();
+    for dir in [1i64, -1] {
+        let Some((ref_luma, ref_valid)) = planes.get(reference) else { continue };
+        let (mut prev_luma, mut prev_valid) = (ref_luma.clone(), ref_valid.clone());
+        let mut init = Pose::IDENTITY;
+        let mut i = reference as i64 + dir;
+        while i >= 0 && (i as usize) < n {
+            let idx = i as usize;
+            let Some((l, v)) = planes.get(idx) else { break };
+            let target = Plane { w, h, luma: l, valid: v.as_deref() };
+            let reg = direct::register(&Plane { w, h, luma: &prev_luma, valid: prev_valid.as_deref() }, &target, motion, init, 0);
+            if reg.overlap < min_overlap || reg.correlation < DIRECT_MIN_CORRELATION {
+                return Err(NO_DETAIL.into());
+            }
+            init = reg.pose;
+            (prev_luma, prev_valid) = {
+                let (wl, wv) = direct::warp(&target, &reg.pose);
+                (wl, Some(wv))
+            };
+            pairs.push(((i - dir) as usize, idx, reg.overlap * k * k));
+            rmss.push(reg.rms);
+            poses[idx] = Some(reg.pose);
+            i += dir;
+        }
+    }
+    let center = [fw as f64 / 2.0, fh as f64 / 2.0];
+    let to_center = Homography([1.0, 0.0, center[0], 0.0, 1.0, center[1], 0.0, 0.0, 1.0]);
+    let placement = |hm: &Homography| Placement { projection: panorama::Projection::Plane, focal: fw.max(fh) as f64, center, k1: 0.0, h: hm.mul(&to_center) };
+    // The pose is in fractions of the layer: its matrix at full resolution places the layer.
+    let placements: Vec<Option<Placement>> =
+        (0..n).map(|i| if i == reference { Some(placement(&Homography::IDENTITY)) } else { poses[i].map(|p| placement(&p.matrix(fw, fh))) }).collect();
+    let rms = if rmss.is_empty() { 0.0 } else { rmss.iter().sum::<f64>() / rmss.len() as f64 };
+    Ok(Alignment { layout, reference, placements, focal: 0.0, k1: 0.0, pairs, rms })
+}
+
 /// The 35 mm focal length agreed by the sources' EXIF (median), if any.
 fn exif_focal(srcs: &[Source]) -> Option<f64> {
     let mut f: Vec<f64> = srcs.iter().filter_map(|s| s.exif.focal_length_35mm).collect();
@@ -156,12 +243,12 @@ fn exif_focal(srcs: &[Source]) -> Option<f64> {
 
 /// Warps the content of `surf` inside `rect` by a placement shifted by `offset`; image
 /// coordinates are surface coordinates minus `origin`.
-pub(crate) fn warp_placed(surf: &Surface, rect: Rect, origin: (f64, f64), pl: &Placement, offset: (f64, f64), interp: Interp) -> Surface {
+pub(crate) fn warp_placed(surf: &Surface, rect: Rect, origin: (f64, f64), pl: &Placement, offset: (f64, f64), interp: Interp) -> Result<Surface> {
     let pl = pl.translated(offset.0, offset.1);
     if let Some(h) = plane_matrix(&pl, origin) {
-        return warp_surface(surf, rect, &h, interp);
+        return Ok(warp_surface(surf, rect, &h, interp)?);
     }
-    warp_mesh_surface(surf, rect, &|x, y| pl.forward(x - origin.0, y - origin.1), interp)
+    Ok(warp_mesh_surface(surf, rect, &|x, y| pl.forward(x - origin.0, y - origin.1), interp))
 }
 
 /// The projective matrix of a planar, distortion-free placement (surface px → panorama px).
@@ -315,10 +402,18 @@ pub(crate) fn seam_blend(warped: &[Surface], canvas: Rect, order: &[usize], seam
                 .collect()
         })
         .collect();
-    // Shift ROIs to canvas-relative coordinates for the blend.
-    let local: Vec<RoiImage> = rois.iter().map(|r| RoiImage { x0: r.x0 - canvas.x0, y0: r.y0 - canvas.y0, ..r.clone() }).collect();
+    // Shift ROIs to canvas-relative coordinates for the blend, and back after: a shifted copy
+    // would hold every source's pixels twice (#7758).
+    for r in &mut rois {
+        r.x0 -= canvas.x0;
+        r.y0 -= canvas.y0;
+    }
     let levels = if seamless { panorama::blend_levels(cw, chh).min(7) } else { 1 };
-    let (blend, cov) = panorama::multiband(cw, chh, &local, &weights, levels);
+    let (blend, cov) = panorama::multiband(cw, chh, &rois, &weights, levels);
+    for r in &mut rois {
+        r.x0 += canvas.x0;
+        r.y0 += canvas.y0;
+    }
     let cc = fmt.mode.color_channels();
     let nch = fmt.channels();
     let mut composite = Surface::new(fmt);
@@ -447,7 +542,7 @@ fn photomerge(s: &mut Session, p: &Value) -> Result<Value> {
                     .map(|(k, (&i, pl))| {
                         ctx.check()?;
                         ctx.progress(0.35 + 0.25 * k as f32 / placed.len().max(1) as f32, "");
-                        Ok(warp_placed(&srcs[i].surf, Rect::new(0, 0, srcs[i].w as i32, srcs[i].h as i32), (0.0, 0.0), pl, offset, Interp::Bicubic))
+                        warp_placed(&srcs[i].surf, Rect::new(0, 0, srcs[i].w as i32, srcs[i].h as i32), (0.0, 0.0), pl, offset, Interp::Bicubic)
                     })
                     .collect::<Result<Vec<Surface>>>()?
             };
@@ -712,7 +807,11 @@ fn merge_to_hdr(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let mut surf = Surface::new(fmt);
     surf.write_region(area, &data);
-    doc.layers.push(Layer::new("Background", LayerContent::Raster(surf)));
+    // The merged result is opaque: a real Background, as Crop and Straighten makes.
+    let mut bg = Layer::new("Background", LayerContent::Raster(surf));
+    bg.locks.transparency = true;
+    bg.locks.position = true;
+    doc.layers.push(bg);
     let idx = s.add_document(doc, None);
     let ev0 = exposures[order[0]];
     Ok(json!({
@@ -758,7 +857,7 @@ fn crop_and_straighten(s: &mut Session, _p: &Value) -> Result<Value> {
         let corners = f.corners();
         let hq = Homography::rect_to_quad([0.0, 0.0, pw as f64, ph as f64], corners).and_then(|h| h.inverse());
         let Some(hm) = hq else { continue };
-        let warped = warp_surface(&flat, area, &hm, Interp::Bicubic);
+        let warped = warp_surface(&flat, area, &hm, Interp::Bicubic)?;
         let keep = Rect::new(0, 0, pw as i32, ph as i32);
         let mut px = Surface::new(fmt);
         px.write_region(keep, &warped.read_region(keep));
@@ -772,6 +871,7 @@ fn crop_and_straighten(s: &mut Session, _p: &Value) -> Result<Value> {
         let mut nd = Document::new(format!("{} copy {}", doc.name, k + 1), Size::new(pw, ph), doc.mode, doc.depth);
         nd.icc_profile = doc.icc_profile.clone();
         nd.resolution_dpi = doc.resolution_dpi;
+        nd.duotone = doc.duotone.clone();
         let mut bg = Layer::new("Background", LayerContent::Raster(px));
         bg.locks.transparency = true;
         bg.locks.position = true;
@@ -784,8 +884,13 @@ fn crop_and_straighten(s: &mut Session, _p: &Value) -> Result<Value> {
 
 // ---------- specs ----------
 
-fn has_doc(s: &Session) -> std::result::Result<(), String> {
-    s.active().map(|_| ()).ok_or_else(|| "no document open".into())
+/// Photoshop greys Crop and Straighten Photos out for Indexed Color documents.
+fn not_indexed(s: &Session) -> std::result::Result<(), String> {
+    let st = s.active().ok_or("no document open")?;
+    if st.doc.mode == ColorMode::Indexed {
+        return Err("not available for Indexed Color documents".into());
+    }
+    Ok(())
 }
 
 fn always(_: &Session) -> std::result::Result<(), String> {
@@ -820,7 +925,7 @@ pub fn specs() -> Vec<CommandSpec> {
             menu: &["File", "Automate"],
             shortcut: None,
             params: "{} → one new document per photo found on the scan",
-            enabled: has_doc,
+            enabled: not_indexed,
             run: crop_and_straighten,
             journal: true,
         },
@@ -993,6 +1098,7 @@ mod tests {
         assert!((ev[1] - 2.0).abs() < 1e-6 && (ev[2] - 4.0).abs() < 1e-6, "{ev:?}");
         let d = &s.active().unwrap().doc;
         assert_eq!(d.depth, SampleType::F32);
+        assert!(d.is_background(d.layers[0].id), "the merged layer is a real (locked) Background");
         let l = d.layers[0].surface().unwrap();
         // Linear output: ratios across the ramp follow the radiance.
         let (a, b) = (l.rgba(20, 30)[1] as f64, l.rgba(80, 30)[1] as f64);
@@ -1017,6 +1123,54 @@ mod tests {
 
     fn photocraft_algo_srgb(v: f32) -> f32 {
         if v <= 0.003_130_8 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
+    }
+
+    /// A light scan with one dark tilted print on it.
+    fn scan_with_one_photo() -> Document {
+        let (w, h) = (300usize, 220usize);
+        let mut px = vec![[0.98f32, 0.98, 0.98, 1.0]; w * h];
+        let (s, co) = 5.0f64.to_radians().sin_cos();
+        for y in 0..h {
+            for x in 0..w {
+                let (dx, dy) = (x as f64 + 0.5 - 150.0, y as f64 + 0.5 - 110.0);
+                let (u, v) = (co * dx + s * dy, -s * dx + co * dy);
+                if u.abs() < 80.0 && v.abs() < 55.0 {
+                    px[y * w + x] = [0.2 + (u / 160.0) as f32 * 0.3, 0.25, 0.3, 1.0];
+                }
+            }
+        }
+        doc_from("scan", &px, w, h, SampleType::U8)
+    }
+
+    #[test]
+    fn crop_and_straighten_keeps_duotone_inks() {
+        let mut s = Session::new();
+        s.add_document(scan_with_one_photo(), None);
+        s.execute("image.mode.grayscale", json!({})).unwrap();
+        s.execute(
+            "image.mode.duotone",
+            json!({"type": "duotone", "inks": [{"name": "Black", "color": [0, 0, 0]}, {"name": "Orange", "color": [255, 128, 0]}]}),
+        )
+        .unwrap();
+        let src = s.documents()[0].doc.duotone.clone();
+        assert!(src.is_some());
+        let r = s.execute("file.automate.cropAndStraightenPhotos", json!({})).unwrap();
+        assert_eq!(r["photos"].as_array().unwrap().len(), 1, "{r}");
+        let d = &s.documents()[1].doc;
+        assert_eq!(d.mode, ColorMode::Duotone);
+        assert_eq!(d.duotone, src);
+    }
+
+    #[test]
+    fn crop_and_straighten_disabled_for_indexed() {
+        // Photoshop greys the command out for Indexed Color documents.
+        let mut s = Session::new();
+        s.add_document(scan_with_one_photo(), None);
+        s.execute("image.mode.indexedColor", json!({})).unwrap();
+        assert_eq!(s.documents()[0].doc.mode, ColorMode::Indexed);
+        assert!(!s.is_enabled("file.automate.cropAndStraightenPhotos"));
+        assert!(s.execute("file.automate.cropAndStraightenPhotos", json!({})).is_err());
+        assert_eq!(s.documents().len(), 1);
     }
 
     #[test]

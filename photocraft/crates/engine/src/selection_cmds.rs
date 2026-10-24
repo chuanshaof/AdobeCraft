@@ -5,6 +5,7 @@
 use photocraft_algo::selection::{self as sel, SelectionMode};
 use photocraft_doc::Document;
 use photocraft_geom::Rect;
+use photocraft_raster::Surface;
 use serde_json::{Value, json};
 
 use crate::commands::CommandSpec;
@@ -27,14 +28,35 @@ fn mode(p: &Value) -> SelectionMode {
     SelectionMode::parse(p.get("mode").and_then(Value::as_str).unwrap_or("replace"))
 }
 
+/// A Color Range replacement is scoped to the selection that was active when it opened.
+/// Explicit add/subtract/intersect operations retain their normal selection-combine semantics.
+fn scope_color_range(mask: &mut [f32], doc: &Document, area: Rect, m: SelectionMode) {
+    if m != SelectionMode::Replace {
+        return;
+    }
+    if let Some(selection) = doc.selection.as_ref() {
+        let previous = sel::mask_from_surface(Some(selection), area);
+        for (value, bound) in mask.iter_mut().zip(previous) {
+            *value = value.min(bound);
+        }
+    }
+}
+
 /// RGBA pixels the tools sample: the composite, or the active layer.
 fn sample_pixels(s: &Session, all_layers: bool) -> Result<(Rect, Vec<[f32; 4]>)> {
     let d = s.active().ok_or(EngineError::NoDocument)?;
     let area = d.doc.bounds();
+    // Match the decoders' raster budget before either the layer or composite path allocates.
+    let len = area.size().area();
+    let max_bytes: u64 = if cfg!(target_pointer_width = "64") { 8 << 30 } else { 2 << 30 };
+    if len > max_bytes / std::mem::size_of::<[f32; 4]>() as u64 {
+        return Err(EngineError::Other("the canvas is too large to sample for a selection".into()));
+    }
     let layer = d.active_layer.and_then(|id| d.doc.layer(id)).and_then(|l| l.surface());
     match (all_layers, layer) {
         (false, Some(surf)) => {
-            let mut px = vec![[0.0f32; 4]; area.width() as usize * area.height() as usize];
+            let len = usize::try_from(len).map_err(|_| EngineError::Other("the canvas is too large to sample for a selection".into()))?;
+            let mut px = crate::allocation::filled(len, [0.0f32; 4], "sampling pixels for a selection")?;
             surf.read_rgba_into(area, &mut px);
             Ok((area, px))
         }
@@ -55,6 +77,34 @@ fn current_mask(doc: &Document) -> (Rect, Vec<f32>) {
     (area, sel::mask_from_surface(doc.selection.as_ref(), area))
 }
 
+/// Grayscale the canvas is actually showing, as opaque RGBA, when that is not the colour
+/// composite: a gray layer-mask view, or — with every colour channel hidden — the first
+/// visible alpha, Quick Mask, or the active layer's mask. The Magic Wand selects from this
+/// so a white alpha stays one region instead of breaking up along the RGB underneath.
+fn shown_gray(s: &Session) -> Option<(Rect, Vec<[u8; 4]>)> {
+    let st = s.active()?;
+    let doc = &st.doc;
+    let area = doc.bounds();
+    let v = &st.channel_view;
+    let colors_off = v.visible_colors(crate::channel_cmds::color_count(doc)) == 0;
+    let surf = if let Some((mask, crate::mask_view_cmds::MaskViewMode::Gray)) = v.shown_layer_mask(doc) {
+        &mask.surface
+    } else if colors_off {
+        if let Some(i) = (0..doc.channels.len()).find(|i| v.alpha_shown(*i)) {
+            &doc.channels[i].surface
+        } else if let Some(q) = doc.quick_mask.as_ref().filter(|_| !v.quick_mask_hidden) {
+            &q.surface
+        } else if let Some((mask, _)) = v.shown_layer_mask(doc) {
+            &mask.surface
+        } else {
+            &st.active_layer.and_then(|id| doc.layer(id))?.mask.as_ref()?.surface
+        }
+    } else {
+        return None;
+    };
+    Some((area, sel::rgba8_image(surf, area)))
+}
+
 /// 8-bit RGBA of the active layer (or the composite with `all_layers`) over the canvas.
 pub(crate) fn sample_rgba8(s: &Session, all_layers: bool) -> Result<(Rect, Vec<[u8; 4]>)> {
     let d = s.active().ok_or(EngineError::NoDocument)?;
@@ -71,7 +121,10 @@ pub(crate) fn sample_rgba8(s: &Session, all_layers: bool) -> Result<(Rect, Vec<[
 
 fn magic_wand(s: &mut Session, p: &Value) -> Result<Value> {
     let (x, y) = (f(p, "x", 0.0).floor() as i32, f(p, "y", 0.0).floor() as i32);
-    let (area, img) = sample_rgba8(s, b(p, "sampleAllLayers", false))?;
+    let (area, img) = match shown_gray(s) {
+        Some(plane) => plane,
+        None => sample_rgba8(s, b(p, "sampleAllLayers", false))?,
+    };
     let region = sel::wand_region(&img, area, (x, y), f(p, "tolerance", 32.0), b(p, "contiguous", true), b(p, "antiAlias", true));
     drop(img);
     let m = mode(p);
@@ -296,12 +349,19 @@ fn color_range(s: &mut Session, p: &Value) -> Result<Value> {
     let bad = |msg: String| EngineError::BadParams { cmd: CMD.into(), msg };
     let preset = p.get("select").map_or(Some("sampledColors"), Value::as_str).ok_or_else(|| bad("`select` must be a string".into()))?;
     let invert = b(p, "invert", false);
+    let selection_mode = mode(p);
     let fuzz = |d: f32| f(p, "fuzziness", d).max(0.0);
+    // Photoshop's Detect Faces needs a face detector, which there is none of yet (#4455).
+    if b(p, "detectFaces", false) {
+        return Err(bad("detectFaces: face detection isn't available yet; select without it".into()));
+    }
     let (area, mut mask) = match preset {
         "sampledColors" => {
             let (area, px) = sample_pixels(s, b(p, "sampleAllLayers", true))?;
             let w = area.width() as usize;
             // The dialog's eyedroppers: colours picked on the image, at their positions.
+            // Like Photoshop's, they may sample anywhere on the canvas: an active selection only
+            // limits the result (scope_color_range), not where colours are picked (#5244).
             let plus = eyedropper_samples(p, "points", area, &px, &bad)?;
             let minus = eyedropper_samples(p, "subtractPoints", area, &px, &bad)?;
             let query = ColorRangeSamples::with_samples(s, p, area, &plus, &minus)?;
@@ -319,6 +379,10 @@ fn color_range(s: &mut Session, p: &Value) -> Result<Value> {
             };
             let (area, px) = sample_pixels(s, b(p, "sampleAllLayers", true))?;
             (area, sel::hue_range(&px, center))
+        }
+        "skinTones" => {
+            let (area, px) = sample_pixels(s, b(p, "sampleAllLayers", true))?;
+            (area, sel::skin_tones(&px, fuzz(40.0).min(200.0)))
         }
         "highlights" | "midtones" | "shadows" => {
             // Range in levels (Highlights / Shadows: one value, Midtones: [low, high]); Fuzziness
@@ -353,7 +417,7 @@ fn color_range(s: &mut Session, p: &Value) -> Result<Value> {
         }
         other => {
             return Err(bad(format!(
-                "unknown select `{other}` (sampledColors, reds, yellows, greens, cyans, blues, magentas, highlights, midtones, shadows, outOfGamut)"
+                "unknown select `{other}` (sampledColors, reds, yellows, greens, cyans, blues, magentas, highlights, midtones, shadows, skinTones, outOfGamut)"
             )));
         }
     };
@@ -362,7 +426,10 @@ fn color_range(s: &mut Session, p: &Value) -> Result<Value> {
             *v = 1.0 - *v;
         }
     }
-    set_selection(s, "Color Range", area, mask, mode(p))
+    // Invert the colour result first, then constrain it to the original selection.
+    // Add mode must still be able to extend an existing selection intentionally.
+    scope_color_range(&mut mask, &s.active().ok_or(EngineError::NoDocument)?.doc, area, selection_mode);
+    set_selection(s, "Color Range", area, mask, selection_mode)
 }
 
 fn modify(s: &mut Session, p: &Value, op: &str) -> Result<Value> {
@@ -384,11 +451,17 @@ fn modify(s: &mut Session, p: &Value, op: &str) -> Result<Value> {
     // continue past the canvas. Border has no such option: its band always follows the canvas edge,
     // or a Select All would border to nothing.
     let at_bounds = op == "border" || b(p, "applyAtCanvasBounds", false);
-    let (area, m) = current_mask(&s.active().ok_or(EngineError::NoDocument)?.doc);
+    let doc = &s.active().ok_or(EngineError::NoDocument)?.doc;
+    let area = doc.bounds();
+    if area.size().area() > MAX_MODIFY_PIXELS as u64 {
+        return Err(EngineError::BadParams { cmd: format!("select.modify.{op}"), msg: "the selection is too large to modify".into() });
+    }
+    let (_, m) = current_mask(doc);
     let (w, h) = (area.width() as usize, area.height() as usize);
-    // Feather reaches 3σ = 1.5 r; the others reach r. A margin past that keeps the canvas edge out of
-    // reach. A selection clear of the canvas edge needs none: both readings agree there.
-    let reach = if op == "feather" { r * 1.5 } else { r };
+    // Feather reaches 3σ = 3 r (σ = r, as in Photoshop); the others reach r. A margin past that
+    // keeps the canvas edge out of reach. A selection clear of the canvas edge needs none: both
+    // readings agree there.
+    let reach = if op == "feather" { r * 3.0 } else { r };
     let pad = if touches_edge(&m, w, h) { reach.ceil() as usize + 2 } else { 0 };
     let grown = |n: usize| pad.checked_mul(2).and_then(|p| n.checked_add(p));
     let (Some(pw), Some(ph)) = (grown(w), grown(h)) else {
@@ -397,7 +470,9 @@ fn modify(s: &mut Session, p: &Value, op: &str) -> Result<Value> {
     if pw.checked_mul(ph).is_none_or(|n| n > MAX_MODIFY_PIXELS) {
         return Err(EngineError::BadParams { cmd: format!("select.modify.{op}"), msg: "the selection is too large to modify".into() });
     }
-    let padded = pad_mask(&m, w, h, pad, at_bounds);
+    // Unpadded (the usual case) the mask is used as it is: two serial full-canvas copies were
+    // most of a 24 MP Feather or Smooth (#211).
+    let padded = if pad == 0 { m } else { pad_mask(&m, w, h, pad, at_bounds) };
     let out = match op {
         "expand" => sel::expand(&padded, pw, ph, r),
         "contract" => sel::contract(&padded, pw, ph, r),
@@ -405,7 +480,7 @@ fn modify(s: &mut Session, p: &Value, op: &str) -> Result<Value> {
         "smooth" => sel::smooth(&padded, pw, ph, r),
         _ => sel::feather(&padded, pw, ph, r),
     };
-    let out = crop_mask(&out, pw, pad, w, h);
+    let out = if pad == 0 { out } else { crop_mask(&out, pw, pad, w, h) };
     let label = match op {
         "expand" => "Expand Selection",
         "contract" => "Contract Selection",
@@ -434,19 +509,18 @@ fn pad_mask(m: &[f32], w: usize, h: usize, pad: usize, outside_empty: bool) -> V
     if w == 0 || h == 0 {
         return out;
     }
+    // Row by row (a copy and two fills), not sample by sample (#211).
     for (py, row) in out.chunks_exact_mut(pw).enumerate() {
-        let inside_y = (pad..pad + h).contains(&py);
-        if outside_empty && !inside_y {
+        if outside_empty && !(pad..pad + h).contains(&py) {
             continue;
         }
         let y = py.saturating_sub(pad).min(h - 1);
-        for (px, v) in row.iter_mut().enumerate() {
-            let inside_x = (pad..pad + w).contains(&px);
-            if outside_empty && !inside_x {
-                continue;
-            }
-            let x = px.saturating_sub(pad).min(w - 1);
-            *v = m.get(y * w + x).copied().unwrap_or(0.0);
+        let (Some(src), Some((left, rest))) = (m.get(y * w..(y + 1) * w), row.split_at_mut_checked(pad)) else { continue };
+        let Some((mid, right)) = rest.split_at_mut_checked(w) else { continue };
+        mid.copy_from_slice(src);
+        if !outside_empty {
+            left.fill(src.first().copied().unwrap_or(0.0));
+            right.fill(src.last().copied().unwrap_or(0.0));
         }
     }
     out
@@ -454,7 +528,11 @@ fn pad_mask(m: &[f32], w: usize, h: usize, pad: usize, outside_empty: bool) -> V
 
 /// The `w`×`h` centre of a mask padded by `pad_mask`.
 fn crop_mask(m: &[f32], pw: usize, pad: usize, w: usize, h: usize) -> Vec<f32> {
-    m.chunks_exact(pw).skip(pad).take(h).flat_map(|row| row.iter().skip(pad).take(w).copied()).collect()
+    let mut out = Vec::with_capacity(w.saturating_mul(h));
+    for row in m.chunks_exact(pw.max(1)).skip(pad).take(h) {
+        out.extend_from_slice(row.get(pad..pad + w).unwrap_or_default());
+    }
+    out
 }
 
 /// Grow (contiguous) / Similar (anywhere): pixels whose colour lies within
@@ -521,11 +599,51 @@ pub(crate) fn polygon_selection(s: &mut Session, cmd: &str, label: &str, pts: &[
         return Err(EngineError::BadParams { cmd: cmd.into(), msg: "feather must be a number in 0..1000".into() });
     }
     let area = s.active().ok_or(EngineError::NoDocument)?.doc.bounds();
-    let mut mask = sel::polygon(pts, area, b(p, "antiAlias", true));
     if feather > 0.0 {
+        // The blur spreads past the polygon and isn't bit-identical over a smaller window.
+        let mut mask = sel::polygon(pts, area, b(p, "antiAlias", true));
         mask = sel::feather(&mask, area.width() as usize, area.height() as usize, feather);
+        return set_selection(s, label, area, mask, mode(p));
     }
-    set_selection(s, label, area, mask, mode(p))
+    // Only the rows the polygon spans (#4532): rows outside it are empty, and full-width rows
+    // keep `polygon`'s coverage bit-identical (its x arithmetic is relative to the area's left
+    // edge; its y samples are whole rows plus the same sub-row fractions).
+    let band = polygon_rows(pts, area);
+    let mask = sel::polygon(pts, band, b(p, "antiAlias", true));
+    let m = mode(p);
+    let selected = s.edit(label, |doc, _| {
+        doc.selection = combine_band(doc.selection.as_ref(), &mask, band, m);
+        Ok(doc.selection.is_some())
+    })?;
+    Ok(json!({ "selected": selected }))
+}
+
+/// The full-width rows of `area` that points `pts` span (empty when none are finite).
+fn polygon_rows(pts: &[(f32, f32)], area: Rect) -> Rect {
+    let ys = pts.iter().map(|p| p.1).filter(|y| y.is_finite());
+    let (lo, hi) = ys.fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), y| (lo.min(y), hi.max(y)));
+    if lo > hi {
+        return Rect::EMPTY;
+    }
+    let clamp = |v: f32| v.clamp(area.y0 as f32, area.y1 as f32) as i32;
+    let (y0, y1) = (clamp(lo.floor()), clamp(hi.ceil() + 1.0));
+    if y0 >= y1 { Rect::EMPTY } else { Rect::new(area.x0, y0, area.x1, y1) }
+}
+
+/// [`sel::combine`] of a mask covering only `band` (zero elsewhere), giving exactly what the
+/// whole-canvas combine gives: Replace and Intersect are empty outside the band, and Add and
+/// Subtract keep the old selection there.
+fn combine_band(old: Option<&Surface>, mask: &[f32], band: Rect, m: SelectionMode) -> Option<Surface> {
+    let inside = sel::combine(old, mask, band, m);
+    let Some(old) = old.filter(|_| matches!(m, SelectionMode::Add | SelectionMode::Subtract)) else { return inside };
+    if band.is_empty() {
+        return Some(old.clone());
+    }
+    let values = inside.map_or_else(|| vec![0.0; band.width() as usize * band.height() as usize], |w| w.read_region(band));
+    let mut s = old.clone();
+    s.write_region(band, &values);
+    s.prune();
+    (s.tile_count() > 0).then_some(s)
 }
 
 macro_rules! spec {
@@ -541,7 +659,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "select.magicWand",
             "Magic Wand",
             [],
-            r##"{"x":px,"y":px,"tolerance":0..255=32,"contiguous":bool=true,"antiAlias":bool=true,"sampleAllLayers":bool=false,"mode":"replace|add|subtract|intersect"="replace"}"##,
+            r##"{"x":px,"y":px,"tolerance":0..255=32,"contiguous":bool=true,"antiAlias":bool=true,"sampleAllLayers":bool=false,"mode":"replace|add|subtract|intersect"="replace"} (samples the visible alpha, Quick Mask, or layer mask when that is the picture)"##,
             has_doc,
             magic_wand
         ),
@@ -549,7 +667,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "select.colorRange",
             "Color Range…",
             ["Select"],
-            r##"{"select":"sampledColors|reds|yellows|greens|cyans|blues|magentas|highlights|midtones|shadows|outOfGamut"="sampledColors","color":"#rrggbb"=foreground,"colors":["#rrggbb",…]?,"points":[[x,y],…]? (eyedropper samples),"subtractPoints":[[x,y],…]? (minus eyedropper),"order":["+"|"-",…]? (click order of points and subtractPoints; default all points first),"fuzziness":0..200=40 (tones: 0..100 %=20),"localized":bool=false,"range":0..100=100 (% of the longer side),"tonalRange":level|[lo,hi] (shadows 65, highlights 190, midtones [105,150]),"invert":bool=false,"sampleAllLayers":bool=true,"mode":"replace|add|subtract|intersect"="replace"}"##,
+            r##"{"select":"sampledColors|reds|yellows|greens|cyans|blues|magentas|highlights|midtones|shadows|skinTones|outOfGamut"="sampledColors","color":"#rrggbb"=foreground,"colors":["#rrggbb",…]?,"points":[[x,y],…]? (eyedropper samples),"subtractPoints":[[x,y],…]? (minus eyedropper),"order":["+"|"-",…]? (click order of points and subtractPoints; default all points first),"fuzziness":0..200=40 (tones: 0..100 %=20),"detectFaces":bool=false (not available yet: refused),"localized":bool=false,"range":0..100=100 (% of the longer side),"tonalRange":level|[lo,hi] (shadows 65, highlights 190, midtones [105,150]),"invert":bool=false,"sampleAllLayers":bool=true,"mode":"replace|add|subtract|intersect"="replace"}"##,
             has_doc,
             color_range
         ),
@@ -612,6 +730,197 @@ mod tests {
         s.active().unwrap().doc.selection.as_ref().map_or(0.0, |m| m.sample_channel(x, y, 0))
     }
 
+    fn clear_selection(s: &mut Session) {
+        if s.active().unwrap().doc.selection.is_some() {
+            s.execute("select.deselect", json!({})).unwrap();
+        }
+    }
+
+    #[test]
+    fn color_range_skin_tones_selects_skin_not_cream_and_refuses_detect_faces() {
+        let mut s = session();
+        let rgb = |c: [u8; 3]| [f32::from(c[0]) / 255.0, f32::from(c[1]) / 255.0, f32::from(c[2]) / 255.0, 1.0];
+        s.edit("paint", |doc, _| {
+            let bg = doc.layers[0].surface_mut().unwrap();
+            bg.fill_rect(Rect::new(0, 0, 40, 30), &rgb([252, 253, 247]));
+            bg.fill_rect(Rect::new(5, 5, 15, 15), &rgb([183, 119, 81]));
+            bg.fill_rect(Rect::new(25, 5, 35, 15), &rgb([231, 225, 202]));
+            Ok(())
+        })
+        .unwrap();
+        s.execute("select.colorRange", json!({"select": "skinTones"})).unwrap();
+        assert!(coverage(&s, 10, 10) > 0.95, "skin");
+        assert!(coverage(&s, 30, 10) < 0.05, "cream");
+        assert!(coverage(&s, 2, 2) < 0.05, "near-white background");
+        // Subtracting skin from a selection of both squares keeps only the cream one.
+        s.execute("select.rect", json!({"x": 5, "y": 5, "width": 30, "height": 10})).unwrap();
+        s.execute("select.colorRange", json!({"select": "skinTones", "mode": "subtract"})).unwrap();
+        assert!(coverage(&s, 10, 10) < 0.05 && coverage(&s, 30, 10) > 0.95, "{} {}", coverage(&s, 10, 10), coverage(&s, 30, 10));
+        let err = s.execute("select.colorRange", json!({"select": "skinTones", "detectFaces": true})).unwrap_err();
+        assert!(err.to_string().contains("detectFaces"), "{err}");
+    }
+
+    #[test]
+    fn selection_sampling_refuses_oversized_canvases_before_reading_pixels() {
+        let mut s = Session::new();
+        s.add_document(
+            photocraft_doc::Document::new(
+                "large",
+                photocraft_geom::Size::new(300_000, 300_000),
+                photocraft_color::ColorMode::Rgb,
+                photocraft_color::SampleType::U8,
+            ),
+            None,
+        );
+        for all_layers in [false, true] {
+            assert!(sample_pixels(&s, all_layers).unwrap_err().to_string().contains("too large to sample"));
+        }
+        assert!(!s.active().unwrap().history.can_undo());
+    }
+
+    #[test]
+    fn selection_sampling_allocation_failure_keeps_the_selection() {
+        let mut s = session();
+        s.execute("select.rect", json!({"x": 5, "y": 5, "width": 4, "height": 4})).unwrap();
+        let before = s.active().unwrap().doc.clone();
+        let history = s.active().unwrap().history.entries();
+        crate::allocation::fail_next_for_test();
+        let result = s.execute("select.similar", json!({"sampleAllLayers": false}));
+        let _ = crate::allocation::capacity::<u8>(0, "reset failpoint");
+        assert!(result.is_err());
+        assert_eq!(*s.active().unwrap().doc, *before);
+        assert_eq!(s.active().unwrap().history.entries(), history);
+    }
+
+    #[test]
+    fn modify_rejects_oversized_canvases_before_reading_the_mask() {
+        let mut s = Session::new();
+        let mut doc = photocraft_doc::Document::new(
+            "large",
+            photocraft_geom::Size::new(300_000, 300_000),
+            photocraft_color::ColorMode::Rgb,
+            photocraft_color::SampleType::U8,
+        );
+        let mut selection = photocraft_raster::Surface::new(photocraft_color::PixelFormat::GRAY8);
+        selection.write_pixel(0, 0, &[1.0]);
+        doc.selection = Some(selection);
+        s.add_document(doc, None);
+        let before = s.active().unwrap().doc.clone();
+        for op in ["expand", "contract", "border", "smooth", "feather"] {
+            let error = s.execute(&format!("select.modify.{op}"), json!({"radius": 1})).unwrap_err();
+            assert!(error.to_string().contains("too large to modify"));
+            assert_eq!(*s.active().unwrap().doc, *before);
+            assert!(!s.active().unwrap().history.can_undo());
+        }
+    }
+
+    #[test]
+    fn color_range_replace_is_bounded_by_existing_selection() {
+        for params in [json!({"color": "#ff0000", "fuzziness": 0}), json!({"select": "reds"})] {
+            let mut s = session();
+            // Both red squares match, but only the left is inside the original selection.
+            s.execute("select.rect", json!({"x": 5, "y": 5, "width": 10, "height": 10})).unwrap();
+            s.execute("select.colorRange", params).unwrap();
+            assert_eq!(coverage(&s, 10, 10), 1.0);
+            assert_eq!(coverage(&s, 30, 10), 0.0);
+            assert_eq!(coverage(&s, 2, 2), 0.0);
+            s.execute("edit.undo", json!({})).unwrap();
+            assert_eq!(coverage(&s, 10, 10), 1.0);
+            assert_eq!(coverage(&s, 30, 10), 0.0);
+        }
+    }
+
+    #[test]
+    fn color_range_invert_and_partial_masks_stay_within_prior_selection() {
+        let mut s = session();
+        s.execute("select.rect", json!({"x": 5, "y": 5, "width": 10, "height": 10})).unwrap();
+        s.execute("select.colorRange", json!({"select": "highlights", "invert": true})).unwrap();
+        assert_eq!(coverage(&s, 10, 10), 1.0, "inverted white excludes the white background");
+        assert_eq!(coverage(&s, 20, 20), 0.0, "invert must not select outside the old boundary");
+
+        let mut s = session();
+        s.edit("soft selection", |doc, _| {
+            let mut mask = vec![0.0; 40 * 30];
+            mask[10 * 40 + 10] = 128.0 / 255.0;
+            doc.selection = Some(sel::mask_to_surface(&mask, doc.bounds()));
+            Ok(())
+        })
+        .unwrap();
+        s.execute("select.colorRange", json!({"select": "reds"})).unwrap();
+        assert!((coverage(&s, 10, 10) - 128.0 / 255.0).abs() < 0.001);
+        assert_eq!(coverage(&s, 30, 10), 0.0);
+    }
+
+    #[test]
+    fn color_range_eyedropper_samples_anywhere_but_the_result_stays_in_the_selection() {
+        // #5244: as in Photoshop, a colour picked outside the active selection is accepted; only
+        // the result is limited to the selection.
+        let mut s = session();
+        s.execute("select.rect", json!({"x": 0, "y": 0, "width": 20, "height": 30})).unwrap();
+        let outside = json!({"points": [[30, 10]], "fuzziness": 0});
+        assert!(ColorRangeSamples::new(&s, &outside).is_ok());
+        s.execute("select.colorRange", outside).unwrap();
+        assert_eq!(coverage(&s, 10, 10), 1.0, "the red inside the selection is selected");
+        assert_eq!(coverage(&s, 30, 10), 0.0, "the sampled red outside it stays out");
+        assert_eq!(coverage(&s, 2, 2), 0.0, "white is not the sampled colour");
+    }
+
+    #[test]
+    fn color_range_eyedropper_respects_selection_but_add_can_extend_it() {
+        let mut s = session();
+        s.execute("select.rect", json!({"x": 5, "y": 5, "width": 10, "height": 10})).unwrap();
+        s.execute("select.colorRange", json!({"points": [[10, 10]], "fuzziness": 0})).unwrap();
+        assert_eq!(coverage(&s, 10, 10), 1.0);
+        assert_eq!(coverage(&s, 30, 10), 0.0);
+
+        // Explicitly adding a matching colour is still allowed to grow the selection.
+        s.execute("select.colorRange", json!({"points": [[30, 10]], "fuzziness": 0, "mode": "add"})).unwrap();
+        assert_eq!(coverage(&s, 10, 10), 1.0);
+        assert_eq!(coverage(&s, 30, 10), 1.0);
+
+        clear_selection(&mut s);
+        s.execute("select.colorRange", json!({"color": "#ff0000", "fuzziness": 0})).unwrap();
+        assert_eq!(coverage(&s, 30, 10), 1.0, "an unbounded color range still searches the canvas");
+    }
+
+    #[test]
+    fn magic_wand_selects_the_visible_alpha_or_mask_not_the_rgb() {
+        let mut s = session();
+        // Alpha covers the first red square and the pixels beside it. RGB would stop at the red.
+        s.execute("select.rect", json!({"x": 0, "y": 0, "width": 20, "height": 20})).unwrap();
+        s.execute("channel.new", json!({"fill": "selection", "name": "Alpha"})).unwrap();
+        s.execute("select.magicWand", json!({"x": 7, "y": 7, "tolerance": 0, "antiAlias": false})).unwrap();
+        assert_eq!(coverage(&s, 7, 7), 1.0);
+        assert_eq!(coverage(&s, 2, 2), 1.0, "the white alpha includes pixels that are not the red square");
+        assert_eq!(coverage(&s, 30, 10), 0.0, "outside the alpha stays unselected");
+        // Colour channels back on: the wand reads RGB again.
+        s.execute("channel.setVisible", json!({"channel": "composite", "visible": true})).unwrap();
+        s.execute("channel.setVisible", json!({"channel": 0, "visible": false})).unwrap();
+        s.execute("select.magicWand", json!({"x": 7, "y": 7, "tolerance": 0, "antiAlias": false})).unwrap();
+        assert_eq!(coverage(&s, 7, 7), 1.0);
+        assert_eq!(coverage(&s, 2, 2), 0.0, "RGB sampling stops at the red square");
+        // Eyes off again, Alpha still the picture.
+        s.execute("channel.setVisible", json!({"channel": 0, "visible": true})).unwrap();
+        s.execute("channel.setVisible", json!({"channel": "composite", "visible": false})).unwrap();
+        s.execute("select.magicWand", json!({"x": 7, "y": 7, "tolerance": 0, "antiAlias": false})).unwrap();
+        assert_eq!(coverage(&s, 2, 2), 1.0);
+
+        let mut s = session();
+        s.execute("select.rect", json!({"x": 0, "y": 0, "width": 20, "height": 20})).unwrap();
+        s.execute("layer.layerMask.revealSelection", json!({})).unwrap();
+        s.execute("view.layerMask", json!({"mode": "gray"})).unwrap();
+        s.execute("select.magicWand", json!({"x": 7, "y": 7, "tolerance": 0, "antiAlias": false})).unwrap();
+        assert_eq!(coverage(&s, 2, 2), 1.0, "gray mask view selects the mask");
+        assert_eq!(coverage(&s, 30, 10), 0.0);
+        s.execute("view.layerMask", json!({"mode": "off"})).unwrap();
+        for name in ["red", "green", "blue"] {
+            s.execute("channel.setVisible", json!({"channel": name, "visible": false})).unwrap();
+        }
+        s.execute("select.magicWand", json!({"x": 7, "y": 7, "tolerance": 0, "antiAlias": false})).unwrap();
+        assert_eq!(coverage(&s, 2, 2), 1.0, "a layer mask shown alone is what the wand reads");
+        assert_eq!(coverage(&s, 30, 10), 0.0);
+    }
+
     #[test]
     fn magic_wand_contiguous_and_modes() {
         let mut s = session();
@@ -643,6 +952,7 @@ mod tests {
                     json!({"points": [[2, 3], [10, 3]], "subtractPoints": [[10, 3]], "order": ["+", "+", "-"], "fuzziness": 40}),
                     json!({"points": [[2, 3]], "localized": true, "range": 50, "fuzziness": 80}),
                 ] {
+                    clear_selection(&mut s);
                     let q = ColorRangeSamples::new(&s, &p).unwrap();
                     let doc = s.active().unwrap().doc.clone();
                     let pixels = photocraft_compose::render(&doc, doc.bounds());
@@ -675,6 +985,7 @@ mod tests {
         })
         .unwrap();
         for all_layers in [false, true] {
+            clear_selection(&mut s);
             let p = json!({"points": [[7, 7]], "sampleAllLayers": all_layers, "fuzziness": 0});
             let query = ColorRangeSamples::new(&s, &p).unwrap();
             let (area, px) = sample_pixels(&s, all_layers).unwrap();
@@ -723,6 +1034,45 @@ mod tests {
         assert!(lighter > redder + 0.15 && redder > 0.0, "lighter {lighter}, redder {redder}");
     }
 
+    #[test]
+    fn color_range_fuzziness_zero_selects_exact_match_only() {
+        // Sampled Colors at Fuzziness 0 selects only the exact match (TOOL-214-3, #214).
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 50, "height": 10})).unwrap();
+        s.edit("paint", |doc, _| {
+            let bg = doc.layers[0].surface_mut().unwrap();
+            let v = |c: u8| f32::from(c) / 255.0;
+            // Exact target color [200, 140, 120]
+            bg.fill_rect(Rect::new(0, 0, 10, 10), &[v(200), v(140), v(120), 1.0]);
+            // Off by 1 level in red [201, 140, 120]
+            bg.fill_rect(Rect::new(10, 0, 20, 10), &[v(201), v(140), v(120), 1.0]);
+            // Off by 1 level in green [200, 141, 120]
+            bg.fill_rect(Rect::new(20, 0, 30, 10), &[v(200), v(141), v(120), 1.0]);
+            // Off by 2 levels in blue [200, 140, 122] (crosses 8-bit Lab grid threshold)
+            bg.fill_rect(Rect::new(30, 0, 40, 10), &[v(200), v(140), v(122), 1.0]);
+            // Exact target color again at a different position
+            bg.fill_rect(Rect::new(40, 0, 50, 10), &[v(200), v(140), v(120), 1.0]);
+            Ok(())
+        })
+        .unwrap();
+
+        // Sampled via eyedropper point at [5, 5] with Fuzziness 0
+        s.execute("select.colorRange", json!({"points": [[5, 5]], "fuzziness": 0})).unwrap();
+        assert_eq!(coverage(&s, 5, 5), 1.0, "sampled pixel itself is fully selected");
+        assert_eq!(coverage(&s, 45, 5), 1.0, "identical color elsewhere on canvas is fully selected");
+        assert_eq!(coverage(&s, 15, 5), 0.0, "1 level off in red is unselected at fuzziness 0");
+        assert_eq!(coverage(&s, 25, 5), 0.0, "1 level off in green is unselected at fuzziness 0");
+        assert_eq!(coverage(&s, 35, 5), 0.0, "1 level off in blue is unselected at fuzziness 0");
+
+        // Sampled via hex color with Fuzziness 0
+        s.execute("select.colorRange", json!({"color": "#c88c78", "fuzziness": 0})).unwrap();
+        assert_eq!(coverage(&s, 5, 5), 1.0, "exact color match from hex is fully selected");
+        assert_eq!(coverage(&s, 45, 5), 1.0, "identical color elsewhere on canvas is fully selected");
+        assert_eq!(coverage(&s, 15, 5), 0.0, "1 level off in red is unselected for hex at fuzziness 0");
+        assert_eq!(coverage(&s, 25, 5), 0.0, "1 level off in green is unselected for hex at fuzziness 0");
+        assert_eq!(coverage(&s, 35, 5), 0.0, "1 level off in blue is unselected for hex at fuzziness 0");
+    }
+
     /// Red squares (from `session`), a blue square, a black and a mid-grey strip on white.
     fn session_colours() -> Session {
         let mut s = session();
@@ -746,16 +1096,18 @@ mod tests {
         assert_eq!((coverage(&s, 10, 10), coverage(&s, 30, 10), coverage(&s, 10, 24)), (1.0, 1.0, 1.0));
         assert_eq!((coverage(&s, 2, 2), coverage(&s, 22, 24), coverage(&s, 32, 24)), (0.0, 0.0, 0.0));
         // Eyedropper point on the blue square; `invert` flips the result.
+        clear_selection(&mut s);
         s.execute("select.colorRange", json!({"points": [[7, 22]], "fuzziness": 100, "invert": true})).unwrap();
         assert_eq!((coverage(&s, 10, 24), coverage(&s, 10, 10), coverage(&s, 2, 2)), (0.0, 1.0, 1.0));
         // Localized clusters: picked on the left red square, a 25% range (10 px) leaves the right one.
+        clear_selection(&mut s);
         s.execute("select.colorRange", json!({"points": [[10, 10]], "fuzziness": 100, "localized": true, "range": 25})).unwrap();
         assert_eq!(coverage(&s, 10, 10), 1.0);
         assert!(coverage(&s, 13, 10) > 0.5);
         assert_eq!(coverage(&s, 30, 10), 0.0);
-        // One undo step per call.
+        // Undo restores the empty selection that preceded the most recent Color Range.
         s.execute("edit.undo", json!({})).unwrap();
-        assert_eq!(coverage(&s, 2, 2), 1.0);
+        assert_eq!(coverage(&s, 2, 2), 0.0);
     }
 
     #[test]
@@ -772,6 +1124,7 @@ mod tests {
         })
         .unwrap();
         let run = |s: &mut Session, extra: Value| {
+            clear_selection(s);
             let mut p = json!({"points": [[5, 5], [45, 5]], "fuzziness": 10});
             p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
             s.execute("select.colorRange", p).unwrap();
@@ -788,6 +1141,7 @@ mod tests {
         let sub_last = run(&mut s, json!({"points": [[5, 5], [45, 5], [5, 5]], "subtractPoints": [[15, 5]], "order": ["+", "+", "+", "-"]}));
         assert!(sub_last[0] < 0.5, "{sub_last:?}");
         // A malformed or inconsistent order is an error, never a panic.
+        clear_selection(&mut s);
         for bad in [json!(["+"]), json!(["+", "+", "x"]), json!("+-"), json!(["-", "-", "+"])] {
             assert!(s.execute("select.colorRange", json!({"points": [[5, 5], [45, 5]], "subtractPoints": [[15, 5]], "order": bad})).is_err(), "{bad}");
         }
@@ -799,18 +1153,24 @@ mod tests {
         s.execute("select.colorRange", json!({"select": "reds"})).unwrap();
         assert_eq!((coverage(&s, 10, 10), coverage(&s, 30, 10)), (1.0, 1.0));
         assert_eq!((coverage(&s, 10, 24), coverage(&s, 2, 2), coverage(&s, 32, 24)), (0.0, 0.0, 0.0));
+        clear_selection(&mut s);
         s.execute("select.colorRange", json!({"select": "blues"})).unwrap();
         assert_eq!((coverage(&s, 10, 24), coverage(&s, 10, 10)), (1.0, 0.0));
+        clear_selection(&mut s);
         s.execute("select.colorRange", json!({"select": "greens"})).unwrap();
         assert!(s.active().unwrap().doc.selection.is_none() || coverage(&s, 10, 10) == 0.0);
         // Tones: black is a shadow, white a highlight, 50% grey (128) a midtone.
+        clear_selection(&mut s);
         s.execute("select.colorRange", json!({"select": "shadows"})).unwrap();
         assert_eq!((coverage(&s, 22, 24), coverage(&s, 2, 2), coverage(&s, 32, 24)), (1.0, 0.0, 0.0));
+        clear_selection(&mut s);
         s.execute("select.colorRange", json!({"select": "highlights"})).unwrap();
         assert_eq!((coverage(&s, 22, 24), coverage(&s, 2, 2)), (0.0, 1.0));
+        clear_selection(&mut s);
         s.execute("select.colorRange", json!({"select": "midtones", "fuzziness": 0})).unwrap();
         assert_eq!((coverage(&s, 32, 24), coverage(&s, 2, 2), coverage(&s, 22, 24)), (1.0, 0.0, 0.0));
         // A wider shadow range takes the grey too.
+        clear_selection(&mut s);
         s.execute("select.colorRange", json!({"select": "shadows", "tonalRange": 140, "fuzziness": 0})).unwrap();
         assert_eq!(coverage(&s, 32, 24), 1.0);
         // Modes combine as for the other selection commands.
@@ -1005,5 +1365,77 @@ mod tests {
         assert!(s.active().unwrap().doc.selection.is_none());
         s.execute("edit.undo", json!({})).unwrap();
         assert_eq!(coverage(&s, 2, 2), 1.0);
+    }
+
+    /// The previous per-sample padding and cropping, kept as the oracle for the row-wise ones.
+    fn old_pad_mask(m: &[f32], w: usize, h: usize, pad: usize, outside_empty: bool) -> Vec<f32> {
+        let pw = w + 2 * pad;
+        let mut out = vec![0.0f32; pw * (h + 2 * pad)];
+        for (py, row) in out.chunks_exact_mut(pw).enumerate() {
+            let inside_y = (pad..pad + h).contains(&py);
+            if outside_empty && !inside_y {
+                continue;
+            }
+            let y = py.saturating_sub(pad).min(h - 1);
+            for (px, v) in row.iter_mut().enumerate() {
+                if outside_empty && !(pad..pad + w).contains(&px) {
+                    continue;
+                }
+                *v = m.get(y * w + px.saturating_sub(pad).min(w - 1)).copied().unwrap_or(0.0);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn row_wise_pad_and_crop_match_per_sample_ones() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let (w, h) = (37, 23);
+        let m: Vec<f32> = (0..w * h)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed % 1000) as f32 / 999.0
+            })
+            .collect();
+        for pad in [0, 1, 5, 40] {
+            for outside_empty in [false, true] {
+                let padded = pad_mask(&m, w, h, pad, outside_empty);
+                assert_eq!(padded, old_pad_mask(&m, w, h, pad, outside_empty), "pad {pad} {outside_empty}");
+                assert_eq!(crop_mask(&padded, w + 2 * pad, pad, w, h), m, "pad {pad}");
+            }
+        }
+    }
+
+    /// The lasso over the polygon's rows gives exactly the whole-canvas result (#4532): random
+    /// polygons, partly off the canvas, with and without anti-aliasing, in every mode over an
+    /// existing selection.
+    #[test]
+    fn lasso_over_its_rows_matches_the_whole_canvas() {
+        let mut seed = 0x2545_f491_u32;
+        let mut rnd = |lo: f32, hi: f32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            lo + (seed % 10_000) as f32 / 10_000.0 * (hi - lo)
+        };
+        for case in 0..24 {
+            let mut s = Session::new();
+            s.execute("file.new", json!({"width": 300, "height": 520})).unwrap();
+            s.execute("select.rect", json!({"x": 40, "y": 60, "width": 200, "height": 300})).unwrap();
+            let n = 3 + case % 7;
+            let pts: Vec<(f32, f32)> = (0..n).map(|_| (rnd(-30.0, 330.0), rnd(100.0, 420.0))).collect();
+            let aa = case % 2 == 0;
+            let m = ["replace", "add", "subtract", "intersect"][case % 4];
+            let doc = s.active().unwrap().doc.clone();
+            let area = doc.bounds();
+            let want = sel::combine(doc.selection.as_ref(), &sel::polygon(&pts, area, aa), area, SelectionMode::parse(m));
+            let points: Vec<[f32; 2]> = pts.iter().map(|p| [p.0, p.1]).collect();
+            s.execute("select.lasso", json!({"points": points, "antiAlias": aa, "mode": m})).unwrap();
+            let got = s.active().unwrap().doc.selection.clone();
+            let read = |x: &Option<Surface>| x.as_ref().map(|s| s.read_region(area));
+            assert_eq!(read(&got), read(&want), "case {case}: {m}, anti-alias {aa}, {pts:?}");
+        }
     }
 }

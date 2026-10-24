@@ -25,8 +25,7 @@ use crate::widgets;
 /// The engine command the dialog drives.
 pub const COMMAND: &str = "select.colorRange";
 
-/// Select menu entries in Photoshop's order (engine value, label). Skin Tones is left out: the
-/// engine has no skin-tone model.
+/// Select menu entries in Photoshop's order (engine value, label).
 pub const SELECTS: &[(&str, &str)] = &[
     ("sampledColors", "Sampled Colors"),
     ("reds", "Reds"),
@@ -38,6 +37,7 @@ pub const SELECTS: &[(&str, &str)] = &[
     ("highlights", "Highlights"),
     ("midtones", "Midtones"),
     ("shadows", "Shadows"),
+    ("skinTones", "Skin Tones"),
     ("outOfGamut", "Out Of Gamut"),
 ];
 
@@ -82,7 +82,7 @@ pub fn controls(f: &Map<String, Value>) -> Controls {
     let select = s(f, "select", "sampledColors");
     let sampled = select == "sampledColors";
     let tonal = matches!(select, "highlights" | "midtones" | "shadows");
-    Controls { fuzziness: sampled || tonal, sampling: sampled, range: sampled && flag(f, "localized"), tonal }
+    Controls { fuzziness: sampled || tonal || select == "skinTones", sampling: sampled, range: sampled && flag(f, "localized"), tonal }
 }
 
 /// Open the dialog with Photoshop's defaults (Sampled Colors, Fuzziness 40, the foreground colour
@@ -141,6 +141,8 @@ pub fn params(f: &Map<String, Value>) -> Value {
             p.insert("localized".into(), json!(true));
             p.insert("range".into(), json!(num(f, "range", 100.0)));
         }
+    } else if select == "skinTones" {
+        p.insert("fuzziness".into(), json!(num(f, "fuzziness", 40.0)));
     } else if c.tonal {
         p.insert("fuzziness".into(), json!(num(f, "toneFuzziness", 20.0)));
         let range = match select {
@@ -202,6 +204,20 @@ fn query_key(app: &PhotocraftApp, params: &Value) -> u64 {
     key.finish().max(1)
 }
 
+/// Keep the accelerated preview paths in sync with the engine's Color Range replacement.
+/// The full-resolution engine handles other combine modes itself.
+fn scope_preview(proxy: &Document, params: &Value, mask: &mut [f32]) {
+    if matches!(params.get("mode").and_then(Value::as_str), Some("add" | "subtract" | "intersect")) {
+        return;
+    }
+    if let Some(selection) = proxy.selection.as_ref() {
+        let prior = photocraft_algo::selection::mask_from_surface(Some(selection), proxy.bounds());
+        for (value, bound) in mask.iter_mut().zip(prior) {
+            *value = value.min(bound);
+        }
+    }
+}
+
 /// The selection mask `params` would make, on the proxy: the engine command run on a scratch
 /// session (Out Of Gamut uses the document's own proof setup).
 fn proxy_mask(app: &PhotocraftApp, proxy: &Document, k: u32, params: &Value) -> Result<Vec<f32>, String> {
@@ -223,7 +239,7 @@ fn proxy_mask(app: &PhotocraftApp, proxy: &Document, k: u32, params: &Value) -> 
             _ => photocraft_compose::render(proxy, area).px,
         };
         let invert = params.get("invert").and_then(Value::as_bool).unwrap_or(false);
-        return Ok(query
+        let mut mask: Vec<f32> = query
             .coverage(&px, area.width() as usize, k as f32, [0.0, 0.0])
             .into_iter()
             .map(|v| {
@@ -231,13 +247,17 @@ fn proxy_mask(app: &PhotocraftApp, proxy: &Document, k: u32, params: &Value) -> 
                 // Match the command's GRAY8 mask rounding, before display interpolation.
                 (v.clamp(0.0, 1.0) * 255.0 + 0.5).floor() / 255.0
             })
-            .collect());
+            .collect();
+        scope_preview(proxy, params, &mut mask);
+        return Ok(mask);
     }
     if params.get("select").and_then(Value::as_str) == Some("outOfGamut") {
         let pv = app.session.color.proof(proxy.id);
         let (m, _) = photocraft_engine::color_cmds::gamut_mask(proxy, &pv.setup, pv.gamut_threshold).map_err(|e| e.to_string())?;
         let invert = params.get("invert").and_then(Value::as_bool).unwrap_or(false);
-        return Ok(m.iter().map(|v| f32::from(*v) / 255.0).map(|v| if invert { 1.0 - v } else { v }).collect());
+        let mut mask: Vec<f32> = m.iter().map(|v| f32::from(*v) / 255.0).map(|v| if invert { 1.0 - v } else { v }).collect();
+        scope_preview(proxy, params, &mut mask);
+        return Ok(mask);
     }
     let mut p = params.clone();
     // Eyedropper points are in document pixels; the proxy is 1/k the size.
@@ -258,9 +278,8 @@ fn proxy_mask(app: &PhotocraftApp, proxy: &Document, k: u32, params: &Value) -> 
     }
     let mut s = photocraft_engine::Session::new();
     s.tools = app.session.tools.clone();
-    let mut doc = proxy.clone();
-    doc.selection = None;
-    s.add_document(doc, None);
+    // Preserve the proxy's pre-existing selection so preview and OK use the same scope.
+    s.add_document(proxy.clone(), None);
     if let Some(id) = app.session.active().and_then(|d| d.active_layer) {
         let _ = s.select_layer(id);
     }
@@ -373,7 +392,9 @@ fn radio(ui: &mut egui::Ui, on: bool, label: &str) -> egui::Response {
         if on {
             ui.painter().circle_filled(r.center(), 3.0, t.accent);
         }
-        let l = ui.add(egui::Label::new(egui::RichText::new(tl!(&label)).color(t.text_dim)).sense(Sense::click()));
+        let l = ui
+            .add(egui::Label::new(egui::RichText::new(tl!(&label)).color(t.text_dim)).selectable(false).sense(Sense::click()))
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
         resp.union(l)
     })
     .inner
@@ -523,7 +544,8 @@ pub fn body(app: &mut PhotocraftApp, ui: &mut egui::Ui, f: &mut Map<String, Valu
             });
             ui.add_space(8.0);
             let mut inv = flag(f, "invert");
-            if widgets::checkbox(ui, &mut inv, tl!("Invert")).changed() {
+            // Selection invert (≠ Image › Adjustments › Invert → Đảo màu).
+            if widgets::checkbox(ui, &mut inv, crate::i18n::tr_ctx(crate::i18n::current(), "colorRange", "Invert")).changed() {
                 f.insert("invert".into(), json!(inv));
             }
         });
@@ -789,6 +811,31 @@ mod tests {
     }
 
     #[test]
+    fn preview_and_eyedropper_keep_the_original_selection_boundary() {
+        let mut app = app_with_doc();
+        app.session.execute("select.rect", json!({"x": 0, "y": 0, "width": 20, "height": 30})).unwrap();
+        let doc = app.session.active().unwrap().doc.clone();
+        for params in [json!({"select": "sampledColors", "color": "#ff0000", "fuzziness": 0}), json!({"select": "reds"})] {
+            let mask = proxy_mask(&app, &doc, 1, &params).unwrap();
+            assert_eq!(mask[5 * 40 + 5], 1.0, "red inside the selection stays visible");
+            assert_eq!(mask[5 * 40 + 25], 0.0, "the blue outside the selection stays excluded");
+        }
+        for params in [json!({"select": "sampledColors", "color": "#ffffff", "invert": true}), json!({"select": "outOfGamut", "invert": true})] {
+            let mask = proxy_mask(&app, &doc, 1, &params).unwrap();
+            assert_eq!(mask[5 * 40 + 25], 0.0, "even inverted previews stay within the selection");
+        }
+
+        // As in Photoshop, the eyedropper samples anywhere; only the result is scoped (#5244).
+        open(&mut app);
+        assert!(pick_top(&mut app, [25.0, 5.0], egui::Modifiers::NONE));
+        assert_eq!(points(&app.ui.dialogs.last().unwrap().fields, "points"), vec![[25.0, 5.0]], "a colour outside the selection is sampled");
+        let mask = proxy_mask(&app, &doc, 1, &json!({"select": "sampledColors", "points": [[25, 5]], "fuzziness": 0})).unwrap();
+        assert_eq!(mask[5 * 40 + 25], 0.0, "but the preview stays within the selection");
+        assert!(pick_top(&mut app, [5.0, 5.0], egui::Modifiers::NONE));
+        assert_eq!(points(&app.ui.dialogs.last().unwrap().fields, "points"), vec![[5.0, 5.0]]);
+    }
+
+    #[test]
     fn preview_cache_refreshes_after_foreground_and_proof_changes() {
         let mut app = app_with_doc();
         let p = json!({"select": "outOfGamut"});
@@ -893,6 +940,11 @@ mod tests {
         assert!(h.query_by_label("Midtones from:").is_some() && h.query_by_label("Midtones to:").is_some());
         set(&mut h, "select", json!("outOfGamut"));
         assert!(disabled(&h, "Fuzziness:") && h.query_by_label("Midtones from:").is_none());
+        // Skin Tones: Fuzziness (the colour one), no eyedroppers or clusters.
+        set(&mut h, "select", json!("skinTones"));
+        assert!(!disabled(&h, "Fuzziness:") && disabled(&h, "Localized Color Clusters") && disabled(&h, "Add to Sample"));
+        let skin: Map<String, Value> = serde_json::from_value(json!({"select": "skinTones", "fuzziness": 25.0, "points": [[1, 1]]})).unwrap();
+        assert_eq!(params(&skin), json!({"select": "skinTones", "invert": false, "fuzziness": 25.0}));
         assert_eq!(
             controls(&serde_json::from_value(json!({"select": "highlights"})).unwrap()),
             Controls { fuzziness: true, sampling: false, range: false, tonal: true }
@@ -921,7 +973,8 @@ mod tests {
     #[test]
     fn ok_applies_one_undo_step() {
         let mut h = harness(app_with_doc());
-        h.state_mut().run("select.rect", json!({"x": 0, "y": 20, "width": 5, "height": 5})).unwrap();
+        // The prior selection covers the left red square: Color Range is scoped to it (#3313).
+        h.state_mut().run("select.rect", json!({"x": 0, "y": 0, "width": 20, "height": 30})).unwrap();
         let past = h.state().session.active().unwrap().history.past_len();
         open(h.state_mut());
         h.run_steps(4);
@@ -935,7 +988,7 @@ mod tests {
         assert_eq!(app.session.active().unwrap().history.undo_label(), Some("Color Range"));
         h.state_mut().run("edit.undo", json!({})).unwrap();
         let app = h.state();
-        assert_eq!((coverage(app, 5, 5), coverage(app, 2, 22)), (0.0, 1.0), "undo restores the previous selection");
+        assert_eq!((coverage(app, 5, 5), coverage(app, 2, 22), coverage(app, 30, 5)), (1.0, 1.0, 0.0), "undo restores the previous selection");
     }
 
     #[test]

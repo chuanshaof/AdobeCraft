@@ -183,6 +183,20 @@ fn composite_surface(doc: &Document, r: Rect) -> Surface {
     s
 }
 
+/// The name Define Pattern gives a pattern without one: the active document's name without its
+/// extension ("Pattern" without a document), numbered past the library's existing names. The
+/// Define Pattern dialog starts from it.
+pub fn default_name(s: &Session) -> String {
+    let doc_name = s.active().map(|st| st.doc.name.clone()).unwrap_or_default();
+    let base =
+        std::path::Path::new(&doc_name).file_stem().map(|x| x.to_string_lossy().to_string()).filter(|b| !b.is_empty()).unwrap_or_else(|| "Pattern".into());
+    let taken = |n: &str| s.patterns.items.iter().any(|q| q.name == n);
+    if !taken(&base) {
+        return base;
+    }
+    (2..).map(|i| format!("{base} {i}")).find(|n| !taken(n)).unwrap_or(base)
+}
+
 fn define(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "edit.definePattern";
     let st = s.active().ok_or(EngineError::NoDocument)?;
@@ -210,17 +224,7 @@ fn define(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let name = match p.get("name").and_then(Value::as_str) {
         Some(n) if !n.trim().is_empty() => n.to_string(),
-        _ => {
-            let base = std::path::Path::new(&doc.name).file_stem().map(|x| x.to_string_lossy().to_string()).unwrap_or_else(|| "Pattern".into());
-            let mut i = 1;
-            loop {
-                let n = if i == 1 { base.clone() } else { format!("{base} {i}") };
-                if !s.patterns.items.iter().any(|q| q.name == n) {
-                    break n;
-                }
-                i += 1;
-            }
-        }
+        _ => default_name(s),
     };
     let pat = Pattern::new(name, surf, r.width(), r.height());
     let id = pat.id.clone();
@@ -264,8 +268,12 @@ fn delete(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn import(s: &mut Session, p: &Value) -> Result<Value> {
     let cmd = "pattern.import";
-    let path = p.get("path").and_then(Value::as_str).ok_or_else(|| bad(cmd, "missing `path` (.pat file)"))?;
-    let bytes = std::fs::read(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    // A file on disk, or its bytes (a dropped file, the web build).
+    let bytes = match (p.get("path").and_then(Value::as_str), p.get("data").and_then(Value::as_str)) {
+        (Some(path), _) => std::fs::read(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?,
+        (None, Some(b64)) => photocraft_paint::tile::b64_decode(b64).ok_or_else(|| bad(cmd, "`data` is not base64"))?,
+        (None, None) => return Err(bad(cmd, "missing `path` (.pat file) or `data`")),
+    };
     let pats = photocraft_io::pattern_map::read_pat(&bytes).map_err(EngineError::Other)?;
     let mut ids = Vec::new();
     for pat in pats {
@@ -275,7 +283,7 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
             None => s.patterns.items.push(pat),
         }
     }
-    Ok(json!({"imported": ids}))
+    Ok(json!({"imported": ids, "count": ids.len()}))
 }
 
 fn export(s: &mut Session, p: &Value) -> Result<Value> {
@@ -292,34 +300,57 @@ fn export(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"path": path, "count": pats.len(), "bytes": bytes.len()}))
 }
 
-pub(crate) fn placement(p: &Value) -> (f32, f32, bool, (f32, f32)) {
-    let num = |k: &str, d: f64| p.get(k).and_then(Value::as_f64).unwrap_or(d) as f32;
-    let phase = p
-        .get("phase")
-        .and_then(Value::as_array)
-        .map_or((0.0, 0.0), |a| (a.first().and_then(Value::as_f64).unwrap_or(0.0) as f32, a.get(1).and_then(Value::as_f64).unwrap_or(0.0) as f32));
-    ((num("scale", 100.0) / 100.0).clamp(0.01, 10.0), num("angle", 0.0), p.get("link").and_then(Value::as_bool).unwrap_or(true), phase)
+/// A pattern's scale, angle, link and phase from `p`. The angle is normalised to (-180, 180];
+/// a non-finite angle or a phase beyond ±`MAX_PHASE` is an error (it would render NaN).
+pub(crate) fn placement(cmd: &str, p: &Value) -> Result<(f32, f32, bool, (f32, f32))> {
+    let scale = p.get("scale").and_then(Value::as_f64).unwrap_or(100.0) as f32;
+    let max = crate::pattern_fill_cmds::MAX_PHASE;
+    let a = p.get("phase").and_then(Value::as_array);
+    let c = |i: usize| {
+        let v = a.and_then(|a| a.get(i)).and_then(Value::as_f64).unwrap_or(0.0);
+        (v.is_finite() && v.abs() <= max).then_some(v as f32).ok_or_else(|| bad(cmd, format!("`phase` needs finite coordinates within ±{max}")))
+    };
+    let phase = (c(0)?, c(1)?);
+    let angle = crate::gradient_fill_cmds::angle_param(cmd, p, 0.0)?;
+    Ok(((scale / 100.0).clamp(0.01, 10.0), angle, p.get("link").and_then(Value::as_bool).unwrap_or(true), phase))
 }
 
+/// The edit of `layer.newFillLayer.pattern`: a Pattern Fill layer of `pat` placed as `p` asks,
+/// above `active`. The Pattern Fill dialog previews it on a copy of the document.
+pub(crate) fn insert_fill_layer(
+    doc: &mut Document,
+    active: &mut Option<photocraft_doc::LayerId>,
+    pat: &Pattern,
+    p: &Value,
+    default_mask: bool,
+) -> Result<photocraft_doc::LayerId> {
+    let (scale, angle, link, phase) = placement("layer.newFillLayer.pattern", p)?;
+    ensure_in_doc(doc, pat);
+    let fill = Fill::Pattern { name: pat.name.clone(), scale, id: pat.id.clone(), angle, link, phase };
+    let mut l = Layer::new(doc.next_layer_name("Pattern Fill"), LayerContent::Fill(fill));
+    crate::commands::mask_new_layer(doc, &mut l, p, "layer.newFillLayer.pattern", default_mask)?;
+    let id = doc.insert_above(*active, l);
+    *active = Some(id);
+    Ok(id)
+}
+
+/// `layer.newFillLayer.pattern`: a Pattern Fill layer above the active one, masked as the Layers panel's Use Default Masks on Fill Layers option says.
 fn new_fill_layer(s: &mut Session, p: &Value) -> Result<Value> {
     let pat = resolve_param(s, "layer.newFillLayer.pattern", p)?;
-    let (scale, angle, link, phase) = placement(p);
-    let id = s.edit("New Pattern Fill Layer", |doc, active| {
-        ensure_in_doc(doc, &pat);
-        let fill = Fill::Pattern { name: pat.name.clone(), scale, id: pat.id.clone(), angle, link, phase };
-        let mut l = Layer::new(doc.next_layer_name("Pattern Fill"), LayerContent::Fill(fill));
-        crate::commands::mask_new_layer(doc, &mut l, p, "layer.newFillLayer.pattern")?;
-        let id = doc.insert_above(*active, l);
-        *active = Some(id);
-        Ok(id)
-    })?;
+    let default_mask = crate::commands::layer_panel_option(s, "useDefaultMasksOnFillLayers", true);
+    let id = s.edit("New Pattern Fill Layer", |doc, active| insert_fill_layer(doc, active, &pat, p, default_mask))?;
     Ok(json!({"layer": id.0, "pattern": pat.id}))
 }
 
+/// `brush.texturePattern`: use a pattern as the brush texture, converted to grey as the luminance of its composite over white.
 fn brush_texture(s: &mut Session, p: &Value) -> Result<Value> {
     let pat = resolve_param(s, "brush.texturePattern", p)?;
+    let n = pat.is_paintable().then(|| usize::try_from(pat.pixel_count()).ok()).flatten();
+    let Some(n) = n else {
+        return Err(bad("brush.texturePattern", "the pattern is empty or too large to paint"));
+    };
     // Brush textures are grey: luminance of the composite over white.
-    let mut px = vec![[0.0f32; 4]; (pat.width * pat.height) as usize];
+    let mut px = vec![[0.0f32; 4]; n];
     pat.surface.read_rgba_into(pat.rect(), &mut px);
     let lum: Vec<f32> = px
         .iter()
@@ -340,8 +371,11 @@ fn brush_texture(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// A swatch colour for UIs (average of the tile), straight RGB.
 pub fn average_color(p: &Pattern) -> Color {
-    let mut px = vec![[0.0f32; 4]; (p.width * p.height) as usize];
-    p.surface.read_rgba_into(p.rect(), &mut px);
+    // A pattern too large to paint is averaged over its paintable top-left corner.
+    let side = photocraft_doc::pattern::MAX_PAINT_PIXELS.isqrt() as u32;
+    let (w, h) = (p.width.min(side), p.height.min(side));
+    let mut px = vec![[0.0f32; 4]; w as usize * h as usize];
+    p.surface.read_rgba_into(Rect::new(0, 0, w as i32, h as i32), &mut px);
     let n = px.len().max(1) as f32;
     let s = px.iter().fold([0.0f32; 3], |a, q| [a[0] + q[0], a[1] + q[1], a[2] + q[2]]);
     Color::rgb(s[0] / n, s[1] / n, s[2] / n)
@@ -354,7 +388,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Define Pattern…",
             menu: &["Edit"],
             shortcut: None,
-            params: r##"{"name":str?,"rect":[x0,y0,x1,y1]? (default: selection bounds, else the canvas)} → {"pattern":id} (added to the library; samples the visible composite)"##,
+            params: r##"{"name":text,"rect":[x0,y0,x1,y1]?} → {"pattern":id} (name: default the document's name numbered past the library's names; rect: default the selection bounds or else the canvas; added to the library from the visible composite)"##,
             enabled: has_doc,
             journal: true,
             run: define,
@@ -394,7 +428,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Import Patterns…",
             menu: &[],
             shortcut: None,
-            params: r##"{"path":".pat file"}"##,
+            params: r##"{"path":".pat file"?,"data":base64 bytes? (instead of a path)} → {imported:[ids],count}"##,
             enabled: always,
             journal: true,
             run: import,
@@ -485,8 +519,17 @@ mod tests {
         let v = s.execute("pattern.import", json!({"path": path})).unwrap();
         assert!(v["imported"].as_array().unwrap().iter().any(|x| x == id.as_str()));
         assert_eq!(resolve(&s, &id).unwrap().surface.read_region(Rect::new(0, 0, 5, 4)), pat.surface.read_region(Rect::new(0, 0, 5, 4)));
+        // The same file as bytes (a dropped file, the web build).
+        let bytes = std::fs::read(path).unwrap();
+        s.execute("pattern.delete", json!({"pattern": "Crimson"})).unwrap();
+        let v = s.execute("pattern.import", json!({"data": photocraft_paint::tile::b64_encode(&bytes)})).unwrap();
+        assert_eq!(v["count"], v["imported"].as_array().unwrap().len());
+        assert_eq!(resolve(&s, "Crimson").unwrap().id, id);
         std::fs::remove_dir_all(dir).ok();
         assert!(s.execute("pattern.import", json!({"path": "/nonexistent.pat"})).is_err());
+        for bad in [json!({}), json!({"data": "not base64!"}), json!({"data": "aGVsbG8="})] {
+            assert!(s.execute("pattern.import", bad.clone()).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -505,6 +548,26 @@ mod tests {
             assert!(s.active().unwrap().doc.patterns.is_empty());
             assert!(s.execute("layer.newFillLayer.pattern", json!({"pattern": "nope"})).is_err());
         }
+    }
+
+    #[test]
+    fn pattern_placement_rejects_non_finite_angle_and_phase() {
+        // 1e39 overflowed f32 to infinity: a NaN render, and a fill layer .pcraft refused to save.
+        let mut s = session(8);
+        let n = s.active().unwrap().doc.layers.len();
+        for cmd in ["layer.newFillLayer.pattern", "edit.fill", "paint.bucket"] {
+            for bad in [json!({"angle": 1e39}), json!({"angle": "x"}), json!({"phase": [1e39, 0]}), json!({"phase": [0, -1e300]})] {
+                let mut p = json!({"pattern": "Checkerboard", "contents": "pattern", "x": 1, "y": 1});
+                p.as_object_mut().unwrap().extend(bad.as_object().unwrap().clone());
+                assert!(s.execute(cmd, p).is_err(), "{cmd} {bad}");
+            }
+        }
+        assert_eq!(s.active().unwrap().doc.layers.len(), n);
+        // The angle is normalised to (-180, 180] like the Pattern Fill dialog's.
+        let r = s.execute("layer.newFillLayer.pattern", json!({"pattern": "Checkerboard", "angle": 270, "phase": [3, -4]})).unwrap();
+        let id = LayerId(r["layer"].as_u64().unwrap());
+        let Some(LayerContent::Fill(Fill::Pattern { angle, phase, .. })) = s.active().unwrap().doc.layer(id).map(|l| &l.content) else { panic!() };
+        assert_eq!((*angle, *phase), (-90.0, (3.0, -4.0)));
     }
 
     #[test]
@@ -529,7 +592,7 @@ mod tests {
         s.execute("edit.fill", json!({"color": "#0000ff"})).unwrap();
         s.execute("select.deselect", json!({})).unwrap();
         s.execute("layer.layerStyle.patternOverlay", json!({"pattern": "Diagonal Lines"})).unwrap();
-        s.execute("layer.layerStyle.stroke", json!({"size": 3, "color": "#00ff00", "add": true})).unwrap();
+        s.execute("layer.layerStyle.stroke", json!({"size": 3, "position": "outside", "color": "#00ff00", "add": true})).unwrap();
         let out = pixel(&s, 8, 15);
         assert!(out[1] > 0.9 && out[0] < 0.1, "stroke outside: {out:?}");
     }
@@ -551,5 +614,15 @@ mod tests {
         s.execute("brush.texturePattern", json!({"pattern": "Dots", "scale": 50})).unwrap();
         assert!(s.tools.brush.texture.enabled);
         assert!(matches!(s.tools.brush.texture.pattern, photocraft_paint::Pattern::Tile(_)));
+    }
+
+    #[test]
+    fn a_pattern_too_large_to_paint_is_refused_not_allocated() {
+        // width × height overflows u32: this panicked (debug) or wrapped (release).
+        let mut s = session(8);
+        let huge = Pattern { id: "huge".into(), name: "Huge".into(), width: 65_536, height: 65_536, surface: Surface::new(PixelFormat::RGBA8) };
+        s.patterns.items.push(huge);
+        let e = s.execute("brush.texturePattern", json!({"pattern": "huge"})).unwrap_err();
+        assert!(e.to_string().contains("too large"), "{e}");
     }
 }

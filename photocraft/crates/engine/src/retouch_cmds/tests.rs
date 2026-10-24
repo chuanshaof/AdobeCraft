@@ -4,6 +4,202 @@ use photocraft_color::ColorMode;
 const DEPTHS: [u64; 3] = [8, 16, 32];
 
 #[test]
+fn periodic_clone_large_footprint_applies_opacity_once_and_respects_destination_masks() {
+    for depth in DEPTHS {
+        for lock in [false, true] {
+            let mut s = session(8, 8, depth, "rgb");
+            paint_layer(&mut s, |x, _| {
+                if x < 4 {
+                    [1.0, 0.0, 0.0, 1.0]
+                } else if x == 7 {
+                    [0.0; 4]
+                } else {
+                    [1.0; 4]
+                }
+            });
+            s.edit("lock", |doc, active| {
+                doc.layer_mut(active.unwrap()).unwrap().locks.transparency = lock;
+                Ok(())
+            })
+            .unwrap();
+            s.execute("select.rect", json!({"x":5,"y":0,"width":3,"height":8})).unwrap();
+            s.execute("paint.cloneStamp", json!({"points":[[6,4]],"offset":[4,0],"size":32,"hardness":100,"opacity":50,"wrap":true})).unwrap();
+            assert_eq!(rgba(&s, 4, 4), [1.0; 4], "selection is evaluated at the wrapped destination");
+            let opaque = rgba(&s, 6, 4);
+            assert!((opaque[1] - 0.5).abs() <= tol(depth), "overlapping tile copies must not multiply opacity: {opaque:?}");
+            let transparent = rgba(&s, 7, 4);
+            if lock {
+                assert_eq!(transparent[3], 0.0, "locked transparent destination stays transparent");
+            } else {
+                assert!((transparent[3] - 0.5).abs() <= tol(depth), "unlocked transparent destination receives one stroke: {transparent:?}");
+                assert_eq!(transparent[0], 1.0);
+            }
+        }
+    }
+}
+
+#[test]
+fn periodic_clone_selection_uses_native_cmyk_pixels_across_seam() {
+    let mut s = session(64, 32, 8, "cmyk");
+    paint_layer(&mut s, |x, _| if x < 32 { [0.0, 0.0, 1.0, 1.0] } else { [1.0, 1.0, 0.0, 1.0] });
+    s.execute("select.rect", json!({"x":0,"y":0,"width":4,"height":32})).unwrap();
+    s.execute("paint.cloneStamp", json!({"points":[[63,16]],"offset":[-23,0],"size":16,"hardness":100,"wrap":true})).unwrap();
+    let (inside, outside) = (rgba(&s, 1, 16), rgba(&s, 5, 16));
+    assert!(inside[0] > 0.8 && inside[2] < 0.3, "selected wrapped destination becomes yellow: {inside:?}");
+    assert!(outside[2] > outside[0] + 0.2, "unselected neighbour remains blue: {outside:?}");
+}
+
+#[test]
+fn periodic_clone_projection_is_disjoint_and_matches_pixel_modulo() {
+    use std::collections::HashSet;
+    let tile = Rect::new(0, 0, 8, 6);
+    for rect in [Rect::new(-2, -3, 3, 2), Rect::new(-10, -9, 19, 14), Rect::new(7, 5, 10, 8), Rect::new(i32::MIN, i32::MIN, i32::MIN + 3, i32::MIN + 2)] {
+        let expected: HashSet<_> = (rect.y0..rect.y1).flat_map(|y| (rect.x0..rect.x1).map(move |x| (x.rem_euclid(8), y.rem_euclid(6)))).collect();
+        let mut actual = HashSet::new();
+        for r in periodic::project(rect, tile) {
+            for y in r.y0..r.y1 {
+                for x in r.x0..r.x1 {
+                    assert!(actual.insert((x, y)), "projected rectangles overlap");
+                }
+            }
+        }
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn periodic_clone_preview_interpolates_across_transformed_source_seam() {
+    use crate::presets::clone_source::Mapping;
+    for depth in DEPTHS {
+        let mut s = session(32, 24, depth, "rgb");
+        paint_layer(&mut s, |x, _| if x == 0 { [1.0, 0.0, 0.0, 1.0] } else { [0.0, 0.0, 1.0, 1.0] });
+        let before = s.active().unwrap().doc.clone();
+        // A rotated mapping samples halfway between the last and first columns.
+        let map = Mapping { source: (31.5, 10.0), anchor: (0.0, 0.0), m: [0.0, 1.0, -1.0, 0.0] };
+        let r = Rect::new(0, 0, 1, 1);
+        let wrapped = clone_preview_periodic(&s, r, &map, "current", true).unwrap();
+        assert_eq!(wrapped.px, [[0.5, 0.0, 0.5, 1.0]]);
+        let ordinary = clone_preview(&s, r, &map, "current").unwrap();
+        assert_eq!(ordinary.px, [[0.0, 0.0, 1.0, 0.5]]);
+        assert_eq!(s.active().unwrap().doc, before);
+    }
+}
+
+#[test]
+fn periodic_clone_destination_wraps_edges_and_undoes_at_every_depth() {
+    for depth in DEPTHS {
+        for wrap in [false, true] {
+            let mut s = session(100, 60, depth, "rgb");
+            paint_layer(&mut s, |x, y| if x < 24 && y < 24 { [1.0, 0.0, 0.0, 1.0] } else { [1.0; 4] });
+            let before = s.active().unwrap().doc.clone();
+            s.execute("paint.cloneStamp", json!({"points":[[98,30]],"source":[10,10],"size":16,"hardness":100,"opacity":50,"wrap":wrap})).unwrap();
+            for x in [98, 1] {
+                let expected = if x == 98 || wrap { [1.0, 0.5, 0.5, 1.0] } else { [1.0; 4] };
+                let actual = rgba(&s, x, 30);
+                for (a, b) in actual.into_iter().zip(expected) {
+                    assert!((a - b).abs() <= tol(depth), "depth={depth} wrap={wrap} x={x}: {actual:?}");
+                }
+            }
+            assert!(s.undo());
+            assert_eq!(s.active().unwrap().doc, before, "one undo restores the whole wrapped stroke");
+        }
+    }
+}
+
+#[test]
+fn periodic_clone_live_matches_commit_through_a_corner() {
+    for depth in DEPTHS {
+        let mut s = session(32, 24, depth, "rgb");
+        paint_layer(&mut s, texture);
+        let before = s.active().unwrap().doc.clone();
+        let mut params = json!({"points":[[30,22]],"source":[10,10],"size":16,"hardness":70,"opacity":45,"flow":60,"wrap":true});
+        let mut live = LiveRetouch::begin(&s, "paint.cloneStamp", &params).unwrap();
+        let mut points = vec![json!([30, 22])];
+        for next in [None, Some([34.0, 26.0]), Some([38.0, 28.0]), Some([30.0, 22.0])] {
+            if let Some([x, y]) = next {
+                live.push(&[StrokePoint::new(x, y, 1.0)]).unwrap();
+                points.push(json!([x, y]));
+            }
+            params["points"] = json!(points);
+            let mut committed = Session::new();
+            committed.add_document((*before).clone(), None);
+            committed.execute("paint.cloneStamp", params.clone()).unwrap();
+            let id = s.active().unwrap().active_layer.unwrap();
+            let actual = live.doc.layer(id).unwrap().surface().unwrap().read_region(before.bounds());
+            let expected = committed.active().unwrap().doc.layer(id).unwrap().surface().unwrap().read_region(before.bounds());
+            assert_eq!(actual, expected, "live versus committed pixels at depth {depth}, points {points:?}");
+        }
+    }
+}
+
+#[test]
+fn periodic_clone_source_repeats_both_axes_at_every_depth() {
+    for depth in DEPTHS {
+        let mut s = session(6, 4, depth, "rgb");
+        paint_layer(&mut s, |x, y| [x as f32 / 6.0, y as f32 / 4.0, 0.25, 1.0]);
+        let st = s.active().unwrap();
+        let surf = st.doc.layer(st.active_layer.unwrap()).unwrap().surface().unwrap();
+        let r = Rect::new(-8, -6, 15, 11);
+        for which in [SampleLayers::Current, SampleLayers::CurrentAndBelow, SampleLayers::All] {
+            let result = periodic::sample(&st.doc, st.active_layer, surf, which, r, "test").unwrap();
+            for y in r.y0..r.y1 {
+                for x in r.x0..r.x1 {
+                    let expected = surf.rgba(x.rem_euclid(6), y.rem_euclid(4));
+                    let actual = to_rgba(&surf.format(), result.px(x, y));
+                    for (a, b) in actual.into_iter().zip(expected) {
+                        assert!((a - b).abs() <= tol(depth), "{depth}-bit ({x},{y}): {actual:?} != {expected:?}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn periodic_clone_source_bounds_allocations_and_accepts_far_coordinates() {
+    let s = session(6, 4, 8, "rgb");
+    let st = s.active().unwrap();
+    let surf = st.doc.layer(st.active_layer.unwrap()).unwrap().surface().unwrap();
+    assert!(periodic::sample(&st.doc, st.active_layer, surf, SampleLayers::Current, Rect::new(0, 0, 100_000, 100_000), "test").is_err());
+    for r in [Rect::new(i32::MIN, i32::MIN, i32::MIN + 3, i32::MIN + 2), Rect::new(i32::MAX - 3, i32::MAX - 2, i32::MAX, i32::MAX)] {
+        let result = periodic::sample(&st.doc, st.active_layer, surf, SampleLayers::Current, r, "test").unwrap();
+        assert_eq!(result.data.len(), 3 * 2 * surf.channels());
+        assert!(result.data.iter().all(|v| *v == 1.0));
+    }
+}
+
+#[test]
+fn proximity_match_reads_original_pixels_for_overlapping_offsets() {
+    // Shifting source one pixel to the left overlaps the destination in a
+    // left-to-right traversal: reading the output would repeat the first value.
+    let img = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
+    let mask = [false, true, true, true, false, false];
+    let result = proximity_source_patch(&img, 6, 1, 1, &mask, -1, 0).unwrap();
+    assert_eq!(result, vec![10.0, 10.0, 20.0, 30.0, 50.0, 60.0]);
+    assert_eq!(img, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0], "source remains untouched");
+}
+
+#[test]
+fn proximity_match_preserves_channels_and_unmasked_pixels() {
+    // A two-channel image shifted from the row above.
+    let img = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+    let mask = [false, false, true, false];
+    let result = proximity_source_patch(&img, 2, 2, 2, &mask, 0, -1).unwrap();
+    assert_eq!(result, vec![1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 7.0, 8.0]);
+}
+
+#[test]
+fn proximity_match_rejects_invalid_translations_without_panicking() {
+    let img = vec![1.0, 2.0, 3.0, 4.0];
+    let mask = [true, false, false, false];
+    assert!(proximity_source_patch(&img, 2, 2, 1, &mask, -1, 0).is_none());
+    assert!(proximity_source_patch(&img, 2, 2, 1, &mask, 0, -1).is_none());
+    assert!(proximity_source_patch(&img, 2, 2, 1, &mask, i32::MAX, 0).is_none());
+    assert!(proximity_source_patch(&img, 2, 2, 1, &mask[..3], 0, 0).is_none());
+    assert!(proximity_source_patch(&img, usize::MAX, 2, 1, &mask, 0, 0).is_none());
+}
+
+#[test]
 fn clone_preview_matches_source_without_mutating_session() {
     use crate::presets::clone_source::Mapping;
     for depth in DEPTHS {
@@ -280,7 +476,8 @@ fn blur_reduces_local_variance_and_sharpen_increases_it() {
         let v0 = var(&s, 10);
         s.execute("paint.sharpen", json!({"points": [[5, 15], [25, 15]], "size": 20, "hardness": 100, "strength": 100, "protectDetail": false})).unwrap();
         assert!(var(&s, 10) > v0 * 1.5, "depth {depth}: {v0} → {}", var(&s, 10));
-        s.execute("paint.sharpen", json!({"points": [[35, 15], [55, 15]], "size": 20, "hardness": 100, "strength": 100})).unwrap();
+        // Pinned at 25%: Protect Detail clamps per dab, so denser dabs creep past the range.
+        s.execute("paint.sharpen", json!({"points": [[35, 15], [55, 15]], "size": 20, "hardness": 100, "strength": 100, "spacing": 25})).unwrap();
         let hi = (10..20).flat_map(|y| (40..50).map(move |x| (x, y))).map(|(x, y)| rgba(&s, x, y)[0]).fold(0.0, f32::max);
         assert!(hi <= 0.55 + tol(depth), "protect detail: {hi}");
     }
@@ -303,6 +500,32 @@ fn smudge_moves_colour_along_the_stroke() {
 }
 
 #[test]
+fn smudge_uses_the_brush_settings_spacing() {
+    // #2140: the Brush Settings spacing (the session brush) drives Smudge dabs when the stroke
+    // has no `spacing` param, as it drives the Brush.
+    let run = |spacing: f32, p: Value| {
+        let mut s = session(100, 30, 8, "rgb");
+        paint_layer(&mut s, |x, _| if x < 30 { [1.0, 0.0, 0.0, 1.0] } else { [1.0, 1.0, 1.0, 1.0] });
+        s.tools.brush.spacing = spacing;
+        let mut p = p;
+        p["points"] = json!([[20, 15], [90, 15]]);
+        s.execute("paint.smudge", p).unwrap();
+        (30..95).map(|x| rgba(&s, x, 15)[1]).collect::<Vec<_>>()
+    };
+    let base = json!({"size": 12, "hardness": 100, "strength": 80});
+    let dense = run(0.01, base.clone());
+    let sparse = run(10.0, base.clone());
+    // 1000% of 12 px puts the next dab 120 px away: only the first dab, behind the edge, lands.
+    assert!(sparse.iter().all(|g| *g > 0.99), "1000% spacing: nothing dragged past the edge");
+    assert!(dense.first().is_some_and(|g| *g < 0.6), "1% spacing: red dragged right ({:?})", dense.first());
+    assert_ne!(dense, run(0.25, base.clone()), "1% and 25% differ");
+    // An explicit `spacing` param still wins over the Brush Settings value.
+    let mut explicit = base;
+    explicit["spacing"] = json!(1000);
+    assert_eq!(run(0.01, explicit), sparse);
+}
+
+#[test]
 fn history_brush_restores_earlier_pixels() {
     for depth in [8u64, 32] {
         let mut s = session(40, 20, depth, "rgb");
@@ -319,6 +542,130 @@ fn history_brush_restores_earlier_pixels() {
         assert!(rgba(&s, 20, 10)[1] > 0.99, "between the dabs still green");
         assert!(s.execute("paint.historyBrush", json!({"points": [[5, 10]], "state": 99})).is_err());
     }
+}
+
+/// #4961 and #6110: every retouch stroke renders its coverage densely over the stroke's bounds
+/// and reads a source region over the same box, so a stroke whose box dwarfs the canvas is
+/// refused from the points and brush size alone, before anything is cloned or rendered. The
+/// document is left as it was, and ordinary strokes still paint at every depth.
+#[test]
+fn history_brush_refuses_a_stroke_too_large_to_render() {
+    for depth in DEPTHS {
+        let mut s = session(40, 20, depth, "rgb");
+        s.execute("paint.stroke", json!({"points": [[0, 10], [40, 10]], "size": 12, "hardness": 1.0, "color": "#ff0000"})).unwrap();
+        let before = rgba(&s, 20, 10);
+
+        let err = s.execute("paint.historyBrush", json!({"points": [[0, 0], [60000, 60000]], "size": 6, "hardness": 100})).unwrap_err();
+        assert!(err.to_string().contains("stroke too large"), "depth {depth}: {err}");
+        assert_eq!(rgba(&s, 20, 10), before, "depth {depth}: a refused stroke leaves the pixels alone");
+
+        // The guard is sized for real work: a stroke corner to corner across the canvas still runs.
+        s.execute("paint.historyBrush", json!({"points": [[0, 0], [40, 20]], "size": 6, "hardness": 100})).unwrap();
+        assert!(rgba(&s, 20, 10).iter().all(|v| *v > 0.99), "depth {depth}: the Open snapshot is white");
+    }
+}
+
+/// #6110: Pattern Stamp already refused a stroke it could not render; every other retouch stroke
+/// reached the same dense conversion unguarded. Each command refuses the oversized stroke without
+/// touching the pixels or the history, and an ordinary stroke still succeeds.
+#[test]
+fn every_retouch_stroke_refuses_a_box_it_cannot_render() {
+    let huge = json!([[0, 0], [900_000, 900_000]]);
+    let ok = json!([[2, 2], [30, 16]]);
+    // Fixtures that are valid for a plain RGB document with one pixel layer.
+    let cases: [(&str, Value); 4] = [
+        ("paint.cloneStamp", json!({"offset": [4, 0], "size": 8, "hardness": 100})),
+        ("paint.healingBrush", json!({"offset": [4, 0], "size": 8, "hardness": 100})),
+        ("paint.spotHealing", json!({"size": 8, "hardness": 100})),
+        ("paint.historyBrush", json!({"size": 8, "hardness": 100})),
+    ];
+    for (cmd, base) in cases {
+        let mut s = session(40, 20, 8, "rgb");
+        s.execute("paint.stroke", json!({"points": [[0, 10], [40, 10]], "size": 12, "hardness": 1.0, "color": "#ff0000"})).unwrap();
+        let before = rgba(&s, 20, 10);
+        let steps = s.active().unwrap().history.past_len();
+        let with = |points: &Value| {
+            let mut v = base.clone();
+            if let Some(o) = v.as_object_mut() {
+                o.insert("points".into(), points.clone());
+            }
+            v
+        };
+        let err = s.execute(cmd, with(&huge)).unwrap_err().to_string();
+        assert!(err.contains("stroke too large"), "{cmd}: {err}");
+        assert_eq!(rgba(&s, 20, 10), before, "{cmd}: a refused stroke leaves the pixels alone");
+        assert_eq!(s.active().unwrap().history.past_len(), steps, "{cmd}: and records no history step");
+
+        // The allowance still covers ordinary work: this must succeed, not merely avoid the error.
+        s.execute(cmd, with(&ok)).unwrap_or_else(|e| panic!("{cmd}: an ordinary stroke must work: {e}"));
+        assert_eq!(s.active().unwrap().history.past_len(), steps + 1, "{cmd}: and records one step");
+    }
+
+    // Remove takes a list of strokes; each one is charged as it is parsed.
+    let mut s = session(40, 20, 8, "rgb");
+    let err = s.execute("paint.remove", json!({"strokes": [[[0, 0], [900_000, 900_000]]], "size": 8})).unwrap_err().to_string();
+    assert!(err.contains("stroke too large"), "paint.remove: {err}");
+}
+
+/// The review on #6110: the estimate from the input points is not the bound. Brush dynamics place
+/// dabs beyond those points, so the budget is applied to the extent the renderer actually produced,
+/// before the dense buffer is allocated. An injected budget makes that observable without asking
+/// for a stroke big enough to exhaust anything.
+#[test]
+fn the_budget_is_applied_to_the_rendered_extent_not_the_input_points() {
+    use photocraft_paint::{BrushSettings, Stroke, StrokePoint};
+    let mut brush = BrushSettings { size: 24.0, hardness: 1.0, ..Default::default() };
+    brush.scattering.enabled = true;
+    brush.scattering.scatter.jitter = 6.0;
+    let stroke = Stroke { brush, points: vec![StrokePoint::new(10.0, 10.0, 1.0), StrokePoint::new(40.0, 10.0, 1.0)] };
+
+    // What the renderer really covered, once scattering has placed every dab.
+    let (bounds, cov) = super::coverage_within("t", &stroke, u64::MAX).unwrap();
+    let rendered = u64::from(bounds.width()) * u64::from(bounds.height());
+    assert_eq!(cov.len() as u64, rendered, "the dense buffer is exactly the rendered extent");
+
+    // Scattering reaches past the points plus half the tip, which is what the estimate alone sees.
+    let points_only = (40.0 - 10.0 + 24.0 + 8.0) * (24.0 + 8.0);
+    assert!(rendered as f64 > points_only, "scattering expanded the stroke: {rendered} vs {points_only}");
+
+    // A budget one pixel under what it rendered refuses it; exactly the rendered extent fits.
+    let err = super::coverage_within("t", &stroke, rendered - 1).unwrap_err().to_string();
+    assert!(err.contains("stroke too large"), "{err}");
+    assert!(super::coverage_within("t", &stroke, rendered).is_ok(), "the rendered extent itself fits");
+}
+
+#[test]
+fn history_brush_reads_a_source_when_its_pixels_were_locked() {
+    // Given a white layer locked in history state 1, then unlocked and filled red.
+    let mut s = Session::new();
+    s.execute("file.new", json!({"width": 16, "height": 16, "depth": 8, "mode": "rgb", "background": "white"})).unwrap();
+    s.execute("layer.lockLayers", json!({"pixels": true})).unwrap();
+    s.execute("layer.lockLayers", json!({"pixels": false})).unwrap();
+    s.execute("edit.fill", json!({"color": "#ff0000"})).unwrap();
+
+    // When History Brush samples the locked historical pixels.
+    let result = s.execute("paint.historyBrush", json!({"points": [[8, 8]], "size": 4, "hardness": 100, "state": 1}));
+
+    // Then it paints white; the historical lock limits edits, not reads.
+    assert!(result.is_ok(), "{result:?}");
+    assert!(rgba(&s, 8, 8).iter().all(|v| *v > 0.99), "{:?}", rgba(&s, 8, 8));
+}
+
+#[test]
+fn history_brush_refuses_a_locked_destination_when_source_is_unlocked() {
+    // Given an unlocked white source and a red, currently locked destination.
+    let mut s = Session::new();
+    s.execute("file.new", json!({"width": 16, "height": 16, "depth": 8, "mode": "rgb", "background": "white"})).unwrap();
+    s.execute("edit.fill", json!({"color": "#ff0000"})).unwrap();
+    s.execute("layer.lockLayers", json!({"pixels": true})).unwrap();
+
+    // When History Brush samples the unlocked source and attempts to paint the locked destination.
+    let result = s.execute("paint.historyBrush", json!({"points": [[8, 8]], "size": 4, "hardness": 100, "state": 0}));
+
+    // Then the destination lock still rejects the edit and preserves red pixels.
+    assert!(result.is_err());
+    let pixel = rgba(&s, 8, 8);
+    assert!(pixel[0] > 0.99 && pixel[1] < 0.01, "{pixel:?}");
 }
 
 #[test]
@@ -342,6 +689,7 @@ fn retouch_commands_are_registered_and_need_a_pixel_layer() {
         "paint.sharpen",
         "paint.smudge",
         "paint.historyBrush",
+        "paint.remove",
     ];
     for id in ids {
         let spec = crate::commands::find(id).unwrap_or_else(|| panic!("{id} missing"));
@@ -358,7 +706,7 @@ fn retouch_commands_are_registered_and_need_a_pixel_layer() {
 // Paint target (#207): mask, alpha channel, Quick Mask
 // ---------------------------------------------------------------------------------------------
 
-const RETOUCH_IDS: [&str; 11] = [
+const RETOUCH_IDS: [&str; 12] = [
     "paint.cloneStamp",
     "paint.patternStamp",
     "paint.healingBrush",
@@ -370,6 +718,7 @@ const RETOUCH_IDS: [&str; 11] = [
     "paint.sharpen",
     "paint.smudge",
     "paint.historyBrush",
+    "paint.remove",
 ];
 
 /// Grey noise in 0.3..0.7 (no period along the clone offset used below).
@@ -426,10 +775,11 @@ fn retouch_params(id: &str, history_state: usize, target: Value) -> Value {
     p
 }
 
-/// Tools whose stroke must visibly change grey noise (Sponge has no colour to change on grey, and
-/// healing a noise texture with itself may land on the same values).
+/// Tools whose stroke must visibly change grey noise (Sponge has no colour to change on grey,
+/// healing a noise texture with itself may land on the same values, and Remove completes this
+/// periodic noise exactly).
 fn changes_gray(id: &str) -> bool {
-    !matches!(id, "paint.sponge" | "paint.healingBrush" | "paint.spotHealing")
+    !matches!(id, "paint.sponge" | "paint.healingBrush" | "paint.spotHealing" | "paint.remove")
 }
 
 #[test]
@@ -647,6 +997,39 @@ fn patch_source_repairs_the_selection_with_texture_from_the_drag_target() {
 }
 
 #[test]
+fn patch_content_aware_copies_the_dragged_to_content_into_the_selection() {
+    // Photoshop's Patch: Content-Aware (measured on 25.4): only the selection changes; its middle
+    // is the dragged-to content (Color 0 keeps its level), the edge band blends.
+    for depth in [8, 16] {
+        let mut s = session(128, 64, depth, "rgb");
+        paint_layer(&mut s, blemished(40));
+        s.execute("select.rect", json!({"x": 32, "y": 12, "width": 24, "height": 24})).unwrap();
+        let r = s.execute("paint.patch", json!({"offset": [-30, 2], "contentAware": true, "structure": 7, "color": 0})).unwrap();
+        assert_eq!(r["contentAware"], json!(true));
+        for (x, y) in [(42, 22), (44, 24), (46, 26)] {
+            let (got, want) = (rgba(&s, x, y), texture(x - 30, y + 2));
+            for c in 0..4 {
+                assert!((got[c] - want[c]).abs() <= tol(depth), "depth {depth}: middle copied at {x},{y}: {got:?} vs {want:?}");
+            }
+        }
+        for (x, y) in [(31, 20), (56, 25), (12, 20), (44, 40)] {
+            let (got, want) = (rgba(&s, x, y), texture(x, y));
+            assert!((got[0] - want[0]).abs() <= tol(depth), "depth {depth}: untouched {x},{y}: {got:?}");
+        }
+        assert_eq!(s.active().unwrap().history.undo_label(), Some("Patch (Content-Aware)"));
+        s.execute("edit.undo", json!({})).unwrap();
+        assert_eq!(rgba(&s, 44, 24)[1], 0.0, "depth {depth}: undo brings the blemish back");
+    }
+    // Bad options are refused before any work.
+    let mut s = session(96, 48, 8, "rgb");
+    paint_layer(&mut s, blemished(40));
+    s.execute("select.rect", json!({"x": 36, "y": 16, "width": 16, "height": 16})).unwrap();
+    for p in [json!({"offset": [-30, 0], "contentAware": true, "structure": 9}), json!({"offset": [-30, 0], "contentAware": true, "color": -1})] {
+        assert!(s.execute("paint.patch", p.clone()).is_err(), "{p}");
+    }
+}
+
+#[test]
 fn patch_destination_repairs_the_drag_target_from_the_selection() {
     let mut s = session(96, 48, 16, "rgb");
     paint_layer(&mut s, blemished(40));
@@ -700,7 +1083,7 @@ fn patch_fails_gracefully() {
         json!({"offset": [0, -30]}),
         json!({"offset": [10, 0], "target": "mask"}),
         json!({"offset": [10, 0], "target": {"channel": 7}}),
-        json!({"offset": [10, 0], "layer": 999}),
+        json!({"offset": [10, 0], "layer": u64::MAX}),
     ] {
         assert!(s.execute("paint.patch", p.clone()).is_err(), "{p}");
     }
@@ -790,6 +1173,135 @@ fn content_aware_move_moves_the_object_and_fills_its_place_at_all_depths() {
 }
 
 #[test]
+fn content_aware_move_preview_shows_the_result_without_touching_the_session() {
+    use crate::jobs::JobCtx;
+    let mut s = session(128, 64, 8, "rgb");
+    paint_layer(&mut s, with_object(20, 26));
+    s.execute("select.rect", json!({"x": 16, "y": 22, "width": 20, "height": 20})).unwrap();
+    let before = s.active().unwrap().revision;
+    let p = json!({"offset": [70, 0]});
+    let (doc, damage) = content_aware_move_preview(&s, &p).unwrap().run(&JobCtx::new()).unwrap();
+    let px = |d: &Document, x, y| d.layers[0].surface().unwrap().rgba(x, y);
+    assert!(is_object(px(&doc, 95, 31)) && !is_object(px(&doc, 25, 31)), "the preview shows the move");
+    assert!(damage.contains(95, 31) && damage.contains(25, 31), "{damage:?}");
+    // The session is untouched.
+    assert!(is_object(rgba(&s, 25, 31)) && !is_object(rgba(&s, 95, 31)));
+    assert_eq!(s.active().unwrap().revision, before);
+    // A small selection is solved at full resolution, with nothing to refine.
+    let job = content_aware_move_preview(&s, &p).unwrap();
+    assert!(!job.is_coarse() && job.refine().is_none());
+    // A cancelled preview stops; bad params are errors.
+    let ctx = JobCtx::new();
+    ctx.cancel();
+    assert!(matches!(content_aware_move_preview(&s, &p).unwrap().run(&ctx), Err(EngineError::Cancelled)));
+    assert!(content_aware_move_preview(&s, &json!({"offset": [0, 0]})).is_err());
+    assert!(content_aware_move_preview(&s, &json!({"offset": [70, 0], "rotate": "x"})).is_err());
+    assert!(content_aware_move_preview(&s, &json!({"offset": [70, 0], "mode": "copy"})).is_err());
+}
+
+/// A 30×30 object in the middle of a 400×300 selection (over the 256×256 a preview solves at full
+/// resolution) on a 700×400 canvas, dragged by (250, 60).
+fn large_move(depth: u64) -> Session {
+    let mut s = session(700, 400, depth, "rgb");
+    paint_layer(&mut s, |x, y| if (195..225).contains(&x) && (145..175).contains(&y) { [0.05, 0.1, 0.9, 1.0] } else { texture(x, y) });
+    s.execute("select.rect", json!({"x": 10, "y": 10, "width": 400, "height": 300})).unwrap();
+    s
+}
+
+#[test]
+fn content_aware_move_previews_large_selections_coarse_then_exact_at_all_depths() {
+    use crate::jobs::JobCtx;
+    let p = json!({"offset": [250, 60]});
+    for depth in DEPTHS {
+        let mut s = large_move(depth);
+        let before = s.active().unwrap().revision;
+        let job = content_aware_move_preview(&s, &p).unwrap();
+        assert!(job.is_coarse(), "depth {depth}: solved scaled down");
+        let (coarse, damage) = job.run(&JobCtx::new()).unwrap();
+        let px = |d: &Document, x, y| d.layers[0].surface().unwrap().rgba(x, y);
+        // The object lands where the command puts it (its middle; the coarse pass softens the
+        // edges) and its old place is filled.
+        for (x, y) in [(460, 220), (470, 230), (455, 215), (465, 225)] {
+            assert!(is_object(px(&coarse, x, y)), "depth {depth}: the object lands at {x},{y}: {:?}", px(&coarse, x, y));
+        }
+        for (x, y) in [(435, 220), (485, 220), (460, 195), (460, 245)] {
+            assert!(!is_object(px(&coarse, x, y)), "depth {depth}: nothing of the object at {x},{y}");
+        }
+        assert!(!is_object(px(&coarse, 210, 160)), "depth {depth}: the old place is filled");
+        assert!(damage.contains(470, 230) && damage.contains(210, 160), "{damage:?}");
+        // Outside the selection and where it lands, nothing changes.
+        for (x, y) in [(5, 5), (690, 20), (20, 390)] {
+            assert_eq!(px(&coarse, x, y), rgba(&s, x, y), "depth {depth}: {x},{y} untouched");
+        }
+        // The session is untouched.
+        assert!(is_object(rgba(&s, 210, 160)) && !is_object(rgba(&s, 460, 220)));
+        assert_eq!(s.active().unwrap().revision, before);
+        // Cancelled, either pass stops.
+        let ctx = JobCtx::new();
+        ctx.cancel();
+        assert!(matches!(job.run(&ctx), Err(EngineError::Cancelled)), "depth {depth}");
+        let fine = job.refine().unwrap();
+        assert!(!fine.is_coarse() && fine.refine().is_none());
+        assert!(matches!(fine.run(&ctx), Err(EngineError::Cancelled)), "depth {depth}");
+        if depth != 8 {
+            continue;
+        }
+        // The refined preview is the command's result, bit for bit.
+        let (exact, _) = fine.run(&JobCtx::new()).unwrap();
+        assert_eq!(s.active().unwrap().revision, before);
+        s.execute("paint.contentAwareMove", p.clone()).unwrap();
+        let b = exact.bounds();
+        let made = s.active().unwrap().doc.layers[0].surface().unwrap().read_region(b);
+        assert!(exact.layers[0].surface().unwrap().read_region(b) == made, "refined preview = command");
+    }
+}
+
+#[test]
+fn content_aware_move_coarse_preview_handles_transform_extend_and_limits() {
+    use crate::jobs::JobCtx;
+    let s = large_move(8);
+    let px = |d: &Document, x, y| d.layers[0].surface().unwrap().rgba(x, y);
+    // Transform On Drop: turned 90° about the selection's centre (210, 160), then moved; the
+    // object sits at the centre, so it lands at (460, 220) either way.
+    let (turned, _) = content_aware_move_preview(&s, &json!({"offset": [250, 60], "rotate": 90})).unwrap().run(&JobCtx::new()).unwrap();
+    assert!(is_object(px(&turned, 460, 220)) && !is_object(px(&turned, 210, 160)));
+    // Extend keeps the original.
+    let (extended, _) = content_aware_move_preview(&s, &json!({"offset": [250, 60], "mode": "extend"})).unwrap().run(&JobCtx::new()).unwrap();
+    assert!(is_object(px(&extended, 460, 220)) && is_object(px(&extended, 210, 160)));
+    // Off the canvas, or past the command's own limit, is still an error.
+    assert!(content_aware_move_preview(&s, &json!({"offset": [400, 0]})).is_err());
+    let mut big = session(5000, 4000, 8, "rgb");
+    big.execute("select.rect", json!({"x": 0, "y": 0, "width": 4500, "height": 3900})).unwrap();
+    assert!(content_aware_move_preview(&big, &json!({"offset": [10, 10]})).is_err());
+}
+
+#[test]
+fn content_aware_move_transform_on_drop_scales_and_rotates_the_content() {
+    // A horizontal 16×6 bar in a 36×36 selection, dropped 80 px right and turned 90° with 125%
+    // width: it lands upright, 20 px tall, and the blend works around the turned content.
+    let bar = |x: i32, y: i32| if (20..36).contains(&x) && (30..36).contains(&y) { [0.05, 0.1, 0.9, 1.0] } else { texture(x, y) };
+    for depth in [8, 32] {
+        let mut s = session(160, 64, depth, "rgb");
+        paint_layer(&mut s, bar);
+        s.execute("select.rect", json!({"x": 10, "y": 15, "width": 36, "height": 36})).unwrap();
+        let r = s.execute("paint.contentAwareMove", json!({"offset": [80, 0], "rotate": 90, "scaleX": 125})).unwrap();
+        assert_eq!(r["transformed"], json!(true));
+        for (x, y) in [(108, 24), (108, 33), (108, 42), (106, 30)] {
+            assert!(is_object(rgba(&s, x, y)), "depth {depth}: the turned, stretched bar covers {x},{y}: {:?}", rgba(&s, x, y));
+        }
+        for (x, y) in [(101, 33), (115, 33)] {
+            assert!(!is_object(rgba(&s, x, y)), "depth {depth}: no unturned bar at {x},{y}");
+        }
+        assert!(!is_object(rgba(&s, 28, 33)), "depth {depth}: the old place is filled");
+        assert!(selected(&s, 108, 33) && !selected(&s, 28, 33), "depth {depth}: the selection followed");
+        // One step: undo brings the bar and the selection back.
+        s.execute("edit.undo", json!({})).unwrap();
+        assert!(is_object(rgba(&s, 28, 33)) && !is_object(rgba(&s, 108, 24)), "depth {depth}: undo");
+        assert!(selected(&s, 28, 33), "depth {depth}: undo restores the selection");
+    }
+}
+
+#[test]
 fn content_aware_extend_keeps_the_original() {
     let mut s = session(128, 64, 8, "rgb");
     paint_layer(&mut s, with_object(20, 26));
@@ -803,40 +1315,55 @@ fn content_aware_extend_keeps_the_original() {
 
 #[test]
 fn content_aware_move_structure_and_color_shape_the_result() {
-    // Structure 7, Color 0: the content is copied exactly, edge to edge.
-    let mut s = session(128, 64, 16, "rgb");
-    paint_layer(&mut s, texture);
-    s.execute("select.rect", json!({"x": 10, "y": 10, "width": 24, "height": 24})).unwrap();
-    s.execute("paint.contentAwareMove", json!({"offset": [70, 20], "structure": 7, "mode": "extend"})).unwrap();
-    for (x, y) in [(10, 10), (22, 22), (33, 33)] {
+    // Structure 7, Color 0: the content is copied exactly but for a band about a patch wide along
+    // its edge, which blends into the new surroundings; Structure 3 gives the same, bit for bit
+    // (as in Photoshop).
+    let moved = |structure: u64| {
+        let mut s = session(128, 64, 16, "rgb");
+        paint_layer(&mut s, texture);
+        s.execute("select.rect", json!({"x": 10, "y": 10, "width": 24, "height": 24})).unwrap();
+        s.execute("paint.contentAwareMove", json!({"offset": [70, 20], "structure": structure, "mode": "extend"})).unwrap();
+        s
+    };
+    let s = moved(7);
+    for (x, y) in [(16, 16), (22, 22), (27, 27)] {
         let (got, want) = (rgba(&s, x + 70, y + 20), texture(x, y));
         for c in 0..4 {
             assert!((got[c] - want[c]).abs() <= tol(16), "strict copy at {x},{y}: {got:?} vs {want:?}");
         }
     }
-    // A lower Structure re-synthesises an edge band: the edge differs from a plain copy, the
-    // centre doesn't.
-    let mut s = session(128, 64, 16, "rgb");
-    paint_layer(&mut s, texture);
+    let s3 = moved(3);
+    for y in 30..54 {
+        for x in 80..104 {
+            assert_eq!(rgba(&s, x, y), rgba(&s3, x, y), "structure 3 and 7 agree at {x},{y}");
+        }
+    }
+    // Structure 2 widens the re-synthesised band: the edge differs from a plain copy, the centre
+    // doesn't. Structure 1 re-synthesises the content too, its centre included.
     let copy = |s: &Session, x: i32, y: i32| (rgba(s, x + 70, y + 20), rgba(s, x, y));
-    s.execute("select.rect", json!({"x": 10, "y": 10, "width": 24, "height": 24})).unwrap();
-    s.execute("paint.contentAwareMove", json!({"offset": [70, 20], "structure": 1, "mode": "extend"})).unwrap();
+    let s = moved(2);
     let (centre, orig) = copy(&s, 22, 22);
     assert_eq!(centre, orig, "the centre is kept");
     let edge = (0..24).filter(|i| copy(&s, 10 + i, 10).0 != copy(&s, 10 + i, 10).1).count();
     assert!(edge > 12, "the top edge row is blended in ({edge} of 24 pixels differ)");
+    let s = moved(1);
+    let (centre, orig) = copy(&s, 22, 22);
+    assert_ne!(centre, orig, "structure 1 re-synthesises the centre too");
 
     // Color 10 fits a bright patch to a dark place; Color 0 keeps it bright.
     let mean = |color: u64| {
         let mut s = session(128, 64, 32, "rgb");
         paint_layer(&mut s, |x, _| if x < 64 { [0.8, 0.8, 0.8, 1.0] } else { [0.2, 0.2, 0.2, 1.0] });
-        s.execute("select.rect", json!({"x": 20, "y": 20, "width": 16, "height": 16})).unwrap();
+        s.execute("select.rect", json!({"x": 20, "y": 20, "width": 24, "height": 24})).unwrap();
         s.execute("paint.contentAwareMove", json!({"offset": [70, 0], "structure": 7, "color": color, "mode": "extend"})).unwrap();
-        (94..102).map(|x| rgba(&s, x, 28)[0]).sum::<f32>() / 8.0
+        // The copied middle (the edge band is re-synthesised from the dark surroundings).
+        (98..106).map(|x| rgba(&s, x, 32)[0]).sum::<f32>() / 8.0
     };
-    let (kept, fitted) = (mean(0), mean(10));
+    let (kept, some, fitted) = (mean(0), mean(3), mean(10));
     assert!((kept - 0.8).abs() < 1e-3, "color 0 keeps the colour: {kept}");
-    assert!(fitted < 0.3, "color 10 adapts to the dark surroundings: {fitted}");
+    // Photoshop shifts by up to about 0.04 per step of Color.
+    assert!((some - 0.68).abs() < 0.03, "color 3 adapts part of the way: {some}");
+    assert!((fitted - 0.4).abs() < 0.03, "color 10 adapts most of the way: {fitted}");
 }
 
 #[test]
@@ -910,11 +1437,22 @@ fn content_aware_move_fails_gracefully() {
         json!({"offset": [0, -30]}),
         json!({"offset": [10, 0], "target": "mask"}),
         json!({"offset": [10, 0], "target": {"channel": 7}}),
-        json!({"offset": [10, 0], "layer": 999}),
+        json!({"offset": [10, 0], "layer": u64::MAX}),
+        json!({"offset": [10, 0], "scaleX": 0}),
+        json!({"offset": [10, 0], "scaleY": 0.5}),
+        json!({"offset": [10, 0], "scaleX": 1e9}),
+        json!({"offset": [10, 0], "scaleX": "big"}),
+        json!({"offset": [10, 0], "rotate": 1e300}),
+        json!({"offset": [10, 0], "rotate": [45]}),
+        json!({"offset": [5000, 0], "scaleX": 200}),
+        json!({"offset": [0, 0], "scaleX": 100, "rotate": 360}),
     ] {
         assert!(s.execute("paint.contentAwareMove", p.clone()).is_err(), "{p}");
     }
     assert!(s.execute("paint.contentAwareMove", json!({"offset": [10, 0], "structure": 7.0, "color": null})).is_ok());
+    // Transform On Drop: scaling in place needs no drag; a big patch may reach past the edge.
+    assert!(s.execute("paint.contentAwareMove", json!({"offset": [0, 0], "scaleX": 150, "rotate": -30})).is_ok());
+    assert!(s.execute("paint.contentAwareMove", json!({"offset": [20, 0], "scaleX": -10000, "scaleY": 10000})).is_ok());
 }
 
 #[test]
@@ -1133,6 +1671,68 @@ fn live_clone_matches_the_commit() {
     }
 }
 
+// Both preview implementations must reject an entire pointer batch before their renderer,
+// coverage, tail or working surface changes. Compare a resumed stroke with a clean control.
+macro_rules! live_coordinate_regression {
+    ($name:ident, $live:ty, [$($cmd:literal),+]) => {
+        #[test]
+        fn $name() {
+            for depth in DEPTHS {
+                let mut s = session(32, 32, depth, "rgb");
+                paint_layer(&mut s, texture);
+                let st = s.active().unwrap();
+                let (doc, revision, history) = (st.doc.clone(), st.revision, st.history.past_len());
+                let id = st.active_layer.unwrap();
+                for cmd in [$($cmd),+] {
+                    let p = json!({"points": [[8, 16]], "source": [4, 8], "size": 4, "hardness": 100});
+                    let mut live = <$live>::begin(&s, cmd, &p).unwrap();
+                    let mut control = <$live>::begin(&s, cmd, &p).unwrap();
+                    // The first regression case fails fast even without the guard, before any
+                    // enormous coordinate reaches the path walker.
+                    for (x, y) in [
+                        (f64::NAN, 16.0),
+                        (16.0, f64::NAN),
+                        (f64::INFINITY, 16.0),
+                        (16.0, f64::NEG_INFINITY),
+                        (1e300, 16.0),
+                        (16.0, -crate::brush_cmds::MAX_COORD - 1.0),
+                    ] {
+                        let shown = live.doc.clone();
+                        let bounds = live.bounds();
+                        let batch = [StrokePoint::new(12.0, 18.0, 1.0), StrokePoint::new(x, y, 1.0)];
+                        let err = live.push(&batch).unwrap_err();
+                        assert!(matches!(err, EngineError::BadParams { cmd: ref actual, ref msg }
+                            if actual == cmd && msg.contains("point coordinates must be finite")));
+                        assert!(std::sync::Arc::ptr_eq(&shown, &live.doc), "{cmd}: invalid batch changed the preview");
+                        assert_eq!(live.bounds(), bounds, "{cmd}");
+                    }
+                    let next = [StrokePoint::new(-4.0, 16.0, 1.0), StrokePoint::new(24.0, 16.0, 1.0)];
+                    assert_eq!(live.push(&next).unwrap(), control.push(&next).unwrap(), "{cmd}");
+                    assert_eq!(live.bounds(), control.bounds(), "{cmd}");
+                    let got = live.doc.layer(id).unwrap().surface().unwrap();
+                    let want = control.doc.layer(id).unwrap().surface().unwrap();
+                    assert_eq!(got.read_region(live.bounds()), want.read_region(control.bounds()), "{cmd}");
+                    assert_eq!(got.content_bounds(), want.content_bounds(), "{cmd}");
+                }
+                let st = s.active().unwrap();
+                assert!(std::sync::Arc::ptr_eq(&doc, &st.doc));
+                assert_eq!((st.revision, st.history.past_len()), (revision, history));
+            }
+        }
+    };
+}
+
+live_coordinate_regression!(
+    live_retouch_rejects_invalid_batches_without_changing_the_preview,
+    LiveRetouch,
+    ["paint.cloneStamp", "paint.healingBrush", "paint.historyBrush", "paint.patternStamp"]
+);
+live_coordinate_regression!(
+    live_dab_rejects_invalid_batches_without_changing_the_preview,
+    LiveDab,
+    ["paint.dodge", "paint.burn", "paint.sponge", "paint.blur", "paint.sharpen", "paint.smudge"]
+);
+
 /// The live Dodge shows what the commit paints, also where a stroke doubles back across the
 /// cells that remember each pixel's original colour (the live stroke edits one dab at a time).
 /// 32-bit, so the live working copy isn't quantised between dabs.
@@ -1155,12 +1755,539 @@ fn live_dodge_matches_the_commit_across_cells() {
         for x in 0..200 {
             let (got, want) = (a.rgba(x, y), b.rgba(x, y));
             changed |= (want[0] - texture(x, y)[0]).abs() > 0.02;
-            // The commit also lays the stroke's last dab, which the live stroke shows on release.
-            if (x - 150).pow(2) + (y - 70).pow(2) > 25 * 25 {
+            // The commit also lays the stroke's last dab, which the live stroke shows on release
+            // (a soft tip reaches past its 20 px radius).
+            let reach = photocraft_paint::tip_reach(20.0, 0.3).ceil() as i32 + 2;
+            if (x - 150).pow(2) + (y - 70).pow(2) > reach * reach {
                 worst = (0..4).map(|c| (got[c] - want[c]).abs()).fold(worst, f32::max);
             }
         }
     }
     assert!(changed);
-    assert!(worst <= 1e-4, "live and commit differ by {worst}");
+    // A soft tip's footprint spans more live cells, so sums land in a different order: within
+    // 2e-4 (a twentieth of an 8-bit level).
+    assert!(worst <= 2e-4, "live and commit differ by {worst}");
+}
+
+#[test]
+fn retouch_strokes_refuse_absurd_point_coordinates() {
+    // #976: a segment to (1e300, 0) has an infinite length and the dab walker would never stop, so
+    // every retouch tool's `points` must stay within ±1e6, as the painting tools' do.
+    let cmds = [
+        "paint.dodge",
+        "paint.burn",
+        "paint.sponge",
+        "paint.blur",
+        "paint.sharpen",
+        "paint.smudge",
+        "paint.cloneStamp",
+        "paint.healingBrush",
+        "paint.spotHealing",
+        "paint.historyBrush",
+        "paint.patternStamp",
+        "paint.remove",
+    ];
+    // A single far point first: cheap even without the bound, so a regression fails fast.
+    let far = [json!([[1_000_001, 0]]), json!([[0, 0], [0, -2_000_000]]), json!([[0, 0], [1e300, 0]]), json!([[1e300, 1e300]])];
+    for depth in DEPTHS {
+        let mut s = session(32, 32, depth, "rgb");
+        paint_layer(&mut s, |x, y| [x as f32 / 32.0, y as f32 / 32.0, 0.25, 1.0]);
+        s.execute("cloneSource.set", json!({"source": [8, 8]})).unwrap();
+        let (before, past) = (rgba(&s, 16, 16), s.active().unwrap().history.past_len());
+        for cmd in cmds {
+            for points in &far {
+                let err = s.execute(cmd, json!({ "points": points })).unwrap_err();
+                assert!(err.to_string().contains("within ±"), "{cmd} {points} at {depth}: {err}");
+            }
+        }
+        assert_eq!((rgba(&s, 16, 16), s.active().unwrap().history.past_len()), (before, past), "{depth}: nothing changed");
+        // Control: a stroke on the canvas still retouches.
+        s.execute("paint.dodge", json!({"points": [[4, 16], [28, 16]], "size": 8})).unwrap();
+        assert_ne!(rgba(&s, 16, 16), before, "{depth}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Remove Tool
+// ---------------------------------------------------------------------------------------------
+
+/// A flat grey layer with a dark square at 40..52 × 24..36.
+fn square_session(depth: u64, mode: &str) -> Session {
+    let mut s = session(96, 64, depth, mode);
+    paint_layer(&mut s, |x, y| if (40..52).contains(&x) && (24..36).contains(&y) { [0.05, 0.05, 0.05, 1.0] } else { [0.5, 0.5, 0.5, 1.0] });
+    s
+}
+
+/// A ring of points around the square.
+fn ring() -> Vec<[f64; 2]> {
+    (0..=64).map(|i| f64::from(i) / 64.0 * std::f64::consts::TAU).map(|t| [46.0 + 13.0 * t.cos(), 30.0 + 13.0 * t.sin()]).collect()
+}
+
+fn near(a: [f32; 4], b: [f32; 4], tol: f32) -> bool {
+    a.iter().zip(b).all(|(x, y)| (x - y).abs() <= tol)
+}
+
+#[test]
+fn remove_a_ring_around_an_object_removes_it_in_one_undo_step() {
+    for (depth, mode) in [(8, "rgb"), (16, "gray"), (32, "rgb"), (8, "cmyk"), (16, "lab")] {
+        let mut s = square_session(depth, mode);
+        let bg = rgba(&s, 10, 10);
+        assert!(!near(rgba(&s, 46, 30), bg, 0.05), "{mode}/{depth}: the square is there");
+        let past = s.active().unwrap().history.past_len();
+        let r = s.execute("paint.remove", json!({"points": ring(), "size": 4})).unwrap();
+        assert!(r["damage"].is_array(), "{r}");
+        for (x, y) in [(46, 30), (40, 24), (51, 35)] {
+            assert!(near(rgba(&s, x, y), bg, 0.03), "{mode}/{depth} ({x}, {y}): {:?} vs {bg:?}", rgba(&s, x, y));
+        }
+        assert_eq!(s.active().unwrap().history.past_len(), past + 1, "{mode}/{depth}: one undo step");
+        s.execute("edit.undo", json!({})).unwrap();
+        assert!(!near(rgba(&s, 46, 30), bg, 0.05), "{mode}/{depth}: undo brings the square back");
+    }
+}
+
+#[test]
+fn remove_open_strokes_and_the_selection_limit_what_changes() {
+    let mut s = square_session(8, "rgb");
+    let bg = rgba(&s, 10, 10);
+    // Without closeLoops a ring leaves its inside alone.
+    s.execute("paint.remove", json!({"points": ring(), "size": 4, "closeLoops": false})).unwrap();
+    assert!(!near(rgba(&s, 46, 30), bg, 0.05));
+    // A stroke straight over the square removes it.
+    s.execute("paint.remove", json!({"points": [[38, 30], [54, 30]], "size": 16})).unwrap();
+    assert!(near(rgba(&s, 46, 30), bg, 0.03), "{:?}", rgba(&s, 46, 30));
+    // Selected elsewhere, a stroke over the square changes nothing.
+    let mut s = square_session(8, "rgb");
+    s.execute("select.rect", json!({"x": 0, "y": 0, "width": 20, "height": 20})).unwrap();
+    let err = s.execute("paint.remove", json!({"points": [[46, 30]], "size": 20})).unwrap_err().to_string();
+    assert!(err.contains("check the selection"), "{err}");
+    assert!(!near(rgba(&s, 46, 30), bg, 0.05));
+}
+
+#[test]
+fn remove_on_an_empty_layer_is_a_no_op_without_a_history_step() {
+    let mut s = square_session(8, "rgb");
+    s.execute("layer.new.layer", json!({})).unwrap();
+    let past = s.active().unwrap().history.past_len();
+    let v = s.execute("paint.remove", json!({"points": [[38, 30], [54, 30]], "size": 16})).unwrap();
+    assert_eq!(v, json!({"changed": false}));
+    assert_eq!(s.active().unwrap().history.past_len(), past);
+    // With Sample All Layers on, the image below is there to remove from.
+    s.execute("paint.remove", json!({"points": [[38, 30], [54, 30]], "size": 16, "sampleAllLayers": true})).unwrap();
+    assert_eq!(s.active().unwrap().history.past_len(), past + 1);
+}
+
+#[test]
+fn remove_thin_scratches_take_their_surroundings() {
+    let mut s = session(80, 40, 16, "rgb");
+    paint_layer(&mut s, |x, y| if y == 20 { [1.0, 1.0, 1.0, 1.0] } else { [x as f32 / 80.0, 0.4, 0.6, 1.0] });
+    s.execute("paint.remove", json!({"points": [[5, 20], [75, 20]], "size": 2})).unwrap();
+    for x in [10, 40, 70] {
+        assert!(near(rgba(&s, x, 20), [x as f32 / 80.0, 0.4, 0.6, 1.0], 0.02), "x {x}: {:?}", rgba(&s, x, 20));
+    }
+}
+
+#[test]
+fn remove_bad_params_are_errors() {
+    assert!(Session::new().execute("paint.remove", json!({"points": [[1, 1]]})).is_err(), "no document");
+    let mut s = square_session(8, "rgb");
+    for p in [
+        json!({}),
+        json!({"points": []}),
+        json!({"points": "x"}),
+        json!({"points": [[1, 1]], "size": "big", "closeLoops": "yes", "sampleAllLayers": 3}),
+        json!({"points": [[1, 1]], "layer": u64::MAX}),
+    ] {
+        let _ = s.execute("paint.remove", p);
+    }
+    let err = s.execute("paint.remove", json!({"points": [[-500, -500]], "size": 10})).unwrap_err().to_string();
+    assert!(err.contains("outside the canvas"), "{err}");
+    // A stroke far off the canvas is refused before its coverage (its whole bounding box) is rendered.
+    let err = s.execute("paint.remove", json!({"points": [[0, 0], [99_999, 99_999]], "size": 5000})).unwrap_err().to_string();
+    assert!(err.contains("too large"), "{err}");
+    let err = s.execute("paint.remove", json!({"points": [[48, 32]], "size": 3000})).unwrap_err().to_string();
+    assert!(err.contains("nothing is left"), "{err}");
+}
+
+/// Flat (150, 120, 100) with Gaussian film grain of σ 12 levels (the #2104 test image).
+fn film_grain(x: i32, y: i32) -> [f32; 4] {
+    let u = |k: u32| {
+        let mut z = (x as u32).wrapping_mul(0x9E37_79B9) ^ (y as u32).wrapping_mul(0x85EB_CA6B) ^ k.wrapping_mul(0xC2B2_AE35);
+        z = (z ^ (z >> 16)).wrapping_mul(0x7FEB_352D);
+        z = (z ^ (z >> 15)).wrapping_mul(0x846C_A68B);
+        ((z ^ (z >> 16)) as f32 + 1.0) / (u32::MAX as f32 + 2.0)
+    };
+    let n = (-2.0 * u(1).ln()).sqrt() * (std::f32::consts::TAU * u(2)).cos() * 12.0;
+    [(150.0 + n) / 255.0, (120.0 + n) / 255.0, (100.0 + n) / 255.0, 1.0]
+}
+
+#[test]
+fn spot_healing_keeps_film_grain_through_overlapping_strokes() {
+    // #2104: on flat colour with grain the heal must carry the grain, not leave a smooth patch,
+    // and must not lose more with each overlapping stroke (each samples the ones before).
+    let red = |s: &Session, x0: i32, x1: i32, y0: i32, y1: i32| {
+        let v: Vec<f32> = (y0..y1).flat_map(|y| (x0..x1).map(move |x| (x, y))).map(|(x, y)| rgba(s, x, y)[0] * 255.0).collect();
+        let m = v.iter().sum::<f32>() / v.len() as f32;
+        (m, (v.iter().map(|a| (a - m).powi(2)).sum::<f32>() / v.len() as f32).sqrt())
+    };
+    for (depth, kind) in [(8u64, "contentAware"), (8, "proximityMatch"), (8, "createTexture"), (16, "createTexture")] {
+        let mut s = session(400, 300, depth, "rgb");
+        paint_layer(&mut s, film_grain);
+        let (m0, sd0) = red(&s, 0, 100, 0, 100);
+        for i in 0..8 {
+            let y = 100 + 10 * i;
+            s.execute("paint.spotHealing", json!({"points": [[140, y], [260, y]], "size": 30, "hardness": 100, "type": kind})).unwrap();
+            let (m, sd) = red(&s, 150, 250, y - 4, y + 5);
+            assert!(sd > 0.8 * sd0 && sd < 1.25 * sd0, "{kind} depth {depth} stroke {}: grain {sd} vs {sd0} around", i + 1);
+            assert!((m - m0).abs() < 3.0, "{kind} depth {depth} stroke {}: mean {m} vs {m0}", i + 1);
+        }
+    }
+}
+
+/// The live Pattern Stamp shows exactly what the commit paints, fed point by point, at 8 and 16
+/// bits: aligned strokes through their coverage (`LiveRetouch`), Impressionist ones dab by dab
+/// (`LiveDab` with float working pixels, as the commit's).
+#[test]
+fn live_pattern_stamp_matches_the_commit() {
+    let all = [[20.0, 30.0], [34.0, 36.0], [50.0, 28.0], [70.0, 34.0]];
+    for depth in [8, 16] {
+        for (impressionist, aligned) in [(false, true), (false, false), (true, true)] {
+            let mut s = session(96, 64, depth, "rgb");
+            paint_layer(&mut s, texture);
+            let opts = |pts: &[[f64; 2]]| {
+                json!({"points": pts, "size": 14, "hardness": 40, "opacity": 70, "pattern": "Checkerboard", "scale": 150, "angle": 20,
+                       "aligned": aligned, "impressionist": impressionist, "mode": "multiply", "seed": 11})
+            };
+            let (doc, h) = (s.active().unwrap().doc.clone(), s.active().unwrap().history.past_len());
+            let pts = |v: &[[f64; 2]]| v.iter().map(|q| StrokePoint::new(q[0], q[1], 1.0)).collect::<Vec<_>>();
+            let shown = if impressionist {
+                assert!(LiveRetouch::begin(&s, "paint.patternStamp", &opts(&all[..1])).is_err(), "Impressionist is laid dab by dab");
+                let mut live = live_pattern_impressionist(&s, &opts(&all[..1])).unwrap();
+                live.push(&pts(&all[1..3])).unwrap();
+                live.push(&pts(&all[3..])).unwrap();
+                live.doc.clone()
+            } else {
+                assert!(live_pattern_impressionist(&s, &opts(&all[..1])).is_err());
+                let mut live = LiveRetouch::begin(&s, "paint.patternStamp", &opts(&all[..1])).unwrap();
+                live.push(&pts(&all[1..3])).unwrap();
+                live.push(&pts(&all[3..])).unwrap();
+                live.doc.clone()
+            };
+            assert!(std::sync::Arc::ptr_eq(&doc, &s.active().unwrap().doc), "the preview leaves the document alone");
+            s.execute("paint.patternStamp", opts(&all)).unwrap();
+            assert_eq!(s.active().unwrap().history.past_len(), h + 1, "one History step");
+            let id = s.active().unwrap().active_layer.unwrap();
+            let (a, b) = (shown.layer(id).unwrap().surface().unwrap(), s.active().unwrap().doc.layer(id).unwrap().surface().unwrap());
+            let mut changed = false;
+            for y in 0..64 {
+                for x in 0..96 {
+                    let (got, want) = (a.rgba(x, y), b.rgba(x, y));
+                    changed |= (0..3).any(|c| (want[c] - texture(x, y)[c]).abs() > 0.02);
+                    assert_eq!(got, want, "impressionist {impressionist} aligned {aligned} {depth}-bit ({x}, {y})");
+                }
+            }
+            assert!(changed, "the stroke painted");
+        }
+    }
+}
+
+/// A live Pattern Stamp on the layer mask paints the mask, as the commit does, and leaves the
+/// layer's pixels alone.
+#[test]
+fn live_pattern_stamp_paints_the_targeted_mask() {
+    let mut s = session(64, 48, 8, "rgb");
+    paint_layer(&mut s, texture);
+    s.execute("layer.layerMask.revealAll", json!({})).unwrap();
+    let all = [[16.0, 20.0], [40.0, 24.0]];
+    let opts = |pts: &[[f64; 2]]| json!({"points": pts, "size": 12, "pattern": "Checkerboard", "target": "mask", "seed": 3});
+    let mut live = LiveRetouch::begin(&s, "paint.patternStamp", &opts(&all[..1])).unwrap();
+    live.push(&[StrokePoint::new(40.0, 24.0, 1.0)]).unwrap();
+    let shown = live.doc.clone();
+    s.execute("paint.patternStamp", opts(&all)).unwrap();
+    let id = s.active().unwrap().active_layer.unwrap();
+    let (lv, cm) = (shown.layer(id).unwrap(), s.active().unwrap().doc.layer(id).unwrap());
+    let (lm, cmask) = (&lv.mask.as_ref().unwrap().surface, &cm.mask.as_ref().unwrap().surface);
+    let b = Rect::new(0, 0, 64, 48);
+    assert_eq!(lm.read_region(b), cmask.read_region(b), "the live mask is the committed mask");
+    assert!((0..64).any(|x| cmask.rgba(x, 22)[0] < 0.99), "the mask was painted");
+    assert_eq!(lv.surface().unwrap().read_region(b), cm.surface().unwrap().read_region(b), "pixels untouched");
+}
+
+#[test]
+fn remove_several_strokes_apply_as_one_job_and_one_undo_step() {
+    let mut s = square_session(8, "rgb");
+    let bg = rgba(&s, 10, 10);
+    let past = s.active().unwrap().history.past_len();
+    // Each stroke covers half of the square; together they remove it.
+    let r = s.execute("paint.remove", json!({"strokes": [[[38, 30], [45, 30]], [[47, 30], [54, 30]]], "size": 16})).unwrap();
+    assert!(r["damage"].is_array(), "{r}");
+    for (x, y) in [(41, 30), (46, 30), (51, 30)] {
+        assert!(near(rgba(&s, x, y), bg, 0.03), "({x}, {y}): {:?} vs {bg:?}", rgba(&s, x, y));
+    }
+    assert_eq!(s.active().unwrap().history.past_len(), past + 1, "one undo step for both strokes");
+    for p in [
+        json!({"strokes": [], "size": 16}),
+        json!({"strokes": "x", "size": 16}),
+        json!({"strokes": [[]], "size": 16}),
+        json!({"strokes": [[[1, 1]], "x"], "size": 16}),
+    ] {
+        assert!(s.execute("paint.remove", p).is_err());
+    }
+}
+
+#[test]
+fn remove_to_a_new_layer_leaves_the_target_untouched() {
+    let mut s = square_session(8, "rgb");
+    let target = s.active().unwrap().active_layer.unwrap();
+    let bg = rgba(&s, 10, 10);
+    let square = rgba(&s, 46, 30);
+    let past = s.active().unwrap().history.past_len();
+    let r = s.execute("paint.remove", json!({"points": [[38, 30], [54, 30]], "size": 16, "newLayer": true})).unwrap();
+    let nid = LayerId(r["layer"].as_u64().expect("the new layer's id"));
+    let d = s.active().unwrap();
+    assert_eq!(d.active_layer, Some(nid), "the new layer is active");
+    assert_ne!(nid, target);
+    let order: Vec<LayerId> = d.doc.walk().into_iter().map(|(_, _, l)| l.id).collect();
+    assert_eq!(order, vec![target, nid], "the new layer sits above the target");
+    assert_eq!(d.doc.layer(nid).unwrap().name, "Layer 1");
+    // The target keeps its pixels; the new layer carries the fill inside the hole only.
+    let old = d.doc.layer(target).unwrap().surface().unwrap();
+    assert!(near(old.rgba(46, 30), square, 0.001));
+    let new = d.doc.layer(nid).unwrap().surface().unwrap();
+    assert!(near(new.rgba(46, 30), bg, 0.03), "{:?}", new.rgba(46, 30));
+    assert_eq!(new.rgba(10, 10)[3], 0.0, "transparent away from the hole");
+    assert_eq!(d.history.past_len(), past + 1);
+    s.execute("edit.undo", json!({})).unwrap();
+    let d = s.active().unwrap();
+    assert!(d.doc.layer(nid).is_none(), "undo removes the layer");
+    assert_eq!(d.active_layer, Some(target));
+    // On an empty layer with Sample All Layers, the composite is what gets filled, onto a new layer.
+    s.execute("layer.new.layer", json!({})).unwrap();
+    let empty = s.active().unwrap().active_layer.unwrap();
+    let r = s.execute("paint.remove", json!({"points": [[38, 30], [54, 30]], "size": 16, "sampleAllLayers": true, "newLayer": true})).unwrap();
+    let nid = LayerId(r["layer"].as_u64().unwrap());
+    let d = s.active().unwrap();
+    let order: Vec<LayerId> = d.doc.walk().into_iter().map(|(_, _, l)| l.id).collect();
+    assert_eq!(order, vec![target, empty, nid]);
+    assert!(near(d.doc.layer(nid).unwrap().surface().unwrap().rgba(46, 30), bg, 0.03));
+    assert!(near(d.doc.layer(target).unwrap().surface().unwrap().rgba(46, 30), square, 0.001));
+}
+
+/// A Clone Stamp or History Brush stroke drawn live and offered to its commit: the commit takes
+/// the live pixels, and they are what running the command afresh paints, bit for bit, at every
+/// depth, with and without a feathered selection.
+#[test]
+fn a_live_clone_or_history_stroke_commits_its_own_pixels() {
+    let all = [[30.0, 30.0], [50.0, 34.0], [70.0, 28.0], [90.0, 40.0], [60.0, 50.0], [35.0, 44.0], [36.0, 45.0]];
+    let pts = |v: &[[f64; 2]]| v.iter().map(|q| StrokePoint::new(q[0], q[1], 1.0)).collect::<Vec<_>>();
+    for depth in DEPTHS {
+        for (cmd, extra) in [("paint.cloneStamp", json!({"source": [20, 15], "mode": "multiply"})), ("paint.historyBrush", json!({"state": 1}))] {
+            for selected in [false, true] {
+                let setup = || {
+                    let mut s = session(120, 70, depth, "rgb");
+                    paint_layer(&mut s, texture);
+                    s.execute("paint.stroke", json!({"points": [[0, 40], [120, 40]], "size": 20, "hardness": 1.0, "color": "#c03030"})).unwrap();
+                    if selected {
+                        s.execute("select.rect", json!({"x": 40, "y": 20, "width": 50, "height": 40, "ellipse": true, "feather": 3})).unwrap();
+                    }
+                    s
+                };
+                let params = |v: &[[f64; 2]]| {
+                    let mut p = json!({"points": v, "size": 14, "hardness": 40, "opacity": 70});
+                    for (k, x) in extra.as_object().unwrap() {
+                        p[k] = x.clone();
+                    }
+                    p
+                };
+                let mut s = setup();
+                let mut live = LiveRetouch::begin(&s, cmd, &params(&all[..1])).unwrap();
+                live.push(&pts(&all[1..3])).unwrap();
+                live.push(&pts(&all[3..4])).unwrap();
+                live.push(&pts(&all[4..])).unwrap();
+                s.offer_live_retouch(live).unwrap();
+                let r = s.execute(cmd, params(&all)).unwrap();
+                s.clear_live_stroke();
+                assert_eq!(r["fromLive"], true, "{cmd} {depth}-bit selected={selected}");
+                let mut fresh = setup();
+                let r = fresh.execute(cmd, params(&all)).unwrap();
+                assert!(r.get("fromLive").is_none());
+                let (a, b) = (s.active().unwrap(), fresh.active().unwrap());
+                let bounds = a.doc.bounds();
+                let got = a.doc.layer(a.active_layer.unwrap()).unwrap().surface().unwrap().read_region(bounds);
+                let want = b.doc.layer(b.active_layer.unwrap()).unwrap().surface().unwrap().read_region(bounds);
+                let diff = got.iter().zip(&want).position(|(x, y)| x.to_bits() != y.to_bits());
+                assert!(diff.is_none(), "{cmd} {depth}-bit selected={selected}: first difference at value {diff:?}");
+                assert_eq!(a.history.past_len(), b.history.past_len());
+            }
+        }
+    }
+}
+
+/// An offered live stroke is taken only by the commit it was drawn for, and only once.
+#[test]
+fn a_live_retouch_offer_is_taken_only_by_its_own_commit() {
+    let mut s = session(96, 64, 8, "rgb");
+    paint_layer(&mut s, texture);
+    let all = [[50.0, 30.0], [60.0, 34.0], [70.0, 30.0]];
+    let params = |v: &[[f64; 2]], opacity: u32| json!({"points": v, "source": [20, 20], "size": 12, "hardness": 50, "opacity": opacity});
+    let offer = |s: &mut Session| {
+        let live = LiveRetouch::begin(s, "paint.cloneStamp", &params(&all, 70)).unwrap();
+        s.offer_live_retouch(live).unwrap();
+    };
+    let from_live = |r: Value| r.get("fromLive").is_some();
+    // Other points, other params, another command: rendered afresh.
+    offer(&mut s);
+    assert!(!from_live(s.execute("paint.cloneStamp", params(&all[..2], 70)).unwrap()));
+    s.execute("edit.undo", json!({})).unwrap();
+    offer(&mut s);
+    assert!(!from_live(s.execute("paint.cloneStamp", params(&all, 60)).unwrap()));
+    s.execute("edit.undo", json!({})).unwrap();
+    offer(&mut s);
+    let mut history = params(&all, 70);
+    history.as_object_mut().unwrap().remove("source");
+    assert!(!from_live(s.execute("paint.historyBrush", history).unwrap()));
+    s.execute("edit.undo", json!({})).unwrap();
+    // The document changed after the stroke started.
+    offer(&mut s);
+    s.execute("paint.stroke", json!({"points": [[5, 5], [9, 9]], "size": 4})).unwrap();
+    assert!(!from_live(s.execute("paint.cloneStamp", params(&all, 70)).unwrap()));
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    // A withdrawn offer, and an offer used once.
+    offer(&mut s);
+    s.clear_live_stroke();
+    assert!(!from_live(s.execute("paint.cloneStamp", params(&all, 70)).unwrap()));
+    s.execute("edit.undo", json!({})).unwrap();
+    offer(&mut s);
+    assert!(from_live(s.execute("paint.cloneStamp", params(&all, 70)).unwrap()));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(!from_live(s.execute("paint.cloneStamp", params(&all, 70)).unwrap()));
+    // The Healing Brush blends on release: it has no live pixels to offer.
+    let healing = LiveRetouch::begin(&s, "paint.healingBrush", &params(&all, 70)).unwrap();
+    assert!(s.offer_live_retouch(healing).is_err());
+    // The brush changed during the stroke (the document revision doesn't show it).
+    let live = LiveRetouch::begin(&s, "paint.cloneStamp", &params(&all, 70)).unwrap();
+    s.execute("tools.setBrush", json!({"brush": {"spacing": 0.5}})).unwrap();
+    assert!(s.offer_live_retouch(live).is_err());
+}
+
+/// The live stroke renders only the position and pressure of its points, as its commit parses
+/// them: a pen's tilt and the times don't change what it shows.
+#[test]
+fn a_live_retouch_stroke_ignores_tilt_and_times() {
+    let mut s = session(64, 48, 8, "rgb");
+    paint_layer(&mut s, texture);
+    let p = json!({"points": [[20, 20]], "source": [8, 8], "size": 10, "hardness": 50});
+    let mut plain = LiveRetouch::begin(&s, "paint.cloneStamp", &p).unwrap();
+    let mut pen = LiveRetouch::begin(&s, "paint.cloneStamp", &p).unwrap();
+    let pts = [[30.0, 24.0], [44.0, 30.0]];
+    plain.push(&pts.map(|q| StrokePoint::new(q[0], q[1], 0.8))).unwrap();
+    pen.push(&pts.map(|q| {
+        let mut sp = StrokePoint::new(q[0], q[1], 0.8);
+        (sp.tilt_x, sp.tilt_y, sp.rotation, sp.time) = (40.0, -20.0, 90.0, 120.0);
+        sp
+    }))
+    .unwrap();
+    assert_eq!(plain.points(), pen.points());
+    let id = s.active().unwrap().active_layer.unwrap();
+    let b = s.active().unwrap().doc.bounds();
+    let read = |l: &LiveRetouch| l.doc.layer(id).unwrap().surface().unwrap().read_region(b);
+    assert_eq!(read(&plain), read(&pen));
+}
+
+#[test]
+fn periodic_clone_low_flow_revisits_accumulate_across_tile_aliases() {
+    // Independent oracle: paint the same continuous stroke over two physical copies of a
+    // tile, then combine the two coverage values using the brush's flow accumulation rule.
+    let setup = |width| {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width":width,"height":24,"depth":32})).unwrap();
+        for x in (8..width).step_by(32) {
+            s.execute("paint.pencil", json!({"points":[[x,12]],"size":16,"color":"#ff0000"})).unwrap();
+        }
+        s
+    };
+    let params = |wrap| json!({"points":[[22,12],[54,12]],"offset":[-18,0],"size":2,"hardness":100,"flow":20,"opacity":100,"wrap":wrap});
+    let green = |s: &Session, x| {
+        let st = s.active().unwrap();
+        st.doc.layer(st.active_layer.unwrap()).unwrap().surface().unwrap().rgba(x, 12)[1]
+    };
+    let mut physical = setup(64);
+    physical.execute("paint.cloneStamp", params(false)).unwrap();
+    let (a, b) = (green(&physical, 22), green(&physical, 54));
+    assert!(a > 0.0 && a < 1.0 && b > 0.0 && b < 1.0, "oracle needs two partial visits: {a}, {b}");
+    let expected = a * b;
+    let mut periodic = setup(32);
+    periodic.execute("paint.cloneStamp", params(true)).unwrap();
+    let actual = green(&periodic, 22);
+    assert!((actual - expected).abs() < 0.0001, "repeated visits should build flow: actual green={actual}, expected={expected}, physical copies={a},{b}");
+}
+
+#[test]
+fn periodic_clone_live_offer_commits_and_undoes_the_same_pixels_as_replay() {
+    for depth in [8, 16, 32] {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width":32,"height":24,"depth":depth})).unwrap();
+        s.execute("paint.pencil", json!({"points":[[8,8]],"size":12,"color":"#d03060"})).unwrap();
+        let before = s.active().unwrap().doc.clone();
+        let id = s.active().unwrap().active_layer.unwrap();
+        let params = json!({"points":[[30,22],[34,26],[38,28],[30,22]],"source":[8,8],"size":16,"hardness":70,"opacity":45,"flow":60,"wrap":true});
+        let live = LiveRetouch::begin(&s, "paint.cloneStamp", &params).unwrap();
+        let shown = live.doc.layer(id).unwrap().surface().unwrap().read_region(before.bounds());
+        s.offer_live_retouch(live).unwrap();
+        let result = s.execute("paint.cloneStamp", params.clone()).unwrap();
+        assert_eq!(result["fromLive"], true);
+        let read = |s: &Session| s.active().unwrap().doc.layer(id).unwrap().surface().unwrap().read_region(before.bounds());
+        assert_eq!(read(&s), shown, "offered preview at depth {depth}");
+        let mut replay = Session::new();
+        replay.add_document((*before).clone(), None);
+        replay.execute("paint.cloneStamp", params).unwrap();
+        assert_eq!(read(&s), read(&replay), "command replay at depth {depth}");
+        assert!(s.undo());
+        assert_eq!(s.active().unwrap().doc, before, "one undo at depth {depth}");
+    }
+}
+#[test]
+fn periodic_clone_interior_matches_ordinary_brush_masks_and_transparency() {
+    let cases = [
+        json!({"wetEdges":true}),
+        json!({"dualBrush":{"enabled":true,"size":7,"hardness":0.5,"spacing":0.2}}),
+        json!({"texture":{"enabled":true,"eachTip":false,"depth":0.6}}),
+        json!({"pressureOpacity":true,"pressureSize":false}),
+        json!({"wetEdges":true,"dualBrush":{"enabled":true,"size":7},"pressureOpacity":true}),
+    ];
+    for depth in DEPTHS {
+        for brush in &cases {
+            let setup = || {
+                let mut s = session(96, 64, depth, "rgb");
+                paint_layer(&mut s, |x, y| {
+                    let mut px = texture(x, y);
+                    px[3] = if x < 40 { 0.4 } else { 0.75 };
+                    px
+                });
+                s.execute("tools.setBrush", json!({"brush":brush})).unwrap();
+                s.execute("select.rect", json!({"x":48,"y":16,"width":36,"height":36,"feather":2})).unwrap();
+                s
+            };
+            let mut ordinary = setup();
+            let mut periodic = setup();
+            let mut p = json!({"points":[[55,30,0.4],[65,34,0.8],[72,30,0.3]],"source":[20,20],"size":12,"hardness":65,"flow":35,"opacity":60});
+            ordinary.execute("paint.cloneStamp", p.clone()).unwrap();
+            p["wrap"] = json!(true);
+            periodic.execute("paint.cloneStamp", p).unwrap();
+            let read = |s: &Session| {
+                let st = s.active().unwrap();
+                st.doc.layer(st.active_layer.unwrap()).unwrap().surface().unwrap().read_region(st.doc.bounds())
+            };
+            let (a, b) = (read(&ordinary), read(&periodic));
+            let tolerance = if depth == 8 {
+                1.1 / 255.0
+            } else if depth == 16 {
+                1.1 / 65535.0
+            } else {
+                0.00001
+            };
+            let error = a.iter().zip(&b).map(|(a, b)| (a - b).abs()).fold(0.0_f32, f32::max);
+            assert!(error <= tolerance, "depth={depth}, brush={brush}, max native-channel error={error}");
+        }
+    }
 }

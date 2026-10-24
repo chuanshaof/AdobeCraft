@@ -1,6 +1,6 @@
 //! Paint helpers: Paint Bucket and Gradient tool.
 
-use photocraft_algo::paint::{GradientShape, bucket_fill, bucket_fill_region_src, bucket_fill_src, paint_gradient};
+use photocraft_algo::paint::{GradientShape, bucket_fill_inks, bucket_fill_region_inks, bucket_fill_region_src, bucket_fill_src, paint_gradient};
 use serde_json::{Value, json};
 
 use crate::commands::{CommandSpec, blend_from_str};
@@ -35,11 +35,18 @@ fn point(p: &Value, k: &str) -> Option<(f32, f32)> {
     Some((a.first()?.as_f64()? as f32, a.get(1)?.as_f64()? as f32))
 }
 
+/// `opacity` (1..100 %) as a coverage in 0.01..=1, clamped like the Magic Eraser's: a value
+/// above 1 would overshoot the blend (#4167).
+fn opacity(p: &Value, cmd: &str) -> Result<f32> {
+    Ok(crate::eraser_cmds::number(p, cmd, "opacity", 100.0, 1.0..=100.0)? as f32 / 100.0)
+}
+
 fn bucket(s: &mut Session, p: &Value) -> Result<Value> {
     let fg = s.tools.foreground;
     let c = color(p.get("color"), fg);
     let (x, y) = (f(p, "x", 0.0).floor() as i32, f(p, "y", 0.0).floor() as i32);
-    let (tol, contiguous, aa, opacity) = (f(p, "tolerance", 32.0), b(p, "contiguous", true), b(p, "antiAlias", true), f(p, "opacity", 100.0) / 100.0);
+    let (tol, contiguous, aa) = (f(p, "tolerance", 32.0), b(p, "contiguous", true), b(p, "antiAlias", true));
+    let opacity = opacity(p, "paint.bucket")?;
     let all = b(p, "sampleAllLayers", false) && crate::channel_cmds::target_of(p) == crate::channel_cmds::Target::Pixels;
     // Other visible layers can define the region, but the fill still writes only to the target.
     let region = if all {
@@ -55,12 +62,14 @@ fn bucket(s: &mut Session, p: &Value) -> Result<Value> {
     let pattern = if source == "pattern" {
         let pat = crate::pattern_cmds::resolve_param(s, "paint.bucket", p)?;
         let tile = photocraft_compose::pattern::Tile::new(&pat)
-            .ok_or_else(|| EngineError::BadParams { cmd: "paint.bucket".into(), msg: "the pattern is empty".into() })?;
-        let (scale, angle, _, phase) = crate::pattern_cmds::placement(p);
+            .ok_or_else(|| EngineError::BadParams { cmd: "paint.bucket".into(), msg: "the pattern is empty or too large to paint".into() })?;
+        let (scale, angle, _, phase) = crate::pattern_cmds::placement("paint.bucket", p)?;
         Some((tile, scale, angle, phase))
     } else {
         None
     };
+    // A foreground picked as CMYK fills a CMYK document with the picked inks (#4196).
+    let inks = s.tools.picked_cmyk([c[0], c[1], c[2]]).filter(|_| c[3] >= 1.0 && pattern.is_none());
     let filled = s.edit("Paint Bucket", |doc, active| {
         let area = doc.bounds();
         let sel = doc.selection.clone();
@@ -80,10 +89,10 @@ fn bucket(s: &mut Session, p: &Value) -> Result<Value> {
                 bucket_fill_src(surf, area, (x, y), tol, contiguous, aa, opacity, sel.as_ref(), lock, src)
             }
         } else if let Some(region) = &region {
-            bucket_fill_region_src(surf, region, opacity, sel.as_ref(), lock, |_, _| c);
+            bucket_fill_region_inks(surf, region, opacity, sel.as_ref(), lock, |_, _| c, inks);
             true
         } else {
-            bucket_fill(surf, area, (x, y), tol, contiguous, aa, c, opacity, sel.as_ref(), lock)
+            bucket_fill_inks(surf, area, (x, y), tol, contiguous, aa, opacity, sel.as_ref(), lock, |_, _| c, inks)
         };
         surf.prune();
         Ok(ok)
@@ -114,8 +123,25 @@ fn gradient(s: &mut Session, p: &Value) -> Result<Value> {
             gradients::apply_opacity(cs, &gradients::transparency_param(p, "paint.gradient")?.unwrap_or_default())
         }
     };
+    // Photoshop's interpolation (`method`, with `smoothness` 0..=100, default 100) baked into dense
+    // stops, as for Gradient Overlay: Photoshop 27.11's Classic black → white is 0.037 at t = 1/16
+    // where straight stops give 0.0625.
+    let stops = match p.get("method").and_then(Value::as_str).and_then(photocraft_io::GradientMethod::from_name) {
+        Some(m) if stops.len() >= 2 => {
+            let colors = stops.iter().map(|(t, c)| (*t, photocraft_color::Color::rgba(c[0], c[1], c[2], c[3]))).collect();
+            let mids = vec![0.5; stops.len() - 1];
+            photocraft_io::bake_gradient(colors, &mids, (f(p, "smoothness", 100.0) / 100.0).clamp(0.0, 1.0), m)
+                .into_iter()
+                .map(|(t, c)| {
+                    let rgb = c.to_rgb();
+                    (t, [rgb[0], rgb[1], rgb[2], c.alpha])
+                })
+                .collect()
+        }
+        _ => stops,
+    };
     let reverse = b(p, "reverse", false);
-    let opacity = f(p, "opacity", 100.0) / 100.0;
+    let opacity = opacity(p, "paint.gradient")?;
     let blend = p.get("mode").and_then(Value::as_str).and_then(blend_from_str).unwrap_or(photocraft_color::BlendMode::Normal);
     let dither = b(p, "dither", true); // Photoshop dithers gradients by default (reduces banding).
     s.edit("Gradient", |doc, active| {
@@ -146,7 +172,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "Gradient",
             menu: &[],
             shortcut: None,
-            params: r##"{"from":[x,y],"to":[x,y],"style":"linear|radial|angle|reflected|diamond"="linear","colors":["#rrggbb",…]? (evenly spaced),"gradient":preset name?,"stops":[[t,"#rrggbb"|"foreground"|"background"],…]?,"transparency":[[t,0..100],…]? (default: the current gradient, see gradient.presets.select),"reverse":bool=false,"dither":bool=true,"opacity":1..100=100,"mode":"normal|multiply|…"="normal","target":"pixels"|"mask"|"quickMask"|{"channel":i}=Channels panel target}"##,
+            params: r##"{"from":[x,y],"to":[x,y],"style":"linear|radial|angle|reflected|diamond"="linear","colors":["#rrggbb",…]? (evenly spaced),"gradient":preset name?,"stops":[[t,"#rrggbb"|"foreground"|"background"],…]?,"transparency":[[t,0..100],…]? (default: the current gradient, see gradient.presets.select),"method":"classic|perceptual|linear|smooth"? (Photoshop's interpolation; omitted: straight stops),"smoothness":0..100=100,"reverse":bool=false,"dither":bool=true,"opacity":1..100=100,"mode":"normal|multiply|…"="normal","target":"pixels"|"mask"|"quickMask"|{"channel":i}=Channels panel target}"##,
             enabled: crate::commands::has_paintable,
             run: gradient,
             journal: true,
@@ -330,6 +356,30 @@ mod tests {
         assert_eq!(px(&s, 5, 5), vec![0.0, 0.0, 1.0, 1.0]);
     }
 
+    /// #4196: the Paint Bucket and Edit > Stroke write a CMYK pick as its inks into a CMYK document,
+    /// not as its sRGB stand-in converted back (100/0/0/0 cyan would come out as about 100/28/0/17).
+    #[test]
+    fn bucket_and_stroke_write_a_cmyk_pick_as_its_inks() {
+        let cyan = [1.0f32, 0.0, 0.0, 0.0];
+        let mut s = session();
+        s.execute("image.mode.cmyk", json!({})).unwrap();
+        let rgb = photocraft_color::convert::cmyk_to_rgb(cyan).map(|c| c.clamp(0.0, 1.0));
+        s.execute("tools.setColors", json!({"foreground": rgb, "foregroundCmyk": cyan})).unwrap();
+        let inks_at = |s: &Session, x: i32, y: i32| -> Vec<f32> {
+            let st = s.active().unwrap();
+            let surf = st.doc.layer(st.active_layer.unwrap()).unwrap().surface().unwrap();
+            surf.read_region(Rect::new(x, y, x + 1, y + 1)).into_iter().take(4).collect()
+        };
+        let is_cyan = |got: &[f32]| got.iter().zip(cyan).all(|(a, b)| (a - b).abs() < 0.02);
+        s.execute("paint.bucket", json!({"x": 2, "y": 2, "antiAlias": false})).unwrap();
+        let got = inks_at(&s, 5, 5);
+        assert!(is_cyan(&got), "bucket: {got:?}");
+        s.execute("select.all", json!({})).unwrap();
+        s.execute("edit.stroke", json!({"width": 2, "location": "inside", "color": rgb})).unwrap();
+        let got = inks_at(&s, 0, 5);
+        assert!(is_cyan(&got), "stroke: {got:?}");
+    }
+
     #[test]
     fn bucket_fills_with_a_pattern() {
         // Paint Bucket with contents="pattern" flood-fills the region with a pattern, not a colour.
@@ -380,5 +430,60 @@ mod tests {
         assert!(smooth.iter().all(|&v| v == smooth[0]), "no dither: perfectly flat");
         let noisy = run(true);
         assert!(noisy.windows(2).any(|w| w[0] != w[1]), "dither: per-pixel variation");
+    }
+
+    /// The two commands under test, each painting #808080 over a white document.
+    fn grey_fill(cmd: &str, opacity: Value) -> Value {
+        match cmd {
+            "paint.bucket" => json!({"x": 2, "y": 2, "color": "#808080", "opacity": opacity}),
+            _ => json!({"from": [0, 0], "to": [19, 0], "colors": ["#808080", "#808080"], "dither": false, "opacity": opacity}),
+        }
+    }
+
+    fn white(depth: u32) -> Session {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 20, "height": 10, "depth": depth, "background": "white"})).unwrap();
+        s
+    }
+
+    /// Issue #4167: an opacity above 100 overshot the blend (200 painted near-black on white).
+    #[test]
+    fn bucket_and_gradient_clamp_opacity_like_the_magic_eraser() {
+        for cmd in ["paint.bucket", "paint.gradient"] {
+            for depth in [8, 16, 32] {
+                let mut full = white(depth);
+                full.execute(cmd, grey_fill(cmd, json!(100))).unwrap();
+                let expected = px(&full, 5, 5);
+                assert!((expected[0] - 128.0 / 255.0).abs() < 0.01, "{cmd} depth {depth}: 100% paints #808080, got {expected:?}");
+                for over in [200.0, 1e9] {
+                    let mut s = white(depth);
+                    s.execute(cmd, grey_fill(cmd, json!(over))).unwrap();
+                    assert_eq!(px(&s, 5, 5), expected, "{cmd} depth {depth}: opacity {over} clamps to 100");
+                }
+                let (mut low, mut one) = (white(depth), white(depth));
+                low.execute(cmd, grey_fill(cmd, json!(-50))).unwrap();
+                one.execute(cmd, grey_fill(cmd, json!(1))).unwrap();
+                assert_eq!(px(&low, 5, 5), px(&one, 5, 5), "{cmd} depth {depth}: opacity below 1 clamps to 1");
+                assert!(px(&low, 5, 5).iter().all(|v| (0.0..=1.0).contains(v)), "{cmd} depth {depth}: no overshoot");
+            }
+        }
+    }
+
+    #[test]
+    fn bucket_and_gradient_reject_non_numeric_opacity_without_editing() {
+        for cmd in ["paint.bucket", "paint.gradient"] {
+            for bad in [json!("50"), json!(true), json!([50]), json!({"v": 50})] {
+                let mut s = white(8);
+                let (before, steps) = (px(&s, 5, 5), s.active().unwrap().history.past_len());
+                let err = s.execute(cmd, grey_fill(cmd, bad.clone())).unwrap_err();
+                assert!(matches!(err, EngineError::BadParams { .. }), "{cmd} {bad}: {err:?}");
+                assert_eq!(px(&s, 5, 5), before, "{cmd} {bad}: pixels unchanged");
+                assert_eq!(s.active().unwrap().history.past_len(), steps, "{cmd} {bad}: no history step");
+            }
+            // An explicit null keeps the default (100%), like the Magic Eraser.
+            let mut s = white(8);
+            s.execute(cmd, grey_fill(cmd, Value::Null)).unwrap();
+            assert!((px(&s, 5, 5)[0] - 128.0 / 255.0).abs() < 0.01, "{cmd}: null opacity is 100%");
+        }
     }
 }

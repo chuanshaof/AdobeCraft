@@ -39,13 +39,6 @@ impl ImageData {
         decode_planes(self.compression, &self.data, &Self::layout(header))
     }
 
-    /// Decodes and returns a single channel plane.
-    pub fn decode_channel(&self, header: &Header, index: usize) -> Result<Vec<u8>> {
-        let all = self.decode(header)?;
-        let plane = header.row_bytes() * header.height as usize;
-        all.get(index * plane..(index + 1) * plane).map(<[u8]>::to_vec).ok_or_else(|| crate::error::PsdError::invalid(format!("no merged channel {index}")))
-    }
-
     pub(crate) fn read(r: &mut Reader<'_>, header: &Header) -> Result<Self> {
         let compression = Compression::from_u16(r.u16()?);
         let data = r.peek_rest();

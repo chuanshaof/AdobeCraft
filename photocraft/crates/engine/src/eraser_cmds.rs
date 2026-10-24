@@ -11,7 +11,7 @@ use photocraft_algo::selection as sel;
 use photocraft_doc::{Document, Layer, LayerContent, LayerId};
 use photocraft_geom::Rect;
 use photocraft_paint::Stroke;
-use photocraft_paint::bg_erase::{BgEraseSettings, apply_background_eraser};
+use photocraft_paint::bg_erase::{BgEraseSettings, apply_background_eraser, background_eraser_effect, background_eraser_stroke};
 use photocraft_paint::replace::{Limits, Sampling};
 use serde_json::{Value, json};
 
@@ -27,7 +27,9 @@ fn flag(p: &Value, k: &str, d: bool) -> bool {
 }
 
 /// A finite number param clamped to `range`, `default` when absent; non-numbers are an error.
-fn number(p: &Value, cmd: &str, k: &str, default: f64, range: std::ops::RangeInclusive<f64>) -> Result<f64> {
+/// A numeric param clamped to `range`; missing or null gives `default`, anything else not a
+/// finite number is BadParams. Shared with the Paint Bucket and Gradient opacity.
+pub(crate) fn number(p: &Value, cmd: &str, k: &str, default: f64, range: std::ops::RangeInclusive<f64>) -> Result<f64> {
     match p.get(k) {
         None | Some(Value::Null) => Ok(default),
         Some(v) => {
@@ -57,19 +59,6 @@ fn has_pixel_layer(s: &Session) -> std::result::Result<(), String> {
 fn active_pixel_layer(s: &Session, cmd: &str) -> Result<LayerId> {
     has_pixel_layer(s).map_err(|m| bad(cmd, m))?;
     s.active().and_then(|d| d.active_layer).ok_or_else(|| bad(cmd, "no active layer"))
-}
-
-fn is_background(l: &Layer) -> bool {
-    l.name == "Background" && l.locks.transparency && l.locks.position && matches!(l.content, LayerContent::Raster(_))
-}
-
-/// Photoshop converts the Background to a normal layer before erasing to transparency.
-fn unlock_background(l: &mut Layer) {
-    if is_background(l) {
-        l.name = "Layer 0".into();
-        l.locks.transparency = false;
-        l.locks.position = false;
-    }
 }
 
 fn pixels_locked(doc: &Document, l: &Layer) -> Option<EngineError> {
@@ -114,7 +103,9 @@ fn magic_eraser(s: &mut Session, p: &Value) -> Result<Value> {
     let bg = s.tools.background;
     let dmg = s.edit("Magic Eraser", |doc, _| {
         let selection = doc.selection.clone();
-        unlock_background(doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?);
+        // Photoshop converts the Background to a normal layer before erasing to transparency.
+        doc.layer(id).ok_or(EngineError::NoLayer(id))?;
+        crate::extra_cmds::background_to_layer(doc, id);
         let lock = doc.effective_locks(id).transparency;
         let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
         let surf = l.surface_mut().ok_or_else(|| bad(CMD, "not a pixel layer"))?;
@@ -126,8 +117,9 @@ fn magic_eraser(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(damage(s, dmg, true))
 }
 
-/// `paint.backgroundEraser`: a stroke erasing colours similar to the sampled one.
-fn background_eraser(s: &mut Session, p: &Value) -> Result<Value> {
+/// The stroke, settings and layer of a `paint.backgroundEraser` (shared by the command and its
+/// live preview), after the same checks.
+fn background_eraser_setup(s: &Session, p: &Value) -> Result<(Stroke, BgEraseSettings, LayerId)> {
     const CMD: &str = "paint.backgroundEraser";
     let pts = crate::brush_cmds::parse_points(p, CMD)?;
     if pts.iter().any(|q| !q.x.is_finite() || !q.y.is_finite() || q.x.abs() > 1e7 || q.y.abs() > 1e7) {
@@ -143,25 +135,47 @@ fn background_eraser(s: &mut Session, p: &Value) -> Result<Value> {
         background: s.tools.background,
     };
     let id = active_pixel_layer(s, CMD)?;
-    {
-        let d = s.active().ok_or(EngineError::NoDocument)?;
-        let l = d.doc.layer(id).ok_or(EngineError::NoLayer(id))?;
-        if let Some(e) = pixels_locked(&d.doc, l) {
-            return Err(e);
-        }
-        if d.doc.effective_locks(id).transparency && !is_background(l) {
-            return Err(EngineError::Other(format!("Could not use the Background Eraser because the transparency of layer \"{}\" is locked", l.name)));
-        }
+    let d = s.active().ok_or(EngineError::NoDocument)?;
+    let l = d.doc.layer(id).ok_or(EngineError::NoLayer(id))?;
+    if let Some(e) = pixels_locked(&d.doc, l) {
+        return Err(e);
     }
-    let stroke = Stroke { brush, points: pts };
+    if d.doc.effective_locks(id).transparency && !d.doc.is_background(id) {
+        return Err(EngineError::Other(format!("Could not use the Background Eraser because the transparency of layer \"{}\" is locked", l.name)));
+    }
+    Ok((Stroke { brush, points: pts }, bs, id))
+}
+
+/// `paint.backgroundEraser`: a stroke erasing colours similar to the sampled one.
+fn background_eraser(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "paint.backgroundEraser";
+    let (stroke, bs, id) = background_eraser_setup(s, p)?;
     let dmg = s.edit("Background Eraser", |doc, _| {
         let selection = doc.selection.clone();
+        crate::extra_cmds::background_to_layer(doc, id);
         let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
-        unlock_background(l);
         let surf = l.surface_mut().ok_or_else(|| bad(CMD, "not a pixel layer"))?;
         Ok(apply_background_eraser(surf, &stroke, &bs, selection.as_ref()))
     })?;
     Ok(damage(s, dmg, true))
+}
+
+/// A `paint.backgroundEraser` stroke shown while it is drawn: the same params, checks and
+/// erasing per dab as the commit (on a Background already turned into a normal layer), so the
+/// preview at the last point is the committed result.
+pub fn live_background_eraser(s: &Session, p: &Value) -> Result<crate::retouch_cmds::LiveDab> {
+    const CMD: &str = "paint.backgroundEraser";
+    let (stroke, bs, id) = background_eraser_setup(s, p)?;
+    let mut doc = (*s.active().ok_or(EngineError::NoDocument)?.doc).clone();
+    doc.layer(id).ok_or(EngineError::NoLayer(id))?;
+    crate::extra_cmds::background_to_layer(&mut doc, id);
+    let stroke = background_eraser_stroke(&stroke);
+    crate::retouch_cmds::LiveDab::with_effect_on(doc, CMD, &json!({}), stroke, Some(id), 0, true, |pre| match background_eraser_effect(pre, &bs) {
+        Some(effect) => Box::new(effect),
+        // No alpha: the commit erases nothing either.
+        None => Box::new(|_: &mut photocraft_paint::retouch::Region, _: &photocraft_paint::retouch::Footprint| {}),
+    })?
+    .with_tail_preview()
 }
 
 /// Eraser-group command specs.

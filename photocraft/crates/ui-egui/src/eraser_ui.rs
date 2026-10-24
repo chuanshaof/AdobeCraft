@@ -27,7 +27,7 @@ pub fn click(app: &mut PhotocraftApp, tool: Tool, x: f64, y: f64) -> bool {
         "tolerance": o.tolerance,
         "antiAlias": o.anti_alias,
         "contiguous": o.contiguous,
-        "sampleAllLayers": o.sample_all_layers,
+        "sampleAllLayers": o.sample_all.magic_eraser,
         "opacity": o.magic_eraser_opacity,
     });
     let r = app.run("paint.magicEraser", p);
@@ -40,17 +40,48 @@ pub fn finish_stroke(app: &mut PhotocraftApp, tool: Tool, points: &[[f64; 3]]) -
     if tool != Tool::BackgroundEraser {
         return false;
     }
+    let r = app.run("paint.backgroundEraser", background_eraser_params(app, points));
+    report(app, r);
+    true
+}
+
+/// `paint.backgroundEraser` params for a stroke along `points`: shared by the live preview and
+/// the commit, with the jitter seed from the first point (`retouch_ui::stroke_seed`).
+pub(crate) fn background_eraser_params(app: &PhotocraftApp, points: &[[f64; 3]]) -> Value {
     let o = &app.ui.tool_options;
-    let p = json!({
+    json!({
         "points": points,
         "sampling": o.bg_sampling,
         "limits": o.bg_limits,
         "tolerance": o.bg_tolerance,
         "protectForegroundColor": o.bg_protect_fg,
-    });
-    let r = app.run("paint.backgroundEraser", p);
-    report(app, r);
-    true
+        "seed": crate::retouch_ui::stroke_seed(points),
+    })
+}
+
+/// Whether `tool` is the Eraser in Pencil mode: it erases hard, aliased pixels through
+/// `paint.pencil` (`"erase": true`) and shows the Pencil's pixel-grid cursor (#2662).
+pub fn pencil_mode(app: &PhotocraftApp, tool: Tool) -> bool {
+    tool == Tool::Eraser && app.ui.tool_options.eraser_mode == "pencil"
+}
+
+/// Whether `tool` is the Eraser in Block mode: it erases a hard square of 16 screen pixels
+/// (`16 / zoom` document pixels) through `paint.pencil` (`"block": true`); Size, Hardness,
+/// Opacity and Flow don't apply (#2770).
+pub fn block_mode(app: &PhotocraftApp, tool: Tool) -> bool {
+    tool == Tool::Eraser && app.ui.tool_options.eraser_mode == "block"
+}
+
+/// The Block's edge in document pixels at the current zoom (what the engine erases).
+pub fn block_size(app: &PhotocraftApp) -> f32 {
+    photocraft_engine::brush_cmds::block_size(f64::from(app.point_zoom()))
+}
+
+/// The Eraser's Mode dropdown (Brush / Pencil / Block). Returns whether it changed.
+pub fn mode_dropdown(ui: &mut egui::Ui, mode: &mut String) -> bool {
+    opt(ui, tl!("Mode:"));
+    let modes = [("brush".to_string(), tl!("Brush")), ("pencil".to_string(), tl!("Pencil")), ("block".to_string(), tl!("Block"))];
+    widgets::dropdown(ui, "eraser-mode", mode, &modes, 96.0)
 }
 
 fn opt(ui: &mut egui::Ui, text: &str) {
@@ -67,7 +98,7 @@ pub fn options_bar(app: &mut PhotocraftApp, ui: &mut egui::Ui, tool: Tool) -> bo
             widgets::value_field(ui, &mut o.tolerance, 0.0..=255.0, "", 58.0);
             widgets::checkbox(ui, &mut o.anti_alias, tl!("Anti-alias"));
             widgets::checkbox(ui, &mut o.contiguous, tl!("Contiguous"));
-            widgets::checkbox(ui, &mut o.sample_all_layers, tl!("Sample All Layers"));
+            widgets::checkbox(ui, &mut o.sample_all.magic_eraser, tl!("Sample All Layers"));
             widgets::vline(ui, 22.0);
             opt(ui, tl!("Opacity:"));
             widgets::value_field(ui, &mut o.magic_eraser_opacity, 1.0..=100.0, "%", 62.0);

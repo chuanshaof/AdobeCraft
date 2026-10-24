@@ -22,6 +22,9 @@ type OverlayKey = (u64, bool, PixelRect, crate::camera_raw_scope_ui::ClippingMod
 
 pub(crate) struct DetailPreview {
     source: Surface,
+    /// The open-time dialog's camera tone curve: Shadows, Highlights, Clarity, Texture and Dehaze
+    /// then act on the raw data, in linear light before it (see [`develop`]).
+    pub(crate) raw_curve: Option<Arc<Vec<[f32; 2]>>>,
     area: PixelRect,
     coverage: Coverage,
     result: Option<(u64, Surface)>,
@@ -29,7 +32,7 @@ pub(crate) struct DetailPreview {
     cancel: Arc<AtomicBool>,
     pub(crate) error: Option<String>,
     failed_revision: Option<u64>,
-    crop: Option<(u64, bool, PixelRect)>,
+    crop: Option<(u64, bool, PixelRect, u64)>,
     texture: Option<TextureHandle>,
     overlay_texture: Option<TextureHandle>,
     overlay_key: Option<OverlayKey>,
@@ -46,6 +49,7 @@ impl DetailPreview {
     pub(crate) fn new(source: Surface, area: PixelRect, coverage: Coverage) -> Self {
         Self {
             source,
+            raw_curve: None,
             area,
             coverage,
             result: None,
@@ -105,6 +109,7 @@ impl DetailPreview {
             return;
         }
         let source = self.source.clone();
+        let raw_curve = self.raw_curve.clone();
         let area = self.area;
         let coverage = self.coverage.clone();
         let mut params = params.clone();
@@ -116,9 +121,10 @@ impl DetailPreview {
             if cancel.load(Ordering::Relaxed) {
                 return;
             }
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| develop(&source, area, &params, &coverage)))
-                .map(|surface| (revision, surface))
-                .map_err(|_| "Camera Raw detail preview failed; the proxy remains available".into());
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| develop(&source, raw_curve.as_deref().map(Vec::as_slice), area, &params, &coverage)))
+                    .map(|surface| (revision, surface))
+                    .map_err(|_| "Camera Raw detail preview failed; the proxy remains available".into());
             if !cancel.load(Ordering::Relaxed) {
                 let _ = tx.send(result);
                 ctx.request_repaint();
@@ -153,7 +159,17 @@ impl DetailPreview {
 
     /// Draw only the visible pixel rectangle. No full-image GPU texture and no GPU-size limit
     /// on the source image; uploads are capped to the current viewport plus a one-pixel border.
-    pub(crate) fn paint(&mut self, ui: &egui::Ui, image: Rect, revision: u64, before: bool, params: &CameraRaw, needed: bool) -> bool {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint(
+        &mut self,
+        ui: &egui::Ui,
+        image: Rect,
+        revision: u64,
+        before: bool,
+        params: &CameraRaw,
+        needed: bool,
+        display: &photocraft_engine::display_color::CanvasDisplay,
+    ) -> bool {
         self.ready = false;
         self.poll(revision);
         if !needed {
@@ -174,9 +190,9 @@ impl DetailPreview {
         } else {
             return false;
         };
-        let key = (if original { 0 } else { revision }, original, crop);
+        let key = (if original { 0 } else { revision }, original, crop, display.key);
         if self.crop != Some(key) {
-            let color = crop_image(surface, crop);
+            let color = crop_image(surface, crop, display);
             let options = TextureOptions { magnification: egui::TextureFilter::Nearest, ..TextureOptions::LINEAR };
             match &mut self.texture {
                 Some(t) => t.set(color, options),
@@ -218,7 +234,7 @@ impl DetailPreview {
         if !self.ready {
             return false;
         }
-        let Some((r, original, crop)) = self.crop else { return false };
+        let Some((r, original, crop, _display_key)) = self.crop else { return false };
         let t = crate::theme::Tokens::get(ui.ctx());
         let key = (r, original, crop, mode, t.kind);
         if self.overlay_key != Some(key) {
@@ -281,8 +297,53 @@ impl DetailPreview {
     }
 }
 
-fn develop(source: &Surface, area: PixelRect, params: &CameraRaw, coverage: &Coverage) -> Surface {
-    let mut result = photocraft_engine::lens_cmds::camera_raw_surface(source, area, params);
+/// The full-size result of `params` over `area`. With a raw file's tone `curve`, the raw-stage
+/// sliders are applied first to the whole area, from the whole frame's maps as Open computes them
+/// ([`photocraft_io::raw::retone`]), then the rest of the pipeline: at 1:1 the preview shows close
+/// to what Open will make. It retones the developed pixels, which already carry the black point,
+/// so it differs from Open only in the deepest shadows, as `retone` documents.
+fn develop(source: &Surface, curve: Option<&[[f32; 2]]>, area: PixelRect, params: &CameraRaw, coverage: &Coverage) -> Surface {
+    let tone = photocraft_io::raw::Tone {
+        shadows: params.shadows,
+        highlights: params.highlights,
+        clarity: params.clarity,
+        texture: params.texture,
+        dehaze: params.dehaze,
+    };
+    let (retoned, params) = match curve {
+        Some(curve) if !tone.is_neutral() => {
+            let (w, h) = (area.width() as usize, area.height() as usize);
+            let mut px = vec![[0.0f32; 4]; w * h];
+            source.read_rgba_into(area, &mut px);
+            photocraft_io::raw::retone(&mut px, w, h, curve, tone);
+            let fmt = source.format();
+            let n = fmt.channels();
+            // Written back in bands of rows, so only one band-sized buffer lives next to `px`
+            // (a whole-area one is another 4 bytes per channel and pixel). Each band is read from
+            // the source first to keep its stored alpha.
+            let mut out = source.clone();
+            let band = (65_536 / w.max(1)).max(1);
+            let mut data = Vec::new();
+            for (b, rows) in px.chunks(band * w.max(1)).enumerate() {
+                let y0 = area.y0 + (b * band) as i32;
+                let rect = PixelRect::new(area.x0, y0, area.x1, y0 + (rows.len() / w.max(1)) as i32);
+                source.read_region_into(rect, &mut data);
+                for (o, q) in data.chunks_exact_mut(n).zip(rows) {
+                    let alpha = if fmt.alpha { o.get(n - 1).copied() } else { None };
+                    photocraft_raster::from_rgba_into(&fmt, *q, o);
+                    if let (Some(a), Some(last)) = (alpha, o.get_mut(n - 1)) {
+                        *last = a;
+                    }
+                }
+                out.write_region(rect, &data);
+            }
+            let rest = CameraRaw { shadows: 0.0, highlights: 0.0, clarity: 0.0, texture: 0.0, dehaze: 0.0, ..params.clone() };
+            (Some(out), rest)
+        }
+        _ => (None, params.clone()),
+    };
+    let base = retoned.as_ref().unwrap_or(source);
+    let mut result = photocraft_engine::lens_cmds::camera_raw_surface(base, area, &params);
     if matches!(coverage, Coverage::None) {
         return result;
     }
@@ -331,16 +392,51 @@ fn visible_pixels(image: Rect, viewport: Rect, area: PixelRect, max_side: usize)
     (crop.width() as usize <= max_side && crop.height() as usize <= max_side && crop.width() as u64 * crop.height() as u64 <= 16_777_216).then_some(crop)
 }
 
-fn crop_image(surface: &Surface, area: PixelRect) -> ColorImage {
-    let width = area.width() as usize;
-    let mut row = vec![[0.0; 4]; width];
-    let mut pixels = Vec::with_capacity(width * area.height() as usize);
-    let enc = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-    for y in area.y0..area.y1 {
-        surface.read_rgba_into(PixelRect::new(area.x0, y, area.x1, y + 1), &mut row);
-        pixels.extend(row.iter().map(|q| Color32::from_rgba_unmultiplied(enc(q[0]), enc(q[1]), enc(q[2]), enc(q[3]))));
+/// Pixels per band [`display_image`] reads and colour-converts at once: at least `photocraft-cms`'s
+/// parallel threshold (16K pixels), and small enough that a band's float scratch is 1 MiB.
+const CROP_BAND_PIXELS: usize = 64 * 1024;
+
+/// The visible pixels of `surface`, as the canvas shows them.
+fn crop_image(surface: &Surface, area: PixelRect, display: &photocraft_engine::display_color::CanvasDisplay) -> ColorImage {
+    display_image(area, display, |rect, out| surface.read_rgba_into(rect, out))
+}
+
+/// `area` as the canvas shows it, with `read` filling each band's float pixels. Converted in
+/// bands of rows, in parallel off wasm, not one row or one whole copy at a time: a row is below
+/// `photocraft-cms`'s parallel threshold, so a per-row conversion ran the display transform (any
+/// document profile other than the monitor's, such as an Adobe RGB photo on sRGB) on one core of
+/// the UI thread for every edit (#4682).
+pub(crate) fn display_image(
+    area: PixelRect,
+    display: &photocraft_engine::display_color::CanvasDisplay,
+    read: impl Fn(PixelRect, &mut [[f32; 4]]) + Sync,
+) -> ColorImage {
+    let (width, height) = (area.width() as usize, area.height() as usize);
+    let mut pixels = vec![Color32::TRANSPARENT; width * height];
+    if width == 0 {
+        return ColorImage::new([width, height], pixels);
     }
-    ColorImage::new([width, area.height() as usize], pixels)
+    let band_rows = (CROP_BAND_PIXELS / width).max(1);
+    let band = |index: usize, out: &mut [Color32]| {
+        let y0 = area.y0.saturating_add((index * band_rows) as i32);
+        let rect = PixelRect::new(area.x0, y0, area.x1, y0.saturating_add((out.len() / width) as i32));
+        let mut buf = photocraft_compose::Buffer { rect, px: vec![[0.0; 4]; out.len()] };
+        read(rect, &mut buf.px);
+        let img = display.to_rgba8(&buf);
+        for (o, &[r, g, b, a]) in out.iter_mut().zip(img.pixels.as_chunks::<4>().0) {
+            *o = Color32::from_rgba_unmultiplied(r, g, b, a);
+        }
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rayon::prelude::*;
+        pixels.par_chunks_mut(band_rows * width).enumerate().for_each(|(i, out)| band(i, out));
+    }
+    #[cfg(target_arch = "wasm32")]
+    for (i, out) in pixels.chunks_mut(band_rows * width).enumerate() {
+        band(i, out);
+    }
+    ColorImage::new([width, height], pixels)
 }
 
 #[cfg(test)]
@@ -358,10 +454,47 @@ mod tests {
         source.write_region(area, &values);
         let params = CameraRaw { exposure: 0.5, texture: 15.0, grain_amount: 30.0, ..Default::default() };
         let expected = photocraft_engine::lens_cmds::camera_raw_surface(&source, area, &params);
-        assert_eq!(develop(&source, area, &params, &Coverage::None), expected);
+        assert_eq!(develop(&source, None, area, &params, &Coverage::None), expected);
         let mask = Surface::with_default(PixelFormat::GRAY8, &[0.0]);
-        assert_eq!(develop(&source, area, &params, &Coverage::Selection(mask)), source);
+        assert_eq!(develop(&source, None, area, &params, &Coverage::Selection(mask)), source);
     }
+    #[test]
+    fn a_raw_open_refines_raw_stage_sliders_from_the_whole_frame() {
+        // Shadows on a raw being opened: the full-size refinement retones the whole frame (as
+        // Open does) and runs the rest of the pipeline after, instead of the filter's Shadows.
+        let area = PixelRect::new(0, 0, 96, 64);
+        let mut source = Surface::new(PixelFormat::RGBA16);
+        let mut values = vec![0.0; 96 * 64 * 4];
+        for (i, p) in values.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let v = if (i % 96) < 48 { 0.12 } else { 0.7 };
+            p.copy_from_slice(&[v, v * 0.9, v * 0.8, 1.0]);
+        }
+        source.write_region(area, &values);
+        let curve = [[0.01, 0.01], [0.05, 0.12], [0.3, 0.6], [1.0, 1.0]];
+        let params = CameraRaw { shadows: 80.0, exposure: 0.25, ..Default::default() };
+        let refined = develop(&source, Some(&curve), area, &params, &Coverage::None);
+        let mut px = vec![[0.0f32; 4]; 96 * 64];
+        source.read_rgba_into(area, &mut px);
+        let tone = photocraft_io::raw::Tone { shadows: 80.0, ..Default::default() };
+        photocraft_io::raw::retone(&mut px, 96, 64, &curve, tone);
+        let mut retoned = source.clone();
+        let flat: Vec<f32> = px.iter().flatten().copied().collect();
+        retoned.write_region(area, &flat);
+        let expected = photocraft_engine::lens_cmds::camera_raw_surface(&retoned, area, &CameraRaw { exposure: 0.25, ..Default::default() });
+        let (a, b) = (refined.rgba(10, 30), expected.rgba(10, 30));
+        assert!(a.iter().zip(&b).all(|(x, y)| (x - y).abs() < 2e-4), "{a:?} vs {b:?}");
+        assert!(
+            refined.rgba(10, 30)[0] > source.rgba(10, 30)[0] + 0.02,
+            "the shadow side is lifted: {:?} from {:?}, retoned {:?}",
+            refined.rgba(10, 30),
+            source.rgba(10, 30),
+            retoned.rgba(10, 30)
+        );
+        // Without a raw curve Shadows is the filter's.
+        let filter = develop(&source, None, area, &params, &Coverage::None);
+        assert_eq!(filter, photocraft_engine::lens_cmds::camera_raw_surface(&source, area, &params));
+    }
+
     #[test]
     fn stale_refinements_and_failed_old_revisions_do_not_replace_new_settings() {
         let source = Surface::with_default(PixelFormat::RGBA8, &[0.2, 0.4, 0.6, 1.0]);
@@ -401,7 +534,7 @@ mod tests {
                 }
                 source.write_region(area, &pixels);
                 let params = CameraRaw { exposure: 0.5, sharpen_amount: 20.0, grain_amount: 30.0, ..Default::default() };
-                let full = develop(&source, area, &params, &Coverage::None);
+                let full = develop(&source, None, area, &params, &Coverage::None);
                 let expected = photocraft_engine::lens_cmds::camera_raw_surface(&source, area, &params);
                 assert_eq!(full, expected);
                 let mut preview = DetailPreview::new(source, area, Coverage::None);
@@ -410,11 +543,30 @@ mod tests {
                 let dark = preview.sample([0.0, 0.0], 1, false, &params).unwrap();
                 let light = preview.sample([1.0 / 40.0, 0.0], 1, false, &params).unwrap();
                 assert!(light[0] - dark[0] > 0.5, "native alternating pixels survive: {mode:?}/{depth:?}");
-                assert_eq!(crop_image(&expected, PixelRect::new(-12, 8, -10, 9)).size, [2, 1]);
+                let mut doc =
+                    photocraft_doc::Document::new("test", photocraft_geom::Size::new(40, 30), photocraft_doc::ColorMode::Rgb, photocraft_doc::SampleType::U8);
+                doc.icc_profile = Some(photocraft_cms::Builtin::Srgb.profile().to_bytes());
+                let display = photocraft_engine::color_cmds::ColorState::default().canvas_display(&doc).unwrap();
+                assert_eq!(crop_image(&expected, PixelRect::new(-12, 8, -10, 9), &display).size, [2, 1]);
                 assert!(preview.sample([f32::NAN, 0.0], 1, false, &params).is_none());
                 assert!(preview.sample([0.5, 0.5], 2, false, &params).is_none());
             }
         }
+    }
+
+    #[test]
+    fn refined_crop_uses_linear_document_display_encoding() {
+        let area = PixelRect::new(0, 0, 1, 1);
+        let mut source =
+            Surface::new(photocraft_color::PixelFormat { mode: photocraft_color::ColorMode::Rgb, sample: photocraft_color::SampleType::F32, alpha: true });
+        source.write_region(area, &[0.25, 0.25, 0.25, 1.0]);
+        let mut doc = photocraft_doc::Document::new("test", photocraft_geom::Size::new(1, 1), photocraft_doc::ColorMode::Rgb, photocraft_doc::SampleType::F32);
+        doc.icc_profile = Some(photocraft_cms::Builtin::LinearSrgb.profile().to_bytes());
+        let mut color = photocraft_engine::color_cmds::ColorState::default();
+        color.settings.monitor_profile = "srgb".into();
+        let display = color.canvas_display(&doc).unwrap();
+        let image = crop_image(&source, area, &display);
+        assert!(image.pixels[0].r() > 130, "linear 0.25 should be shown as encoded sRGB");
     }
 
     #[test]
@@ -436,5 +588,48 @@ mod tests {
         assert_eq!((crop.width(), crop.height()), (802, 602));
         assert!(visible_pixels(image, Rect::from_min_size(Pos2::ZERO, vec2(8000.0, 6000.0)), area, 4096).is_none());
         assert!(visible_pixels(Rect::NOTHING, visible, area, 4096).is_none());
+    }
+
+    #[test]
+    fn banded_crop_matches_one_conversion_of_the_whole_area() {
+        // Several bands, a ragged last one and an area off the image origin, through a real
+        // transform (an Adobe RGB document on an sRGB monitor) and without one.
+        let area = PixelRect::new(-3, 5, 1021, 5 + 2 * (CROP_BAND_PIXELS / 1024) as i32 + 7);
+        let mut source = Surface::new(PixelFormat { mode: photocraft_color::ColorMode::Rgb, sample: photocraft_color::SampleType::U8, alpha: true });
+        let n = (area.width() * area.height()) as usize;
+        let px: Vec<f32> = (0..n).flat_map(|i| [(i % 251) as f32 / 255.0, (i % 241) as f32 / 255.0, (i % 239) as f32 / 255.0, (i % 7) as f32 / 6.0]).collect();
+        source.write_region(area, &px);
+        for profile in [photocraft_cms::Builtin::AdobeRgbCompat, photocraft_cms::Builtin::Srgb] {
+            let mut doc =
+                photocraft_doc::Document::new("test", photocraft_geom::Size::new(1024, 1024), photocraft_doc::ColorMode::Rgb, photocraft_doc::SampleType::U8);
+            doc.icc_profile = Some(profile.profile().to_bytes());
+            let mut color = photocraft_engine::color_cmds::ColorState::default();
+            color.settings.monitor_profile = "srgb".into();
+            let display = color.canvas_display(&doc).unwrap();
+            assert_eq!(display.transform.is_some(), profile == photocraft_cms::Builtin::AdobeRgbCompat);
+            let mut whole = photocraft_compose::Buffer { rect: area, px: vec![[0.0; 4]; n] };
+            source.read_rgba_into(area, &mut whole.px);
+            let expected = display.to_rgba8(&whole);
+            let image = crop_image(&source, area, &display);
+            assert_eq!(image.size, [area.width() as usize, area.height() as usize]);
+            let expected: Vec<Color32> = expected.pixels.as_chunks::<4>().0.iter().map(|&[r, g, b, a]| Color32::from_rgba_unmultiplied(r, g, b, a)).collect();
+            assert_eq!(image.pixels, expected, "{profile:?}");
+        }
+        assert_eq!(
+            crop_image(
+                &source,
+                PixelRect::new(0, 0, 0, 4),
+                &photocraft_engine::color_cmds::ColorState::default()
+                    .canvas_display(&photocraft_doc::Document::new(
+                        "t",
+                        photocraft_geom::Size::new(1, 1),
+                        photocraft_doc::ColorMode::Rgb,
+                        photocraft_doc::SampleType::U8
+                    ))
+                    .unwrap()
+            )
+            .size,
+            [0, 4]
+        );
     }
 }

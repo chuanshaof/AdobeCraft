@@ -61,6 +61,32 @@ fn gradient_builtins_and_listing() {
 }
 
 #[test]
+fn rainbow_gradient_presets() {
+    let mut s = session(8);
+    let v = s.execute("gradient.presets.list", json!({})).unwrap();
+    let group = v["groups"].as_array().unwrap().iter().find(|g| g["name"] == "Rainbows").unwrap();
+    let presets = group["presets"].as_array().unwrap();
+    let names: Vec<&str> = presets.iter().map(|p| p["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["Rainbow", "Pastel Rainbow", "Neon Rainbow", "Oil Slick", "Rainbow Fade"]);
+    // The three hue ramps share the same 13 evenly spaced hues: smooth, not the 7 coarse ROYGBIV points.
+    for p in [&presets[0], &presets[1], &presets[2]] {
+        let stops = p["stops"].as_array().unwrap();
+        assert_eq!(stops.len(), 13, "{}", p["name"]);
+        assert_eq!(stops[0][0], json!(0.0));
+        assert_eq!(stops[12][0], json!(1.0));
+    }
+    assert_eq!(presets[3]["stops"].as_array().unwrap().len(), 11, "oil slick");
+    assert_eq!(presets[4]["transparency"], json!([[0.0, 0.0], [0.125, 100.0], [0.875, 100.0], [1.0, 0.0]]));
+    // Rainbow Fade paints opaque across the middle and transparent at both ends.
+    s.execute("gradient.presets.select", json!({"preset": "Rainbow Fade"})).unwrap();
+    s.execute("layer.new.layer", json!({})).unwrap();
+    s.execute("paint.gradient", json!({"from": [0, 0], "to": [63, 0]})).unwrap();
+    assert!(layer_px(&s, 0, 5)[3] < 0.1, "left edge transparent: {:?}", layer_px(&s, 0, 5));
+    assert!(layer_px(&s, 63, 5)[3] < 0.1, "right edge transparent: {:?}", layer_px(&s, 63, 5));
+    assert!(layer_px(&s, 32, 5)[3] > 0.95, "middle opaque: {:?}", layer_px(&s, 32, 5));
+}
+
+#[test]
 fn gradient_tool_uses_selected_preset_at_every_depth() {
     for depth in [8, 16, 32] {
         let mut s = session(depth);
@@ -91,6 +117,118 @@ fn foreground_to_transparent_paints_alpha() {
     assert!(layer_px(&s, 63, 5)[3] < 0.05);
     let mid = layer_px(&s, 32, 5)[3];
     assert!((mid - 0.5).abs() < 0.05, "{mid}");
+}
+
+/// `gradient.presets.stop` edits the Gradient tool's current gradient in place (the stops the
+/// Gradient Editor window shows): a new stop takes the colour under it, a "foreground" stop stays
+/// live, opacity stops materialize on first edit, and the tool paints with the edited gradient.
+#[test]
+fn preset_stop_edits_the_current_gradient() {
+    let mut s = session(8);
+    // A new stop mid-way samples the ramp there (black → white: mid gray).
+    let v = s.execute("gradient.presets.stop", json!({"action": "add", "location": 0.5})).unwrap();
+    let stops = v["current"]["stops"].as_array().unwrap();
+    assert_eq!(stops.len(), 3, "{v}");
+    assert_eq!(stops[1], json!([0.5, "#808080"]), "sorted by location, the ramp colour at 0.5");
+    // Recolour it and repaint: the tool gradient changed (mid of the stroke is the new colour).
+    s.execute("gradient.presets.stop", json!({"action": "color", "index": 1, "color": "#ff0000"})).unwrap();
+    s.execute("paint.gradient", json!({"from": [0, 0], "to": [63, 0]})).unwrap();
+    let px = layer_px(&s, 32, 10);
+    assert!(px[0] > 0.9 && px[1] < 0.1, "{px:?}");
+    // A "foreground" stop stays live: repaint after changing the foreground picks it up.
+    s.execute("gradient.presets.stop", json!({"action": "color", "index": 0, "color": "foreground"})).unwrap();
+    s.execute("tools.setColors", json!({"foreground": "#0000ff"})).unwrap();
+    s.execute("paint.gradient", json!({"from": [0, 0], "to": [63, 0]})).unwrap();
+    let px = layer_px(&s, 0, 10);
+    assert!(px[2] > 0.9 && px[0] < 0.1, "{px:?}");
+    // Opacity stops materialize the two opaque ends on first edit.
+    let v = s.execute("gradient.presets.stop", json!({"action": "add", "kind": "opacity", "location": 0.5, "opacity": 40})).unwrap();
+    assert_eq!(v["current"]["transparency"], json!([[0.0, 100.0], [0.5, 40.0], [1.0, 100.0]]), "{v}");
+    s.execute("paint.gradient", json!({"from": [0, 0], "to": [63, 0]})).unwrap();
+    // Paint on a fresh layer: the background already holds opaque paint to composite onto.
+    s.execute("layer.new.layer", json!({})).unwrap();
+    s.execute("paint.gradient", json!({"from": [0, 0], "to": [63, 0]})).unwrap();
+    let mid = layer_px(&s, 32, 10)[3];
+    assert!((mid - 0.4).abs() < 0.05, "{mid}");
+    // Guard rails: in-range indexes, known actions, two stops minimum, no midpoints.
+    assert!(s.execute("gradient.presets.stop", json!({"action": "move", "index": 99, "location": 0.5})).is_err());
+    assert!(s.execute("gradient.presets.stop", json!({"action": "explode"})).is_err());
+    assert!(s.execute("gradient.presets.stop", json!({"action": "delete", "index": 0})).is_ok());
+    assert!(s.execute("gradient.presets.stop", json!({"action": "delete", "index": 0})).is_err(), "a gradient keeps at least 2 colour stops");
+    assert!(s.execute("gradient.presets.stop", json!({"action": "midpoint", "index": 0, "location": 0.4})).is_err());
+}
+
+/// A many-stop gradient survives editor gymnastics: five adds build a seven-stop ramp, a stop
+/// dragged past its neighbour keeps the list sorted, the paint follows the edited stops, and
+/// trimming back down ends at a plain two-stop gradient.
+#[test]
+fn preset_stop_survives_a_complex_many_stop_ramp() {
+    let mut s = session(8);
+    s.execute("gradient.presets.select", json!({"stops": [[0.0, "#000000"], [1.0, "#ffffff"]]})).unwrap();
+    for (i, c) in ["#ff0000", "#00ff00", "#0000ff", "#ffff00", "#ff00ff"].iter().enumerate() {
+        let t = (i + 1) as f64 / 6.0;
+        s.execute("gradient.presets.stop", json!({"action": "add", "location": t, "color": c})).unwrap();
+    }
+    let v = s.execute("gradient.presets.list", json!({})).unwrap();
+    assert_eq!(v["current"]["stops"].as_array().unwrap().len(), 7, "{v}");
+    // Drag the yellow stop (index 4, at 4/6) past the magenta one (at 5/6).
+    s.execute("gradient.presets.stop", json!({"action": "move", "index": 4, "location": 0.95})).unwrap();
+    let stops = s.execute("gradient.presets.list", json!({})).unwrap()["current"]["stops"].as_array().unwrap().clone();
+    let locs: Vec<f64> = stops.iter().map(|s| s[0].as_f64().unwrap()).collect();
+    let mut in_order = locs.clone();
+    in_order.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(locs, in_order, "stops stay sorted after a crossing move: {stops:?}");
+    assert_eq!(stops[6], json!([1.0, "#ffffff"]));
+    // The paint follows: near the moved stop the stroke is the stop's yellow.
+    s.execute("layer.new.layer", json!({})).unwrap();
+    s.execute("paint.gradient", json!({"from": [0, 0], "to": [63, 0]})).unwrap();
+    let px = layer_px(&s, 60, 10);
+    assert!(px[0] > 0.95 && px[1] > 0.95 && px[2] < 0.3, "{px:?}");
+    // Trim everything back down to the two end stops.
+    for _ in 0..5 {
+        s.execute("gradient.presets.stop", json!({"action": "delete", "index": 1})).unwrap();
+    }
+    let stops = s.execute("gradient.presets.list", json!({})).unwrap()["current"]["stops"].as_array().unwrap().clone();
+    assert_eq!(stops, json!([[0.0, "#000000"], [1.0, "#ffffff"]]).as_array().unwrap().clone(), "{stops:?}");
+}
+
+/// An opacity hole paints where it is put, follows a move, and once the gradient is fully
+/// opaque again the stored opacity stops normalize away (no pinned 100 % ends).
+#[test]
+fn preset_stop_opacity_hole_moves_and_normalizes() {
+    let mut s = session(8);
+    s.execute("layer.new.layer", json!({})).unwrap();
+    s.execute("gradient.presets.stop", json!({"action": "add", "kind": "opacity", "location": 0.5, "opacity": 0})).unwrap();
+    s.execute("paint.gradient", json!({"from": [0, 0], "to": [63, 0]})).unwrap();
+    assert!(layer_px(&s, 0, 5)[3] > 0.95);
+    assert!(layer_px(&s, 32, 5)[3] < 0.05);
+    assert!(layer_px(&s, 63, 5)[3] > 0.95);
+    // The hole follows the moved stop (index 1 is the 0 % stop between the opaque ends).
+    s.execute("gradient.presets.stop", json!({"action": "move", "kind": "opacity", "index": 1, "location": 0.25})).unwrap();
+    // Paint on fresh layers: painting over earlier strokes would composite their alpha.
+    s.execute("layer.new.layer", json!({})).unwrap();
+    s.execute("paint.gradient", json!({"from": [0, 0], "to": [63, 0]})).unwrap();
+    assert!(layer_px(&s, 20, 5)[3] < 0.15, "{:?}", layer_px(&s, 20, 5));
+    let far = layer_px(&s, 48, 5)[3];
+    assert!(far > 0.55 && far < 0.85, "{far}");
+    // Deleting it returns the gradient to fully opaque, stored as no opacity stops at all.
+    s.execute("gradient.presets.stop", json!({"action": "delete", "kind": "opacity", "index": 1})).unwrap();
+    let v = s.execute("gradient.presets.list", json!({})).unwrap();
+    assert_eq!(v["current"]["transparency"], json!([]), "{v}");
+}
+
+/// The edited current gradient saves as a preset, and re-selecting it paints the same pixels.
+#[test]
+fn edited_preset_saves_and_roundtrips() {
+    let mut s = session(8);
+    s.execute("gradient.presets.stop", json!({"action": "add", "location": 0.5, "color": "#ff0000"})).unwrap();
+    s.execute("gradient.presets.new", json!({"name": "My Gradient"})).unwrap();
+    s.execute("gradient.presets.select", json!({"preset": "Red 01"})).unwrap();
+    s.execute("gradient.presets.select", json!({"preset": "My Gradient"})).unwrap();
+    s.execute("layer.new.layer", json!({})).unwrap();
+    s.execute("paint.gradient", json!({"from": [0, 0], "to": [63, 0]})).unwrap();
+    let px = layer_px(&s, 32, 10);
+    assert!(px[0] > 0.9 && px[1] < 0.1, "{px:?}");
 }
 
 /// Issue #465: explicit `transparency` stops apply with `colors`, a `gradient` preset, explicit
@@ -180,6 +318,23 @@ fn gradient_new_rename_move_delete_groups() {
 }
 
 #[test]
+fn gradient_rename_group_refuses_a_name_another_group_has() {
+    let mut s = Session::new();
+    s.execute("gradient.presets.edit", json!({"action": "newGroup", "name": "Pastels"})).unwrap();
+    let names = |s: &mut Session| -> Vec<Value> {
+        s.execute("gradient.presets.list", json!({})).unwrap()["groups"].as_array().unwrap().iter().map(|g| g["name"].clone()).collect()
+    };
+    let before = names(&mut s);
+    assert!(before.contains(&json!("Blues")));
+    let err = s.execute("gradient.presets.edit", json!({"action": "renameGroup", "group": "Pastels", "name": "Blues"})).unwrap_err();
+    assert!(err.to_string().contains("already exists"), "{err}");
+    assert_eq!(names(&mut s), before, "a refused rename leaves the groups unchanged");
+    // Renaming a group to its own name is fine.
+    s.execute("gradient.presets.edit", json!({"action": "renameGroup", "group": "Pastels", "name": "Pastels"})).unwrap();
+    assert_eq!(names(&mut s), before);
+}
+
+#[test]
 fn presets_persist_through_preferences_json() {
     let mut s = Session::new();
     s.execute("gradient.presets.new", json!({"name": "Saved", "stops": [[0, "#ff0000"], [1, "#0000ff"]]})).unwrap();
@@ -247,6 +402,43 @@ fn pattern_groups_select_apply_and_sync() {
     assert!(crate::pattern_cmds::resolve(&s, "Weave").is_none());
 }
 
+#[test]
+fn pattern_batch_delete_keeps_the_library_when_one_name_is_missing() {
+    let mut s = session(8);
+    let before = s.execute("pattern.presets.list", json!({})).unwrap();
+    let err = s.execute("pattern.presets.edit", json!({"action": "delete", "preset": ["Bricks", "missing"]})).unwrap_err();
+    assert!(err.to_string().contains("missing"), "{err}");
+    assert_eq!(s.execute("pattern.presets.list", json!({})).unwrap(), before);
+    assert!(crate::pattern_cmds::resolve(&s, "Bricks").is_some());
+}
+
+#[test]
+fn pattern_batch_delete_rejects_non_string_members_without_deleting() {
+    for invalid in [json!(null), json!(7), json!({})] {
+        let mut s = session(8);
+        let before = s.execute("pattern.presets.list", json!({})).unwrap();
+        assert!(s.execute("pattern.presets.edit", json!({"action": "delete", "preset": ["Bricks", invalid]})).is_err());
+        assert_eq!(s.execute("pattern.presets.list", json!({})).unwrap(), before);
+    }
+}
+
+#[test]
+fn pattern_batch_delete_refuses_a_document_only_pattern_up_front() {
+    let mut s = session(8);
+    let added = s.execute("edit.definePattern", json!({"name": "Document Only"})).unwrap();
+    let id = added["pattern"].as_str().unwrap().to_string();
+    let pattern = s.patterns.items.iter().find(|p| p.id == id).unwrap().clone();
+    s.edit("Embed pattern fixture", |doc, _| {
+        doc.patterns.push(pattern.clone());
+        Ok(())
+    })
+    .unwrap();
+    s.execute("pattern.delete", json!({"pattern": id})).unwrap();
+    let before = s.patterns.items.clone();
+    assert!(s.execute("pattern.presets.edit", json!({"action": "delete", "preset": ["Bricks", id]})).is_err());
+    assert_eq!(s.patterns.items, before, "nothing is deleted when one entry is not in the library");
+}
+
 // ------------------------------------------------------------------ styles
 
 #[test]
@@ -285,6 +477,25 @@ fn styles_apply_to_selected_layers_and_new_from_layer() {
     assert!(px[(24 * 48 + 24) * 4 + 3] == 255);
 }
 
+/// A preset saved without blending options but with an explicit Opacity carries only that
+/// opacity: ⇧-click (`add`) sets it and leaves the layer's blend mode and Fill alone.
+#[test]
+fn an_opacity_only_style_added_sets_just_the_opacity() {
+    let mut s = session(8);
+    let a = s.execute("layer.new.layer", json!({})).unwrap()["layer"].as_u64().map(LayerId).unwrap_or_else(|| active(&s));
+    s.execute("style.presets.new", json!({"name": "Faded", "includeBlending": false, "effects": [["stroke", {"size": 2}]], "opacity": 40})).unwrap();
+    s.edit("Blending fixture", |doc, _| {
+        let l = doc.layer_mut(a).unwrap();
+        (l.blend, l.fill_opacity, l.opacity) = (photocraft_doc::BlendMode::Multiply, 0.7, 0.9);
+        Ok(())
+    })
+    .unwrap();
+    s.execute("style.presets.apply", json!({"preset": "Faded", "add": true, "layer": a.0})).unwrap();
+    let l = s.active().unwrap().doc.layer(a).unwrap().clone();
+    assert_eq!((l.blend, l.fill_opacity, l.opacity), (photocraft_doc::BlendMode::Multiply, 0.7, 0.4));
+    assert_eq!(l.effects.items.len(), 1);
+}
+
 #[test]
 fn styles_with_pattern_overlay_copy_the_pattern() {
     let mut s = session(8);
@@ -295,6 +506,7 @@ fn styles_with_pattern_overlay_copy_the_pattern() {
         effects: vec![crate::layer_style::effect_from_params("patternOverlay", &json!({"pattern": "Bricks"})).unwrap()],
         blend: None,
         fill_opacity: None,
+        opacity: None,
     });
     s.execute("style.presets.apply", json!({"preset": "Bricky", "layer": id.0})).unwrap();
     assert!(s.active().unwrap().doc.patterns.iter().any(|p| p.name == "Bricks"));
@@ -400,6 +612,92 @@ fn tool_presets_save_filter_select() {
     assert!(s.execute("tool.presets.new", json!({"name": "x"})).is_err());
 }
 
+/// Crop presets are `crop` tool presets: saved, listed, persisted and deleted like the others.
+#[test]
+fn crop_presets_are_tool_presets_that_persist() {
+    let mut s = Session::new();
+    let opts =
+        json!({"toolOptions": {"crop_ratio": "whr", "crop_width": "4 in", "crop_height": "5 in", "crop_resolution": "300", "crop_resolution_unit": "px/in"}});
+    s.execute("tool.presets.new", json!({"name": "4 x 5 in 300 ppi", "tool": "crop", "options": opts})).unwrap();
+    let r = s.execute("tool.presets.new", json!({"name": "4 x 5 in 300 ppi", "tool": "crop", "options": opts})).unwrap();
+    assert_eq!(r["name"], "4 x 5 in 300 ppi 2", "a taken name gets a number");
+    let mut t = Session::new();
+    t.load_prefs_json(&s.prefs_to_json()).unwrap();
+    let v = t.execute("tool.presets.list", json!({"tool": "crop"})).unwrap();
+    assert_eq!(v["presets"].as_array().unwrap().len(), 2);
+    let r = t.execute("tool.presets.select", json!({"preset": "4 x 5 in 300 ppi"})).unwrap();
+    assert_eq!(r["options"]["toolOptions"]["crop_width"], "4 in");
+    // Deleting several is all or nothing.
+    assert!(t.execute("tool.presets.edit", json!({"action": "delete", "preset": ["4 x 5 in 300 ppi", "missing"]})).is_err());
+    assert_eq!(t.presets.tool_presets.iter().filter(|p| p.tool == "crop").count(), 2);
+    let r = t.execute("tool.presets.edit", json!({"action": "delete", "preset": ["4 x 5 in 300 ppi 2", "4 x 5 in 300 ppi", "4 x 5 in 300 ppi"]})).unwrap();
+    assert_eq!(r["deleted"], 2);
+    assert!(t.presets.tool_presets.iter().all(|p| p.tool != "crop"));
+}
+
+#[test]
+fn tool_preset_names_and_params_are_checked() {
+    let mut s = Session::new();
+    let n = s.presets.tool_presets.len();
+    let long = "x".repeat(crate::brush_preset_cmds::MAX_NAME + 1);
+    for bad in [
+        json!({"name": long, "tool": "crop"}),
+        json!({"name": 7, "tool": "crop"}),
+        json!({"name": ["a"], "tool": "crop"}),
+        json!({"tool": 3}),
+        json!({"tool": "crop", "options": "big"}),
+        json!({"tool": "crop", "options": [1]}),
+        json!(null),
+        json!([]),
+    ] {
+        assert!(s.execute("tool.presets.new", bad.clone()).is_err(), "{bad}");
+    }
+    assert_eq!(s.presets.tool_presets.len(), n);
+    // An empty or blank name falls back to the tool's; the longest name fits.
+    assert_eq!(s.execute("tool.presets.new", json!({"name": "   ", "tool": "crop"})).unwrap()["name"], "crop");
+    let max = "é".repeat(crate::brush_preset_cmds::MAX_NAME);
+    assert_eq!(s.execute("tool.presets.new", json!({"name": max, "tool": "crop"})).unwrap()["name"], json!(max));
+    assert!(s.execute("tool.presets.edit", json!({"action": "rename", "preset": "crop", "name": long})).is_err());
+    assert!(s.execute("tool.presets.edit", json!({"action": "rename", "preset": "crop", "name": "  "})).is_err());
+    // The store is capped.
+    while s.presets.tool_presets.len() < super::tools::MAX_PRESETS {
+        let i = s.presets.tool_presets.len();
+        s.presets.tool_presets.push(super::tools::ToolPreset { name: format!("p{i}"), tool: "crop".into(), options: json!({}) });
+    }
+    assert!(s.execute("tool.presets.new", json!({"name": "one more", "tool": "crop"})).is_err());
+}
+
+/// A damaged entry in the saved tool presets is skipped; the other presets (and preferences) load.
+#[test]
+fn damaged_tool_presets_skip_only_the_bad_entries() {
+    let mut s = Session::new();
+    s.execute("gradient.presets.new", json!({"name": "Kept", "stops": [[0, "#ff0000"], [1, "#0000ff"]]})).unwrap();
+    let mut prefs: Value = serde_json::from_str(&s.prefs_to_json()).unwrap();
+    prefs["presets"]["tool_presets"] = json!([
+        {"name": "Good", "tool": "crop", "options": {"toolOptions": {"crop_ratio": "2:3"}}},
+        {"name": 5, "tool": "crop"},
+        {"tool": "crop"},
+        {"name": "   ", "tool": "crop"},
+        {"name": "x".repeat(300), "tool": "crop"},
+        {"name": "No tool", "tool": ""},
+        "junk",
+        null,
+        {"name": "Good", "tool": "brush"},
+        {"name": "Odd options", "tool": "crop", "options": 12},
+    ]);
+    let mut t = Session::new();
+    t.load_prefs_json(&prefs.to_string()).unwrap();
+    let names: Vec<&str> = t.presets.tool_presets.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["Good", "Odd options"]);
+    assert!(t.presets.tool_presets[1].options.is_object());
+    assert!(t.presets.gradients.iter().any(|g| g.items.iter().any(|p| p.name == "Kept")), "other presets still load");
+    // Not an array at all: no tool presets, still no crash.
+    prefs["presets"]["tool_presets"] = json!({"a": 1});
+    let mut u = Session::new();
+    u.load_prefs_json(&prefs.to_string()).unwrap();
+    assert!(u.presets.tool_presets.is_empty());
+}
+
 // ------------------------------------------------------------------ clone source
 
 fn clone_doc(depth: u32) -> Session {
@@ -486,4 +784,115 @@ fn clone_source_errors_and_overlay() {
     let v: Value = s.execute("cloneSource.set", json!({"source": [1, 1], "width": 5000, "rotation": 270})).unwrap();
     assert_eq!(v["width"], json!(1000.0));
     assert_eq!(v["rotation"], json!(-90.0));
+}
+
+fn shape_fill(s: &Session, id: LayerId) -> Option<Fill> {
+    match &s.active().unwrap().doc.layer(id).unwrap().content {
+        LayerContent::Shape(sh) => sh.fill.clone(),
+        _ => panic!("not a shape layer"),
+    }
+}
+
+/// #5568: clicking a gradient with a shape layer selected fills the shape with it in one undo
+/// step; a gradient fill keeps its angle, style, scale and reverse.
+#[test]
+fn gradient_preset_click_fills_the_selected_shape_layer() {
+    let mut s = session(8);
+    let id = LayerId(s.execute("shape.create", json!({"rect": [8, 8, 40, 30], "fill": "#336699"})).unwrap()["layer"].as_u64().unwrap());
+    let before = shape_fill(&s, id);
+    let r = s.execute("gradient.presets.select", json!({"preset": "Red 01"})).unwrap();
+    assert_eq!(r["layer"], json!(id.0));
+    let Some(Fill::Gradient { stops, angle, style, .. }) = shape_fill(&s, id) else { panic!("not a gradient") };
+    // Red 01 starts at #7f0000; a new gradient fill is linear at 90°.
+    assert_eq!(stops[0].1.to_rgba8(), [0x7f, 0, 0, 0xff]);
+    assert_eq!((angle, style), (90.0, photocraft_doc::GradientStyle::Linear));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(shape_fill(&s, id), before);
+
+    s.execute("shape.edit", json!({"layer": id.0, "fill": {"gradient": {"angle": 30, "style": "radial", "scale": 80, "reverse": true}}})).unwrap();
+    s.execute("gradient.presets.select", json!({"preset": "Green 01"})).unwrap();
+    let Some(Fill::Gradient { angle, style, scale, reverse, .. }) = shape_fill(&s, id) else { panic!("not a gradient") };
+    assert_eq!((angle, style, scale, reverse), (30.0, photocraft_doc::GradientStyle::Radial, 0.8, true));
+}
+
+/// A locked shape refuses the click before anything changes, the Gradient tool's gradient included.
+#[test]
+fn gradient_preset_click_on_a_locked_shape_changes_nothing() {
+    let mut s = session(8);
+    let id = LayerId(s.execute("shape.create", json!({"rect": [8, 8, 40, 30], "fill": "#336699"})).unwrap()["layer"].as_u64().unwrap());
+    let (before, gradient) = (shape_fill(&s, id), s.presets.gradient.name.clone());
+    s.execute("layer.lockLayers", json!({"all": true})).unwrap();
+    let err = s.execute("gradient.presets.select", json!({"preset": "Red 01"})).unwrap_err().to_string();
+    assert!(err.contains("locked"), "{err}");
+    assert_eq!(shape_fill(&s, id), before);
+    assert_eq!(s.presets.gradient.name, gradient);
+}
+
+// ------------------------------------------------------------------ persistence
+
+/// #5602: one damaged preset set in the preferences file must not discard the saved New
+/// Document presets (or any other set) at the next launch.
+#[test]
+fn a_damaged_preset_set_keeps_the_other_sets() {
+    let mut s = Session::new();
+    let settings = json!({"width": 1600, "height": 900, "resolution": 144});
+    s.execute("document.presets.save", json!({"name": "Banner", "settings": settings})).unwrap();
+    let export = json!({
+        "format": "jpg", "quality": 70, "lossless": false, "transparency": false, "scale": 50, "width": 640, "height": 480,
+        "lockAspect": true, "sizing": "pixels", "metadata": "exif", "profile": "srgb", "embedProfile": false, "tgaBits": "24"
+    });
+    s.execute("file.export.presets.save", json!({"name": "Web JPEG", "settings": export})).unwrap();
+    let saved = s.presets.to_json(&s);
+    for key in
+        ["gradients", "gradient", "styles", "shapes", "pattern_groups", "recent_documents", "custom_shapes", "layer_defaults", "swatches", "export_presets"]
+    {
+        let mut blob = saved.clone();
+        blob[key] = json!("not a preset set");
+        let mut next = Session::new();
+        next.load_presets_json(blob);
+        assert_eq!(next.presets.documents, s.presets.documents, "damaged `{key}`");
+        assert_eq!(next.presets.tool_presets.len(), Session::new().presets.tool_presets.len(), "damaged `{key}`");
+        if key != "export_presets" {
+            assert_eq!(next.presets.export_presets, s.presets.export_presets, "damaged `{key}`");
+        }
+    }
+    let mut blob = saved.clone();
+    blob["export_presets"] = json!("not a preset set");
+    let mut next = Session::new();
+    next.load_presets_json(blob);
+    assert!(next.presets.export_presets.is_empty());
+    assert_eq!(next.presets.documents, s.presets.documents);
+    let mut blob = saved.clone();
+    blob["documents"] = json!("not a preset set");
+    let mut next = Session::new();
+    next.load_presets_json(blob);
+    assert!(next.presets.documents.is_empty());
+    assert_eq!(next.presets.export_presets, s.presets.export_presets);
+    // Null sets keep their defaults, as before.
+    let mut next = Session::new();
+    next.load_presets_json(
+        json!({"tool_presets": null, "gradients": null, "documents": saved["documents"].clone(), "export_presets": saved["export_presets"].clone()}),
+    );
+    assert_eq!(next.presets.tool_presets.len(), Session::new().presets.tool_presets.len());
+    assert_eq!(next.presets.gradients.len(), Session::new().presets.gradients.len());
+    assert_eq!(next.presets.documents, s.presets.documents);
+    assert_eq!(next.presets.export_presets, s.presets.export_presets);
+}
+
+// ------------------------------------------------------------------ export presets
+
+#[test]
+fn export_presets_survive_a_presets_json_round_trip() {
+    let mut s = Session::new();
+    s.execute("file.export.presets.save", json!({"name": "Web", "settings": {"format": "jpg", "quality": 70}})).unwrap();
+    assert_eq!(s.presets.export_presets.len(), 1);
+
+    let saved = s.presets.to_json(&s);
+    assert_eq!(saved["export_presets"].as_array().map(Vec::len), Some(1));
+
+    let mut restored = Session::new();
+    restored.load_presets_json(saved);
+    assert_eq!(restored.presets.export_presets.len(), 1);
+    assert_eq!(restored.presets.export_presets[0].name, "Web");
+    assert_eq!(restored.presets.export_presets[0].settings.format, "jpg");
 }

@@ -17,7 +17,7 @@ use photocraft_doc::{Document, LayerContent, LayerId, TextLayer, TextStyles};
 use serde_json::{Map, Value, json};
 
 use crate::commands::CommandSpec;
-use crate::type_cmds::{apply_char_props, apply_para_props, refresh};
+use crate::type_cmds::{apply_char_props, apply_para_props, refresh_at};
 use crate::{EngineError, Result, Session};
 
 const FAMILY: &str = photocraft_text::fonts::DEFAULT_FAMILY;
@@ -84,7 +84,7 @@ fn id_param(cmd: &str, p: &Value) -> Result<Option<u32>> {
 /// A character style with every field changed from the default, to see which fields a set of
 /// Character-panel keys touches.
 fn perturbed_char() -> CharStyle {
-    use photocraft_doc::text::{Caps, FontFeature, FontVariation, Kerning};
+    use photocraft_doc::text::{Caps, FontBaseline, FontFeature, FontVariation, Kerning};
     CharStyle {
         font_family: "\u{1}".into(),
         font_style: "\u{1}".into(),
@@ -105,6 +105,7 @@ fn perturbed_char() -> CharStyle {
         kerning: Kerning::Off,
         kern: -12345.0,
         caps: Caps::AllCaps,
+        baseline: FontBaseline::Subscript,
         ligatures: false,
         discretionary_ligatures: true,
         features: vec![FontFeature { tag: "\u{1}".into(), value: 9 }],
@@ -284,26 +285,29 @@ fn restyle(t: &mut TextLayer, old: &TextStyles, new: &TextStyles, range: Option<
 /// Replaces the document's styles with `new` and re-resolves every type layer (as one history
 /// step), applying `op` to `target` (layer + optional byte range).
 fn commit(s: &mut Session, label: &str, new: TextStyles, target: &[Target], op: Op) -> Result<usize> {
-    s.edit(label, |doc, _| {
-        let old = doc.text_styles.clone();
-        doc.text_styles = new.clone();
-        let snapshot = doc.clone();
-        let ids: Vec<LayerId> = doc.walk().into_iter().filter(|(_, _, l)| matches!(l.content, LayerContent::Text(_))).map(|(_, _, l)| l.id).collect();
-        let mut changed = 0;
-        for id in ids {
-            let tgt = target.iter().find(|(t, _)| *t == id);
-            let Some(LayerContent::Text(t)) = doc.layer_mut(id).map(|l| &mut l.content) else { continue };
-            let did = match tgt {
-                Some((_, r)) => restyle(t, &old, &new, *r, op),
-                None => restyle(t, &old, &new, Some((0, 0)), Op::default()),
-            };
-            if did {
-                refresh(&snapshot, t);
-                changed += 1;
-            }
+    s.edit(label, |doc, _| Ok(apply_styles(doc, &new, target, op)))
+}
+
+// Shared by history-backed commands and isolated preview documents.
+fn apply_styles(doc: &mut Document, new: &TextStyles, target: &[Target], op: Op) -> usize {
+    let old = doc.text_styles.clone();
+    doc.text_styles = new.clone();
+    let (dpi, format) = (doc.resolution_dpi, doc.pixel_format());
+    let ids: Vec<LayerId> = doc.walk().into_iter().filter(|(_, _, l)| matches!(l.content, LayerContent::Text(_))).map(|(_, _, l)| l.id).collect();
+    let mut changed = 0;
+    for id in ids {
+        let tgt = target.iter().find(|(t, _)| *t == id);
+        let Some(LayerContent::Text(t)) = doc.layer_mut(id).map(|l| &mut l.content) else { continue };
+        let did = match tgt {
+            Some((_, r)) => restyle(t, &old, new, *r, op),
+            None => restyle(t, &old, new, Some((0, 0)), Op::default()),
+        };
+        if did {
+            refresh_at(dpi, format, t);
+            changed += 1;
         }
-        Ok(changed)
-    })
+    }
+    changed
 }
 
 /// A type layer and an optional byte range in it.
@@ -513,7 +517,7 @@ fn delete(s: &mut Session, p: &Value, paragraph: bool) -> Result<Value> {
         } else {
             doc.text_styles.character.retain(|d| d.id != id);
         }
-        let snapshot = doc.clone();
+        let (dpi, format) = (doc.resolution_dpi, doc.pixel_format());
         let ids: Vec<LayerId> = doc.walk().into_iter().map(|(_, _, l)| l.id).collect();
         for lid in ids {
             let Some(LayerContent::Text(t)) = doc.layer_mut(lid).map(|l| &mut l.content) else { continue };
@@ -534,7 +538,7 @@ fn delete(s: &mut Session, p: &Value, paragraph: bool) -> Result<Value> {
                 }
             }
             if hit {
-                refresh(&snapshot, t);
+                refresh_at(dpi, format, t);
                 n += 1;
             }
         }
@@ -559,9 +563,8 @@ fn rename(s: &mut Session, p: &Value, paragraph: bool) -> Result<Value> {
     Ok(json!({ "id": id, "name": name }))
 }
 
-fn set_options(s: &mut Session, p: &Value, paragraph: bool) -> Result<Value> {
+fn prepare_options(mut st: TextStyles, p: &Value, paragraph: bool) -> Result<(TextStyles, u32)> {
     let cmd = if paragraph { "type.paragraphStyle.set" } else { "type.characterStyle.set" };
-    let mut st = styles(s)?;
     let id = lookup_id(cmd, &st, p, paragraph, paragraph)?;
     let (ca, pa) = parse_attrs(cmd, p.get("attrs").unwrap_or(&Value::Null))?;
     let replace = p.get("replace").and_then(Value::as_bool).unwrap_or(false);
@@ -600,6 +603,20 @@ fn set_options(s: &mut Session, p: &Value, paragraph: bool) -> Result<Value> {
             d.name = n;
         }
     }
+    Ok((st, id))
+}
+
+/// Apply Style Options to an isolated document, using exactly the command's resolution and
+/// rendering logic. The source document and the caller's session/history remain untouched.
+pub fn preview_options(doc: &Document, p: &Value, paragraph: bool) -> Result<Document> {
+    let (new, _) = prepare_options(doc.text_styles.clone(), p, paragraph)?;
+    let mut shown = doc.clone();
+    apply_styles(&mut shown, &new, &[], Op::default());
+    Ok(shown)
+}
+
+fn set_options(s: &mut Session, p: &Value, paragraph: bool) -> Result<Value> {
+    let (st, id) = prepare_options(styles(s)?, p, paragraph)?;
     let layers = commit(s, "Style Options", st, &[], Op::default())?;
     let mut v = list(s, &json!({}), paragraph)?;
     v["layers"] = json!(layers);

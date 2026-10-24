@@ -73,12 +73,12 @@ fn settings(app: &PhotocraftApp, pressure: f32) -> Settings {
 fn spacing(app: &PhotocraftApp) -> f64 {
     let f = app.ui.tool_options.magnetic_frequency;
     let f = if f.is_finite() { f64::from(f.clamp(0.0, 100.0)) } else { 57.0 };
-    (8.0 + (100.0 - f) * 0.9) / f64::from(app.current_zoom().max(0.01))
+    (8.0 + (100.0 - f) * 0.9) / f64::from(app.point_zoom().max(0.01))
 }
 
 /// Within this distance of the first point (document px), a click closes the border.
 fn close_radius(app: &PhotocraftApp) -> f64 {
-    8.0 / f64::from(app.current_zoom().max(0.01))
+    8.0 / f64::from(app.point_zoom().max(0.01))
 }
 
 fn dist(a: [f64; 2], b: [f64; 2]) -> f64 {
@@ -104,7 +104,8 @@ fn trace(app: &mut PhotocraftApp, from: [f64; 2], to: [f64; 2], guide: &[[f64; 2
 
 /// Pointer events while the Magnetic Lasso is the tool (it takes them all).
 pub fn pointer(app: &mut PhotocraftApp, ev: ToolEvent, mods: Modifiers) -> bool {
-    if app.ui.tool != Tool::MagneticLasso {
+    // ⌘ held makes it the Move tool (`hold_keys::cmd_moves`): nothing to take then.
+    if app.active_tool() != Tool::MagneticLasso {
         return false;
     }
     match ev {
@@ -419,7 +420,8 @@ pub fn draw(app: &PhotocraftApp, painter: &egui::Painter, xf: &ViewXform, hover:
     }
     let screen = |q: &[f64; 2]| xf.to_screen(q[0] as f32, q[1] as f32);
     let pts: Vec<Pos2> = m.path.iter().chain(m.live.iter().skip(1)).map(screen).collect();
-    crate::tool_feedback::draw_ants(painter, &pts, false);
+    // Solid until the selection is made, as in Photoshop (#7495).
+    crate::tool_feedback::draw_solid_path(painter, &pts, false);
     for p in m.anchors.iter().filter_map(|&i| m.path.get(i)).map(screen) {
         let r = Rect::from_center_size(p, vec2(5.0, 5.0));
         painter.rect_filled(r, 0.0, Color32::WHITE);

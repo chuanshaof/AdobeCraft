@@ -228,6 +228,47 @@ fn budgets_stop_runaway_plugins() {
 }
 
 #[test]
+fn parallel_bands_preserve_the_originating_error() {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+    let mut s = Surface::new(PixelFormat::RGBA8);
+    s.fill_rect(Rect::new(0, 0, 256, 256), &[0.0, 0.0, 0.0, 1.0]);
+    s.fill_rect(Rect::new(0, 256, 256, 512), &[1.0, 0.0, 0.0, 1.0]);
+    for (body, expected) in [
+        ("(i32.const 7)", Error::Failed("pc_filter returned error code 7".into())),
+        ("unreachable", Error::Trap("wasm `unreachable` instruction executed".into())),
+    ] {
+        // The later band fails immediately while the earlier one is still running (or hasn't
+        // started). Collecting in band order must not turn that failure into sibling cancellation.
+        let filter = format!(
+            "(if (result i32) (f32.gt (f32.load (local.get $buf)) (f32.const 0.5)) \
+             (then {body}) (else (loop $spin (br $spin)) (i32.const 0)))"
+        );
+        let limits = Limits { band_bytes: 1, fuel_base: 100_000_000, fuel_per_sample: 0, ..Limits::default() };
+        let p = Plugin::load(&ok_module(&filter), limits).unwrap();
+        let before = s.clone();
+        let e = pool.install(|| p.apply(&s, Rect::new(0, 0, 256, 512), None, &json!({}))).unwrap_err();
+        assert_eq!(e, expected);
+        assert_eq!(s, before, "a failed run must not change the input");
+    }
+}
+
+#[test]
+fn parallel_bands_preserve_instruction_budget() {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+    let p = Plugin::load(
+        &ok_module("(loop $spin (br $spin)) (i32.const 0)"),
+        Limits { band_bytes: 1, fuel_base: 1_000_000, fuel_per_sample: 0, ..Limits::default() },
+    )
+    .unwrap();
+    let mut s = Surface::new(PixelFormat::RGBA8);
+    s.fill_rect(Rect::new(0, 0, 768, 512), &[0.25, 0.5, 0.75, 1.0]);
+    for _ in 0..8 {
+        let e = pool.install(|| p.apply(&s, Rect::new(0, 0, 768, 512), None, &json!({}))).unwrap_err();
+        assert_eq!(e, Error::Limit("instruction budget".into()));
+    }
+}
+
+#[test]
 fn wall_clock_budget_stops_runaway_plugins() {
     let spin = ok_module("(loop $l (br $l)) (i32.const 0)");
     // Wall-clock budget, with an effectively unlimited instruction budget.
@@ -275,4 +316,45 @@ fn folder_loading_skips_bad_files() {
     assert!(photocraft_plugins::registry::load_folder(&dir.join("missing")).is_err());
     assert!(photocraft_plugins::registry::load_file(&dir, Limits::default()).is_err(), "a directory is not a module");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_start_function_that_spins_is_cut_off_at_one_slice() {
+    // `fuel_base` is what a call may use; the start function cannot be interrupted to check the
+    // clock, so it gets one slice of it at most.
+    let spin = "(func $spin (loop $l (br $l))) (start $spin)";
+    let limits = Limits { fuel_base: u64::MAX / 4, ..Limits::default() };
+    let (error, took) = run_err(&module(MANIFEST, 1, "(i32.const 0)", spin), limits);
+    assert!(matches!(error, Error::Trap(_) | Error::Limit(_)), "{error:?}");
+    assert!(took < Duration::from_secs(30), "{took:?}");
+}
+
+#[test]
+fn content_spread_over_millions_of_bands_is_refused_before_planning_them() {
+    let p = Plugin::load(INVERT, Limits::default()).unwrap();
+    let mut s = Surface::new(PixelFormat::RGBA8);
+    s.write_pixel(0, 0, &[0.1, 0.2, 0.3, 1.0]);
+    s.write_pixel(4_000_000, 4_000_000, &[0.1, 0.2, 0.3, 1.0]);
+    let t = Instant::now();
+    let e = p.apply(&s, Rect::new(0, 0, 8, 8), None, &json!({})).expect_err("a 15600 × 15600 tile grid is not one run");
+    assert!(matches!(e, Error::Limit(_)), "{e:?}");
+    assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fifo_in_place_of_a_module_file_does_not_block_loading() {
+    let dir = std::env::temp_dir().join(format!("photocraft-plugin-fifo-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("evil.wasm");
+    let _ = std::fs::remove_file(&path);
+    rustix::fs::mknodat(rustix::fs::CWD, &path, rustix::fs::FileType::Fifo, rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR, 0).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let p = path.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(photocraft_plugins::registry::load_file(&p, Limits::default()).map(|_| ()));
+    });
+    let r = rx.recv_timeout(Duration::from_secs(10)).expect("loading a FIFO must not block");
+    assert!(matches!(r, Err(Error::Io(_))), "{r:?}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

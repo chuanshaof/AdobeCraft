@@ -1,6 +1,6 @@
 [package]
 name = "photocraft-cli"
-description = "Headless Photocraft: convert, inspect, run commands, batch, MCP server"
+description = "Headless PhotoCraft: convert, inspect, run commands, batch, MCP server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -30,6 +30,10 @@ photocraft-format = { path = "../../crates/format" }
 photocraft-codecs = { workspace = true }
 serde_json = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+# Synthetic camera raws (#7789).
+photocraft-raw = { workspace = true, features = ["testgen"] }
 
 [build-dependencies]
 # Icon + VERSIONINFO for photocraft-cli.exe; build.rs only uses it when targeting Windows.

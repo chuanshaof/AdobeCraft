@@ -63,6 +63,7 @@ fn composite_area(
     coverage: impl Fn(i32, i32) -> f32 + Sync,
     color: impl Fn(i32, i32) -> [f32; 4] + Sync,
     lock_transparency: bool,
+    inks: Option<[f32; 4]>,
 ) {
     // Composite tile by tile (in parallel on native); tiles with zero coverage are left untouched,
     // so their copy-on-write storage (and GPU residency) survives.
@@ -88,11 +89,16 @@ fn composite_area(
                 let i = ((y - r.y0) as usize * w + (x - r.x0) as usize) * n;
                 let px = &mut region[i..i + n];
                 let d = photocraft_raster::to_rgba(&fmt, px);
-                let mut o = blend::composite(blend_mode, d, color(x, y), k);
-                if lock_transparency {
-                    o[3] = d[3];
-                }
+                let o = if lock_transparency { blend::composite_atop(blend_mode, d, color(x, y), k) } else { blend::composite(blend_mode, d, color(x, y), k) };
                 from_rgba_into(&fmt, o, &mut enc);
+                // A colour picked as CMYK inks replaces fully covered pixels of a CMYK target as it is.
+                if let Some(i) = inks
+                    && fmt.mode == photocraft_color::ColorMode::Cmyk
+                    && blend_mode == BlendMode::Normal
+                    && k >= 1.0
+                {
+                    enc[..4].copy_from_slice(&i);
+                }
                 px.copy_from_slice(&enc[..n]);
             }
         }
@@ -144,6 +150,7 @@ pub fn paint_gradient(
             c
         },
         lock_transparency,
+        None,
     );
 }
 
@@ -180,13 +187,32 @@ pub fn bucket_fill_src(
     lock_transparency: bool,
     src: impl Fn(i32, i32) -> [f32; 4] + Sync,
 ) -> bool {
+    bucket_fill_inks(s, area, seed, tolerance, contiguous, anti_alias, opacity, selection, lock_transparency, src, None)
+}
+
+/// [`bucket_fill_src`] where `inks` (CMYK, 0..1) are what a fully covered pixel of a CMYK target
+/// gets instead of `src`'s sRGB stand-in (a colour that was picked as CMYK).
+#[allow(clippy::too_many_arguments)]
+pub fn bucket_fill_inks(
+    s: &mut Surface,
+    area: Rect,
+    seed: (i32, i32),
+    tolerance: f32,
+    contiguous: bool,
+    anti_alias: bool,
+    opacity: f32,
+    selection: Option<&Surface>,
+    lock_transparency: bool,
+    src: impl Fn(i32, i32) -> [f32; 4] + Sync,
+    inks: Option<[f32; 4]>,
+) -> bool {
     if !area.contains(seed.0, seed.1) {
         return false;
     }
     let img = crate::selection::rgba8_image(s, area);
     let Some(region) = crate::selection::wand_region(&img, area, seed, tolerance, contiguous, anti_alias) else { return false };
     drop(img);
-    bucket_fill_region_src(s, &region, opacity, selection, lock_transparency, src);
+    bucket_fill_region_inks(s, &region, opacity, selection, lock_transparency, src, inks);
     true
 }
 
@@ -200,9 +226,30 @@ pub fn bucket_fill_region_src(
     lock_transparency: bool,
     src: impl Fn(i32, i32) -> [f32; 4] + Sync,
 ) {
+    bucket_fill_region_inks(s, region, opacity, selection, lock_transparency, src, None);
+}
+
+/// [`bucket_fill_region_src`] with the CMYK `inks` of [`bucket_fill_inks`].
+pub fn bucket_fill_region_inks(
+    s: &mut Surface,
+    region: &crate::selection::Region,
+    opacity: f32,
+    selection: Option<&Surface>,
+    lock_transparency: bool,
+    src: impl Fn(i32, i32) -> [f32; 4] + Sync,
+    inks: Option<[f32; 4]>,
+) {
     // Composite only over the filled region's box.
     let b = region.bbox;
-    composite_area(s, b, BlendMode::Normal, |x, y| region.at(x, y) * opacity * selection.map_or(1.0, |m| m.sample_channel(x, y, 0)), src, lock_transparency);
+    composite_area(
+        s,
+        b,
+        BlendMode::Normal,
+        |x, y| region.at(x, y) * opacity * selection.map_or(1.0, |m| m.sample_channel(x, y, 0)),
+        src,
+        lock_transparency,
+        inks,
+    );
 }
 
 #[cfg(test)]
@@ -244,6 +291,22 @@ mod tests {
         assert!(s.pixel(0, 0)[0] < 0.01 && s.pixel(10, 0)[0] > 0.99);
         assert!((s.pixel(5, 0)[0] - 0.5).abs() < 0.01);
         assert_eq!(s.pixel(5, 1)[3], 0.0, "outside the selection");
+    }
+
+    #[test]
+    fn locked_gradient_blends_source_atop_on_semi_transparent_pixels() {
+        // Locked half-transparent white, flat black gradient at 50%: colour halfway, alpha kept (#5783).
+        for fmt in [PixelFormat::RGBA8, PixelFormat::RGBA16, PixelFormat::RGBA32F] {
+            for mode in [BlendMode::Normal, BlendMode::Multiply] {
+                let mut s = Surface::new(fmt);
+                let a = Rect::new(0, 0, 4, 1);
+                s.fill_rect(a, &[1.0, 1.0, 1.0, 0.5]);
+                let black = [0.0, 0.0, 0.0, 1.0];
+                paint_gradient(&mut s, a, (0.0, 0.0), (4.0, 0.0), GradientShape::Linear, &[(0.0, black), (1.0, black)], false, 0.5, mode, false, None, true);
+                let p = s.rgba(2, 0);
+                assert!((p[0] - 0.5).abs() < 0.01 && (p[3] - 0.5).abs() < 0.01, "{fmt:?} {mode:?} {p:?}");
+            }
+        }
     }
 
     #[test]

@@ -13,22 +13,25 @@ use crate::AutomationError;
 pub struct Opened {
     pub document: Document,
     pub warnings: Vec<String>,
+    pub source_read_only: bool,
 }
 
 /// Decode a document that was read through a filesystem capability.
 pub fn open_bytes(name: &str, bytes: &[u8]) -> Result<Opened, AutomationError> {
     if Path::new(name).extension().is_some_and(|extension| extension.eq_ignore_ascii_case(photocraft_format::EXTENSION)) {
-        return Ok(Opened { document: photocraft_format::load_from_bytes(bytes)?, warnings: Vec::new() });
+        let document = photocraft_format::load_from_bytes(bytes)?;
+        return Ok(Opened { warnings: photocraft_io::open_warnings(&document), document, source_read_only: false });
     }
     let r = photocraft_io::import(name, bytes)?;
-    Ok(Opened { document: r.document, warnings: r.warnings })
+    Ok(Opened { document: r.document, warnings: r.warnings, source_read_only: r.source_read_only })
 }
 
 /// Open a document from disk. Directory bundles and `.pcraft` ZIPs load
 /// natively; everything else goes through `photocraft-io` (PSD, PNG, …).
 pub fn open(path: &Path) -> Result<Opened, AutomationError> {
     if path.is_dir() {
-        return Ok(Opened { document: photocraft_format::load_path(path)?, warnings: Vec::new() });
+        let document = photocraft_format::load_path(path)?;
+        return Ok(Opened { warnings: photocraft_io::open_warnings(&document), document, source_read_only: false });
     }
     let bytes = photocraft_format::read_file(path).map_err(|e| AutomationError::Io(format!("{}: {e}", path.display())))?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -38,6 +41,17 @@ pub fn open(path: &Path) -> Result<Opened, AutomationError> {
 /// Previews for a `.pcraft` bundle.
 pub fn previews(doc: &Document) -> SaveOptions {
     SaveOptions { thumbnail: Some(photocraft_compose::thumbnail(doc, 256)), composite: Some(photocraft_compose::thumbnail(doc, 1024)) }
+}
+
+/// Encode the name the saved native bundle will report on reopening. Save As updates
+/// the session identity only *after* a successful write; without a separate snapshot
+/// the manifest serializes the previous name instead.
+fn named_for_output(doc: &Document, path: &str) -> Document {
+    let mut named = doc.clone();
+    if let Some(name) = path.rsplit(['/', '\\']).next().filter(|name| !name.is_empty()) {
+        named.name = name.to_owned();
+    }
+    named
 }
 
 /// Save or export `doc` to `path`, choosing the format from the extension
@@ -55,9 +69,10 @@ pub fn save(
         .or_else(|| path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()))
         .ok_or_else(|| AutomationError::BadRequest(format!("cannot tell the format of `{}`; pass a format", path.display())))?;
     if ext == photocraft_format::EXTENSION {
+        let named = named_for_output(doc, &path.to_string_lossy());
         let mut local = PcraftWriter::new();
         let w = writer.unwrap_or(&mut local);
-        w.save_path(doc, path, &previews(doc))?;
+        w.save_path(&named, path, &previews(&named))?;
         return Ok(Vec::new());
     }
     let r = photocraft_io::export(doc, &ext, opts)?;
@@ -74,7 +89,8 @@ pub fn save_bytes(doc: &Document, name: &str, format_override: Option<&str>, opt
         .or_else(|| Path::new(name).extension().map(|extension| extension.to_string_lossy().to_ascii_lowercase()))
         .ok_or_else(|| AutomationError::BadRequest(format!("cannot tell the format of `{name}`; pass a format")))?;
     if ext == photocraft_format::EXTENSION {
-        return Ok((photocraft_format::save_to_bytes(doc, &previews(doc))?, Vec::new()));
+        let named = named_for_output(doc, name);
+        return Ok((photocraft_format::save_to_bytes(&named, &previews(&named))?, Vec::new()));
     }
     let result = photocraft_io::export(doc, &ext, opts)?;
     Ok((result.bytes, result.warnings))

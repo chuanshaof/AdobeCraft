@@ -247,6 +247,78 @@ fn blend_interior_effects_as_group_puts_overlays_under_fill_opacity() {
 }
 
 #[test]
+fn interior_effects_blend_over_the_layer_mode_unless_grouped() {
+    // #3996: #888888 under a black Color-mode layer with a red Overlay colour overlay. The
+    // layer's mode applies to its own pixels (grey stays grey), then the overlay blends onto
+    // that result and tints it; as a group the overlay of black is black, so grey remains.
+    let grey = 136.0 / 255.0;
+    let lift = 1.0 - 2.0 * (1.0 - grey);
+    for depth in DEPTHS {
+        let mut d = doc(depth, false);
+        d.layers.push(solid(&d, "grey", full(&d), [grey, grey, grey, 1.0]));
+        let mut l = solid(&d, "black", full(&d), [0.0, 0.0, 0.0, 1.0]);
+        l.blend = BlendMode::Color;
+        l.effects.items = vec![Effect::ColorOverlay { common: FxCommon::new(BlendMode::Overlay, 1.0), color: Color::rgb(1.0, 0.0, 0.0) }];
+        d.layers.push(l);
+        check(&d, 2, 2, [1.0, lift, lift, 1.0], "default: overlay over the Color blend");
+        d.layers[1].advanced.blend_interior = true;
+        check(&d, 2, 2, [grey, grey, grey, 1.0], "as group: overlay inside the Color blend");
+    }
+}
+
+#[test]
+fn interior_effects_blend_with_the_backdrop_through_a_see_through_normal_layer() {
+    // #6232: #04170F under a Normal layer at fill 0 with a yellow Soft Light colour overlay. The
+    // overlay soft-lights the dark green it sees through the layer (Photoshop's soft light of
+    // yellow: the W3C D(b) for red and green, which is the cubic ((16b − 12)b + 4)b below a
+    // quarter (#8804), and b² for blue), not transparency, which would leave plain yellow. A
+    // half-transparent part of the layer mixes it in at half strength.
+    let bg: [f32; 3] = [4.0 / 255.0, 23.0 / 255.0, 15.0 / 255.0];
+    let dark = |b: f32| ((16.0 * b - 12.0) * b + 4.0) * b;
+    let lit = [dark(bg[0]), dark(bg[1]), bg[2] * bg[2]];
+    let half = |c: usize| (bg[c] + lit[c]) / 2.0;
+    for depth in DEPTHS {
+        let mut d = doc(depth, false);
+        d.layers.push(solid(&d, "green", full(&d), [bg[0], bg[1], bg[2], 1.0]));
+        let mut l = solid(&d, "fade", Rect::new(0, 0, 6, 8), [0.2, 0.6, 0.9, 1.0]);
+        l.surface_mut().unwrap().fill_rect(Rect::new(6, 0, 12, 8), &photocraft_raster::from_rgba(&d.pixel_format(), [0.2, 0.6, 0.9, 0.5]));
+        l.fill_opacity = 0.0;
+        l.effects.items = vec![Effect::ColorOverlay { common: FxCommon::new(BlendMode::SoftLight, 1.0), color: Color::rgb(1.0, 1.0, 0.0) }];
+        d.layers.push(l);
+        check(&d, 2, 2, [lit[0], lit[1], lit[2], 1.0], "opaque part");
+        check(&d, 9, 2, [half(0), half(1), half(2), 1.0], "half-transparent part");
+    }
+}
+
+#[test]
+fn a_see_through_normal_layer_without_interior_effects_counts_the_backdrop_once() {
+    // A half-transparent backdrop under a Normal layer at fill 50 % whose only effect is a drop
+    // shadow (cast off the canvas): plain Normal compositing, blue at 50 % over red at 50 %. The
+    // layer must not merge into the backdrop first, or the backdrop shows twice (alpha 0.875).
+    for depth in DEPTHS {
+        let mut d = doc(depth, false);
+        d.layers.push(solid(&d, "red", full(&d), [1.0, 0.0, 0.0, 0.5]));
+        let mut l = solid(&d, "blue", Rect::new(0, 0, 12, 4), BLUE);
+        l.fill_opacity = 0.5;
+        l.effects.items = vec![Effect::DropShadow(photocraft_doc::Shadow {
+            common: FxCommon::new(BlendMode::Normal, 1.0),
+            color: Color::BLACK,
+            angle: 90.0,
+            use_global_light: false,
+            distance: 20.0,
+            spread: 1.0,
+            size: 0.0,
+            contour: photocraft_doc::Contour::Linear,
+            anti_alias: false,
+            noise: 0.0,
+            knocks_out: true,
+        })];
+        d.layers.push(l);
+        check(&d, 2, 2, [1.0 / 3.0, 0.0, 2.0 / 3.0, 0.75], "inside the layer");
+    }
+}
+
+#[test]
 fn transparency_shapes_off_spreads_effects_over_the_whole_layer() {
     for depth in DEPTHS {
         let mut d = doc(depth, true);
@@ -269,7 +341,98 @@ fn inside_stroke() -> Effect {
         size: 2.0,
         position: StrokePosition::Inside,
         paint: FxPaint::Color(Color::rgb(1.0, 0.0, 0.0)),
+        overprint: false,
     })
+}
+
+fn outside_stroke() -> Effect {
+    Effect::Stroke(StrokeFx {
+        common: FxCommon::new(BlendMode::Normal, 1.0),
+        size: 6.0,
+        position: StrokePosition::Outside,
+        paint: FxPaint::Color(Color::rgb(1.0, 0.0, 0.0)),
+        overprint: false,
+    })
+}
+
+#[test]
+fn shapeless_stroke_tile_skips_match_full_region_across_blending_settings() {
+    use photocraft_doc::BlendRange;
+
+    let modes = [BlendMode::Normal, BlendMode::Multiply, BlendMode::Screen, BlendMode::Difference];
+    for depth in DEPTHS {
+        for position in [StrokePosition::Outside, StrokePosition::Inside, StrokePosition::Center] {
+            for blend in modes {
+                for fill in [0.0, 0.5, 1.0] {
+                    for blend_if in [false, true] {
+                        let mut d = Document::with_background("t", Size::new(80, 768), ColorMode::Rgb, depth, Color::WHITE);
+                        let mut l = solid(&d, "stroke", Rect::new(28, 318, 52, 342), BLUE);
+                        l.effects.items = vec![Effect::Stroke(StrokeFx {
+                            common: FxCommon::new(BlendMode::Normal, 1.0),
+                            size: 6.0,
+                            position,
+                            paint: FxPaint::Color(Color::rgb(1.0, 0.0, 0.0)),
+                            overprint: false,
+                        })];
+                        l.blend = blend;
+                        l.fill_opacity = fill;
+                        l.advanced.transparency_shapes = false;
+                        if blend_if {
+                            l.blend_if.set(0, [BlendRange::FULL, BlendRange { black: [128, 128], white: [255, 255] }]);
+                        }
+                        d.layers.push(l);
+
+                        let rect = Rect::new(0, 0, 80, 768);
+                        let whole = render_tiled(&d, rect, 1024);
+                        let tiled = render_tiled(&d, rect, 64);
+                        assert_eq!(whole.px, tiled.px, "{depth:?}, {position:?}, {blend:?}, fill={fill}, blend_if={blend_if}");
+
+                        let mut bands = Vec::new();
+                        render_bands(&d, rect, 256, |band| -> Result<(), ()> {
+                            bands.push(band);
+                            Ok(())
+                        })
+                        .unwrap();
+                        let mut band_pixels = Vec::with_capacity(whole.px.len());
+                        for band in bands {
+                            band_pixels.extend(band.px);
+                        }
+                        assert_eq!(whole.px, band_pixels, "banded: {depth:?}, {position:?}, {blend:?}, fill={fill}, blend_if={blend_if}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn shapeless_stroke_skip_rejects_advanced_blending_and_masks() {
+    use photocraft_doc::{BlendRange, Path, Subpath, VectorMask};
+
+    let d = doc(SampleType::U8, true);
+    let mut l = solid(&d, "stroke", Rect::new(2, 2, 8, 8), BLUE);
+    l.effects.items = vec![outside_stroke()];
+    l.advanced.transparency_shapes = false;
+    assert!(shapeless_stroke_bounds(&l).is_some());
+
+    l.advanced.knockout = Knockout::Deep;
+    assert!(shapeless_stroke_bounds(&l).is_none(), "knockout changes the backdrop outside the content");
+    l.advanced.knockout = Knockout::None;
+
+    l.advanced.blend_interior = true;
+    assert!(shapeless_stroke_bounds(&l).is_none(), "Blend Interior effects remain on the uncropped path");
+    l.advanced.blend_interior = false;
+
+    l.blend_if.set(0, [BlendRange::FULL, BlendRange { black: [128, 128], white: [255, 255] }]);
+    assert!(shapeless_stroke_bounds(&l).is_none(), "Blend If remains on the uncropped path");
+    l.blend_if = Default::default();
+
+    l.mask = Some(LayerMask::hide_all());
+    assert!(shapeless_stroke_bounds(&l).is_none(), "enabled masks remain on the uncropped path");
+    l.mask = None;
+
+    l.vector_mask = Some(VectorMask::new(Path::new(vec![Subpath::polygon(&[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)])])));
+    assert!(shapeless_stroke_bounds(&l).is_none(), "enabled vector masks remain on the uncropped path");
 }
 
 #[test]
@@ -318,6 +481,26 @@ fn vector_mask_hides_effects() {
     }
 }
 
+/// The per-render vector-mask cache must key masks by content: `hiding_mask` and
+/// `effects_source` hand it temporary clones whose addresses get reused (#4426).
+#[test]
+fn vector_mask_cache_does_not_mix_up_layers() {
+    use photocraft_doc::{Path, Subpath, VectorMask};
+    for depth in DEPTHS {
+        let mut d = doc(depth, true);
+        for (name, color, x0, x1) in [("a", BLUE, -4.0, 6.0), ("b", GREEN, 6.0, 16.0)] {
+            let mut l = solid(&d, name, full(&d), color);
+            l.effects.items = vec![inside_stroke()];
+            l.advanced.vector_mask_hides_effects = true;
+            let path = Path::new(vec![Subpath::polygon(&[(x0, -4.0), (x1, -4.0), (x1, 12.0), (x0, 12.0)])]);
+            l.vector_mask = Some(VectorMask::new(path));
+            d.layers.push(l);
+        }
+        check(&d, 2, 4, BLUE, "layer A inside its own mask");
+        check(&d, 9, 4, GREEN, "layer B inside its own mask");
+    }
+}
+
 #[test]
 fn defaults_take_the_plain_paths() {
     let d = doc(SampleType::U8, true);
@@ -348,4 +531,27 @@ fn a_knockout_background_does_not_recurse() {
     d.layers[0].fill_opacity = 0.0;
     let got = render(&d, Rect::from_xywh(0, 0, 1, 1)).px[0];
     assert!(got[3] <= 1.0);
+}
+
+/// The Background is found by its structure, not its English name: a file from a German or
+/// Japanese Photoshop calls it "Hintergrund" or "背景", and a deep knockout still reveals it. A
+/// bottom layer merely called "Background", without the Background's locks, is not one.
+#[test]
+fn deep_knockout_reveals_a_localized_background() {
+    for depth in DEPTHS {
+        for name in ["Hintergrund", "背景", "Arrière-plan"] {
+            let mut d = doc(depth, true);
+            d.layers[0].name = name.into();
+            let green = solid(&d, "green", full(&d), GREEN);
+            d.layers.push(green);
+            d.layers.push(knocker(&d, Knockout::Deep));
+            check(&d, 2, 2, WHITE, name);
+        }
+        let mut d = doc(depth, true);
+        d.layers[0].locks = Default::default();
+        let green = solid(&d, "green", full(&d), GREEN);
+        d.layers.push(green);
+        d.layers.push(knocker(&d, Knockout::Deep));
+        check(&d, 2, 2, [0.0; 4], "an unlocked layer named Background");
+    }
 }

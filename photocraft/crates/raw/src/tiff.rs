@@ -13,6 +13,7 @@ pub(crate) mod tag {
     pub const IMAGE_LENGTH: u16 = 257;
     pub const BITS_PER_SAMPLE: u16 = 258;
     pub const COMPRESSION: u16 = 259;
+    pub const PREDICTOR: u16 = 317;
     pub const PHOTOMETRIC: u16 = 262;
     pub const MAKE: u16 = 271;
     pub const MODEL: u16 = 272;
@@ -35,6 +36,10 @@ pub(crate) mod tag {
     pub const EXIF_IFD: u16 = 34665;
     pub const EXIF_CFA_PATTERN: u16 = 41730;
     pub const MAKER_NOTE: u16 = 37500;
+    pub const COLOR_SPACE: u16 = 40961;
+    pub const INTEROP_IFD: u16 = 40965;
+    /// In the Interoperability IFD.
+    pub const INTEROP_INDEX: u16 = 1;
     pub const DNG_VERSION: u16 = 50706;
     pub const UNIQUE_CAMERA_MODEL: u16 = 50708;
     pub const CFA_PLANE_COLOR: u16 = 50710;
@@ -65,6 +70,7 @@ pub(crate) mod tag {
     pub const OPCODE_LIST_2: u16 = 51009;
     pub const OPCODE_LIST_3: u16 = 51022;
     pub const BASELINE_EXPOSURE_OFFSET: u16 = 51109;
+    pub const PROFILE_GAIN_TABLE_MAP: u16 = 52525;
     // CR2 private tag in the raw IFD: slice count, slice width, last slice width.
     pub const CR2_SLICE: u16 = 50752;
 }
@@ -89,7 +95,7 @@ pub(crate) struct Entry {
 
 impl Entry {
     /// Size in bytes of one value of this entry's type (0 = unknown type).
-    fn unit(&self) -> usize {
+    pub(crate) fn unit(&self) -> usize {
         type_size(self.typ)
     }
 }
@@ -110,12 +116,13 @@ impl Ifd {
     }
 }
 
+/// Bytes per value of TIFF field type `typ`, BigTIFF's 8-byte types included, or 0 for an unknown type.
 pub(crate) fn type_size(typ: u16) -> usize {
     match typ {
         1 | 2 | 6 | 7 => 1,
         3 | 8 => 2,
         4 | 9 | 11 | 13 => 4,
-        5 | 10 | 12 => 8,
+        5 | 10 | 12 | 16 | 17 | 18 => 8,
         _ => 0,
     }
 }
@@ -207,9 +214,11 @@ impl<'a> Tiff<'a> {
             }
             for t in [tag::SUB_IFDS, tag::EXIF_IFD] {
                 if let Some(e) = ifd.get(t) {
-                    // Reverse so the first SubIFD is visited first.
-                    let mut v = self.uints(e);
-                    v.truncate(16);
+                    // Linked-directory traversal only needs the first sixteen offsets. Read
+                    // those values directly instead of expanding the complete file-controlled
+                    // array and truncating it afterward.
+                    let n = (e.count as usize).min(16);
+                    let v = (0..n).map(|i| self.uint(e, i)).collect::<Option<Vec<_>>>().unwrap_or_default();
                     stack.extend(v.into_iter().rev().map(|o| o as usize));
                 }
             }
@@ -296,6 +305,17 @@ impl<'a> Tiff<'a> {
         (!s.is_empty()).then_some(s)
     }
 
+    /// [`Tiff::ascii`] for diagnostics: reads at most `limit` bytes (and a few more, so a
+    /// character cut at the limit still decodes) of a value that may be gigabytes long and
+    /// shared by many entries.
+    pub fn ascii_prefix(&self, e: &Entry, limit: usize) -> Option<String> {
+        let b = self.raw(e)?;
+        let b = b.get(..b.len().min(limit.saturating_add(4)))?;
+        let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+        let s = String::from_utf8_lossy(b.get(..end)?).trim().to_string();
+        (!s.is_empty()).then_some(s)
+    }
+
     pub fn tag_uint(&self, ifd: &Ifd, t: u16) -> Option<u32> {
         ifd.get(t).and_then(|e| self.uint(e, 0))
     }
@@ -313,16 +333,41 @@ impl<'a> Tiff<'a> {
     }
 }
 
+/// The EXIF orientation (1..=8) of a raw tag value; anything else is the default 1. The range is
+/// checked on the `u32`: narrowing first let a LONG like 65538 pass as 2 (#1817).
+pub(crate) fn orientation(v: Option<u32>) -> u16 {
+    v.filter(|o| (1..=8).contains(o)).and_then(|o| u16::try_from(o).ok()).unwrap_or(1)
+}
+
 /// A human-readable listing of every IFD and entry (debugging aid).
 pub(crate) fn dump(data: &[u8]) -> String {
     use std::fmt::Write;
+    // Caps so a crafted TIFF (many entries aliasing one large ASCII value) cannot expand a
+    // small diagnostic input into a multi-gigabyte String.
+    const MAX_ASCII_PREVIEW: usize = 256;
+    const MAX_OUTPUT: usize = 1 << 20;
     let Some(t) = Tiff::new(data) else { return "not a TIFF-structured file".into() };
     let mut s = String::new();
-    for ifd in t.all_ifds() {
+    'ifds: for ifd in t.all_ifds() {
         let _ = writeln!(s, "IFD @{}", ifd.offset);
         for e in &ifd.entries {
+            if s.len() >= MAX_OUTPUT {
+                s.push_str("… (output truncated)\n");
+                break 'ifds;
+            }
             let preview: String = if e.typ == 2 {
-                t.ascii(e).unwrap_or_default()
+                let mut a = t.ascii_prefix(e, MAX_ASCII_PREVIEW).unwrap_or_default();
+                if a.len() > MAX_ASCII_PREVIEW {
+                    // Truncate at a char boundary at or below the cap (lossy UTF-8 can hold
+                    // multi-byte replacement chars).
+                    let mut cut = MAX_ASCII_PREVIEW;
+                    while cut > 0 && !a.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    a.truncate(cut);
+                    a.push('…');
+                }
+                a
             } else {
                 let n = (e.count as usize).min(12);
                 let v: Vec<String> = (0..n).map(|i| t.float(e, i).map(|f| format!("{f}")).unwrap_or_else(|| "?".into())).collect();
@@ -337,6 +382,17 @@ pub(crate) fn dump(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn orientation_is_range_checked_before_narrowing() {
+        // #1817: 65538 as u16 is 2, which passed the 1..=8 check.
+        for (v, want) in [(None, 1), (Some(0), 1), (Some(9), 1), (Some(65_538), 1), (Some(65_537), 1), (Some(u32::MAX), 1)] {
+            assert_eq!(orientation(v), want, "{v:?}");
+        }
+        for o in 1..=8u32 {
+            assert_eq!(orientation(Some(o)), o as u16);
+        }
+    }
 
     #[test]
     fn header_variants() {
@@ -364,6 +420,23 @@ mod tests {
     }
 
     #[test]
+    fn eight_byte_types_are_read_from_their_offset() {
+        for typ in [16u16, 17, 18] {
+            let mut b = b"II*\0\x08\0\0\0".to_vec();
+            b.extend_from_slice(&1u16.to_le_bytes());
+            b.extend_from_slice(&50000u16.to_le_bytes());
+            b.extend_from_slice(&typ.to_le_bytes());
+            b.extend_from_slice(&1u32.to_le_bytes());
+            b.extend_from_slice(&26u32.to_le_bytes());
+            b.extend_from_slice(&0u32.to_le_bytes());
+            b.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+            let t = Tiff::new(&b).unwrap();
+            let ifd = t.ifd_at(8, 0).unwrap();
+            assert_eq!(t.raw(ifd.get(50000).unwrap()), Some(&0x0102_0304_0506_0708u64.to_le_bytes()[..]), "type {typ}");
+        }
+    }
+
+    #[test]
     fn rational_with_zero_denominator_is_none() {
         let mut b = b"II*\0\x08\0\0\0".to_vec();
         b.extend_from_slice(&1u16.to_le_bytes());
@@ -378,4 +451,50 @@ mod tests {
         let ifd = t.ifd_at(8, 0).unwrap();
         assert_eq!(t.float(ifd.get(50730).unwrap(), 0), None);
     }
+
+    #[test]
+    fn dump_output_is_bounded_for_aliased_ascii() {
+        // Many ASCII entries all pointing at one large value must not expand the diagnostic
+        // dump without bound. Build an IFD whose entries alias a big ASCII blob.
+        const ENTRIES: usize = 4000;
+        const BLOB: usize = 100_000;
+        let header = 8u32;
+        let ifd_at = header;
+        let entry_count_bytes = 2;
+        let entries_bytes = ENTRIES * 12;
+        let next_ptr_bytes = 4;
+        let blob_at = ifd_at as usize + entry_count_bytes + entries_bytes + next_ptr_bytes;
+        let mut b = b"II*\0".to_vec();
+        b.extend_from_slice(&ifd_at.to_le_bytes());
+        b.extend_from_slice(&(ENTRIES as u16).to_le_bytes());
+        for i in 0..ENTRIES {
+            b.extend_from_slice(&(1000 + i as u16).to_le_bytes()); // tag
+            b.extend_from_slice(&2u16.to_le_bytes()); // type ASCII
+            b.extend_from_slice(&(BLOB as u32).to_le_bytes()); // count
+            b.extend_from_slice(&(blob_at as u32).to_le_bytes()); // value offset (aliased)
+        }
+        b.extend_from_slice(&0u32.to_le_bytes()); // next IFD = none
+        b.resize(blob_at + BLOB, b'A');
+        let out = dump(&b);
+        // Comfortably below entries * blob (~400 MB); the caps keep it near 1 MiB.
+        assert!(out.len() < 2 << 20, "dump output was {} bytes", out.len());
+        assert!(out.contains("output truncated") || out.len() < 1 << 20);
+    }
+}
+
+#[test]
+fn linked_directory_values_are_read_only_as_needed() {
+    // The traversal limit is independent of the TIFF entry count: callers should
+    // never need a complete attacker-controlled offset array to visit SubIFDs.
+    let mut b = b"II*\0\x08\0\0\0".to_vec();
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&330u16.to_le_bytes());
+    b.extend_from_slice(&4u16.to_le_bytes());
+    b.extend_from_slice(&(1_000_000u32).to_le_bytes());
+    b.extend_from_slice(&26u32.to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes());
+    b.resize(26 + 16 * 4, 0);
+    let t = Tiff::new(&b).unwrap();
+    assert!(t.all_ifds().len() <= 17);
 }

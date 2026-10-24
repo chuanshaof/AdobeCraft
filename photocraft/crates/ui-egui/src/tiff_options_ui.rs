@@ -9,6 +9,8 @@ use crate::{ExportSettings, PhotocraftApp};
 
 /// A save waiting on the TIFF Options answer.
 pub struct Prompt {
+    /// The document that requested the save, even if tabs change while this is open.
+    doc: photocraft_doc::DocId,
     /// Where the document goes.
     pub path: String,
     /// "Discard Layers and Save a Copy".
@@ -33,8 +35,10 @@ pub fn wants_prompt(app: &PhotocraftApp, path: &str) -> bool {
 }
 
 /// Parks the save behind the prompt.
-pub fn park(app: &mut PhotocraftApp, path: String) {
-    app.tiff_options = Some(Prompt { path, discard_layers: false, dont_ask_again: false });
+pub fn park(app: &mut PhotocraftApp, path: String) -> Result<(), String> {
+    let doc = app.active_doc_id()?;
+    app.tiff_options = Some(Prompt { doc, path, discard_layers: false, dont_ask_again: false });
+    Ok(())
 }
 
 pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
@@ -61,15 +65,27 @@ pub fn show(app: &mut PhotocraftApp, ctx: &egui::Context) {
     cancel |= modal.should_close();
     p.discard_layers = discard;
     p.dont_ask_again = dont_ask;
-    if ok || ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+    // A focused button takes Enter as its click without consuming the key: Enter on Cancel cancels.
+    if ok || (!cancel && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))) {
         let Some(p) = app.tiff_options.take() else { return };
         if p.dont_ask_again {
             app.session.edit_prefs(|prefs| prefs.file_handling.ask_before_saving_layered_tiff = false);
         }
-        let settings = ExportSettings { tiff_layers: !p.discard_layers, ..Default::default() };
-        if let Err(e) = app.write_document(p.path.clone(), &settings) {
-            app.ui.status = crate::i18n::fmt(tl!("Save failed: {error}"), &[("error", &e)]);
-            app.ui.status_error = true;
+        let settings = ExportSettings { tiff_layers: !p.discard_layers, ..app.save_settings() };
+        let step = serde_json::json!({"path": p.path, "tiffLayers": !p.discard_layers});
+        let written = app.with_document(p.doc, |app| app.write_document(p.path, &settings, p.discard_layers));
+        if written.is_ok() {
+            // An action being recorded keeps the Save As with this answer (#2032).
+            app.session.journal.push(("file.saveAs".into(), step));
+        }
+        match written {
+            Err(e) => {
+                app.ui.status = crate::i18n::fmt(tl!("Save failed: {error}"), &[("error", &e)]);
+                app.ui.status_error = true;
+            }
+            Ok(Some(_)) if !p.discard_layers => crate::discard_ui::saved_document(app, ctx, p.doc),
+            // A background save releases the close prompt when it finishes (`jobs_ui`).
+            Ok(_) => {}
         }
     } else if cancel {
         app.tiff_options = None;

@@ -83,11 +83,6 @@ fn undo_redo_and_last_document_state() {
     assert_eq!(doc(&s).layer_comps[0].name, "Layer Comp 1");
     s.execute("layer.translate", json!({"layer": a.0, "dx": 3, "dy": 0})).unwrap();
     // A fresh document state (not a comp) is remembered when a comp is applied over it.
-    s.edit("forget", |d, _| {
-        d.last_applied_comp = None;
-        Ok(())
-    })
-    .unwrap();
     s.execute("layerComp.apply", json!({})).unwrap();
     assert_eq!(pos(&s, a), Some((4, 4)));
     assert!(doc(&s).last_document_state.is_some());
@@ -105,6 +100,60 @@ fn undo_redo_and_last_document_state() {
     assert!(doc(&s).layer_comps.is_empty());
     assert!(s.undo());
     assert_eq!(doc(&s).layer_comps.len(), 1);
+}
+
+#[test]
+fn ordinary_layout_edits_become_the_last_document_state() {
+    for depth in [8, 16, 32] {
+        for (command, mut params) in [
+            ("layer.translate", json!({"dx": 9, "dy": 3})),
+            ("layer.setProps", json!({"visible": false})),
+            ("layer.setProps", json!({"opacity": 0.25})),
+            ("layer.setProps", json!({"blend": "multiply"})),
+        ] {
+            let (mut s, a, _) = session(depth);
+            s.execute("layerComp.new", json!({})).unwrap();
+            params["layer"] = json!(a.0);
+            s.execute(command, params).unwrap();
+            let edited = capture_states(doc(&s));
+            s.execute("layerComp.apply", json!({})).unwrap();
+            assert_ne!(capture_states(doc(&s)), edited);
+            assert!(s.is_enabled("layerComp.restoreLastDocumentState"));
+            s.execute("layerComp.restoreLastDocumentState", json!({})).unwrap();
+            assert_eq!(capture_states(doc(&s)), edited, "{depth}-bit");
+        }
+    }
+}
+
+#[test]
+fn cycling_comps_keeps_the_latest_edited_layout() {
+    let (mut s, a, _) = session(8);
+    let one = s.execute("layerComp.new", json!({"name": "One"})).unwrap()["comp"].clone();
+    s.execute("layer.translate", json!({"layer": a.0, "dx": 10, "dy": 0})).unwrap();
+    let two = s.execute("layerComp.new", json!({"name": "Two"})).unwrap()["comp"].clone();
+    for dx in [7, 13] {
+        s.execute("layer.translate", json!({"layer": a.0, "dx": dx, "dy": 0})).unwrap();
+        let edited = capture_states(doc(&s));
+        s.execute("layerComp.apply", json!({"comp": one})).unwrap();
+        s.execute("layerComp.apply", json!({"comp": two})).unwrap();
+        s.execute("layerComp.apply", json!({"comp": two})).unwrap();
+        s.execute("layerComp.restoreLastDocumentState", json!({})).unwrap();
+        assert_eq!(capture_states(doc(&s)), edited);
+    }
+}
+
+#[test]
+fn unrecorded_properties_do_not_replace_the_backup_on_reapply() {
+    let (mut s, a, _) = session(8);
+    s.execute("layerComp.new", json!({"position": false, "appearance": false})).unwrap();
+    s.execute("layer.translate", json!({"layer": a.0, "dx": 10, "dy": 0})).unwrap();
+    s.execute("layer.setProps", json!({"layer": a.0, "visible": false, "opacity": 0.5})).unwrap();
+    let edited = capture_states(doc(&s));
+    s.execute("layerComp.apply", json!({})).unwrap();
+    assert!(doc(&s).layer(a).unwrap().visible);
+    s.execute("layerComp.apply", json!({})).unwrap();
+    s.execute("layerComp.restoreLastDocumentState", json!({})).unwrap();
+    assert_eq!(capture_states(doc(&s)), edited);
 }
 
 #[test]
@@ -254,4 +303,140 @@ fn unreachable_comp_positions_leave_the_layer_in_place() {
         assert!(!doc(&s).layer(a).unwrap().visible);
         assert_eq!(pos(&s, b), Some((31, 22)));
     }
+}
+
+#[test]
+fn clearing_one_comps_warning_leaves_the_others() {
+    // Regression for #4197: the per-comp warning icon cleared every comp's warnings.
+    let (mut s, a, _) = session(8);
+    let c1 = s.execute("layerComp.new", json!({"name": "One"})).unwrap()["comp"].as_u64().unwrap();
+    let c2 = s.execute("layerComp.new", json!({"name": "Two"})).unwrap()["comp"].as_u64().unwrap();
+    s.edit("del", |d, _| {
+        d.remove(a);
+        Ok(())
+    })
+    .unwrap();
+    // Reporting can be limited to one comp too.
+    let w = s.execute("layerComp.updateWarnings", json!({"comp": c2})).unwrap();
+    assert_eq!(w["count"], 1);
+    assert_eq!(w["warnings"][0]["comp"], c2);
+    s.execute("layerComp.updateWarnings", json!({"clear": true, "comp": c1})).unwrap();
+    assert!(doc(&s).comp(c1 as u32).unwrap().missing_layers(doc(&s)).is_empty());
+    assert_eq!(doc(&s).comp(c2 as u32).unwrap().missing_layers(doc(&s)), vec![a]);
+    let w = s.execute("layerComp.updateWarnings", json!({})).unwrap();
+    assert_eq!(w["count"], 1);
+    assert_eq!(w["warnings"][0]["comp"], c2);
+    // Without "comp" every comp is cleared (Clear All Layer Comp Warnings).
+    s.execute("layerComp.updateWarnings", json!({"clear": true})).unwrap();
+    assert_eq!(s.execute("layerComp.updateWarnings", json!({})).unwrap()["count"], 0);
+}
+
+#[test]
+fn clearing_warnings_of_an_unknown_comp_is_an_error() {
+    let (mut s, a, _) = session(8);
+    let c1 = s.execute("layerComp.new", json!({})).unwrap()["comp"].as_u64().unwrap();
+    s.edit("del", |d, _| {
+        d.remove(a);
+        Ok(())
+    })
+    .unwrap();
+    let before = doc(&s).layer_comps.clone();
+    for bad in [json!(c1 + 99), json!("nope"), json!(-1), json!(1.5), json!(true), json!([c1])] {
+        assert!(s.execute("layerComp.updateWarnings", json!({"clear": true, "comp": bad})).is_err(), "{bad}");
+    }
+    assert_eq!(doc(&s).layer_comps, before);
+    assert_eq!(s.execute("layerComp.updateWarnings", json!({})).unwrap()["count"], 1);
+}
+
+#[test]
+fn reorder_comps_preserves_capture_and_applied_state_and_undoes() {
+    let (mut s, _, _) = session(8);
+    for name in ["One", "Two", "Three"] {
+        s.execute("layerComp.new", json!({"name":name})).unwrap();
+    }
+    let before = doc(&s).layer_comps.clone();
+    let applied = doc(&s).last_applied_comp;
+    let steps = s.active().unwrap().history.past_len();
+    s.execute("layerComp.reorder", json!({"comp":"One", "index":2})).unwrap();
+    assert_eq!(doc(&s).layer_comps, vec![before[1].clone(), before[2].clone(), before[0].clone()]);
+    assert_eq!(doc(&s).last_applied_comp, applied);
+    assert_eq!(s.active().unwrap().history.past_len(), steps + 1);
+    assert!(s.undo());
+    assert_eq!(doc(&s).layer_comps, before);
+    assert!(s.redo());
+    s.execute("layerComp.reorder", json!({"comp":before[0].id, "index":0})).unwrap();
+    assert_eq!(doc(&s).layer_comps, before);
+    let steps = s.active().unwrap().history.past_len();
+    s.execute("layerComp.reorder", json!({"comp":"One", "index":0})).unwrap();
+    assert_eq!(s.active().unwrap().history.past_len(), steps);
+}
+
+#[test]
+fn reorder_comps_rejects_bad_indices_without_changes() {
+    let mut s = Session::new();
+    assert!(!s.is_enabled("layerComp.reorder"));
+    s.execute("file.new", json!({"width":8, "height":8})).unwrap();
+    assert!(!s.is_enabled("layerComp.reorder"));
+    s.execute("layerComp.new", json!({"name":"Only"})).unwrap();
+    let before = doc(&s).layer_comps.clone();
+    let steps = s.active().unwrap().history.past_len();
+    for index in [Value::Null, json!(-1), json!(1), json!(1.5), json!("0"), json!(u64::MAX)] {
+        assert!(s.execute("layerComp.reorder", json!({"index":index})).is_err());
+    }
+    assert!(s.execute("layerComp.reorder", json!({"comp":"Missing", "index":0})).is_err());
+    assert_eq!(doc(&s).layer_comps, before);
+    assert_eq!(s.active().unwrap().history.past_len(), steps);
+}
+
+/// Apply Layer Comp is recorded by the comp's name, not its document-local id: played in another
+/// document it applies that document's comp of the name, or stops when there is none (#7181).
+#[test]
+fn a_recorded_apply_layer_comp_finds_the_comp_by_name() {
+    let (mut s, _, _) = session(8);
+    s.execute("layerComp.new", json!({"name": "Wanted"})).unwrap();
+    let wanted = doc(&s).layer_comps[0].id;
+    s.execute("actions.record", json!({"name": "ApplyWanted"})).unwrap();
+    s.execute("layerComp.apply", json!({"comp": wanted})).unwrap();
+    s.execute("actions.stop", json!({})).unwrap();
+    // `{}` and `null` apply the last applied comp; they are recorded by name too.
+    s.execute("actions.record", json!({"name": "ApplyLast"})).unwrap();
+    s.execute("layerComp.apply", json!({})).unwrap();
+    s.execute("actions.stop", json!({})).unwrap();
+    s.execute("actions.record", json!({"name": "ApplyNull"})).unwrap();
+    s.execute("layerComp.apply", Value::Null).unwrap();
+    s.execute("actions.stop", json!({})).unwrap();
+    for action in ["ApplyWanted", "ApplyLast", "ApplyNull"] {
+        let steps = s.execute("actions.get", json!({"action": action})).unwrap()["steps"].clone();
+        assert_eq!(steps, json!([["layerComp.apply", {"comp": "Wanted"}]]), "{action}");
+    }
+
+    // A second document whose comp with the recorded id is another one.
+    let (mut other, _, ob) = session(8);
+    other.actions = s.actions.clone();
+    let show = |s: &mut Session, visible: bool| {
+        s.edit("t", |d, _| {
+            d.layer_mut(ob).unwrap().visible = visible;
+            Ok(())
+        })
+        .unwrap();
+    };
+    show(&mut other, false);
+    other.execute("layerComp.new", json!({"name": "Different"})).unwrap();
+    show(&mut other, true);
+    other.execute("layerComp.new", json!({"name": "Wanted"})).unwrap();
+    assert_eq!(doc(&other).layer_comps[0].id, wanted, "the recorded id names `Different` here");
+    show(&mut other, false);
+    other.execute("actions.play", json!({"action": "ApplyWanted"})).unwrap();
+    let applied = doc(&other).last_applied_comp.and_then(|id| doc(&other).comp(id)).map(|c| c.name.clone());
+    assert_eq!(applied.as_deref(), Some("Wanted"));
+    assert!(doc(&other).layer(ob).unwrap().visible, "Wanted shows the layer");
+
+    // A document without a comp of that name stops the action instead of applying another one.
+    other.execute("layerComp.delete", json!({"comp": "Wanted"})).unwrap();
+    show(&mut other, false);
+    let before = (doc(&other).last_applied_comp, doc(&other).layer(ob).unwrap().visible);
+    let played = other.execute("actions.play", json!({"action": "ApplyWanted"})).unwrap();
+    assert_eq!(played["ran"], 0, "{played}");
+    assert!(played["failed"]["error"].as_str().unwrap().contains("no layer comp named \"Wanted\""), "{played}");
+    assert_eq!((doc(&other).last_applied_comp, doc(&other).layer(ob).unwrap().visible), before, "the document is unchanged");
 }

@@ -50,7 +50,7 @@ fn has_layer_for_slice(s: &Session) -> std::result::Result<(), String> {
     if matches!(l.content, LayerContent::Adjustment(_)) {
         return Err("adjustment layers have no bounds to slice".into());
     }
-    if d.doc.layers.first().is_some_and(|b| b.id == id && b.name == "Background" && b.locks.transparency && b.locks.position) {
+    if d.doc.is_background(id) {
         return Err("the Background layer can't have a layer-based slice".into());
     }
     if d.doc.slices.list.iter().any(|s| s.layer == Some(id)) {
@@ -243,7 +243,8 @@ pub fn resolved_json(doc: &Document, r: &ResolvedSlice) -> Value {
         "number": r.number,
         "id": r.id,
         "origin": r.origin.id(),
-        "name": r.name,
+        // A covered slice's later pieces show as `<name>-NN`; the slice itself keeps its name.
+        "name": s.map(|s| s.name.as_str()).filter(|n| !n.is_empty()).unwrap_or(&r.name),
         "rect": [r.rect.x0, r.rect.y0, r.rect.width(), r.rect.height()],
         "kind": r.kind.id(),
         "layer": s.and_then(|s| s.layer).map(|l| l.0),
@@ -254,6 +255,30 @@ pub fn resolved_json(doc: &Document, r: &ResolvedSlice) -> Value {
         "cellText": s.map_or("", |s| s.cell_text.as_str()),
         "background": s.and_then(|s| s.background).map(|c| format!("#{:02x}{:02x}{:02x}", c[1], c[2], c[3])),
     })
+}
+
+/// A stored slice as `slice.list` and `slice.set` report it: once, with its own (canvas-clipped)
+/// rectangle, the one `slice.set` takes back, and the visible `pieces` a later slice cuts it into,
+/// which are numbered and exported separately (#7770). `number` is its first piece's, `null` when
+/// later slices cover it wholly. `None` for an unknown id.
+fn stored_json(doc: &Document, id: u32, resolved: &[ResolvedSlice]) -> Option<Value> {
+    let sl = doc.slices.get(id)?;
+    let pieces: Vec<&ResolvedSlice> = resolved.iter().filter(|r| r.id == Some(id)).collect();
+    let first = pieces.first();
+    let whole = ResolvedSlice {
+        number: first.map_or(0, |r| r.number),
+        id: Some(id),
+        origin: sl.origin,
+        rect: sl.rect.intersect(&doc.bounds()),
+        name: first.map_or_else(|| sl.name.clone(), |r| r.name.clone()),
+        kind: sl.kind,
+    };
+    let mut v = resolved_json(doc, &whole);
+    if first.is_none() {
+        v["number"] = Value::Null;
+    }
+    v["pieces"] = pieces.iter().map(|r| json!({"number": r.number, "name": r.name, "rect": [r.rect.x0, r.rect.y0, r.rect.width(), r.rect.height()]})).collect();
+    Some(v)
 }
 
 // ---------- commands ----------
@@ -283,8 +308,8 @@ fn from_guides(s: &mut Session) -> Result<Value> {
     let b = d.doc.bounds();
     let mut xs: Vec<i32> = vec![b.x0, b.x1];
     let mut ys: Vec<i32> = vec![b.y0, b.y1];
-    xs.extend(d.doc.guides.vertical.iter().map(|g| (*g as f64).round() as i32).filter(|x| *x > b.x0 && *x < b.x1));
-    ys.extend(d.doc.guides.horizontal.iter().map(|g| (*g as f64).round() as i32).filter(|y| *y > b.y0 && *y < b.y1));
+    xs.extend(d.doc.guides.vertical.iter().map(|g| g.round() as i32).filter(|x| *x > b.x0 && *x < b.x1));
+    ys.extend(d.doc.guides.horizontal.iter().map(|g| g.round() as i32).filter(|y| *y > b.y0 && *y < b.y1));
     if xs.len() == 2 && ys.len() == 2 {
         return Err(EngineError::Other("the document has no guides inside the canvas".into()));
     }
@@ -321,16 +346,16 @@ fn set_slice(s: &mut Session, p: &Value) -> Result<Value> {
     // nothing is committed unless every option is valid and the slice stays on the canvas.
     let id = s.edit("Slice Options", |doc, _| {
         let id = store(doc, t)?;
+        let canvas = doc.bounds();
         let sl = doc.slices.get_mut(id).ok_or_else(|| bad(cmd, "slice vanished"))?;
         apply_options(sl, p, cmd)?;
-        if !slices::resolve(doc).iter().any(|r| r.id == Some(id)) {
+        if sl.rect.intersect(&canvas).is_empty() {
             return Err(bad(cmd, "slice is off the canvas"));
         }
         Ok(id)
     })?;
     let d = s.active().ok_or(EngineError::NoDocument)?;
-    let r = slices::resolve(&d.doc).into_iter().find(|r| r.id == Some(id)).ok_or_else(|| bad(cmd, "slice is off the canvas"))?;
-    Ok(resolved_json(&d.doc, &r))
+    stored_json(&d.doc, id, &slices::resolve(&d.doc)).ok_or_else(|| bad(cmd, "slice vanished"))
 }
 
 fn promote(s: &mut Session, p: &Value) -> Result<Value> {
@@ -444,7 +469,22 @@ fn divide(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn list(s: &mut Session) -> Result<Value> {
     let d = s.active().ok_or(EngineError::NoDocument)?;
-    let all: Vec<Value> = slices::resolve(&d.doc).iter().map(|r| resolved_json(&d.doc, r)).collect();
+    // One entry per slice, in reading order of its first piece: auto slices as they resolve, a
+    // stored slice once with its pieces; slices wholly covered by later ones follow.
+    let resolved = slices::resolve(&d.doc);
+    let mut listed = std::collections::HashSet::new();
+    let mut all: Vec<Value> = Vec::new();
+    for r in &resolved {
+        match r.id {
+            None => all.push(resolved_json(&d.doc, r)),
+            Some(id) if listed.insert(id) => all.extend(stored_json(&d.doc, id, &resolved)),
+            Some(_) => {}
+        }
+    }
+    let canvas = d.doc.bounds();
+    for sl in d.doc.slices.list.iter().filter(|sl| !listed.contains(&sl.id) && !sl.rect.intersect(&canvas).is_empty()) {
+        all.extend(stored_json(&d.doc, sl.id, &resolved));
+    }
     Ok(json!({"slices": all, "locked": s.file_menu.slices_locked}))
 }
 
@@ -534,7 +574,7 @@ pub fn specs() -> Vec<CommandSpec> {
             label: "List Slices",
             menu: &[],
             shortcut: None,
-            params: "{} → {slices:[{number,id,origin:auto|layer|user,name,rect:[x,y,w,h],kind,layer,url,alt,…}], locked}",
+            params: "{} → {slices:[{number,id,origin:auto|layer|user,name,rect:[x,y,w,h],kind,layer,url,alt,…,pieces?:[{number,name,rect}] (a stored slice's visible parts; number null when wholly covered)}], locked}",
             enabled: has_doc,
             journal: false,
             run: |s, _| list(s),

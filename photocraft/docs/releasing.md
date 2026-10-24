@@ -9,6 +9,23 @@ This is PhotoCraft's implementation of the shared
 [release playbook](release-playbook.md). User-facing names say **PhotoCraft**. Files, binaries
 and ids stay lowercase (`photocraft-<version>-<platform>-<arch>.<ext>`, `ai.storyteller.photocraft`).
 
+## In-app update checks
+
+The native desktop app checks the public GitHub latest-release endpoint in a background
+thread once at launch, with no periodic checks or automatic retries. Preferences › General › Automatically
+Check for Updates disables the startup check; Help › Check for Updates runs one manually.
+Checks use a 15-second timeout and a 1 MiB response limit, need no GitHub token, and send
+no document or personal data. Network failures are quiet during automatic checks and visible
+in the manual check window. Concurrent requests share one check.
+HTTPS validates certificates and host names against the operating system's trust store.
+
+Tags must be semantic versions (`v0.8.0` or `0.8.0`); only published stable versions newer
+than the installed workspace version trigger a notice. The notice opens the official release
+page to choose an installer; installation remains a user action. Drafts and prereleases do
+not trigger it. Web/headless frontends and the Flatpak (no network in its sandbox; `flatpak update`
+owns updates there) have no update transport. No release-workflow changes
+are required: publishing a newer stable GitHub Release makes it discoverable.
+
 ## Cutting a release
 
 1. **Bump the version** on `main`. The only place it lives is `[workspace.package] version`
@@ -53,6 +70,7 @@ in the dialog.
 | Windows 10+ x86 (32-bit) | `photocraft-<v>-windows-x86.msi`, `photocraft-<v>-windows-x86-portable.zip` | `windows-latest` |
 | Linux x86_64 | `photocraft-<v>-linux-x86_64.{AppImage,AppImage.zsync,deb,rpm,tar.gz,flatpak}` | `ubuntu-22.04` (Flatpak: `ubuntu-24.04`) |
 | Linux aarch64 | `photocraft-<v>-linux-aarch64.{AppImage,AppImage.zsync,deb,rpm,tar.gz,flatpak}` | `ubuntu-22.04-arm` (Flatpak: `ubuntu-24.04-arm`) |
+| Linux riscv64 (glibc 2.39+) | `photocraft-<v>-linux-riscv64.tar.gz` | cross-compiled on `ubuntu-24.04` (ports.ubuntu.com riscv64 libs); CLI smoke-tested under QEMU |
 | FreeBSD 14 x86_64 | `photocraft-<v>-freebsd-x86_64.tar.gz` | FreeBSD 14.3 VM on `ubuntu-latest` |
 | Web | `photocraft-web-<v>.zip` (static site; see [`packaging/web/README.md`](../packaging/web/README.md)) | `ubuntu-latest` |
 
@@ -62,7 +80,7 @@ Every binary reports its version, the commit and the build date: `photocraft --v
 `cargo build` doesn't set them and reports `0.2.0 (dev build)`.
 
 Every desktop build job (macOS, Windows, Linux, FreeBSD) also checks out [craft-fonts](https://github.com/storytold/craft-fonts)
-at the commit in `CRAFT_FONTS_REF` (top of `release.yml`) and builds with `CRAFT_FONTS_DIR` and
+at the `craft-fonts-ref` commit in `.github/workflows/release.yml` and builds with `CRAFT_FONTS_DIR` and
 `CRAFT_FONTS_REQUIRED=1`, so desktop releases embed its Japanese fonts (the web build embeds none: see
 `docs/development.md` › Fonts) and fail rather than ship without them. The packages carry each font's licence as
 `OFL-<family>.txt` (`copy_font_licences` in `packaging/env.sh`; the portable zip on Windows;
@@ -140,6 +158,13 @@ goes in `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`, so host build scripts aren't affected
   "Open with" for PSD/PSB and image files. It also registers App Paths (Win+R `photocraft`).
   The MSI version is the numeric `X.Y.Z`, because MSI has no pre-release field. Same-version
   upgrades are allowed so that release candidates replace each other.
+- Double-clicking the MSI opens a setup wizard (WixUI_InstallDir without the licence page):
+  Welcome, install folder (remembered for upgrades in `HKLM\Software\PhotoCraft\InstallDir`),
+  Ready, a progress page, and a Finish page that says where to find the app, with a ticked "Launch
+  PhotoCraft" box. The pages name the full version (`photocraft.en-us.wxl`). `package.ps1` draws
+  the wizard's banner and side bitmaps from the app icon, so no WiX stock art ships. `msiexec /qn`
+  still installs silently. Building needs the WiX UI and Util extensions:
+  `wix extension add -g WixToolset.UI.wixext/5.0.2 WixToolset.Util.wixext/5.0.2`.
 - Shortcut icon identifiers keep the executable's `.exe` extension: MSI uses the identifier
   as the cached icon filename, and an extensionless filename can render as a blank document
   icon. `packaging/windows/check-icons.ps1` checks the references and extensions in CI;
@@ -159,7 +184,8 @@ goes in `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`, so host build scripts aren't affected
 
   The script is the single place to change when the Windows signing setup changes.
 
-Locally on Windows: `dotnet tool install -g wix --version 5.0.2`, then
+Locally on Windows: `dotnet tool install -g wix --version 5.0.2`,
+`wix extension add -g WixToolset.UI.wixext/5.0.2 WixToolset.Util.wixext/5.0.2`, then
 `pwsh packaging/windows/package.ps1 -Arch x64`.
 
 ### Linux
@@ -174,6 +200,13 @@ Why these formats:
 - **AppImage** runs on any distribution without installing anything. The
   download-and-go option and the fallback for distros the packages don't cover. It's built
   with the maintained `AppImage/appimagetool`, whose static runtime doesn't need libfuse2.
+  The packaging script verifies pinned AppImageTool 1.9.1 and type2 runtime 20251108 binaries.
+  For an offline build, pre-seed `$CARGO_TARGET_DIR/appimagetool-1.9.1-$ARCH.AppImage` and
+  `$CARGO_TARGET_DIR/type2-runtime-20251108-$ARCH` with the matching official release assets;
+  the script checks both SHA-256 digests and makes the cached AppImageTool executable after verification;
+  the runtime is only read as data.
+  An `APPIMAGETOOL` override must point to that same verified AppImageTool binary and already be
+  executable (`chmod +x` it before packaging).
   Each AppImage embeds update information (`gh-releases-zsync|…|latest|…`, #349) and ships
   with a `.zsync` beside it, so AppImageUpdate, AppImageLauncher and similar tools can find
   the next release and download only the blocks that changed.
@@ -268,11 +301,14 @@ and lists the tarball, which checks the layout without a FreeBSD machine.
 
 ### Web
 
-`packaging/web/package.sh` runs `trunk build --release` (see `apps/photocraft-web/Trunk.toml`)
-and zips `dist/web` together with sample `_headers` and `.htaccess` files and the hosting guide.
-The site only uses relative URLs, so it works under any path and in an iframe. The wasm builds
-with the size-optimized `wasm-release` Cargo profile (set in `apps/photocraft-web/index.html`),
-and the script fails if any `.wasm` exceeds 24 MiB, below Cloudflare's 25 MiB per-file limit.
+`packaging/web/package.sh` runs `trunk build --release` for the app (`apps/photocraft-web`, into
+`dist/web`) and for the module that starts it (`apps/photocraft-web-boot`, into `dist/web-boot`).
+It gzips the app's wasm, cuts it into parts of at most 20 MiB and zips the boot module's page with
+the parts, sample `_headers` and `.htaccess` files and the hosting guide. The site only uses
+relative URLs, so it works under any path and in an iframe. The wasm builds with the
+size-optimized `wasm-release` Cargo profile (set in `apps/photocraft-web/index.html`), and the
+script fails if any file in the site exceeds 24 MiB, below Cloudflare's 25 MiB per-file limit;
+the app's wasm itself may be larger, since it ships as parts.
 [`packaging/web/README.md`](../packaging/web/README.md) covers MIME types, compression,
 caching, the iframe snippet and the `?webgl` / `?cpu` flags.
 

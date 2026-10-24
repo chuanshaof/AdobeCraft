@@ -81,12 +81,18 @@ pub struct PresetState {
     pub tool_presets: Vec<tools::ToolPreset>,
     /// File › New: named snapshots, separate from the name of the document being created.
     pub documents: Vec<crate::document_preset_cmds::DocumentPreset>,
+    /// File › New › Recent: the settings of documents recently created there, newest first.
+    pub recent_documents: Vec<crate::document_preset_cmds::DocumentSettings>,
+    /// File › Export › Export As: named export configurations.
+    pub export_presets: Vec<crate::export_preset_cmds::ExportPreset>,
     pub clone: clone_source::CloneSources,
     /// The user defaults "Make Default" in the Layer Style dialog saves
     /// (effect kind → param set); "Reset to Default" restores them.
     pub layer_defaults: BTreeMap<String, Value>,
     /// Swatches panel library.
     pub swatches: Vec<Group<swatches::Swatch>>,
+    /// The user contour library of the Layer Style dialog (`layer.layerStyle.contours.*`).
+    pub contours: Vec<photocraft_doc::Contour>,
     /// Bumped on every preset change (UIs key thumbnail caches on it).
     pub rev: u64,
 }
@@ -102,9 +108,12 @@ impl Default for PresetState {
             pattern: None,
             tool_presets: tools::builtin(),
             documents: Vec::new(),
+            recent_documents: Vec::new(),
+            export_presets: Vec::new(),
             clone: Default::default(),
             layer_defaults: BTreeMap::new(),
             swatches: swatches::builtin(),
+            contours: Vec::new(),
             rev: 0,
         }
     }
@@ -123,16 +132,24 @@ struct Persisted {
     shapes: Option<Vec<Group<shapes::ShapePreset>>>,
     #[serde(default)]
     pattern_groups: Option<Vec<Group<String>>>,
+    // Read entry by entry (`tools::load`): a bad entry must not discard the rest.
     #[serde(default)]
-    tool_presets: Option<Vec<tools::ToolPreset>>,
+    tool_presets: Option<Value>,
     // Read this set independently: a bad entry must not discard the other preset kinds.
     #[serde(default)]
     documents: Option<Value>,
+    #[serde(default)]
+    recent_documents: Option<Value>,
+    #[serde(default)]
+    export_presets: Option<Value>,
     #[serde(default)]
     custom_shapes: Option<Vec<crate::edit_menu_cmds::CustomShape>>,
     #[serde(default)]
     layer_defaults: Option<BTreeMap<String, Value>>,
     swatches: Option<Vec<Group<swatches::Swatch>>>,
+    // Read entry by entry: a bad contour must not discard the other presets.
+    #[serde(default)]
+    contours: Option<Value>,
 }
 
 impl PresetState {
@@ -144,21 +161,44 @@ impl PresetState {
             styles: Some(self.styles.clone()),
             shapes: Some(self.shapes.clone()),
             pattern_groups: Some(self.pattern_groups.clone()),
-            tool_presets: Some(self.tool_presets.clone()),
+            tool_presets: Some(json!(self.tool_presets)),
             documents: Some(json!(self.documents)),
+            recent_documents: Some(json!(self.recent_documents)),
+            export_presets: Some(json!(self.export_presets)),
             custom_shapes: Some(s.edit_state.custom_shapes.clone()),
             layer_defaults: Some(self.layer_defaults.clone()),
             swatches: Some(self.swatches.clone()),
+            contours: Some(crate::contour_lib_cmds::to_json(&self.contours)),
         };
         serde_json::to_value(p).unwrap_or(Value::Null)
     }
 }
 
 impl Session {
-    /// Restore presets saved by [`PresetState::to_json`]. Missing sets keep their defaults; a
-    /// malformed blob is ignored (presets are never worth refusing to start over).
+    /// Restore presets saved by [`PresetState::to_json`]. Missing or malformed sets keep their
+    /// defaults (presets are never worth refusing to start over). Each set loads on its own: the
+    /// shell writes back only the keys that changed, so one damaged set would otherwise discard
+    /// every other set, saved document presets included, at each launch (#5602).
     pub fn load_presets_json(&mut self, v: Value) {
-        let Ok(p) = serde_json::from_value::<Persisted>(v) else { return };
+        let Value::Object(mut m) = v else { return };
+        fn take<T: serde::de::DeserializeOwned>(m: &mut serde_json::Map<String, Value>, key: &str) -> Option<T> {
+            m.remove(key).filter(|v| !v.is_null()).and_then(|v| serde_json::from_value(v).ok())
+        }
+        let p = Persisted {
+            gradients: take(&mut m, "gradients"),
+            gradient: take(&mut m, "gradient"),
+            styles: take(&mut m, "styles"),
+            shapes: take(&mut m, "shapes"),
+            pattern_groups: take(&mut m, "pattern_groups"),
+            tool_presets: take(&mut m, "tool_presets"),
+            documents: take(&mut m, "documents"),
+            recent_documents: take(&mut m, "recent_documents"),
+            export_presets: take(&mut m, "export_presets"),
+            custom_shapes: take(&mut m, "custom_shapes"),
+            layer_defaults: take(&mut m, "layer_defaults"),
+            swatches: take(&mut m, "swatches"),
+            contours: take(&mut m, "contours"),
+        };
         let st = &mut self.presets;
         if let Some(g) = p.gradients {
             st.gradients = g;
@@ -176,10 +216,16 @@ impl Session {
             st.pattern_groups = g;
         }
         if let Some(t) = p.tool_presets {
-            st.tool_presets = t;
+            st.tool_presets = tools::load(t);
         }
         if let Some(d) = p.documents {
             st.documents = crate::document_preset_cmds::load(d);
+        }
+        if let Some(r) = p.recent_documents {
+            st.recent_documents = crate::document_preset_cmds::load_recent(r);
+        }
+        if let Some(e) = p.export_presets {
+            st.export_presets = crate::export_preset_cmds::load(e);
         }
         if let Some(c) = p.custom_shapes {
             self.edit_state.custom_shapes = c;
@@ -191,6 +237,9 @@ impl Session {
             // A hand-edited preferences file can't make the library unbounded.
             crate::swatch_cmds::cap_library(&mut g);
             self.presets.swatches = g;
+        }
+        if let Some(c) = p.contours.filter(Value::is_array) {
+            self.presets.contours = crate::contour_lib_cmds::from_json(&c);
         }
         self.presets.rev += 1;
     }
@@ -286,9 +335,20 @@ pub(crate) fn edit_groups<T: Named>(groups: &mut Vec<Group<T>>, action: &str, p:
                 Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).map(str::to_string).collect(),
                 _ => vec![req_str(p, "preset", cmd)?.to_string()],
             };
+            // All or nothing: a missing name deletes none of the others.
+            if let Some(name) = names.iter().find(|n| find(groups, n, group).is_none()) {
+                return Err(bad(cmd, format!("no preset \"{name}\"")));
+            }
+            let mut names = names;
+            names.sort();
+            names.dedup();
             for name in &names {
-                let (gi, ii) = find(groups, name, group).ok_or_else(|| bad(cmd, format!("no preset \"{name}\"")))?;
-                groups[gi].items.remove(ii);
+                if let Some((gi, ii)) = find(groups, name, group)
+                    && let Some(g) = groups.get_mut(gi)
+                    && ii < g.items.len()
+                {
+                    g.items.remove(ii);
+                }
             }
             Ok(json!({"deleted": names.len()}))
         }
@@ -313,6 +373,9 @@ pub(crate) fn edit_groups<T: Named>(groups: &mut Vec<Group<T>>, action: &str, p:
             let g = req_str(p, "group", cmd)?;
             let to = req_str(p, "name", cmd)?.to_string();
             let i = groups.iter().position(|x| x.name == g).ok_or_else(|| bad(cmd, format!("no group \"{g}\"")))?;
+            if g != to && groups.iter().any(|x| x.name == to) {
+                return Err(bad(cmd, format!("a group named \"{to}\" already exists")));
+            }
             groups[i].name = to.clone();
             Ok(json!({"group": to}))
         }

@@ -7,12 +7,49 @@
 # Licensed MIT OR Apache-2.0. See LICENSE-translations.txt and ATTRIBUTION.md.
 # Product names and technology names retain their spelling.
 
+# Layer Mask Display Options (the layer mask rubylith's colour and opacity)
+	Mask Options…	마스크 옵션…
+	Layer Mask Display Options…	레이어 마스크 표시 옵션…
+
+# Channel Options and New Spot Channel (#3761)
+	Channel Color	채널 색상
+	Color Indicates:	색상 표시 내용:
+	Solidity:	견고도:
+	Masked Areas	마스크 영역
+	Selected Areas	선택 영역
+	Spot Color	별색
+	Ink Characteristics	잉크 특성
+
+# Guide layout dialog
+
+# Custom print paper (#3820)
+	Paper Width	용지 너비
+	Paper Height	용지 높이
+	Columns	열
+	Rows	행
+	Number	개수
+	Top:	위:
+	Left:	왼쪽:
+	Bottom:	아래:
+	Right:	오른쪽:
+	Target:	대상:
+	Selected Artboards	선택한 아트보드
+	Center Columns	열 가운데 정렬
+	Clear Existing Guides	기존 안내선 지우기
+	Invalid guide layout	잘못된 안내선 레이아웃
+	Leave empty for automatic size	자동 크기를 사용하려면 비워 두세요
+	5 Columns, 3 Rows	5열, 3행
+	8 Columns	8열
+	12 Columns	12열
+
 	File	파일
 	Edit	편집
 	Image	이미지
 	Layer	레이어
 	Type	문자
 	Select	선택
+	Selected	선택됨
+	Scope	범위
 	Filter	필터
 	View	보기
 	Window	창
@@ -22,8 +59,15 @@
 	New from Clipboard	클립보드에서 새로 만들기
 	Open…	열기…
 	Open As…	형식을 지정하여 열기…
+	Open EXR Parts…	EXR 파트 열기…
+	Add beauty precomp from the AOVs	AOV에서 뷰티 프리컴포지션 추가
+	Both	양쪽
+	Left	왼쪽
+	Right	오른쪽
 	Open Recent	최근 파일 열기
 	Clear Recent Files	최근 파일 목록 지우기
+	Remove from Recent	최근 항목에서 제거
+	Remove {name} from Recent	최근 항목에서 {name} 제거
 	Close	닫기
 	Minimize	최소화
 	Maximize	최대화
@@ -33,6 +77,8 @@
 	Save	저장
 	Save As…	다른 이름으로 저장…
 	Save a Copy…	사본 저장…
+	{name} can't keep everything in this document	{name}에는 이 문서의 모든 내용을 저장할 수 없습니다
+	Choose a format that keeps it, such as Photoshop (PSD), or save a copy.	Photoshop(PSD)처럼 모든 내용을 유지하는 형식을 선택하거나 사본을 저장하세요.
 	Revert	되돌리기
 	Export	내보내기
 	Quick Export as PNG	PNG로 빠르게 내보내기
@@ -70,7 +116,17 @@
 	Script Events Manager…	스크립트 이벤트 관리자…
 	Import	가져오기
 	Browse…	찾아보기…
+	Source Files	소스 파일
+	Use:	사용:
+	Files	파일
+	Folder	폴더
+	Add Open Files	열린 파일 추가
+	Sort By Name	이름순 정렬
+	Attempt to Automatically Align Source Images	소스 이미지 자동 정렬 시도
+	Create Smart Object after Loading Layers	레이어를 불러온 후 스마트 오브젝트 만들기
 	Reveal in Finder	Finder에서 보기
+	Show in Explorer	파일 탐색기에서 보기
+	Show in Folder	폴더에서 보기
 	File Info…	파일 정보…
 	Print…	인쇄…
 	Print One Copy	한 부 인쇄
@@ -92,6 +148,8 @@
 	Search…	검색…
 	Check Spelling…	맞춤법 검사…
 	Find and Replace Text…	텍스트 찾기 및 바꾸기…
+	Add to Dictionary	사전에 추가
+	No Spelling Suggestions	맞춤법 제안 없음
 	Fill…	채우기…
 	Stroke…	획…
 	Content-Aware Fill…	내용 인식 채우기…
@@ -106,6 +164,8 @@
 	Transform Again on a Copy	사본에 변형 다시 적용
 	Scale	크기 조절
 	Rotate	회전
+	Set horizontal skew	가로 기울이기 설정
+	Set vertical skew	세로 기울이기 설정
 	Skew	기울이기
 	Distort	왜곡
 	Perspective	원근
@@ -241,6 +301,8 @@
 	Layer via Cut	잘라내어 레이어 만들기
 	Layer From Background…	배경에서 레이어 만들기…
 	Layer from Background…	배경에서 레이어 만들기…
+	Background from Layer	레이어에서 배경 만들기
+	Background From Layer	레이어에서 배경 만들기
 	New Shape Layer	새 모양 레이어
 	New Type Layer	새 문자 레이어
 	New Fill Layer	새 칠 레이어
@@ -310,6 +372,7 @@
 	Update Modified Content	수정된 내용 업데이트
 	Update All Modified Content	수정된 모든 내용 업데이트
 	Stack Mode	스택 모드
+	Choose Stack Mode:	스택 모드 선택:
 	Entropy	엔트로피
 	Kurtosis	첨도
 	Maximum	최대값
@@ -344,6 +407,7 @@
 	Select Linked Layers	연결된 레이어 선택
 	Merge Layers	레이어 병합
 	Merge Down	아래 레이어와 병합
+	Merge Group	그룹 병합
 	Merge Visible	보이는 레이어 병합
 	Stamp Visible	보이는 레이어의 병합 사본 만들기
 	Select Layer Above	위 레이어 선택
@@ -447,12 +511,18 @@
 	Save Default Type Styles	기본 문자 스타일 저장
 	Deselect	선택 해제
 	Reselect	다시 선택
-	Inverse	반대로
+	Inverse	반전
 	Inverse Selection	선택 영역 반전
 	Similar	유사한 항목
 	Color Range…	색상 범위…
 	Focus Area…	초점 영역…
 	Select and Mask…	선택 및 마스크…
+# Select and Mask dialog labels
+	Smart Radius	고급 반경
+	Shift Edge	가장자리 이동
+	Decontaminate	오염 제거
+	Output	출력
+	Refine Edge	가장자리 다듬기
 	Modify	수정
 	Border…	테두리…
 	Smooth…	매끄럽게…
@@ -474,6 +544,12 @@
 	Blur	흐림 효과
 	Blur Gallery	흐림 효과 갤러리
 	Field Blur…	필드 흐림 효과…
+# Field Blur pins (#3373)
+	No pin selected	선택한 핀 없음
+	Click the image to add a pin; drag a pin to move it, or its ring to change its blur. Delete removes the selected pin.	이미지를 클릭하여 핀을 추가합니다. 핀을 드래그하여 이동하고, 링을 드래그하여 흐림 정도를 바꿉니다. Delete 키로 선택한 핀을 삭제합니다.
+	Drag the handles on the outline to resize and turn it, the square to round its corners, and the dots inside to set where the blur starts.	윤곽선의 핸들을 드래그하여 크기를 바꾸고 회전하고, 사각형으로 모서리를 둥글게 하며, 안쪽 점으로 흐림이 시작되는 위치를 설정합니다.
+	Drag the pin to move the band, or its ring to change its blur. Drag the solid lines to widen the sharp band, the dashed lines to set the transition, and the dots to turn it.	핀을 드래그하여 띠를 이동하고 링을 드래그하여 흐림 정도를 바꿉니다. 실선으로 선명한 띠를 넓히고, 점선으로 전환 범위를, 점으로 회전을 조정합니다.
+	Drag the handles on the outline to resize and turn it; the ring sets the blur angle.	윤곽선의 핸들을 드래그하여 크기를 바꾸고 회전합니다. 링으로 흐림 각도를 설정합니다.
 	Iris Blur…	조리개 흐림 효과…
 	Tilt-Shift…	기울기-이동…
 	Path Blur…	패스 흐림 효과…
@@ -642,18 +718,36 @@
 	New Workspace…	새 작업 영역…
 	Delete Workspace…	작업 영역 삭제…
 	Reset Workspace	작업 영역 초기화
+	Reset Tool	도구 초기화
+	Reset All Tools	모든 도구 초기화
+	Reset all tools to their default settings?	모든 도구를 기본 설정으로 초기화하시겠습니까?
 	Lock Workspace	작업 영역 잠금
 	Theme	테마
 	Pro Theme	프로 테마
 	Pro Medium Gray Theme	프로 중간 회색 테마
+	Pro Light Gray Theme	프로 밝은 회색 테마
+	Pro Light Theme	프로 밝은 테마
 	Studio Theme	스튜디오 테마
 	Studio Light Theme	스튜디오 밝은 테마
+	Adwaita Light Theme	Adwaita 밝은 테마
+	Adwaita Dark Theme	Adwaita 어두운 테마
 	Classic Theme	클래식 테마
+	Solarized dark	Solarized 어두움
+	Solarized Dark Theme	Solarized 어두운 테마
+	Breeze dark	Breeze 어두움
+	Breeze Dark Theme	Breeze 어두운 테마
+	Breeze light	Breeze 밝게
+	Breeze Light Theme	Breeze 밝은 테마
+	Soft dark	소프트 다크
+	Soft light	소프트 라이트
+	Soft Dark Theme	소프트 다크 테마
+	Soft Light Theme	소프트 라이트 테마
 	Next Theme	다음 테마
 	Actions	액션
 	Brush Settings	브러시 설정
 	Brushes	브러시
 	Channels	채널
+	Channel	채널
 	Character	문자
 	Character Styles	문자 스타일
 	Clone Source	복제 원본
@@ -698,6 +792,24 @@
 	Split Warp Horizontally	뒤틀기 가로로 분할
 	Split Warp Vertically	뒤틀기 세로로 분할
 	Statistics…	통계…
+	Refine Strokes	다듬기 획
+	Edits	편집
+# Counted status and panel messages
+@plural	Exported {n} swatch to {file}|Exported {n} swatches to {file}	색상 견본 {n}개를 {file}(으)로 내보냈습니다
+@plural	Imported {n} swatch from {file}|Imported {n} swatches from {file}	{file}에서 색상 견본 {n}개를 가져왔습니다
+@plural	Imported {n} brush from {group}|Imported {n} brushes from {group}	{group}에서 브러시 {n}개를 가져왔습니다
+@plural	Played {n} step|Played {n} steps	단계 {n}개를 재생했습니다
+@plural	{n} step|{n} steps	단계 {n}개
+@plural	Saved for Web: {n} file|Saved for Web: {n} files	웹용으로 저장됨: 파일 {n}개
+@plural	Updated {n} linked smart object changed on disk|Updated {n} linked smart objects changed on disk	디스크에서 변경된 연결된 스마트 오브젝트 {n}개를 업데이트했습니다
+@plural	{n} layer recorded by this comp was deleted. Update the comp, or clear the warning.|{n} layers recorded by this comp were deleted. Update the comp, or clear the warning.	이 레이어 구성 요소에 기록된 레이어 {n}개가 삭제되었습니다. 레이어 구성 요소를 업데이트하거나 경고를 지우세요.
+@plural	{n} plane|{n} planes	평면 {n}개
+@plural	{n} preset|{n} presets	사전 설정 {n}개
+@plural	{n} sample point removed|{n} sample points removed	샘플 지점 {n}개를 제거했습니다
+@plural	{n} slice|{n} slices	분할 영역 {n}개
+@plural	{warning} (+{n} more brush preset warning)|{warning} (+{n} more brush preset warnings)	{warning} (브러시 사전 설정 경고 {n}개 더 있음)
+@plural	{what} with {n} warning|{what} with {n} warnings	{what}: 경고 {n}개
+
 @plural	{n} item|{n} items	항목 {n}개
 	Auto	자동
 	(print to the printer)	(프린터로 인쇄)
@@ -732,7 +844,7 @@
 	All Caps	모두 대문자
 	All Slices	모든 분할 영역
 	All User Slices	모든 사용자 분할 영역
-	All shortcuts reset to Photoshop defaults.	모든 단축키를 Photoshop 기본값으로 초기화했습니다.
+	All shortcuts reset to PhotoCraft defaults.	모든 단축키를 PhotoCraft 기본값으로 초기화했습니다.
 	Alt	Alt
 	Alt-click to define a source point to clone from	Alt 키를 누른 채 클릭하여 복제 원본 지점 지정
 	Always use pressure for opacity	불투명도에 항상 필압 사용
@@ -747,6 +859,9 @@
 	Appearance	모양새
 	Appearance (Layer Style)	모양새(레이어 스타일)
 	Apply Layer Mask	레이어 마스크 적용
+	Add Mask to Selection	선택 영역에 마스크 추가
+	Subtract Mask from Selection	선택 영역에서 마스크 빼기
+	Intersect Mask with Selection	마스크와 선택 영역 교차
 	Apply Per Tip	끝당 적용
 	Apply next selected layer comp	선택한 다음 레이어 구성 요소 적용
 	Apply previous selected layer comp	선택한 이전 레이어 구성 요소 적용
@@ -762,15 +877,25 @@
 	Background	배경
 	Background Color	배경색
 	Background Contents	배경 내용
+	Custom background color	사용자 정의 배경색
 	Balance	균형
 	Baseline	기준선
 	Baseline shift	기준선 이동
 	Basic	기본
 	Before (Y)	이전 (Y)
+	Save Settings…	설정 저장…
+	Load Settings…	설정 불러오기…
+	Save these settings as a Camera Raw .xmp file	이 설정을 Camera Raw .xmp 파일로 저장
+	Load settings from a Camera Raw .xmp file	Camera Raw .xmp 파일에서 설정 불러오기
+	Loaded Camera Raw settings from {file}	{file}에서 Camera Raw 설정을 불러왔습니다
+	Loaded Camera Raw settings from {file} ({n} not supported)	{file}에서 Camera Raw 설정을 불러왔습니다 (미지원 {n}개)
 	Begin recording	기록 시작
 	Bend:	구부림:
 	Bicubic	쌍입방
 	Bicubic (smooth gradients)	쌍입방(부드러운 그레이디언트)
+	Automatic	자동
+	Bicubic Smoother (enlargement)	쌍입방 더 부드럽게(확대)
+	Bicubic Sharper (reduction)	쌍입방 더 선명하게(축소)
 	Bilinear	쌍선형
 	Black	검정
 	Black & White	흑백
@@ -781,7 +906,6 @@
 	Blending Options	혼합 옵션
 	Blue	파랑
 	Blue, Red, Yellow	파랑, 빨강, 노랑
-	Both	둘 다
 	Both Axes	양쪽 축
 	Bottom	아래쪽
 	Brightness	밝기
@@ -796,6 +920,7 @@
 	Cancel	취소
 	Reset	재설정
 	Cancel (Esc)	취소 (Esc)
+	Manage submitted jobs in the system print queue	제출된 작업은 시스템 인쇄 대기열에서 관리하세요
 	Cancel any current edits (Esc)	현재 편집 취소 (Esc)
 	Cancel current crop operation  (Esc)	현재 자르기 작업 취소  (Esc)
 	Cancel transform (Esc)	변형 취소 (Esc)
@@ -829,6 +954,7 @@
 	Click to zoom in  ·  {key}-click to zoom out  ·  drag right/left to zoom in/out	클릭하여 확대 · {key} 키를 누른 채 클릭하여 축소 · 오른쪽/왼쪽으로 드래그하여 확대/축소
 	Click with the Note tool to add a note.	메모 도구로 클릭하여 메모를 추가하세요.
 	Click: corner · Drag: smooth · Click first point: close · {key} finish · Esc cancel	클릭: 모서리 · 드래그: 곡선 · 첫 점 클릭: 닫기 · {key}: 완료 · Esc: 취소
+	Click: corner · Drag: smooth · {alt}-drag: break handle · Click or drag first point: close · {key} finish · Esc cancel	클릭: 모서리 · 드래그: 곡선 · {alt}+드래그: 핸들 분리 · 첫 점 클릭 또는 드래그: 닫기 · {key}: 완료 · Esc: 취소
 	Clip to layer below	아래 레이어에 클리핑
 	Clipped	클리핑됨
 	Close Style Options	스타일 옵션 닫기
@@ -860,12 +986,14 @@
 	Contiguous	인접
 	Contrast	대비
 	Control:	제어:
-	Convert document's colors to the working space	문서 색상을 작업 색상 공간으로 변환
 	Convert to sRGB	sRGB로 변환
 	Copies	부수
 	Copper	구리
 	Copyright	저작권
 	Copyright and Contact Info	저작권 및 연락처 정보
+	Copyright Info URL	저작권 정보 URL
+	Copyright Notice	저작권 고지
+	Document Title	문서 제목
 	Corner Crop Marks	모서리 자르기 표시
 	Corner radius	모서리 반경
 	Correction	보정
@@ -917,6 +1045,7 @@
 	Delete Group	그룹 삭제
 	Delete Layer Mask	레이어 마스크 삭제
 	Delete Layers	레이어 삭제
+	Add Shortcut	단축키 추가
 	Delete Shortcut	단축키 삭제
 	Delete Timeline	타임라인 삭제
 	Delete Tool Preset	도구 사전 설정 삭제
@@ -924,6 +1053,17 @@
 	Delete current channel	현재 채널 삭제
 	Delete current state	현재 상태 삭제
 	Delete effect layer	효과 레이어 삭제
+
+# Layers-panel trash confirmation
+	Delete layer ‘{name}’?	레이어 ‘{name}’을(를) 삭제하시겠습니까?
+	Delete {count} layers? {names}	레이어 {count}개를 삭제하시겠습니까? {names}
+	Delete layer?	레이어를 삭제하시겠습니까?
+	The document is closed	문서가 닫혔습니다
+	The document or selected layers changed. Please request deletion again.	문서 또는 선택한 레이어가 변경되었습니다. 삭제를 다시 요청하세요.
+	Missing delete command	삭제 명령이 없습니다
+	Invalid delete command	잘못된 삭제 명령입니다
+	Layer deleted, but confirmation preference could not be saved: {error}	레이어가 삭제되었지만 확인 설정을 저장할 수 없습니다: {error}
+
 	Delete layer	레이어 삭제
 	Delete layer comp	레이어 구성 요소 삭제
 	Delete note	메모 삭제
@@ -955,7 +1095,7 @@
 	Done	완료
 	Dots	점
 	Drag a rectangle around the object	오브젝트를 둘러싸는 사각형을 드래그하세요
-	Drag on the image to add a constraint; Shift for horizontal/vertical; right-click to delete.	이미지 위에서 드래그하여 제약 조건 추가; Shift 키로 수평/수직 유지; 오른쪽 클릭하여 삭제.
+	Drag on the image to add a constraint; Shift for horizontal/vertical; right-click a constraint to change or delete it.	이미지 위에서 드래그하여 제약 조건 추가; Shift 키로 수평/수직 유지; 제약 조건을 오른쪽 클릭하여 변경 또는 삭제.
 	Drag to move the active shape's path or the Work Path	드래그하여 활성 모양의 패스 또는 작업 패스 이동
 	Click: select anchor · Drag: move anchor, handle or segment · {shift}-click: add · {alt}-click: whole subpath	클릭: 기준점 선택 · 드래그: 기준점, 핸들 또는 세그먼트 이동 · {shift}-클릭: 추가 · {alt}-클릭: 하위 패스 전체
 	Draw with the Pen tool (P) or make a work path from a selection.	펜 도구(P)로 그리거나 선택 영역에서 작업 패스를 만드세요.
@@ -1051,7 +1191,10 @@
 	Ignore All	모두 무시
 	Image Size	이미지 크기
 	Import Brushes…	브러시 가져오기…
-	Import Photoshop brushes (.abr)	Photoshop 브러시 가져오기(.abr)
+	Gradient Preset Options	그레이디언트 사전 설정 옵션
+	Import .GRD	.GRD 가져오기
+	Choose a gradient file (.grd).	그레이디언트 파일 (.grd)을 선택하세요.
+	Import brushes (.abr)	브러시 가져오기(.abr)
 	Import Presets	사전 설정 가져오기
 	Imported	가져옴
 	Indent First	첫 줄 들여쓰기
@@ -1086,13 +1229,13 @@
 	Leading	행간
 	Leading (set to the font size × auto-leading when Auto)	행간(자동일 때 글꼴 크기 × 자동 행간으로 설정)
 	Leave as is (don't color manage)	그대로 두기(색상 관리 안 함)
-	Left	왼쪽
 	Left align text	텍스트 왼쪽 정렬
 	Length:	길이:
 	Level	레벨
 	Levels	레벨
 	Lighten	밝게 하기
 	Lightness	명도
+	Result	결과
 	Lights	밝은 계열
 	Limits:	제한:
 	Linear Gradient	선형 그레이디언트
@@ -1101,7 +1244,6 @@
 	Liquify is not open	픽셀 유동화가 열려 있지 않습니다
 	Load	불러오기
 	Load 3D LUT…	3D LUT 불러오기…
-	Load Photoshop brushes (.abr)	Photoshop 브러시 불러오기(.abr)
 	Load channel as selection	채널을 선택 영역으로 불러오기
 	Load…	불러오기…
 	Localized Color Clusters	지역화된 색상 군집
@@ -1190,6 +1332,8 @@
 	Override Pressure	필압 재정의
 	Override Rotation	회전 재정의
 	Override Tilt	기울기 재정의
+	Override Tilt X	X축 기울기 재정의
+	Override Tilt Y	Y축 기울기 재정의
 	PRESET DETAILS	사전 설정 세부 정보
 	PSD	PSD
 	Paint Overlay	오버레이 칠하기
@@ -1259,6 +1403,7 @@
 	Record ● a sequence of edits, then play ▶ it on any document.	연속된 편집을 ● 기록한 다음 원하는 문서에서 ▶ 재생하세요.
 	Red	빨강
 	Redefine style by current selection	현재 선택으로 스타일 재정의
+	Refine	다듬기
 	Reflected Gradient	반사 그레이디언트
 	Registration Marks	맞춤 표시
 	Regular	보통
@@ -1273,10 +1418,22 @@
 	Rename	이름 바꾸기
 	Rename Group…	그룹 이름 바꾸기…
 	Rename Layer…	레이어 이름 바꾸기…
+	Rename Path…	패스 이름 바꾸기…
 	Rename Tool Preset…	도구 사전 설정 이름 바꾸기…
 	Rename…	이름 바꾸기…
 	Resample	리샘플링
 	Reset All to Defaults	모두 기본값으로 초기화
+	Import Shortcuts…	단축키 가져오기…
+	Load a keyboard shortcut set saved as .kys	.kys로 저장된 키보드 단축키 세트 불러오기
+	Imported {n} shortcuts from {file}. Click OK to keep them.	{file}에서 단축키 {n}개를 가져왔습니다. 유지하려면 확인을 클릭하세요.
+	{n} commands are not in PhotoCraft.	명령 {n}개는 PhotoCraft에 없습니다.
+	Keyboard shortcuts imported	키보드 단축키를 가져왔습니다
+	Your keyboard shortcut set {set} is in use here: {n} shortcuts differ from the defaults. Edit › Keyboard Shortcuts shows them; Reset All to Defaults undoes this.	키보드 단축키 세트 {set}을(를) 여기서 사용합니다. 단축키 {n}개가 기본값과 다릅니다. 편집 › 키보드 단축키에서 확인할 수 있고, 모두 기본값으로 초기화로 되돌릴 수 있습니다.
+	Import keyboard shortcuts?	키보드 단축키를 가져오시겠습니까?
+	PhotoCraft found your keyboard shortcut set {set} from another image editor on this computer: {n} of its shortcuts differ from PhotoCraft's. Import it?	PhotoCraft가 이 컴퓨터에서 다른 이미지 편집기의 키보드 단축키 세트 {set}을(를) 찾았습니다. 단축키 {n}개가 PhotoCraft와 다릅니다. 가져오시겠습니까?
+	Edit › Keyboard Shortcuts › Reset All to Defaults undoes an import.	편집 › 키보드 단축키 › 모두 기본값으로 초기화를 누르면 가져오기를 되돌릴 수 있습니다.
+	Don't Import	가져오지 않음
+	The keyboard shortcut set was not imported: {error}	키보드 단축키 세트를 가져오지 못했습니다: {error}
 	Reset Section	섹션 초기화
 	Reset Transform	변형 초기화
 	Reset to defaults	기본값으로 초기화
@@ -1285,7 +1442,6 @@
 	Restore All	모두 복원
 	Restore Defaults	기본값 복원
 	Restrictive (Web)	제한됨(웹)
-	Right	오른쪽
 	Right align text	텍스트 오른쪽 정렬
 	Rigid	고정
 	Rotate:	회전:
@@ -1330,6 +1486,7 @@
 	Set shape fill type	모양 채우기 유형 설정
 	Set shape stroke type	모양 획 유형 설정
 	Set the text color	텍스트 색상 설정
+	Create warped text	뒤틀린 텍스트 만들기
 	Shadows	어두운 영역
 	Shape:	모양:
 	Sharpening	선명 효과
@@ -1368,6 +1525,9 @@
 	Stroke	획
 	Stroke Catch-up	획 따라잡기
 	Stroke:	획:
+	Location	위치
+	Location:	위치:
+	Preserve Transparency	투명도 유지
 	Style	스타일
 	Style Options	스타일 옵션
 	Style Options…	스타일 옵션…
@@ -1412,7 +1572,6 @@
 	Use Default	기본값 사용
 	Use Legacy	기존 방식 사용
 	Use Measurement Scale	측정 비율 사용
-	Use the embedded profile (instead of the working space)	포함된 프로파일 사용(작업 색상 공간 대신)
 	Variables bind a layer's visibility, text or pixels to a named data slot.	변수는 레이어의 표시 여부, 텍스트 또는 픽셀을 이름이 지정된 데이터 슬롯에 연결합니다.
 	Vertical scale	세로 비율
 	Vibrance	활기
@@ -1429,6 +1588,7 @@
 	White Balance: As Shot	화이트 밸런스: 촬영 시 설정
 	Whites	흰색 계열
 	Width	너비
+	Slant	기울기
 	Width:	너비:
 	Work Path	작업 패스
 	Yellow	노랑
@@ -1446,6 +1606,8 @@
 	↑↓ navigate   {key} run   esc close	↑↓ 이동   {key} 실행   esc 닫기
 	Version {version}	버전 {version}
 	New Document	새 문서
+	New Document With Mask	새 문서(마스크 포함)
+	New Layer With Mask	새 레이어(마스크 포함)
 	Saved	저장됨
 	Save Preset…	사전 설정 저장…
 	Preset Name	사전 설정 이름
@@ -1466,6 +1628,8 @@
 	Blur Tool	흐림 효과 도구
 	Bold	굵게
 	Brush	브러시
+	Pencil	연필
+	Block	블록
 	Brush Pose	브러시 자세
 	Brush Tip Shape	브러시 끝 모양
 	Brush Tool	브러시 도구
@@ -1493,7 +1657,7 @@
 	Current Tool	현재 도구
 	Custom Shape Tool	사용자 정의 모양 도구
 	Cyans	사이안 계열
-	Default Photoshop Size	Photoshop 기본 크기
+	Default PhotoCraft Size	PhotoCraft 기본 크기
 	Delete Workspace	작업 영역 삭제
 	Diamond	다이아몬드
 	Dimensions:	치수:
@@ -1514,6 +1678,8 @@
 	Efficiency: 100%	효율: 100%
 	Ellipse Tool	타원 도구
 	Elliptical Marquee Tool	원형 선택 윤곽 도구
+	Single Row Marquee Tool	단일 행 선택 윤곽 도구
+	Single Column Marquee Tool	단일 열 선택 윤곽 도구
 	Emboss	엠보스
 	Eraser	지우개
 	Eraser Tool	지우개 도구
@@ -1536,6 +1702,8 @@
 	Highlights from:	밝은 영역 시작:
 	History Brush Tool	작업 내역 브러시 도구
 	Horizontal Type Tool	수평 문자 도구
+	Horizontal Type Mask Tool	수평 문자 마스크 도구
+	Vertical Type Mask Tool	세로 문자 마스크 도구
 	Image Size:	이미지 크기:
 	Inches	인치
 	Indexed	인덱스
@@ -1570,6 +1738,8 @@
 	Millimeters	밀리미터
 	Mobile	모바일
 	Move Tool	이동 도구
+	Could not use the move tool because the layer is locked.	레이어가 잠겨 있어 이동 도구를 사용할 수 없습니다.
+	Could not complete the Free Transform command because the layer is locked.	레이어가 잠겨 있어 자유 변형 명령을 완료할 수 없습니다.
 	Multiply	곱하기
 	My Brushes	내 브러시
 	Neutrals	중립색
@@ -1588,10 +1758,15 @@
 	Paints from the document's opening state	문서를 열었을 때의 상태로 칠하기
 	Path Selection Tool	패스 선택 도구
 	Direct Selection Tool	직접 선택 도구
+	Add Anchor Point Tool	기준점 추가 도구
+	Delete Anchor Point Tool	기준점 삭제 도구
+	Click a segment to add an anchor point · {alt}-click an anchor to delete it	세그먼트를 클릭하여 기준점 추가 · {alt}-클릭: 기준점 삭제
+	Click an anchor point to delete it · {alt}-click a segment to add one	기준점을 클릭하여 삭제 · {alt}-클릭: 세그먼트에 기준점 추가
 	Pattern Overlay	패턴 오버레이
 	Pen Pressure	펜 압력
 	Pen Tilt	펜 기울기
 	Pen Tool	펜 도구
+	Convert Point Tool	기준점 변환 도구
 	Photo	사진
 	PhotoCraft website	PhotoCraft 웹사이트
 	Picas	파이카
@@ -1607,6 +1782,8 @@
 	Postcard	엽서
 	Poster	포스터
 	Pro (Dark)	프로(어둡게)
+	Pro (Light)	프로(밝게)
+	Pro (Light Gray)	프로(밝은 회색)
 	Pro (Medium Gray)	프로(중간 회색)
 	Protect Texture	텍스처 보호
 	Purple	보라
@@ -1614,6 +1791,7 @@
 	Quick Selection Tool	빠른 선택 도구
 	Radial	방사형
 	Rasterize Layer	레이어 래스터화
+	Rasterize Layers	레이어 래스터화
 	Ratio	비율
 	Recent	최근 항목
 	Rectangle Tool	사각형 도구
@@ -1669,12 +1847,13 @@
 	Zoom Tool	돋보기 도구
 	{name} Properties	{name} 속성
 	Revert “{name}” to the last saved version? Your changes will be lost.	“{name}”을(를) 마지막으로 저장한 버전으로 되돌릴까요? 변경 사항이 사라집니다.
-	Do you want to save the changes you made to “{name}” before quitting?	종료하기 전에 “{name}”의 변경 사항을 저장할까요?
-	Do you want to save the changes you made to “{name}” before closing?	닫기 전에 “{name}”의 변경 사항을 저장할까요?
+	Do you want to save the changes you made to “{name}” before quitting?	종료하기 전에 “{name}”의 변경 사항을 저장하시겠습니까?
+	Do you want to save the changes you made to “{name}” before closing?	닫기 전에 “{name}”의 변경 사항을 저장하시겠습니까?
 	Doc: {flat}/{layered}	문서: {flat}/{layered}
 	Scratch: {size}	스크래치: {size}
 	Untagged {mode}	프로파일 없는 {mode}
 	{w} px x {h} px ({ppi} ppi)	{w} px x {h} px ({ppi} ppi)
+	{w} {unit} x {h} {unit} ({ppi} ppi)	{w} {unit} x {h} {unit} ({ppi} ppi)
 	Resolution: {dpi} pixels/inch	해상도: {dpi}픽셀/인치
 	Doc: {w} × {h} px	문서: {w} × {h} px
 	Frame {current} / {total}	프레임 {current} / {total}
@@ -1711,6 +1890,9 @@
 	Cache tile size	캐시 타일 크기
 	Camera Raw Defaults	Camera Raw 기본값
 	Canvas border	캔버스 테두리
+	Show canvas dots	캔버스 점 표시
+	Clip thumbnails to layer bounds	썸네일을 레이어 경계로 자르기
+	Clip Thumbnails to Layer Bounds	썸네일을 레이어 경계로 자르기
 	Canvas color	캔버스 색상
 	Canvas custom color	캔버스 사용자 정의 색상
 	Color picker	색상 피커
@@ -1798,11 +1980,14 @@
 	Preserve details	세부 정보 유지
 	Print resolution	인쇄 해상도
 	Pro	프로
+	Pro light	프로 밝게
+	Pro light gray	프로 밝은 회색
 	Pro medium	프로 중간 회색
 	Pro photo	ProPhoto
 	Quick export format	빠른 내보내기 형식
 	Quick export location	빠른 내보내기 위치
 	Recent file count	최근 파일 수
+	LUT folder	LUT 폴더
 	Recent files	최근 파일
 	Recent fonts	최근 글꼴
 	Recover on launch	시작 시 복구
@@ -1825,6 +2010,8 @@
 	Show only crosshair while painting	칠하는 동안 십자선만 표시
 	Show slice numbers	분할 영역 번호 표시
 	Show tooltips	도구 설명 표시
+	Enable animations	애니메이션 사용
+	Show highlight on rollover	롤오버 시 강조 표시
 	Show transformation values	변형 값 표시
 	Slice color	분할 영역 색상
 	Smart guide color	고급 안내선 색상
@@ -1834,6 +2021,8 @@
 	Standard	표준
 	Studio	스튜디오
 	Studio light	스튜디오 밝게
+	Adwaita	Adwaita
+	Adwaita dark	Adwaita 어둡게
 	Subdivisions	하위 분할
 	System	시스템
 	Text engine	텍스트 엔진
@@ -1883,6 +2072,7 @@
 	Collapse group  ({key}-click: all groups)	그룹 접기  ({key} 키를 누른 채 클릭: 모든 그룹)
 	Create new brush from the current settings	현재 설정으로 새 브러시 만들기
 	Create new brush from these settings	이 설정으로 새 브러시 만들기
+	Update the current brush with these settings	이 설정으로 현재 브러시 업데이트
 	Delete brush	브러시 삭제
 	Drag the arrow to set the angle, the dots to set the roundness	화살표를 드래그하여 각도를, 점을 드래그하여 원형률을 설정하세요
 	Expand	펼치기
@@ -1890,7 +2080,8 @@
 	Expand group  ({key}-click: all groups)	그룹 펼치기  ({key} 키를 누른 채 클릭: 모든 그룹)
 	Fade steps	약화 단계
 	Hide the layer's effects  ({key}-click: all layers)	레이어 효과 숨기기  ({key} 키를 누른 채 클릭: 모든 레이어)
-	Import Brushes… (.abr)	브러시 가져오기… (.abr)
+	Import Brushes… (.abr or image)	브러시 가져오기… (.abr 또는 이미지)
+	Import Brush from Image…	이미지에서 브러시 가져오기…
 	Move Group Down	그룹 아래로 이동
 	Move Group Up	그룹 위로 이동
 	Reset the brush to the defaults	브러시를 기본값으로 초기화
@@ -1923,6 +2114,7 @@
 	Create Warped Text	뒤틀린 텍스트 만들기
 	Rasterize Smart Object	스마트 오브젝트 래스터화
 	Rasterize Fill Content	칠 내용 래스터화
+	Rasterize Layer Style	레이어 스타일 래스터화
 	Unlock: picking a preset replaces these settings	잠금 해제: 사전 설정 선택 시 이 설정 대체
 	Lock: keep these settings when picking another preset	잠금: 다른 사전 설정 선택 시 이 설정 유지
 	Diameter:	직경:
@@ -1934,17 +2126,28 @@
 	Rename Brush…	브러시 이름 바꾸기…
 	Delete Brush	브러시 삭제
 	New Brush Preset…	새 브러시 사전 설정…
+	Capture Brush Size in Preset	사전 설정에 브러시 크기 캡처
+	Include Tool Settings	도구 설정 포함
+	Include Color	색상 포함
+	Enter a name for the brush preset	브러시 사전 설정의 이름을 입력하십시오
+	A brush preset with this name already exists	이 이름의 브러시 사전 설정이 이미 있습니다
 	Brush Preset Options	브러시 사전 설정 옵션
 	Group name	그룹 이름
 	Brush name	브러시 이름
-	Grid view	격자 보기
-	List view	목록 보기
+	Brush Name	브러시 이름
+	Brush Stroke	브러시 획
+	Brush Tip	브러시 끝
 	Off: the speed of the pointer sets the spacing	끔: 포인터 속도에 따라 간격 설정
 	Tilt Scale	기울기 비율
 	Brush Projection	브러시 투영
 	Apply the pen's tilt and rotation to the tip shape	펜의 기울기와 회전을 브러시 끝 모양에 적용
 	Mixer Brush	혼합 브러시
 	Wet	젖음
+	Current Brush Load	현재 브러시 물감
+	Load Brush	브러시 채우기
+	Clean Brush	브러시 세척
+	Load the brush after each stroke	획마다 브러시 채우기
+	Clean the brush after each stroke	획마다 브러시 세척
 	Mix	혼합
 	Wetness Jitter	젖음 지터
 	Mix Jitter	혼합 지터
@@ -1959,6 +2162,13 @@
 	Centre the gradient (offset 0, 0)	그레이디언트를 중앙에 배치(오프셋 0, 0)
 	The current gradient (pick one in Window › Gradients)	현재 그레이디언트(창 › 그레이디언트에서 선택)
 	Select a type layer to edit its character and paragraph settings.	문자 및 단락 설정을 편집하려면 문자 레이어를 선택하세요.
+# Gradient Editor window, opened from the options bar's gradient swatch.
+	Gradient Editor	그레이디언트 편집기
+	Gradient picker	그레이디언트 선택기
+	Save As Preset	사전 설정으로 저장
+	The gradient the Gradient tool paints with	그레이디언트 도구가 칠하는 그레이디언트입니다
+	Adds the current gradient to the Gradients panel	현재 그레이디언트를 그레이디언트 패널에 추가합니다
+	Gradient stops	그레이디언트 스톱
 	Text color	텍스트 색상
 	Type Options	문자 옵션
 	Anti-aliasing method	앤티 앨리어스 방식
@@ -1984,10 +2194,24 @@
 	No path to make a selection from: draw one with the Pen tool or select one in the Paths panel.	선택 영역으로 만들 패스가 없습니다: 펜 도구로 그리거나 패스 패널에서 선택하세요.
 	Cancel opening	열기 취소
 	Cancelled opening {name}	{name} 열기를 취소했습니다
+	Damaged Photoshop document	손상된 Photoshop 문서
+	The document “{name}” may be damaged.	문서 “{name}”이(가) 손상되었을 수 있습니다.
+	Some layers, pixels or masks could not be read. Do you want to continue opening it?	일부 레이어, 픽셀 또는 마스크를 읽을 수 없습니다. 계속 여시겠습니까?
+	If you continue, saving over the original may permanently discard unreadable data. Save a copy to keep the original.	계속하면 원본에 덮어써서 저장할 때 읽을 수 없는 데이터가 영구적으로 삭제될 수 있습니다. 원본을 유지하려면 사본을 저장하십시오.
+	Continue	계속
+	The document “{name}” does not have an embedded {mode} profile.	문서 “{name}”에 포함된 {mode} 프로파일이 없습니다.
+	The document “{name}” has an embedded color profile that does not match the current {mode} working space.	문서 “{name}”에 포함된 색상 프로파일이 현재 {mode} 작업 색상 공간과 일치하지 않습니다.
+	Working: {working}	작업 색상 공간: {working}
 	Developing {name}	{name} 현상 중
 	Cancelled {label}	{label} 작업을 취소했습니다
 	Esc to cancel	Esc 키로 취소
+	Opened {name}	{name} 열림
 	Opening {name}	{name} 여는 중
+	Saved {name}	{name} 저장됨
+	Saving {name}	{name} 저장 중
+	Saving {percent}	저장 중 {percent}
+	A save to {name} is still running; try again when it finishes	{name}에 저장하는 작업이 아직 진행 중입니다. 완료된 후 다시 시도하세요
+	{label} is writing the file and can no longer be cancelled	{label}: 파일을 쓰는 중이므로 더 이상 취소할 수 없습니다
 	Opening {name}…	{name} 여는 중…
 	Opening…	여는 중…
 	Reading…	읽는 중…
@@ -2000,6 +2224,7 @@
 	32 bit (float)	32비트(부동 소수점)
 	Floating point	부동 소수점
 	Use Global Light	전체 조명 사용
+	Overprint	중복 인쇄
 	Native file drag-and-drop is unavailable	파일 드래그 앤 드롭을 사용할 수 없습니다
 	Native file drag-and-drop is not supported on Wayland yet. Use File › Open, or copy the image in your file manager and paste it with {paste}.	Wayland에서는 아직 파일 드래그 앤 드롭을 지원하지 않습니다. 파일 › 열기를 사용하거나, 파일 관리자에서 이미지를 복사한 뒤 {paste}(으)로 붙여넣으세요.
 	To drop files, start PhotoCraft under XWayland: `{command}`	파일을 끌어다 놓으려면 XWayland에서 PhotoCraft를 실행하세요: `{command}`
@@ -2011,6 +2236,8 @@
 	Show bounding box when dragging layer	레이어를 드래그할 때 테두리 상자 표시
 	System title bar	시스템 제목 표시줄
 	Mixer Brush Tool	혼합 브러시 도구
+	Color Replacement Tool	색상 대체 도구
+	Color Replacement	색상 대체
 	Rendering Mode	렌더링 모드
 	Automatic (recommended)	자동(권장)
 	CPU / Compatibility	CPU / 호환성
@@ -2019,6 +2246,8 @@
 	GPU acceleration could not continue. Your documents are unchanged.	GPU 가속을 계속할 수 없습니다. 문서는 변경되지 않았습니다.
 	PhotoCraft is using the CPU image compositor. The window may still use your graphics adapter.	PhotoCraft가 CPU로 이미지를 합성하고 있습니다. 창 표시에는 그래픽 어댑터를 계속 사용할 수 있습니다.
 	Retry GPU requires a restart. Save your work first.	GPU를 다시 사용하려면 다시 시작해야 합니다. 먼저 작업을 저장하세요.
+	Retry GPU tries the graphics processor again now.	GPU 다시 사용을 누르면 바로 그래픽 프로세서를 다시 시도합니다.
+	GPU acceleration resumed.	GPU 가속을 다시 사용합니다.
 	Keep Using CPU	CPU 계속 사용
 	Retry GPU	GPU 다시 사용
 	Advanced	고급
@@ -2045,6 +2274,9 @@ cameraRaw	Color	색상
 	Patch Tool	패치 도구
 	Patch:	패치:
 	Lasso around an area, then drag the selection	올가미로 영역을 둘러싼 다음 선택 영역을 드래그하세요
+	Transform On Drop	놓을 때 변형
+	Scale or rotate the moved area, then press {key}	이동한 영역의 크기를 조절하거나 회전한 다음 {key} 키를 누르세요
+	Now drag the selection onto another area	이제 선택 영역을 다른 영역으로 드래그하세요
 
 # Warp grid presets merged on main in #388.
 	3 x 3	3 × 3
@@ -2062,6 +2294,10 @@ cameraRaw	Color	색상
 
 # UI scale steps (#611)
 	75%	75%
+	80%	80%
+	85%	85%
+	90%	90%
+	95%	95%
 	125%	125%
 	150%	150%
 	175%	175%
@@ -2158,6 +2394,7 @@ cameraRaw	Color	색상
 	Reduce Color Noise	색상 노이즈 감소
 	Sharpen Details	세부 묘사 선명하게
 	Remove Jpeg Artifact	JPEG 가공물 제거
+	Remove Tool	제거 도구
 	Blade Curvature	조리개 날 곡률
 	Depth Map	깊이 맵
 	Focal Distance	초점 거리
@@ -2702,6 +2939,14 @@ cameraRaw	Color	색상
 	Structure:	구조:
 	Content-Aware Move Tool	내용 인식 이동 도구
 	TIFF Options	TIFF 옵션
+	Targa Options	Targa 옵션
+	JPEG Options	JPEG 옵션
+	Image Options	이미지 옵션
+	Format Options	포맷 옵션
+	Baseline ("Standard")	기본("표준")
+	Baseline Optimized	기본 최적화
+	24 bits/pixel	24비트/픽셀
+	32 bits/pixel	32비트/픽셀
 	Including layers will increase file size.	레이어를 포함하면 파일 크기가 커집니다.
 	Discard Layers and Save a Copy	레이어를 삭제하고 사본 저장
 	Don't show again	다시 표시 안 함
@@ -2763,11 +3008,17 @@ cameraRaw	Color	색상
 
 # Shared screen eyedropper and text Color Picker (#1128).
 	Color Picker (Text Color)	색상 선택기 (텍스트 색상)
+	Color Picker ({name})	색상 선택기 ({name})
+	Color Picker (Fill Color)	색상 선택기 (채우기 색상)
+	Fill color	채우기 색상
+	Color Picker (Stroke Color)	색상 선택기 (획 색상)
+	Stroke color	획 색상
 	Pick screen color	화면 색상 선택
 	Sample a pixel anywhere on the screen	화면의 아무 픽셀에서 색상 추출
 	Click to pick · Esc to cancel	클릭하여 선택 · Esc로 취소
 	Pick a screen pixel or press Esc to cancel	화면 픽셀을 선택하거나 Esc를 눌러 취소
 	Scroll to zoom	스크롤하여 확대/축소
+	Drag to pan · Scroll to zoom · Double-click to fit	드래그하여 이동 · 스크롤하여 확대/축소 · 두 번 클릭하여 맞추기
 	Show/Hide All Panels	모든 패널 표시/숨기기
 	Show/Hide Panels	패널 표시/숨기기
 	Could not open	열 수 없음
@@ -2787,6 +3038,19 @@ cameraRaw	Color	색상
 	Domed	돔
 	Domed (Inverted)	돔(반전)
 	Diagonal (Descending)	대각선(내림)
+	Contour Editor	윤곽선 편집기
+	Anti-aliased	앤티 앨리어스
+	Corner	모퉁이
+	Gloss Contour	광택 윤곽선
+	Contour	윤곽선
+	Cone - Inverted	원뿔 - 반전
+	Cove - Deep	후미 - 깊게
+	Cove - Shallow	후미 - 얕게
+	Half Round	반원
+	Ring - Double	링 - 이중
+	Rolling Slope - Descending	구르는 경사 - 내림차순
+	Rounded Steps	둥근 계단
+	Sawtooth 1	톱니 1
 
 	Red Eye Tool	적목 현상 도구
 	Red Eye	적목 현상
@@ -2804,9 +3068,9 @@ cameraRaw	Color	색상
 	Indigo	남색
 	Fuchsia	자홍색
 	Large document: redrawing on the CPU	큰 문서: CPU에서 다시 그리는 중
+	Redrawing	다시 그리는 중
 	This redraw took {seconds} s on the CPU.	이번 다시 그리기는 CPU에서 {seconds}초 걸렸습니다.
 	Edits that change the whole document, such as a layer's blend mode, opacity or visibility, redraw all of it.	레이어의 혼합 모드, 불투명도, 표시 여부처럼 문서 전체를 바꾸는 편집은 문서 전체를 다시 그립니다.
-	Its layers don't fit the GPU memory budget. Raising Memory usage in Preferences › Performance raises the budget, up to a quarter of this computer's memory.	레이어가 GPU 메모리 예산에 맞지 않습니다. 환경 설정 › 성능에서 메모리 사용량을 늘리면 이 컴퓨터 메모리의 4분의 1까지 예산이 늘어납니다.
 	The GPU compositor wasn't used: {reason}	GPU 합성기를 사용하지 않았습니다: {reason}
 fontWeight	Thin	아주 가늘게
 fontWeight	ExtraLight	더 가늘게
@@ -2826,4 +3090,544 @@ fontWeight	Italic	기울임
 	Rotate View	보기 회전
 	Rotate View Tool	보기 회전 도구
 	Reset View	보기 재설정
-	Drag around the centre to rotate the view  ·  Shift constrains to 15°	중심 주위를 드래그해 보기를 회전합니다  ·  Shift는 15°로 제한
+	Drag around the centre to rotate the view  ·  Shift constrains to 15°	중심 주위를 드래그해 보기 회전  ·  Shift로 15° 단위 제한
+
+# Painting symmetry presets.
+	Dual Axis	이중 축
+	Diagonal	대각선
+	Transform Symmetry	대칭 변형
+
+# Eyedropper Sample Size and Sample (#1649).
+	Point Sample	포인트 샘플
+	3 by 3 Average	3 × 3 평균
+	5 by 5 Average	5 × 5 평균
+	11 by 11 Average	11 × 11 평균
+	31 by 31 Average	31 × 31 평균
+	51 by 51 Average	51 × 51 평균
+	101 by 101 Average	101 × 101 평균
+	Sample Size:	샘플 크기:
+	All Layers No Adjustments	모든 레이어(조정 제외)
+	Current & Below No Adjustments	현재 및 이하(조정 제외)
+	Show Sampling Ring	샘플링 링 표시
+
+# Color Picker warnings
+	Out of gamut for printing: click for the nearest printable colour	인쇄 색역 밖: 클릭하면 가장 가까운 인쇄 가능한 색상으로 바뀝니다
+	Not a web colour: click for the nearest web colour	웹 색상이 아님: 클릭하면 가장 가까운 웹 색상으로 바뀝니다
+	Color to Alpha…	색상을 알파로…
+	Transparency Threshold	투명도 한계값
+	Opacity Threshold	불투명도 한계값
+	PhotoCraft — Screen Color Picker	PhotoCraft — 화면 색상 선택기
+
+	Rasterize svg groups deeper than	이 깊이보다 깊은 SVG 그룹 래스터화
+	0 turns this threshold off; SVG groups nested deeper than 100 levels are always rasterized.	0이면 이 한계값을 끕니다. 100단계보다 깊이 중첩된 SVG 그룹은 항상 래스터화됩니다.
+	Rule of Thirds	삼등분 법칙
+	Golden Ratio	황금 비율
+	Golden Spiral	황금 나선
+	Auto Show Overlay	오버레이 자동 표시
+	Always Show Overlay	오버레이 항상 표시
+	Never Show Overlay	오버레이 표시 안 함
+	Cycle Overlay	오버레이 순환
+	Cycle Orientation	방향 순환
+	Set the overlay options for the Crop tool	자르기 도구의 오버레이 옵션 설정
+	Alt-click went to the desktop, which moves windows with Alt-drag. Set its window-move key to Super, or latch Alt in Window › Modifier Keys.	Alt 클릭이 데스크톱으로 전달되었습니다. 데스크톱이 Alt 드래그로 창을 이동합니다. 창 이동 키를 Super로 바꾸거나 창 › 보조 키에서 Alt를 고정하세요.
+
+# Shared Layer Style color picker
+	Color Picker (Layer Style Color)	색상 피커 (레이어 스타일 색상)
+	Auto Hide Notifications	알림 자동 숨기기
+	Notification Duration (seconds)	알림 지속 시간(초)
+	Bundle Arrow-Key Nudges	방향키 이동을 하나로 묶기
+	Nudge Bundle Pause (ms)	이동 묶음 대기 시간(ms)
+	Appearance Mode	화면 모드
+	Dark Theme	어두운 테마
+	Light Theme	밝은 테마
+	Pro Medium	Pro Medium
+	Studio Light	Studio Light
+	Next Appearance Mode	다음 화면 모드
+	Sync with system	시스템과 동기화
+	Active	활성
+	Color Picker (Solid Color)	색상 피커 (단색)
+	Straighten the image by drawing a line on it	이미지에 선을 그려 수평 맞추기
+	Set additional Crop options	추가 자르기 옵션 설정
+	Show Cropped Area	잘린 영역 표시
+	Enable Crop Shield	자르기 방패 사용
+	Match Canvas	캔버스와 일치
+	Auto Adjust Opacity	자동으로 불투명도 조정
+	Crop Shield color	자르기 방패 색상
+	Color Picker (Crop Shield Color)	색상 선택기 (자르기 방패 색상)
+	From Center	중앙에서
+	Link radii	반경 연결
+	Star Ratio:	별 비율:
+	Create Rectangle	사각형 만들기
+	Create Ellipse	타원 만들기
+	Create Triangle	삼각형 만들기
+	Create Polygon	다각형 만들기
+	Pressure curve	필압 곡선
+	Click to add a point, right-click to remove	클릭하여 점 추가, 마우스 오른쪽 클릭으로 제거
+	Some brush presets could not be loaded	일부 브러시 사전 설정을 불러오지 못했습니다
+	Retry saving presets	사전 설정 저장 다시 시도
+	Brush preset changes are not saved: {error}	브러시 사전 설정 변경 내용이 저장되지 않았습니다: {error}
+	Keep this tab open to retain your brushes.	브러시를 유지하려면 이 탭을 열어 두세요.
+	Browser storage is unavailable; brushes are session-only. Keep this tab open to retain them.	브라우저 저장소를 사용할 수 없어 브러시는 이 세션에서만 유지됩니다. 유지하려면 이 탭을 열어 두세요.
+	Saving brush presets… Keep this tab open until saving finishes.	브러시 사전 설정 저장 중… 저장이 끝날 때까지 이 탭을 열어 두세요.
+	Reflect	반사
+	Glow	광선
+	Negation	부정
+	XOR	XOR
+	Color Burn (Paint.NET)	색상 번 (Paint.NET)
+	Color Dodge (Paint.NET)	색상 닷지 (Paint.NET)
+	Stroke Options	획 옵션
+	Solid	실선
+	Dashed	파선
+	Dotted	점선
+	Alignment	정렬
+	Caps	끝 모양
+	Butt / Flat	평평한 끝
+	Miter	마이터
+	Round	원형
+	Bevel	베벨
+	Miter limit	마이터 한도
+	Dashed line	파선
+	Dash	선
+	Gap	간격
+	Dash / gap lengths × stroke width	선 / 간격 길이 × 획 폭
+	Add pair	쌍 추가
+	Remove pair	쌍 제거
+	Dash offset	파선 오프셋
+	Open paths use centered strokes	열린 패스는 가운데 획을 사용합니다
+	Use finite lengths and a positive pattern total	유한한 길이와 양수 패턴 합계를 사용하세요
+	No subject found — try Object Selection or the Lasso	피사체를 찾을 수 없습니다 — 오브젝트 선택 또는 올가미를 사용해 보세요
+	Quick Selection found nothing there	빠른 선택으로 해당 위치에서 아무것도 찾지 못했습니다
+	Object Selection found nothing there — try a tighter rectangle	오브젝트 선택으로 해당 위치에서 아무것도 찾지 못했습니다 — 더 좁은 사각형을 사용해 보세요
+	No subject found — try a rectangle around the object	피사체를 찾을 수 없습니다 — 개체 주위에 사각형을 그려 보세요
+	Auto Erase	자동 지우기
+	Click the first point or press {key} to close · {del} removes a point · Esc cancels	첫 점을 클릭하거나 {key}를 눌러 닫기 · {del}로 점 제거 · Esc로 취소
+	Click, then move along an edge · click to fasten a point · {alt}-click for a straight segment · double-click to close	클릭한 다음 가장자리를 따라 이동 · 클릭하여 고정점 추가 · {alt}-클릭으로 직선 구간 · 두 번 클릭하여 닫기
+	Follows only edges this close to the pointer ([ and ] change it)	포인터에서 이 거리 안의 가장자리만 따라감([ 및 ]로 변경)
+	Higher values follow only edges that contrast sharply with their surroundings	값이 높을수록 주변과 대비가 강한 가장자리만 따라감
+	How often fastening points are placed by themselves	고정점이 자동으로 놓이는 빈도
+	Scrubby Zoom	스크러비 확대/축소
+	{mode} Color · {bits} bit	{mode} 색상 · {bits}비트
+	Drag a crop box · drag inside to move · edges resize ({ratio} ratio, {centre} centre) · Space moves while drawing · arrows nudge · X swaps orientation · {commit} commits · Esc cancels	드래그하여 자르기 상자 만들기 · 안쪽을 드래그하여 이동 · 가장자리로 크기 조절({ratio} 비율, {centre} 중심) · 그리는 중 Space로 이동 · 화살표로 미세 이동 · X로 방향 전환 · {commit} 적용 · Esc 취소
+	Appearance Settings…	화면 설정…
+	Add to favorites	즐겨찾기에 추가
+	Remove from favorites	즐겨찾기에서 제거
+# File Info ▸ Camera Data (read-only EXIF fields; "Make" is the camera maker, not the verb).
+	Camera Data	카메라 데이터
+cameraData	Make	제조사
+cameraData	Model	모델
+cameraData	Date Taken	촬영 날짜
+cameraData	Exposure	노출 시간
+cameraData	F-Stop	조리개 값
+cameraData	ISO Speed	ISO 감도
+cameraData	Focal Length	초점 거리
+cameraData	Focal Length (35 mm)	초점 거리(35mm 환산)
+cameraData	Lens	렌즈
+# Shared panel docking
+	Activate Panel	패널 활성화
+	Change Panel Group	패널 그룹 변경
+	Change Panel Layout	패널 레이아웃 변경
+	Close Panel	패널 닫기
+	Dock Panel	패널 도킹
+	Float Panel	패널 띄우기
+	Move Panel	패널 이동
+	Group with	다음과 그룹화
+	Panel menu	패널 메뉴
+	Resize panel window	패널 창 크기 조절
+	Resize panels	패널 크기 조절
+	Use Classic Mode	클래식 모드 사용
+	Auto Center Preview	미리 보기 자동 가운데 맞춤
+	Next Document	다음 문서
+	Previous Document	이전 문서
+	W x H x Resolution	폭 x 높이 x 해상도
+	Front Image	전면 이미지
+	Frame Tool	프레임 도구
+	Create a new rectangular frame	새 사각형 프레임 만들기
+	Create a new elliptical frame	새 타원형 프레임 만들기
+	Include in playback	재생에 포함
+	Perspective Crop Tool	원근 자르기 도구
+	Show Grid	격자 표시
+	Drag a box or click four corners · drag the corners onto the edges of a skewed shape · {commit} commits · Esc cancels	상자를 드래그하거나 네 모서리를 클릭 · 모서리를 기울어진 모양의 가장자리로 드래그 · {commit} 적용 · Esc 취소
+	Artboard Tool	아트보드 도구
+	Make Portrait	세로 방향으로
+	Make Landscape	가로 방향으로
+	Add New Artboard	새 아트보드 추가
+	W	폭
+	H	높이
+	Freeform Pen Tool	자유 형태 펜 도구
+	Curvature Pen Tool	곡률 펜 도구
+	Curve Fit:	곡선 맞춤:
+	Drag: draw freehand · {alt}-click: straight segment · Release on the start point: close	드래그: 자유롭게 그리기 · {alt}-클릭: 직선 세그먼트 · 시작점에서 놓기: 닫기
+	Click: smooth point · Double-click: corner · Drag a point: move · Click first point: close · {key} finish	클릭: 매끄러운 점 · 더블 클릭: 모서리 · 점 드래그: 이동 · 첫 점 클릭: 닫기 · {key}: 완료
+	New Crop Preset…	새 자르기 사전 설정…
+	Delete Crop Preset…	자르기 사전 설정 삭제…
+	Select the crop presets to delete:	삭제할 자르기 사전 설정을 선택하십시오:
+	Select the crop presets to delete	삭제할 자르기 사전 설정을 선택하십시오
+	Enter a name for the crop preset	자르기 사전 설정의 이름을 입력하십시오
+	There is no crop size or ratio to save	저장할 자르기 크기나 비율이 없습니다
+	Scale:	비율:
+	Snap to Origin	원점에 스냅
+	Search settings…	설정 검색…
+	No matching settings	일치하는 설정 없음
+# Edit › Content-Aware Fill workspace
+	Sampling Brush Tool	샘플링 브러시 도구
+	Sampling Area Overlay	샘플링 영역 오버레이
+	Show Sampling Area	샘플링 영역 표시
+	Indicates	표시 대상
+	Sampling Area	샘플링 영역
+	Excluded Area	제외 영역
+	Sampling Area Options	샘플링 영역 옵션
+	Rectangular	사각형
+	Fill Settings	채우기 설정
+	Rotation Adaptation	회전 적응
+	Very High	매우 높음
+	Full	전체
+	Mirror	미러
+	Output Settings	출력 설정
+	Output To	출력 위치
+
+	Animation Options	애니메이션 옵션
+	Entire Document	전체 문서
+	Filter Options	필터 옵션
+	Layer Bounds	레이어 경계
+	Layers Panel Options	레이어 패널 옵션
+	New Artboard…	새 아트보드…
+	New Group	새 그룹
+	New Group…	새 그룹…
+	New Layer…	새 레이어…
+	Panel Options…	패널 옵션…
+	Prevent Auto-Nesting	자동 중첩 방지
+	Show Layers	레이어 표시
+	Thumbnail Contents	축소판 내용
+	Thumbnail Size	축소판 크기
+	Use Default Masks on Fill Layers	칠 레이어에 기본 마스크 사용
+	Expand New Effects	새 효과 펼치기
+	Add “copy” to Copied Layers and Groups	복사한 레이어 및 그룹에 “복사” 추가
+	Preview on canvas when reordering layers	레이어 순서 변경 시 캔버스에서 미리보기
+	Show layer mask badges	레이어 마스크 배지 표시
+
+# Smart Filter editors
+	Blending Options ({filter})	혼합 옵션 ({filter})
+	Hide the layer's effects and Smart Filters  ({key}-click: all layers)	레이어 효과 및 스마트 필터 숨기기  ({key}+클릭: 모든 레이어)
+	Show the layer's effects and Smart Filters  ({key}-click: all layers)	레이어 효과 및 스마트 필터 표시  ({key}+클릭: 모든 레이어)
+	Wait for the current job to finish.	현재 작업이 완료될 때까지 기다리세요.
+	The document or Smart Filter changed. Reopen its dialog.	문서 또는 스마트 필터가 변경되었습니다. 대화 상자를 다시 여세요.
+	Opacity must be between 0% and 100%.	불투명도는 0%에서 100% 사이여야 합니다.
+	Dissolve is approximated: it blends without Photoshop's dither.	디졸브는 근사치입니다. Photoshop의 디더링 없이 혼합됩니다.
+	Loading fonts…	글꼴 불러오는 중…
+	Response curve	응답 곡선
+	Simulate Pressure	압력 시뮬레이션
+	Stroke Path…	패스 획…
+	Background Eraser	배경 지우개
+	Clone Stamp	복제 도장
+	Healing Brush	복구 브러시
+	Spot Healing Brush	스팟 복구 브러시
+	History Brush	작업 내역 브러시
+	Smudge	손가락
+	Dodge	닷지
+	Burn	번
+	Amount:	양:
+	Protect:	보호:
+	Protect skin tones	피부톤 보호
+	Edit points to modify the curve	점을 편집하여 곡선 수정
+	Draw to modify the curve	그려서 곡선 수정
+curves	Smooth	매끄럽게
+	Smooth the curve values	곡선 값을 매끄럽게 하기
+	Drag to draw the curve · {key}-click draws a straight line	드래그하여 곡선 그리기 · {key}-클릭으로 직선 그리기
+	Edit Plane	평면 편집
+	Create Plane	평면 만들기
+	Grid Size:	격자 크기:
+	Vanishing Point: click four corners to create a plane	소실점: 네 모서리를 클릭하여 평면을 만드십시오
+	Vanishing Point is not active	소실점이 활성화되어 있지 않습니다
+	Apply Vanishing Point ({key})	소실점 적용 ({key})
+	Fix the red plane first: its corners must form a convex quad	먼저 빨간색 평면을 수정하십시오: 모서리가 볼록 사각형을 이루어야 합니다
+# Select and Mask view modes (#1754)
+	Onion Skin	어니언 스킨
+	Marching Ants	점선 윤곽
+	On Black	검정 배경
+	On White	흰색 배경
+	On Layers	레이어 위
+	Show Edge	가장자리 표시
+	Show Original	원본 표시
+	F cycles the views; hold X to see the image	F로 보기 전환, X를 누르고 있으면 이미지 표시
+# Select and Mask Refine Edge Brush (#2972)
+	Refine Edge Brush (R)	가장자리 다듬기 브러시 (R)
+	Expand Detection Area	감지 영역 확장
+	Restore Original Edge	원래 가장자리 복원
+	Paint over hair or fur on the image; Alt paints the other mode	이미지의 머리카락이나 털 위를 칠합니다. Alt는 다른 모드로 칠합니다
+	Clear Brush Strokes	브러시 획 지우기
+	Show rulers	눈금자 표시
+	Presentation	프레젠테이션
+
+# Color Sampler (added with the i18n coverage repair)
+	Click to place · Alt-click or drag off-canvas to remove	클릭하여 배치 · Alt-클릭 또는 캔버스 밖으로 드래그하여 제거
+	No document open	열린 문서 없음
+	{n} of {max} sample points	{max}개 중 {n}개의 샘플 지점
+
+# History panel menu (#2966)
+	Step Forward	한 단계 앞으로
+	Step Backward	한 단계 뒤로
+	Clear History	작업 내역 지우기
+	New Snapshot…	새 스냅샷…
+	History Options…	작업 내역 옵션…
+# Print dialog (#2697)
+	Emulsion Down	감광면 아래로
+	Functions	기능
+	Print Resolution:	인쇄 해상도:
+	Use Previous Layer to Create Clipping Mask	이전 레이어를 사용하여 클리핑 마스크 만들기
+	Fill with {mode}-neutral color (white)	{mode} 중립 색상으로 채우기(흰색)
+	Fill with {mode}-neutral color (black)	{mode} 중립 색상으로 채우기(검정)
+	Fill with {mode}-neutral color (50% gray)	{mode} 중립 색상으로 채우기(50% 회색)
+	(No neutral color exists for {mode} mode.)	({mode} 모드에는 중립 색상이 없습니다.)
+	Apply mask to layer before removing?	제거하기 전에 마스크를 레이어에 적용하시겠습니까?
+	The layer or its mask changed. Drag the mask onto the Trash again.	레이어 또는 마스크가 변경되었습니다. 마스크를 휴지통으로 다시 드래그하세요.
+	Delete the vector mask?	벡터 마스크를 삭제하시겠습니까?
+# View › Guides › New Guide… › Color
+	Light Blue	연한 파랑
+	Light Red	연한 빨강
+	Medium Blue	중간 파랑
+	Light Gray	연한 회색
+	Stop	정지
+	Object Finder	개체 찾기
+	No object found there — drag a rectangle around it	그곳에서 개체를 찾지 못했습니다 — 주위에 사각형을 드래그하세요
+	The active layer has no pixels here — turn on Sample All Layers or select a layer with pixels	활성 레이어의 이 위치에는 픽셀이 없습니다 — 모든 레이어 샘플링을 켜거나 픽셀이 있는 레이어를 선택하세요
+	Remove after each stroke	획마다 제거
+	Apply the removal ({key})	제거 적용 ({key})
+	Strokes to remove: {n} (Enter applies, Esc cancels)	제거할 획: {n} (Enter 적용, Esc 취소)
+	Load Contours…	윤곽선 불러오기…
+	Replace Contours…	윤곽선 바꾸기…
+	Save Contours…	윤곽선 저장…
+	Delete Contour	윤곽선 삭제
+	Loaded contours from {file}	{file}에서 윤곽선을 불러왔습니다
+	Saved contours to {file}	윤곽선을 {file}에 저장했습니다
+	Show home recent files	홈 화면에 최근 파일 표시
+	Clear Brush Controls	브러시 제어 지우기
+	Reset All Locked Settings	모든 잠긴 설정 재설정
+	Copy Texture to Other Tools	다른 도구로 텍스처 복사
+
+# Actions panel: Load/Save Actions (.atn) and kept Photoshop steps
+	Load Actions…	액션 불러오기…
+	Save Actions…	액션 저장…
+	New Action…	새 액션…
+	Start Recording	기록 시작
+	Stop Recording	기록 중지
+	{name} (Photoshop)	{name} (Photoshop)
+	{message} ({note})	{message} ({note})
+@plural	Loaded {n} action from {file}|Loaded {n} actions from {file}	{file}에서 액션 {n}개를 불러왔습니다
+@plural	{n} step has no PhotoCraft equivalent yet|{n} steps have no PhotoCraft equivalent yet	{n}개 단계에는 아직 PhotoCraft에 해당하는 기능이 없습니다
+@plural	Saved {n} action to {file}|Saved {n} actions to {file}	{file}에 액션 {n}개를 저장했습니다
+@plural	{n} step with no Photoshop equivalent left out|{n} steps with no Photoshop equivalent left out	Photoshop에 해당하는 기능이 없는 {n}개 단계를 제외했습니다
+
+	File Naming	파일 이름 지정
+	Starting serial	시작 일련번호
+# Actions panel: set folders, dialog toggle, Insert Stop
+	Insert Stop…	정지 삽입…
+	Save Set…	세트 저장…
+	Message:	메시지:
+	Allow Continue	계속 허용
+	Show dialog during playback	재생 중 대화 상자 표시
+	Select an action first	먼저 액션을 선택하세요
+	Action playback stopped	액션 재생이 중지되었습니다
+	Step {step} is waiting for its dialog	{step}단계가 대화 상자를 기다리고 있습니다
+@plural	{n} action|{n} actions	액션 {n}개
+	Background (Default)	배경(기본값)
+# Batch / Image Processor
+	Include All Subfolders	모든 하위 폴더 포함
+	Auto Add/Delete	자동 추가/삭제
+
+# Native Windows printing qualification
+	Don't also tick Mirror Image in Print Settings…: the two flips cancel out.	인쇄 설정에서도 이미지 반전을 켜지 마세요. 두 번 반전하면 원래대로 돌아갑니다.
+	Print Settings…	인쇄 설정…
+	Remember to turn off the printer's own colour management in Print Settings…	인쇄 설정에서 프린터 자체의 색상 관리를 끄세요…
+	Sent to {printer}	{printer}(으)로 전송됨
+	set in Print Settings…	인쇄 설정에서 지정…
+	ICO is limited to 256 × 256 pixels	ICO는 256 × 256픽셀로 제한됩니다
+# PhotoCraft release checks.
+	Check for Updates…	업데이트 확인…
+	PhotoCraft Updates	PhotoCraft 업데이트
+	Checking for updates…	업데이트 확인 중…
+	Open the release page to choose an installer for your system.	릴리스 페이지에서 시스템에 맞는 설치 프로그램을 선택하세요.
+	Open Download Page	다운로드 페이지 열기
+	PhotoCraft is up to date.	PhotoCraft가 최신 버전입니다.
+	Could not check for updates.	업데이트를 확인할 수 없습니다.
+	Updates have not been checked yet.	아직 업데이트를 확인하지 않았습니다.
+	Check Again	다시 확인
+	Automatically Check for Updates	자동으로 업데이트 확인
+	Installed version: {version}	설치된 버전: {version}
+	PhotoCraft {version} is available.	PhotoCraft {version}을 사용할 수 있습니다.
+# History panel › History Brush source (#2966)
+	Paints from the History panel's source state	작업 내역 패널의 소스 상태에서 칠합니다
+	Sets the source for the history brush	작업 내역 브러시의 소스를 설정합니다
+# Bevel & Emboss shading controls.
+	Highlight Mode	하이라이트 모드
+	Highlight Color	하이라이트 색상
+	Highlight Opacity	하이라이트 불투명도
+	Shadow Mode	그림자 모드
+	Shadow Color	그림자 색상
+	Shadow Opacity	그림자 불투명도
+# Embedded Profile Mismatch: profile names beside the choices, Remember this choice
+	Use the embedded profile ({profile})	포함된 프로파일 사용({profile})
+	Convert to the working space ({profile})	작업 색상 공간으로 변환({profile})
+	Remember this choice for future images	이후 이미지에도 이 선택 기억
+	Turn the prompt back on with Ask On Mismatch in Edit › Color Settings.	편집 › 색상 설정의 Ask On Mismatch로 이 확인을 다시 켤 수 있습니다.
+	Button Mode	단추 모드
+	Button Mode On	단추 모드 켜짐
+
+# Darken / Lighten Interface (⇧⌘F1 / ⇧⌘F2)
+	Darken Interface	인터페이스 어둡게
+	Lighten Interface	인터페이스 밝게
+# Bevel & Emboss Technique.
+	Technique	기법
+	Chisel Hard	단단하게 조각
+	Chisel Soft	부드럽게 조각
+	Open color-less EXR as ACEScg	색 공간 정보 없는 EXR을 ACEScg로 열기
+	Do not append "copy" to filename when saving a copy	사본 저장 시 파일 이름에 "copy"를 붙이지 않음
+# Export As metadata and profile options
+	Color Profile	색상 프로필
+	EXIF	EXIF
+
+# View › Guides › right-click a guide
+	Edit Selected Guides	선택한 안내선 편집
+	Clear Selected Guides	선택한 안내선 지우기
+	Make Selection	선택 영역 만들기
+	Bicubic Automatic	쌍입방 자동
+	Bicubic Smoother	쌍입방 더 부드럽게
+	Bicubic Sharper	쌍입방 더 선명하게
+	Pasting from other apps is unavailable	다른 앱에서 붙여넣기를 사용할 수 없습니다
+	PhotoCraft can't reach the system clipboard in this session. On Wayland, a Flatpak sandbox hides the protocol that images from other apps are read through.	이 세션에서는 PhotoCraft가 시스템 클립보드에 접근할 수 없습니다. Wayland에서는 Flatpak 샌드박스가 다른 앱의 이미지를 읽는 데 쓰이는 프로토콜을 숨깁니다.
+	To paste from other apps, start PhotoCraft under XWayland: `{command}`	다른 앱에서 붙여넣으려면 XWayland에서 PhotoCraft를 실행하세요: `{command}`
+	Nothing to paste: PhotoCraft can't read the system clipboard here	붙여넣을 내용 없음: 여기서는 PhotoCraft가 시스템 클립보드를 읽을 수 없습니다
+	Delete this set	이 세트 삭제
+	New Set…	새 세트…
+	PhotoCraft Defaults	PhotoCraft 기본값
+	Save a list of these shortcuts as a web page	이 단축키 목록을 웹 페이지로 저장
+	Save the changes to this set	이 세트에 변경 사항 저장
+	Save these shortcuts as a .kys file	이 단축키를 .kys 파일로 저장
+	Save these shortcuts as a new set	이 단축키를 새 세트로 저장
+	Set deleted.	세트를 삭제했습니다.
+	Set saved.	세트를 저장했습니다.
+	Set:	세트:
+	Summarize…	요약…
+	There are too many sets: delete one first.	세트가 너무 많습니다. 먼저 하나를 삭제하세요.
+	set name	세트 이름
+	{set} (modified)	{set}(수정됨)
+	Show file name in title	제목에 파일 이름 표시
+
+# Image › Mode › Bitmap (#5559)
+	50% Threshold	50% 한계값
+	Pattern Dither	패턴 디더
+	Diffusion Dither	확산 디더
+	Halftone Screen	하프톤 스크린
+	Custom Pattern	사용자 정의 패턴
+	Frequency:	빈도:
+	Lines/Inch	선/인치
+	Lines/Centimeter	선/센티미터
+	Ellipse	타원
+	Accept and Go to Conflict	적용 후 충돌 항목으로 이동
+	Changes undone.	변경 사항을 취소했습니다.
+	Choose a new shortcut for this command, or leave it without one.	이 명령의 새 단축키를 선택하거나 단축키 없이 두세요.
+	Put this command's shortcuts back as they were	이 명령의 단축키를 원래대로 되돌리기
+	Take the shortcut from the other command and select it	다른 명령에서 단축키를 빼고 그 명령 선택
+	Undo Changes	변경 사항 취소
+	{shortcut} is reserved by the system and can't be assigned.	{shortcut}은(는) 시스템에서 예약되어 할당할 수 없습니다.
+	Low-Latency Drawing (vsync off, applies at next launch)	저지연 그리기(수직 동기화 끔, 다음 실행 시 적용)
+# Free Transform: a new layer while the box is open (#5859)
+	Reference point location	기준점 위치
+	Free Transform is still being applied; try again when it has finished.	자유 변형을 아직 적용하는 중입니다. 완료된 후 다시 시도하세요.
+	The transform couldn't be applied.	변형을 적용할 수 없습니다.
+# Preferences › Performance › GPU Memory; the status bar and slow-redraw notice
+	Its layers need {needed} of GPU memory; the budget leaves them {budget}.	레이어에 GPU 메모리 {needed}가 필요하지만 예산은 {budget}만 남겨 둡니다.
+	Set GPU Memory in Preferences › Performance to what your graphics card can hold, at most 3/8 of its memory. Automatic follows Memory Usage, within a quarter of this computer's memory and 3/8 of the card's, and doesn't count the document against a card whose memory is known. The status bar shows GPU Memory Full while they don't fit.	환경 설정 › 성능에서 GPU 메모리를 그래픽 카드가 감당할 수 있는 양으로 설정하세요(최대 카드 메모리의 3/8). 자동은 메모리 사용량을 따르며, 이 컴퓨터 메모리의 4분의 1과 카드 메모리의 3/8 이내이고, 메모리를 알 수 있는 카드에서는 문서를 차감하지 않습니다. 맞지 않는 동안 상태 표시줄에 GPU 메모리 부족이 표시됩니다.
+	GPU Memory Full	GPU 메모리 부족
+	The layers need {needed} of GPU memory and may hold {budget}, so edits that redraw the whole document do it on the CPU. Click to set GPU Memory.	레이어에 GPU 메모리 {needed}가 필요하지만 {budget}만 사용할 수 있어 문서 전체를 다시 그리는 편집은 CPU에서 처리됩니다. 클릭하여 GPU 메모리를 설정합니다.
+	GPU memory budget: {budget}	GPU 메모리 예산: {budget}
+	Graphics memory: {size}	그래픽 메모리: {size}
+	This document's layers: {needed} of {budget} for layers	이 문서의 레이어: 레이어용 {budget} 중 {needed}
+	This document's layers need {needed} but may hold {budget}: whole-document redraws use the CPU	이 문서의 레이어에 {needed}가 필요하지만 {budget}만 사용할 수 있습니다: 문서 전체 다시 그리기는 CPU를 사용합니다
+	GPU Memory (MB, 0 = Automatic)	GPU 메모리(MB, 0 = 자동)
+	{path}: the path is not valid Unicode; save under another name.	{path}: 경로가 올바른 유니코드가 아닙니다. 다른 이름으로 저장하세요.
+	Replace	대치
+	{name} was changed by another app after it was opened or saved here.	{name}이(가) 여기서 열거나 저장한 뒤 다른 앱에서 변경되었습니다.
+	Replace it with this document, or cancel and use File › Save As to keep both.	이 문서로 대치하거나, 취소하고 파일 › 다른 이름으로 저장을 사용해 둘 다 보관하세요.
+	Decrease Brush Size	브러시 크기 줄이기
+	Increase Brush Size	브러시 크기 늘리기
+	Decrease Brush Hardness	브러시 경도 줄이기
+	Increase Brush Hardness	브러시 경도 늘리기
+	Demosaic	디모자이크
+	How the camera's colour filter mosaic is filled in. It is applied when the file opens; the preview shows the method it was opened with.	카메라 컬러 필터 모자이크를 채우는 방법입니다. 파일을 열 때 적용되며, 미리 보기는 파일을 연 방식으로 표시됩니다.
+	AHD (adaptive homogeneity)	AHD (적응형 균질성)
+	Malvar–He–Cutler	Malvar–He–Cutler
+	Hirakawa–Parks: the cleanest edges and the least colour fringing, the slowest.	Hirakawa–Parks: 가장 깨끗한 가장자리와 가장 적은 색 번짐, 가장 느림.
+	Gradient-corrected interpolation: sharp and fast, with some colour fringing on fine detail.	기울기 보정 보간: 선명하고 빠르지만 미세한 디테일에 약간의 색 번짐이 있음.
+	The fastest and the softest, with colour fringing on fine detail.	가장 빠르고 가장 부드러우며, 미세한 디테일에 색 번짐이 있음.
+	“{name}” already exists. Replace it?	“{name}”이(가) 이미 있습니다. 대치하시겠습니까?
+	The name in the save dialog was “{name}”.	저장 대화상자에 입력한 이름: “{name}”
+	Move Up	위로 이동
+	Move Down	아래로 이동
+	Previous Brush	이전 브러시
+	Next Brush	다음 브러시
+	First Brush	첫 번째 브러시
+	Last Brush	마지막 브러시
+	Preview size	Preview size
+	Memory Usage	메모리 사용량
+	Per-document RAM limit (MB)	문서당 RAM 한도(MB)
+	Installed RAM: {ram} MB; this limit: {percent}%	설치된 RAM: {ram} MB; 이 한도: {percent}%
+	Limits each open document's pixels plus History. Oldest undo states are discarded when the limit is exceeded.	열린 각 문서의 픽셀과 기록을 제한합니다. 한도를 넘으면 가장 오래된 실행 취소 상태가 버려집니다.
+	Applies immediately when saved. Memory is not reserved in advance.	저장하면 바로 적용됩니다. 메모리를 미리 예약하지 않습니다.
+	With GPU Memory set to Automatic, this also limits the GPU layer budget. That budget is capped at one quarter of installed RAM and, when known, three eighths of the graphics card's memory, with a 512 MB minimum. Raising this limit beyond those caps does not increase the GPU budget.	GPU 메모리가 자동이면 GPU 레이어 예산도 제한합니다. 상한은 설치 RAM의 1/4, 알려진 경우 그래픽 메모리의 3/8, 최소 512MB입니다. 이보다 올려도 GPU 예산은 늘지 않습니다.
+	Use	사용
+	In Front	앞
+	Behind	뒤
+	Blend	혼합
+
+# DDS Options (#1327)
+	DDS Options	DDS 옵션
+	Compression	압축
+	Generate Mipmaps	밉맵 생성
+
+# Color Table (.act) dialog
+	There is no color table to save.	저장할 색상표가 없습니다.
+@plural	Saved {n} color to {file}|Saved {n} colors to {file}	{file}에 색상 {n}개 저장
+
+# Graphics Adapter preference (#1885)
+	GPU adapter	GPU 어댑터
+
+# Styles panel: Import / Export Styles (.asl)
+	Import Styles…	스타일 가져오기…
+	Export Selected Styles…	선택한 스타일 내보내기…
+	Export Styles…	스타일 내보내기…
+	{file} is not a style library (.asl)	{file}은(는) 스타일 라이브러리(.asl)가 아닙니다
+@plural	Imported {n} style from {file}|Imported {n} styles from {file}	{file}에서 스타일 {n}개를 가져왔습니다
+@plural	Exported {n} style to {file}|Exported {n} styles to {file}	스타일 {n}개를 {file}(으)로 내보냈습니다
+# Actions: a step dialog holds a suspended recording (#7365)
+	Confirm or cancel the open action step dialog first	먼저 열려 있는 액션 단계 대화 상자를 확인하거나 취소하세요
+	Pro Medium Gray	프로 중간 회색
+	Solarized	Solarized
+	Breeze	Breeze
+	Pro Light Gray	프로 밝은 회색
+	Pro Light	프로 밝게
+	Resize Windows to Fit	창 크기 맞추기
+	EXR	EXR
+# Paragraph direction (TYPE-218-2)
+	Automatic paragraph direction	자동 단락 방향
+	Left-to-right paragraph direction	왼쪽에서 오른쪽 단락 방향
+	Right-to-left paragraph direction	오른쪽에서 왼쪽 단락 방향
+	Not rendered: this adjustment ({key}) is kept as imported.	렌더링되지 않음: 이 조정({key})은 가져온 상태 그대로 유지됩니다.
+# Print preview image (#8236)
+	Print preview image	Print preview image
+# Color panel menu: modes, copy commands and colour ramps (#6000)
+	Hue Cube	색조 큐브
+	Brightness Cube	밝기 큐브
+	Color Wheel	색상환
+	Grayscale Slider	회색 음영 슬라이더
+	RGB Sliders	RGB 슬라이더
+	HSB Sliders	HSB 슬라이더
+	CMYK Sliders	CMYK 슬라이더
+	Lab Sliders	Lab 슬라이더
+	Web Color Sliders	웹 색상 슬라이더
+	Copy Color as HTML	색상을 HTML로 복사
+	Copy Color's Hex Code	색상의 16진수 코드 복사
+	RGB Spectrum	RGB 스펙트럼
+	CMYK Spectrum	CMYK 스펙트럼
+	Grayscale Ramp	회색 음영 램프
+	Current Colors	현재 색상
+	Make Ramp Web Safe	램프를 웹 안전 색상으로 만들기

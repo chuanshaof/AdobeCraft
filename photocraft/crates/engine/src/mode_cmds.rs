@@ -27,6 +27,14 @@ fn num(p: &Value, key: &str, default: f32) -> f32 {
     p.get(key).and_then(Value::as_f64).map_or(default, |v| v as f32)
 }
 
+/// A finite number param, `default` when absent or null; anything else is a bad-params error.
+fn finite_num(p: &Value, cmd: &str, key: &str, default: f64) -> Result<f64> {
+    match p.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v.as_f64().filter(|f| f.is_finite()).ok_or_else(|| bad(cmd, format!("`{key}` must be a number"))),
+    }
+}
+
 fn str_or<'a>(p: &'a Value, key: &str, default: &'a str) -> &'a str {
     p.get(key).and_then(Value::as_str).unwrap_or(default)
 }
@@ -53,9 +61,10 @@ pub fn rotated_size(size: Size, deg: f64) -> Size {
     Size::new(nw as u32, nh as u32)
 }
 
-fn rotate_arbitrary(s: &mut Session, p: &Value) -> Result<Value> {
+pub(crate) fn rotate_arbitrary(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "image.rotation.arbitrary";
-    let angle = f64::from(num(p, "angle", 0.0));
+    // At full precision: an f32 angle can grow the canvas 1 px past what `rotated_size` gives callers.
+    let angle = p.get("angle").and_then(Value::as_f64).unwrap_or(0.0);
     if !angle.is_finite() || angle.abs() > 3600.0 {
         return Err(bad(CMD, "angle out of range"));
     }
@@ -67,7 +76,19 @@ fn rotate_arbitrary(s: &mut Session, p: &Value) -> Result<Value> {
     if deg.rem_euclid(360.0).abs() < 1e-9 {
         return Ok(json!({"width": s.active().map(|d| d.doc.size.width), "height": s.active().map(|d| d.doc.size.height)}));
     }
-    let bg = s.tools.background;
+    // The Background stays opaque, whatever the background colour's alpha.
+    let bg = [s.tools.background[0], s.tools.background[1], s.tools.background[2], 1.0];
+    // Color Sampler points turn with the canvas (the same map the edit applies to the geometry).
+    // They are pixel indices, so map the pixel's centre, as the warp samples the pixels.
+    {
+        let old = s.active().ok_or(EngineError::NoDocument)?.doc.size;
+        let new = rotated_size(old, deg);
+        let (sn, cs) = deg.to_radians().sin_cos();
+        let (cx, cy) = (f64::from(old.width) / 2.0, f64::from(old.height) / 2.0);
+        let (nx, ny) = (f64::from(new.width) / 2.0, f64::from(new.height) / 2.0);
+        let a = Affine { m: [cs, sn, -sn, cs, nx - (cs * cx - sn * cy), ny - (sn * cx + cs * cy)] };
+        s.set_canvas_map(a, Affine::translate(0.5, 0.5).then(&a).then(&Affine::translate(-0.5, -0.5)));
+    }
     let size = s.edit("Rotate Canvas", |doc, _| {
         let old = doc.size;
         let new = rotated_size(old, deg);
@@ -82,38 +103,36 @@ fn rotate_arbitrary(s: &mut Session, p: &Value) -> Result<Value> {
         let canvas = doc.bounds();
         let fmt = doc.pixel_format();
         let dpi = doc.resolution_dpi;
+        let background_id = doc.background().map(|l| l.id);
         for l in doc.layers.iter_mut() {
-            let background = l.name == "Background" && l.locks.position && matches!(l.content, LayerContent::Raster(_));
+            let background = Some(l.id) == background_id;
             if background && let Some(surf) = l.surface_mut() {
                 // The Background stays a Background: rotated pixels over the background colour.
                 let src = surf.content_bounds();
-                let rotated = photocraft_algo::transform::warp_surface(surf, src, &h, interp);
+                let rotated = photocraft_algo::transform::warp_surface(surf, src, &h, interp)?;
                 let mut base = Surface::new(fmt);
                 let fill = photocraft_raster::from_rgba(&fmt, bg);
-                base.write_region(canvas, &fill.repeat(canvas.width() as usize * canvas.height() as usize));
+                // One shared tile per full tile, not a canvas-sized float buffer.
+                base.fill_rect(canvas, &fill);
                 crate::transform_cmds::composite_over(&mut base, &rotated);
                 base.prune();
                 *surf = base;
                 if let Some(m) = l.mask.as_mut() {
-                    m.surface = crate::transform_cmds::warp_gray(&m.surface, &h, interp);
+                    m.surface = crate::transform_cmds::warp_gray(&m.surface, &h, interp)?;
                 }
             } else {
-                // Rotating the whole image moves locked layers too.
-                let locks = l.locks;
-                l.locks.position = false;
-                l.locks.all = false;
-                crate::transform_cmds::transform_layer(None, photocraft_doc::Locks::default(), l, &h, Some(a), interp)?;
-                l.locks = locks;
+                // Rotating the whole image moves locked layers too, including inside groups.
+                with_released_movement_locks(l, |l| crate::transform_cmds::transform_layer(None, photocraft_doc::Locks::default(), l, &h, Some(a), interp))?;
             }
             // What Free Transform leaves alone: unlinked vector masks, gradient angles, artboards…
             crate::canvas_geom::transform_layer_geometry(l, &a, false, dpi);
         }
         crate::canvas_geom::transform_doc_marks(doc, &a);
         for ch in doc.channels.iter_mut().chain(doc.quick_mask.as_mut()) {
-            ch.surface = crate::transform_cmds::warp_gray(&ch.surface, &h, interp);
+            ch.surface = crate::transform_cmds::warp_gray(&ch.surface, &h, interp)?;
         }
         if let Some(sel) = &doc.selection {
-            doc.selection = Some(crate::transform_cmds::warp_gray(sel, &h, Interp::Bilinear)).filter(|s| !s.content_bounds().is_empty());
+            doc.selection = Some(crate::transform_cmds::warp_gray(sel, &h, Interp::Bilinear)?).filter(|s| !s.content_bounds().is_empty());
         }
         // Type, shapes and smart objects re-render from their new geometry.
         crate::canvas_geom::refresh(doc, crate::canvas_geom::Refresh::All);
@@ -121,6 +140,25 @@ fn rotate_arbitrary(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(new)
     })?;
     Ok(json!({"width": size.width, "height": size.height}))
+}
+
+/// Runs `f` with movement locks (`position` and `all`) temporarily released on `l` and all its
+/// descendants, so canvas-wide rotation moves every layer, then restores each lock.
+fn with_released_movement_locks<R>(l: &mut Layer, f: impl FnOnce(&mut Layer) -> Result<R>) -> Result<R> {
+    let mut saved = Vec::new();
+    crate::image_cmds::for_each_layer(std::slice::from_mut(l), &mut |x| {
+        saved.push(x.locks);
+        x.locks.position = false;
+        x.locks.all = false;
+    });
+    let r = f(l);
+    let mut saved = saved.into_iter();
+    crate::image_cmds::for_each_layer(std::slice::from_mut(l), &mut |x| {
+        if let Some(locks) = saved.next() {
+            x.locks = locks;
+        }
+    });
+    r
 }
 
 // ---------- flatten helpers ----------
@@ -136,7 +174,13 @@ fn single_layer(doc: &mut Document, active: &mut Option<LayerId>, mode: ColorMod
     doc.mode = mode;
     doc.depth = SampleType::U8;
     let fmt = doc.pixel_format();
-    let data: Vec<f32> = px.iter().flat_map(|q| photocraft_raster::from_rgba(&fmt, *q)).collect();
+    // Reuse one format-sized pixel buffer instead of allocating a Vec for every pixel.
+    let mut pixel = vec![0.0; fmt.channels()];
+    let mut data = Vec::new();
+    for q in px {
+        photocraft_raster::from_rgba_into(&fmt, *q, &mut pixel);
+        data.extend_from_slice(&pixel);
+    }
     let mut l = Layer::raster(name, fmt);
     if background {
         l.locks.transparency = true;
@@ -185,7 +229,16 @@ fn indexed_color(s: &mut Session, p: &Value) -> Result<Value> {
         .ok_or_else(|| bad(CMD, "palette: exact|systemMac|systemWindows|web|uniform|perceptual|selective|adaptive"))?;
     let forced = parse_forced(str_or(p, "forced", "blackWhite")).ok_or_else(|| bad(CMD, "forced: none|blackWhite|primaries|web"))?;
     let dither = parse_dither(str_or(p, "dither", "diffusion")).ok_or_else(|| bad(CMD, "dither: none|diffusion|pattern|noise"))?;
-    let colors = num(p, "colors", 256.0).clamp(2.0, 256.0) as usize;
+    let colors = match p.get("colors") {
+        None => 256,
+        Some(value) => {
+            let value = value.as_f64().ok_or_else(|| bad(CMD, "colors must be an integer from 2 to 256"))?;
+            if !value.is_finite() || value.fract() != 0.0 || !(2.0..=256.0).contains(&value) {
+                return Err(bad(CMD, "colors must be an integer from 2 to 256"));
+            }
+            value as usize
+        }
+    };
     let amount = num(p, "amount", 75.0).clamp(0.0, 100.0) / 100.0;
     let transparency = p.get("transparency").and_then(Value::as_bool).unwrap_or(true);
     let (pal_len, transparent) = s.edit("Indexed Color", |doc, active| {
@@ -281,8 +334,14 @@ fn color_table(s: &mut Session, p: &Value) -> Result<Value> {
     }
     match p.get("transparent") {
         Some(Value::Null) => table.transparent = None,
-        Some(v) => table.transparent = v.as_u64().filter(|&i| (i as usize) < table.colors.len()).map(|i| i as u8).or(table.transparent),
-        None => {}
+        Some(v) => {
+            let len = table.colors.len();
+            let i =
+                v.as_u64().filter(|&i| i < len as u64).ok_or_else(|| bad(CMD, format!("transparent: an index from 0 to {} or null", len.saturating_sub(1))))?;
+            table.transparent = u8::try_from(i).ok();
+        }
+        // A shrunk table can't keep a transparent entry past its end (#4186).
+        None => table.transparent = table.transparent.filter(|&i| usize::from(i) < table.colors.len()),
     }
     let report = |t: &ColorTable| json!({"colors": t.colors.iter().map(|c| hex(*c)).collect::<Vec<_>>(), "transparent": t.transparent});
     if table == cur {
@@ -301,11 +360,23 @@ fn color_table(s: &mut Session, p: &Value) -> Result<Value> {
             let mut data = surf.read_region(r);
             for q in data.chunks_exact_mut(n) {
                 let c = photocraft_raster::to_rgba(&fmt, q);
-                if c[3] <= 0.0 {
-                    continue;
-                }
-                let i = old.nearest([c[0], c[1], c[2]]);
-                let alpha = if table.transparent == Some(i as u8) { 0.0 } else { c[3] };
+                let rgb = [c[0], c[1], c[2]];
+                let i = if c[3] <= 0.0 {
+                    let Some(i) = old.transparent.map(usize::from) else { continue };
+                    if i >= old.colors.len() || old.rgb(i) != rgb {
+                        continue;
+                    }
+                    i
+                } else {
+                    old.nearest(rgb)
+                };
+                let alpha = if table.transparent == Some(i as u8) {
+                    0.0
+                } else if c[3] <= 0.0 {
+                    1.0
+                } else {
+                    c[3]
+                };
                 let nc = if i < table.colors.len() { table.rgb(i) } else { table.rgb(table.nearest([c[0], c[1], c[2]])) };
                 let mut enc = [0.0f32; 8];
                 let m = photocraft_raster::from_rgba_into(&fmt, [nc[0], nc[1], nc[2], alpha], &mut enc);
@@ -322,30 +393,110 @@ fn color_table(s: &mut Session, p: &Value) -> Result<Value> {
 
 // ---------- Bitmap ----------
 
+/// Bitmap's Output resolution range (ppi): what a new document may have.
+const BITMAP_RESOLUTION: std::ops::RangeInclusive<f64> = 1.0..=crate::document_preset_cmds::MAX_RESOLUTION;
+
+/// Bytes per pixel of the Bitmap conversion's full-canvas working buffers at their peak (see
+/// `bitmap`), on top of the document itself.
+const BITMAP_WORK_BYTES_PER_PX: u64 = 40;
+
+/// Bitmap's Custom Pattern: a pattern's threshold map (see
+/// [`quantize::custom_pattern_thresholds`]) with its width and height.
+fn custom_pattern_map(s: &Session, cmd: &str, p: &Value) -> Result<(Vec<f32>, usize, usize)> {
+    if p.get("pattern").is_some_and(|v| !v.is_string() && !v.is_null()) {
+        return Err(bad(cmd, "`pattern` must be a pattern id or name"));
+    }
+    let pat = crate::pattern_cmds::resolve_param(s, cmd, p)?;
+    // A pattern keeps its own colours: its lightness is what it paints in a Grayscale document,
+    // over white where it is transparent.
+    let px = photocraft_compose::pattern::pattern_rgba(&pat, ColorMode::Grayscale);
+    if px.is_empty() {
+        return Err(bad(cmd, format!("the pattern \"{}\" is empty or too large", pat.display_name())));
+    }
+    let lightness: Vec<f32> = px.iter().map(|q| photocraft_color::convert::rgb_to_gray([q[0], q[1], q[2]]) * q[3] + (1.0 - q[3])).collect();
+    Ok((quantize::custom_pattern_thresholds(&lightness), pat.width as usize, pat.height as usize))
+}
+
 fn bitmap(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "image.mode.bitmap";
-    let dpi = s.active().ok_or(EngineError::NoDocument)?.doc.resolution_dpi.max(1.0);
+    let d = s.active().ok_or(EngineError::NoDocument)?;
+    let input = f64::from(d.doc.resolution_dpi.max(1.0));
+    let (ow, oh) = (d.doc.size.width, d.doc.size.height);
+    // Output resolution (ppi): Photoshop resamples the image to it, keeping the print size,
+    // before converting, and the document takes it as its resolution.
+    let output = finite_num(p, CMD, "resolution", input)?;
+    if !BITMAP_RESOLUTION.contains(&output) {
+        return Err(bad(CMD, format!("resolution {output} is outside {}..{} pixels/inch", BITMAP_RESOLUTION.start(), BITMAP_RESOLUTION.end())));
+    }
+    let (nw, nh) = if (output - input).abs() < 1e-6 {
+        (ow, oh)
+    } else {
+        // Keeping the print size can ask for more pixels than a document may have: refuse that
+        // rather than clamp, which would change the print size.
+        let max = crate::document_preset_cmds::MAX_DIMENSION;
+        let side = |v: u32| {
+            let n = (f64::from(v) * output / input).round().max(1.0);
+            if n > f64::from(max) {
+                return Err(bad(CMD, format!("{n} px across at {output} pixels/inch is more than {max} px; choose a lower Output resolution")));
+            }
+            Ok(n as u32)
+        };
+        (side(ow)?, side(oh)?)
+    };
+    if (nw, nh) != (ow, oh) {
+        // Besides the resampled document, the conversion holds an RGBA f32 composite (16 B/px; 32
+        // while it is laid over white), the gray plane (4) and the RGBA f32 output (16) at the new
+        // size: budget them all before allocating, not just the resample.
+        crate::image_cmds::check_working_budget(CMD, &d.doc, nw, nh, BITMAP_WORK_BYTES_PER_PX, ", or a lower Output resolution")?;
+    }
+    let dpi = output as f32;
+    let mut custom = None;
     let method = match str_or(p, "method", "diffusion") {
         "threshold" | "threshold50" => BitmapMethod::Threshold,
         "pattern" => BitmapMethod::Pattern,
         "diffusion" => BitmapMethod::Diffusion,
         "halftone" => {
-            let freq = num(p, "frequency", 53.0).clamp(1.0, 999.0);
-            BitmapMethod::Halftone { cell: (dpi / freq).max(2.0), angle: num(p, "angle", 45.0), shape: HalftoneShape::from_id(str_or(p, "shape", "round")) }
+            // Photoshop's Halftone Screen: frequency 1..999 lines/inch, angle -180..180 degrees.
+            let freq = finite_num(p, CMD, "frequency", 53.0)?.clamp(1.0, 999.0) as f32;
+            let angle = finite_num(p, CMD, "angle", 45.0)?;
+            if !(-180.0..=180.0).contains(&angle) {
+                return Err(bad(CMD, format!("angle {angle} is outside -180..180")));
+            }
+            let shape = HalftoneShape::from_id(str_or(p, "shape", "round")).ok_or_else(|| bad(CMD, "shape: round|ellipse|line|square|diamond|cross"))?;
+            // The screen is laid out at the output resolution.
+            BitmapMethod::Halftone { cell: (dpi / freq).max(2.0), angle: angle as f32, shape }
+        }
+        "customPattern" => {
+            custom = Some(custom_pattern_map(s, CMD, p)?);
+            BitmapMethod::Threshold
         }
         m => {
-            return Err(bad(CMD, format!("method `{m}` (threshold|pattern|diffusion|halftone)")));
+            return Err(bad(CMD, format!("method `{m}` (threshold|pattern|diffusion|halftone|customPattern)")));
         }
     };
+    if (nw, nh) != (ow, oh) {
+        // Color Sampler points scale with the pixels, as in Image Size.
+        let (sx, sy) = (f64::from(nw) / f64::from(ow.max(1)), f64::from(nh) / f64::from(oh.max(1)));
+        s.set_sampler_map(photocraft_geom::Affine { m: [sx, 0.0, 0.0, sy, 0.0, 0.0] });
+    }
     s.edit("Bitmap", |doc, active| {
+        if (nw, nh) != (doc.size.width, doc.size.height) {
+            crate::image_cmds::resample_doc(doc, nw, nh, photocraft_algo::resample::Resample::Bicubic);
+        }
+        doc.resolution_dpi = dpi;
         let px = composite(doc, true);
         let mut gray: Vec<f32> = px.iter().map(|q| photocraft_color::convert::rgb_to_gray([q[0], q[1], q[2]])).collect();
-        quantize::to_bitmap(&mut gray, doc.size.width as usize, method);
+        let w = doc.size.width as usize;
+        match &custom {
+            Some((map, mw, mh)) => quantize::to_bitmap_custom(&mut gray, w, map, *mw, *mh),
+            None => quantize::to_bitmap(&mut gray, w, method),
+        }
         let out: Vec<[f32; 4]> = gray.iter().map(|g| [*g, *g, *g, 1.0]).collect();
         single_layer(doc, active, ColorMode::Bitmap, &out, "Background", true);
         Ok(())
     })?;
-    Ok(Value::Null)
+    let size = s.active().ok_or(EngineError::NoDocument)?.doc.size;
+    Ok(json!({"width": size.width, "height": size.height, "resolution": dpi}))
 }
 
 // ---------- Duotone ----------
@@ -372,6 +523,10 @@ fn parse_inks(cmd: &str, v: &Value, n: usize) -> Result<Vec<DuotoneInk>> {
         if let Some(pts) = ink.get("curve").and_then(Value::as_array) {
             let mut curve: Vec<CurvePoint> =
                 pts.iter().filter_map(|p| Some(CurvePoint { input: p.get(0)?.as_f64()? as f32 / 100.0, output: p.get(1)?.as_f64()? as f32 / 100.0 })).collect();
+            // 1e39 is a valid JSON number but inf as f32, and a .pcraft with an inf curve can't be saved.
+            if curve.iter().any(|p| !p.input.is_finite() || !p.output.is_finite()) {
+                return Err(bad(cmd, "curve points must be finite numbers 0..100"));
+            }
             curve.sort_by(|a, b| a.input.total_cmp(&b.input));
             if curve.len() >= 2 {
                 d.curve = curve;
@@ -451,7 +606,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "image.mode.bitmap",
             "Bitmap…",
             ["Image", "Mode"],
-            r##"{"method":"diffusion|threshold|pattern|halftone"="diffusion","frequency":1..999=53,"angle":-180..180=45,"shape":"round|ellipse|line|square|diamond|cross"="round"} (halftone frequency in lines/inch; flattens)"##,
+            r##"{"resolution":1..30000=document,"method":"diffusion|threshold|pattern|halftone|customPattern"="diffusion","frequency":1..999=53,"angle":-180..180=45,"shape":"round|ellipse|line|square|diamond|cross"="round","pattern":id|name=Patterns panel selection} (resolution: Output in pixels/inch, resamples first; frequency/angle/shape: Halftone Screen, frequency in lines/inch; pattern: Custom Pattern; flattens)"##,
             |s| mode_is(s, &[ColorMode::Grayscale], "Bitmap needs a Grayscale image (Image › Mode › Grayscale first)"),
             bitmap
         ),

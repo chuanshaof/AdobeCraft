@@ -17,6 +17,8 @@ pub struct CameraInfo {
     pub focal_length: Option<f64>,
     /// 35 mm-equivalent focal length in millimetres.
     pub focal_length_35mm: Option<f64>,
+    /// DateTimeOriginal as stored (`YYYY:MM:DD HH:MM:SS`).
+    pub date_taken: Option<String>,
 }
 
 impl CameraInfo {
@@ -35,11 +37,11 @@ struct Tiff<'a> {
 
 impl Tiff<'_> {
     fn u16(&self, o: usize) -> Option<u16> {
-        let s = self.b.get(o..o + 2)?;
+        let s = self.b.get(o..o.checked_add(2)?)?;
         Some(if self.le { u16::from_le_bytes([s[0], s[1]]) } else { u16::from_be_bytes([s[0], s[1]]) })
     }
     fn u32(&self, o: usize) -> Option<u32> {
-        let s = self.b.get(o..o + 4)?;
+        let s = self.b.get(o..o.checked_add(4)?)?;
         let a = [s[0], s[1], s[2], s[3]];
         Some(if self.le { u32::from_le_bytes(a) } else { u32::from_be_bytes(a) })
     }
@@ -48,20 +50,25 @@ impl Tiff<'_> {
         let Some(n) = self.u16(off) else { return Vec::new() };
         (0..n as usize)
             .filter_map(|k| {
-                let e = off + 2 + k * 12;
-                Some((self.u16(e)?, self.u16(e + 2)?, self.u32(e + 4)?, e + 8))
+                // Checked: offsets come from the file, and usize is 32 bits on wasm.
+                let e = off.checked_add(2)?.checked_add(k * 12)?;
+                Some((self.u16(e)?, self.u16(e.checked_add(2)?)?, self.u32(e.checked_add(4)?)?, e.checked_add(8)?))
             })
             .collect()
     }
     fn data_at(&self, typ: u16, count: u32, field: usize) -> Option<usize> {
         let size = match typ {
-            1 | 2 | 6 | 7 => 1,
+            1 | 2 | 6 | 7 => 1usize,
             3 | 8 => 2,
             4 | 9 | 11 => 4,
             5 | 10 | 12 => 8,
             _ => return None,
-        } * count as usize;
-        if size <= 4 { Some(field) } else { self.u32(field).map(|v| v as usize) }
+        }
+        .checked_mul(usize::try_from(count).ok()?)?;
+        let at = if size <= 4 { field } else { usize::try_from(self.u32(field)?).ok()? };
+        // The whole value must lie inside the payload, not just its first element.
+        self.b.get(at..at.checked_add(size)?)?;
+        Some(at)
     }
     fn number(&self, typ: u16, count: u32, field: usize) -> Option<f64> {
         let at = self.data_at(typ, count, field)?;
@@ -69,26 +76,31 @@ impl Tiff<'_> {
             3 => self.u16(at).map(f64::from),
             4 => self.u32(at).map(f64::from),
             5 => {
-                let (n, d) = (self.u32(at)?, self.u32(at + 4)?);
+                let (n, d) = (self.u32(at)?, self.u32(at.checked_add(4)?)?);
                 (d != 0).then(|| n as f64 / d as f64)
             }
             10 => {
-                let (n, d) = (self.u32(at)? as i32, self.u32(at + 4)? as i32);
+                let (n, d) = (self.u32(at)? as i32, self.u32(at.checked_add(4)?)? as i32);
                 (d != 0).then(|| n as f64 / d as f64)
             }
             _ => None,
         }
     }
     fn text(&self, typ: u16, count: u32, field: usize) -> Option<String> {
+        #[cfg(test)]
+        TEXT_DECODES.with(|c| c.set(c.get() + 1));
         if typ != 2 {
             return None;
         }
         let at = self.data_at(typ, count, field)?;
-        let s = self.b.get(at..at + count as usize)?;
+        let s = self.b.get(at..at.checked_add(usize::try_from(count).ok()?)?)?;
         let s = String::from_utf8_lossy(s).trim_end_matches('\0').trim().to_string();
         (!s.is_empty()).then_some(s)
     }
 }
+
+#[cfg(test)]
+thread_local!(static TEXT_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) });
 
 /// Reads [`CameraInfo`] from a TIFF-structured EXIF payload (an `Exif\0\0` prefix is skipped).
 pub fn read(exif: &[u8]) -> CameraInfo {
@@ -110,14 +122,17 @@ pub fn read(exif: &[u8]) -> CameraInfo {
         seen.push(off);
         for (tag, typ, count, field) in t.ifd(off) {
             match tag {
-                0x010F => info.make = t.text(typ, count, field),
-                0x0110 => info.model = t.text(typ, count, field),
+                // Duplicate TIFF text tags can point at the same large payload. Keep the first
+                // recognized value and do not repeatedly decode/copy later duplicates.
+                0x010F if info.make.is_none() => info.make = t.text(typ, count, field),
+                0x0110 if info.model.is_none() => info.model = t.text(typ, count, field),
                 0x829A => info.exposure_time = t.number(typ, count, field),
                 0x829D => info.f_number = t.number(typ, count, field),
                 0x8827 => info.iso = t.number(typ, count, field),
                 0x920A => info.focal_length = t.number(typ, count, field),
                 0xA405 => info.focal_length_35mm = t.number(typ, count, field).filter(|v| *v > 0.0),
-                0xA434 => info.lens = t.text(typ, count, field),
+                0xA434 if info.lens.is_none() => info.lens = t.text(typ, count, field),
+                0x9003 if info.date_taken.is_none() => info.date_taken = t.text(typ, count, field),
                 0x8769 => {
                     if let Some(p) = t.u32(field) {
                         queue.push(p as usize);
@@ -160,6 +175,9 @@ pub fn build(info: &CameraInfo) -> Vec<u8> {
     }
     if let Some(v) = info.iso {
         exif.push((0x8827, 3, 1, (v as u16).to_le_bytes().to_vec()));
+    }
+    if let Some(s) = &info.date_taken {
+        exif.push((0x9003, 2, s.len() as u32 + 1, text(s)));
     }
     if let Some(v) = info.focal_length {
         exif.push((0x920A, 5, 1, rational(v)));
@@ -224,6 +242,7 @@ mod tests {
             iso: Some(200.0),
             focal_length: Some(35.0),
             focal_length_35mm: Some(52.0),
+            date_taken: Some("2024:02:17 12:40:19".into()),
         };
         let b = build(&info);
         let r = read(&b);
@@ -235,6 +254,96 @@ mod tests {
         assert_eq!(read(b"nonsense"), CameraInfo::default());
         for cut in [5, 12, 30, b.len() - 3] {
             let _ = read(&b[..cut]);
+        }
+    }
+
+    /// Hostile payloads: huge counts, offsets near `u32::MAX`, self-referencing IFDs and random
+    /// bytes read as `None` fields instead of panicking or overflowing (usize is 32 bits on wasm).
+    #[test]
+    fn duplicate_text_tags_keep_the_first_value_without_copying_large_duplicates() {
+        let value = vec![b'X'; 2 * 1024 * 1024];
+        let mut b = b"II*\0".to_vec();
+        b.extend_from_slice(&8u32.to_le_bytes());
+        // IFD0: Make="M", a duplicate Make pointing at a 2 MiB payload, and the Exif IFD link.
+        b.extend_from_slice(&3u16.to_le_bytes());
+        b.extend_from_slice(&0x010Fu16.to_le_bytes());
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.extend_from_slice(&2u32.to_le_bytes());
+        b.extend_from_slice(b"M\0\0\0");
+        b.extend_from_slice(&0x010Fu16.to_le_bytes());
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        b.extend_from_slice(&80u32.to_le_bytes());
+        b.extend_from_slice(&0x8769u16.to_le_bytes());
+        b.extend_from_slice(&4u16.to_le_bytes());
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&50u32.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        // Exif IFD at 50: DateTimeOriginal="D" and the same large duplicate payload at offset 80.
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.extend_from_slice(&0x9003u16.to_le_bytes());
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.extend_from_slice(&2u32.to_le_bytes());
+        b.extend_from_slice(b"D\0\0\0");
+        b.extend_from_slice(&0x9003u16.to_le_bytes());
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        b.extend_from_slice(&80u32.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&value);
+
+        TEXT_DECODES.with(|c| c.set(0));
+        let info = read(&b);
+        assert_eq!(info.make.as_deref(), Some("M"));
+        assert_eq!(info.date_taken.as_deref(), Some("D"));
+        // One decode per tag: duplicates must be skipped before `text` copies their payload.
+        assert_eq!(TEXT_DECODES.with(|c| c.get()), 2);
+    }
+
+    #[test]
+    fn hostile_payloads_never_panic() {
+        let entry = |tag: u16, typ: u16, count: u32, value: u32| {
+            let mut e = tag.to_le_bytes().to_vec();
+            e.extend_from_slice(&typ.to_le_bytes());
+            e.extend_from_slice(&count.to_le_bytes());
+            e.extend_from_slice(&value.to_le_bytes());
+            e
+        };
+        let mut b = b"II*\0".to_vec();
+        b.extend_from_slice(&8u32.to_le_bytes());
+        let entries = [
+            entry(0x010F, 2, u32::MAX, 8),      // Make: count far past the end
+            entry(0x0110, 2, 16, u32::MAX - 1), // Model: offset at the top of the range
+            entry(0x829A, 5, u32::MAX, 20),     // ExposureTime: count overflows the size
+            entry(0x829D, 5, 1, u32::MAX - 3),  // FNumber: rational straddles u32::MAX
+            entry(0x9003, 2, 0x4000_0000, 8),   // DateTimeOriginal: size overflow on 32 bits
+            entry(0x8769, 4, 1, 8),             // Exif IFD pointing back at IFD0
+            entry(0x8769, 4, 1, u32::MAX),      // ... and past the end
+        ];
+        b.extend_from_slice(&(entries.len() as u16 + 3).to_le_bytes()); // claims more entries than exist
+        for e in entries {
+            b.extend_from_slice(&e);
+        }
+        assert_eq!(read(&b), CameraInfo::default());
+        let mut be = b"MM\0*".to_vec();
+        be.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(read(&be), CameraInfo::default());
+        // Deterministic noise behind a valid header, and every truncation of a real payload.
+        let mut x = 0x2545_F491u32;
+        for _ in 0..200 {
+            let mut n = b"II*\0\x08\0\0\0".to_vec();
+            for _ in 0..96 {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                n.push(x as u8);
+            }
+            let _ = read(&n);
+        }
+        let good =
+            build(&CameraInfo { make: Some("Make".into()), date_taken: Some("2024:02:17 12:40:19".into()), exposure_time: Some(0.004), ..Default::default() });
+        for cut in 0..good.len() {
+            let _ = read(&good[..cut]);
         }
     }
 }

@@ -10,8 +10,9 @@
 use photocraft_color::BlendMode;
 use serde::{Deserialize, Serialize};
 
+use crate::curve::ResponseCurve;
 use crate::mixer::MixerSettings;
-use crate::tile::GrayTile;
+use crate::tile::{GrayTile, StoredTile};
 
 /// Largest brush diameter accepted by the rasterizer and brush controls.
 pub const MAX_BRUSH_SIZE: f32 = 5000.0;
@@ -51,20 +52,24 @@ pub struct Dynamic {
     pub fade_steps: u32,
     /// 0..1 floor the control/jitter may reduce the value to (minimum diameter, roundness, depth…).
     pub minimum: f32,
+    /// This dynamic's own response to its control (Fade, Pen Pressure, Pen Tilt, Stylus Wheel,
+    /// Rotation), applied after the global pen curve. Linear by default. Always written to JSON, so
+    /// a `tools.setBrush` patch can set it back to linear. Angle Jitter's controls ignore it.
+    pub curve: ResponseCurve,
 }
 
 impl Default for Dynamic {
     fn default() -> Self {
-        Self { jitter: 0.0, control: Control::Off, fade_steps: 25, minimum: 0.0 }
+        Self { jitter: 0.0, control: Control::Off, fade_steps: 25, minimum: 0.0, curve: ResponseCurve::LINEAR }
     }
 }
 
 impl Dynamic {
     pub const fn controlled(control: Control) -> Self {
-        Self { jitter: 0.0, control, fade_steps: 25, minimum: 0.0 }
+        Self { jitter: 0.0, control, fade_steps: 25, minimum: 0.0, curve: ResponseCurve::LINEAR }
     }
     pub const fn jitter(jitter: f32) -> Self {
-        Self { jitter, control: Control::Off, fade_steps: 25, minimum: 0.0 }
+        Self { jitter, control: Control::Off, fade_steps: 25, minimum: 0.0, curve: ResponseCurve::LINEAR }
     }
     pub fn is_active(&self) -> bool {
         self.jitter > 0.0 || self.control != Control::Off
@@ -72,7 +77,10 @@ impl Dynamic {
 }
 
 /// The brush tip bitmap source.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+///
+/// A loaded [`TipShape::Stored`] tip serialises as `sampled` (its full bitmap), so tool presets,
+/// recorded actions and `brush.get` see the same JSON as for an embedded tip.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TipShape {
     /// Computed round/elliptical tip (hardness, angle, roundness).
@@ -80,6 +88,50 @@ pub enum TipShape {
     Round,
     /// Sampled tip: grayscale bitmap where 1 = full paint. Scaled so its larger side equals `size`.
     Sampled(GrayTile),
+    /// A sampled tip its owner (the preset store) keeps outside the settings and loads on demand.
+    Stored(StoredTile),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+enum TipShapeOut<'a> {
+    Round,
+    Sampled(&'a GrayTile),
+    Stored(&'a StoredTile),
+}
+
+impl Serialize for TipShape {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            TipShape::Round => TipShapeOut::Round,
+            TipShape::Sampled(g) => TipShapeOut::Sampled(g),
+            TipShape::Stored(r) => match r.full.as_deref() {
+                Some(g) => TipShapeOut::Sampled(g),
+                None => TipShapeOut::Stored(r),
+            },
+        }
+        .serialize(s)
+    }
+}
+
+impl TipShape {
+    /// The bitmap a sampled tip paints with (a stored tip's full bitmap, or its preview while it
+    /// isn't loaded); `None` for a computed tip.
+    pub fn bitmap(&self) -> Option<&GrayTile> {
+        match self {
+            TipShape::Round => None,
+            TipShape::Sampled(g) => Some(g),
+            TipShape::Stored(r) => Some(r.bitmap()),
+        }
+    }
+    /// The tip's real pixel size (a stored tip's, not its preview's); `None` for a computed tip.
+    pub fn bitmap_size(&self) -> Option<(u32, u32)> {
+        match self {
+            TipShape::Round => None,
+            TipShape::Sampled(g) => Some((g.width, g.height)),
+            TipShape::Stored(r) => Some((r.width, r.height)),
+        }
+    }
 }
 
 /// Shape Dynamics.
@@ -158,11 +210,52 @@ pub enum PatternStyle {
 }
 
 /// A texture pattern: a procedural generator or an explicit grayscale tile (tiled infinitely).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// A loaded [`Pattern::Stored`] tile serialises as `tile`, like [`TipShape::Stored`].
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Pattern {
-    Procedural { style: PatternStyle, size: u32, seed: u32 },
+    Procedural {
+        style: PatternStyle,
+        size: u32,
+        seed: u32,
+    },
     Tile(GrayTile),
+    /// A tile its owner (the preset store) keeps outside the settings and loads on demand.
+    Stored(StoredTile),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+enum PatternOut<'a> {
+    Procedural { style: PatternStyle, size: u32, seed: u32 },
+    Tile(&'a GrayTile),
+    Stored(&'a StoredTile),
+}
+
+impl Serialize for Pattern {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Pattern::Procedural { style, size, seed } => PatternOut::Procedural { style: *style, size: *size, seed: *seed },
+            Pattern::Tile(g) => PatternOut::Tile(g),
+            Pattern::Stored(r) => match r.full.as_deref() {
+                Some(g) => PatternOut::Tile(g),
+                None => PatternOut::Stored(r),
+            },
+        }
+        .serialize(s)
+    }
+}
+
+impl Pattern {
+    /// The tile a bitmap pattern textures with (a stored tile's full bitmap, or its preview while
+    /// it isn't loaded); `None` for a procedural pattern.
+    pub fn bitmap(&self) -> Option<&GrayTile> {
+        match self {
+            Pattern::Procedural { .. } => None,
+            Pattern::Tile(g) => Some(g),
+            Pattern::Stored(r) => Some(r.bitmap()),
+        }
+    }
 }
 
 impl Default for Pattern {
@@ -182,7 +275,7 @@ pub struct Texture {
     pub scale: f32,
     /// -1..1 (Photoshop's -150..150 mapped to ±1).
     pub brightness: f32,
-    /// -1..1.
+    /// -1..1: Photoshop's -50..0 mapped to -1..0 and its 0..100 to 0..1.
     pub contrast: f32,
     /// Apply the texture to every dab (enables depth jitter) instead of once to the stroke.
     pub each_tip: bool,
@@ -191,6 +284,21 @@ pub struct Texture {
     pub depth: f32,
     /// Depth jitter / control (per tip only); `minimum` is Minimum Depth.
     pub depth_jitter: Dynamic,
+}
+
+impl Texture {
+    /// A pattern value (0..1) after Brightness, Contrast and Invert: the value the mode combines
+    /// with the brush. Measured against Photoshop (#3340): Brightness shifts the pattern by
+    /// `brightness / 255` (±150 moves it 150 levels of 255, not all the way to white or black);
+    /// positive Contrast steepens it around mid-grey by `1 / (1 − c/100)` after the shift (100 is
+    /// a threshold), negative Contrast flattens it by `1 + c/100` before the shift; Invert is last.
+    pub fn level(&self, v: f32) -> f32 {
+        let b = if self.brightness.is_finite() { self.brightness.clamp(-1.0, 1.0) * (150.0 / 255.0) } else { 0.0 };
+        let c = if self.contrast.is_finite() { self.contrast.clamp(-1.0, 1.0) } else { 0.0 };
+        let x = if c >= 0.0 { (v + b - 0.5) / (1.0 - c).max(1e-4) + 0.5 } else { (v - 0.5) * (1.0 + c / 2.0) + 0.5 + b };
+        let x = if x.is_finite() { x.clamp(0.0, 1.0) } else { 0.5 };
+        if self.invert { 1.0 - x } else { x }
+    }
 }
 
 impl Default for Texture {
@@ -302,9 +410,9 @@ pub struct SectionLocks {
     pub protect_texture: bool,
 }
 
-/// Brush Pose: stylus values used instead of (override) or for missing device data.
+/// Brush Pose: fixed values used for the selected stylus-component overrides.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[serde(from = "PoseWire", into = "PoseWire")]
 pub struct Pose {
     pub enabled: bool,
     /// Degrees, -90..90 (W3C Pointer Events convention).
@@ -314,7 +422,8 @@ pub struct Pose {
     pub rotation: f32,
     /// 0..1.
     pub pressure: f32,
-    pub override_tilt: bool,
+    pub override_tilt_x: bool,
+    pub override_tilt_y: bool,
     pub override_rotation: bool,
     pub override_pressure: bool,
 }
@@ -327,9 +436,84 @@ impl Default for Pose {
             tilt_y: 0.0,
             rotation: 0.0,
             pressure: 1.0,
-            override_tilt: false,
+            override_tilt_x: false,
+            override_tilt_y: false,
             override_rotation: false,
             override_pressure: false,
+        }
+    }
+}
+
+// Old presets used one combined flag. Keep that JSON input and readback while the
+// model has only the two independent sources of truth. Explicit axis fields win.
+#[derive(Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct PoseWire {
+    enabled: bool,
+    tilt_x: f32,
+    tilt_y: f32,
+    rotation: f32,
+    pressure: f32,
+    override_tilt: bool,
+    #[serde(default, deserialize_with = "pose_axis_bool")]
+    override_tilt_x: Option<bool>,
+    #[serde(default, deserialize_with = "pose_axis_bool")]
+    override_tilt_y: Option<bool>,
+    override_rotation: bool,
+    override_pressure: bool,
+}
+
+// Missing axis keys migrate from the old flag; a present null/non-boolean is an error.
+fn pose_axis_bool<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+    bool::deserialize(d).map(Some)
+}
+
+impl Default for PoseWire {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tilt_x: 0.0,
+            tilt_y: 0.0,
+            rotation: 0.0,
+            pressure: 1.0,
+            override_tilt: false,
+            override_tilt_x: None,
+            override_tilt_y: None,
+            override_rotation: false,
+            override_pressure: false,
+        }
+    }
+}
+
+impl From<PoseWire> for Pose {
+    fn from(p: PoseWire) -> Self {
+        Self {
+            enabled: p.enabled,
+            tilt_x: p.tilt_x,
+            tilt_y: p.tilt_y,
+            rotation: p.rotation,
+            pressure: p.pressure,
+            override_tilt_x: p.override_tilt_x.unwrap_or(p.override_tilt),
+            override_tilt_y: p.override_tilt_y.unwrap_or(p.override_tilt),
+            override_rotation: p.override_rotation,
+            override_pressure: p.override_pressure,
+        }
+    }
+}
+
+impl From<Pose> for PoseWire {
+    fn from(p: Pose) -> Self {
+        Self {
+            enabled: p.enabled,
+            tilt_x: p.tilt_x,
+            tilt_y: p.tilt_y,
+            rotation: p.rotation,
+            pressure: p.pressure,
+            override_tilt: p.override_tilt_x && p.override_tilt_y,
+            override_tilt_x: Some(p.override_tilt_x),
+            override_tilt_y: Some(p.override_tilt_y),
+            override_rotation: p.override_rotation,
+            override_pressure: p.override_pressure,
         }
     }
 }
@@ -338,6 +522,8 @@ impl Default for Pose {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Smoothing {
+    /// Switch smoothing off without discarding its amount or mode. Old presets remain enabled.
+    pub enabled: bool,
     /// 0..1.
     pub amount: f32,
     /// Lazy-mouse: paint only when the pointer pulls a string of `amount × 100 px` taut.
@@ -352,7 +538,7 @@ pub struct Smoothing {
 
 impl Default for Smoothing {
     fn default() -> Self {
-        Self { amount: 0.0, pulled_string: false, catch_up: true, catch_up_on_end: true, adjust_for_zoom: true }
+        Self { enabled: true, amount: 0.0, pulled_string: false, catch_up: true, catch_up_on_end: true, adjust_for_zoom: true }
     }
 }
 
@@ -381,6 +567,11 @@ pub struct BrushSettings {
     pub pressure_opacity: bool,
     /// Straight RGBA colour (display RGB). Commands fill it from the foreground colour.
     pub color: [f32; 4],
+    /// The inks `color` was picked as (its sRGB colour, the CMYK values), for a CMYK target: the
+    /// stroke paints exactly these, since an sRGB round trip does not give them back (#4344).
+    /// Only valid while `color` is that sRGB colour; ignored with Color Dynamics.
+    #[serde(skip)]
+    pub color_cmyk: Option<([f32; 3], [f32; 4])>,
     /// Background colour for Color Dynamics' foreground/background jitter.
     pub background: [f32; 4],
     /// Erase instead of paint.
@@ -397,6 +588,10 @@ pub struct BrushSettings {
     pub flip_y: bool,
     /// Pencil: no anti-aliasing (coverage is 0 or 1).
     pub aliased: bool,
+    /// With `aliased`, a square tip: every pixel of the dab's whole-pixel square
+    /// ([`crate::grid_square`]), whatever its angle or roundness. The Eraser's Block mode.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub square: bool,
     // --- dynamics sections ---
     pub shape_dynamics: ShapeDynamics,
     pub scattering: Scattering,
@@ -436,6 +631,7 @@ impl Default for BrushSettings {
             pressure_size: true,
             pressure_opacity: false,
             color: [0.0, 0.0, 0.0, 1.0],
+            color_cmyk: None,
             background: [1.0, 1.0, 1.0, 1.0],
             erase: false,
             mode: BlendMode::Normal,
@@ -445,6 +641,7 @@ impl Default for BrushSettings {
             flip_x: false,
             flip_y: false,
             aliased: false,
+            square: false,
             shape_dynamics: ShapeDynamics::default(),
             scattering: Scattering::default(),
             texture: Texture::default(),
@@ -466,6 +663,25 @@ impl Default for BrushSettings {
 }
 
 impl BrushSettings {
+    /// Resize the primary tip and keep an enabled Dual Brush tip at the same relative size.
+    /// An explicit Dual Brush size edit should bypass this and retain the requested diameter.
+    ///
+    /// As in Photoshop, the dual diameter is multiplied by the size ratio unrounded and only capped
+    /// at the top ([`MAX_BRUSH_SIZE`]): a 100 px brush with a 20 px dual tip shrunk to 1 px has a
+    /// 0.2 px dual tip and grows back to exactly 20 px. A sub-pixel floor here would lose the
+    /// proportion on the way back up (#4809); rendering bounds the diameter itself
+    /// ([`Self::bounded_for_render`]).
+    pub fn resize_with_dual_brush(&mut self, new_size: f32) {
+        if self.dual_brush.enabled && self.size.is_finite() && self.size > 0.0 && new_size.is_finite() && new_size > 0.0 {
+            let scaled = self.dual_brush.size * (new_size / self.size);
+            // NaN fails the comparison; infinity is capped.
+            if scaled > 0.0 {
+                self.dual_brush.size = scaled.min(MAX_BRUSH_SIZE);
+            }
+        }
+        self.size = new_size;
+    }
+
     /// Copy the settings with the primary and dual diameters and Scatter amounts constrained for
     /// rasterization.
     ///
@@ -548,10 +764,65 @@ impl BrushSettings {
 pub struct BrushPreset {
     pub name: String,
     pub brush: BrushSettings,
-    /// Shipped with Photocraft (built-ins can be deleted from a session but are regenerated on reset).
+    /// Shipped with PhotoCraft (built-ins can be deleted from a session but are regenerated on reset).
     #[serde(default)]
     pub builtin: bool,
     /// Preset group (folder) in the Brushes panel, e.g. "General" or an imported file's name.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub group: String,
+    /// Folders inside `group`, outermost first (empty = directly in the group), like the nested
+    /// folders of Photoshop's Brushes panel; e.g. an imported `.abr` file's own folders.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folder: Vec<String>,
+    /// What picking the preset brings besides the tip and its sections: the New Brush Preset
+    /// dialog's boxes.
+    #[serde(default, skip_serializing_if = "PresetCaptures::is_default")]
+    pub captures: PresetCaptures,
+}
+
+/// The New Brush Preset dialog's boxes, kept with the preset. The default is a preset made
+/// without the dialog (a built-in, an import, an older save): picking it brings its size and tool
+/// settings, as it always did, and leaves the foreground colour alone.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PresetCaptures {
+    /// Capture Brush Size in Preset. Off: picking the preset keeps the tool's size.
+    pub size: bool,
+    /// Include Tool Settings: the options bar's mode, opacity, flow and pressure buttons. Off:
+    /// picking the preset keeps the tool's.
+    pub tool_settings: bool,
+    /// Include Color: picking the preset sets the foreground colour to the brush's `color`.
+    pub color: bool,
+}
+
+impl Default for PresetCaptures {
+    fn default() -> Self {
+        Self { size: true, tool_settings: true, color: false }
+    }
+}
+
+impl PresetCaptures {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl BrushPreset {
+    /// The tool's brush once this preset is picked while `current` is the tool's brush: the
+    /// preset's brush ([`BrushSettings::picked_over`]), with the size and tool settings it didn't
+    /// capture left as they were.
+    pub fn picked_over(&self, current: &BrushSettings) -> BrushSettings {
+        let mut b = self.brush.clone().picked_over(current);
+        if !self.captures.size {
+            b.resize_with_dual_brush(current.size);
+        }
+        if !self.captures.tool_settings {
+            b.mode = current.mode;
+            b.opacity = current.opacity;
+            b.flow = current.flow;
+            b.pressure_size = current.pressure_size;
+            b.pressure_opacity = current.pressure_opacity;
+        }
+        b
+    }
 }

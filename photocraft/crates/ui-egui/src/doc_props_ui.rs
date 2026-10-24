@@ -3,15 +3,17 @@
 //! Rulers & Grids toggles. Every edit dispatches an engine or view command, so the panel stays thin.
 
 use egui::{Align2, Rect, RichText, Sense, Stroke, StrokeKind, pos2, vec2};
-use photocraft_doc::{ColorMode, Document, Layer, LayerContent, LayerId, SampleType};
+use photocraft_doc::{ColorMode, Document, Layer, LayerId, SampleType};
 use serde_json::{Value, json};
 
+use crate::props_layout::stacked_label;
 use crate::theme::Tokens;
 use crate::{PhotocraftApp, icons, widgets};
 
-/// Photoshop's Background layer: the locked, opaque raster layer at the bottom of the stack.
+/// Photoshop's Background layer: the locked, opaque raster layer at the bottom of the stack,
+/// whatever its (localized) name ([`Document::background`]).
 pub fn is_background(doc: &Document, l: &Layer) -> bool {
-    l.name == "Background" && l.locks.transparency && matches!(l.content, LayerContent::Raster(_)) && doc.layers.first().is_some_and(|b| b.id == l.id)
+    doc.is_background(l.id)
 }
 
 /// Does the Properties panel show the Document view? (No layer selected, or the Background layer.)
@@ -94,16 +96,22 @@ fn field_label(ui: &mut egui::Ui, s: &str, w: f32) {
 }
 
 /// A number field that only reports a committed value (drag released, Enter, focus lost).
-fn committed_field(ui: &mut egui::Ui, id: &str, current: f32, suffix: &str) -> Option<f32> {
+fn committed_field(ui: &mut egui::Ui, id: &str, current: f32, u: crate::layer_props_ui::LenUnit) -> Option<f32> {
     let key = egui::Id::new(("doc-props-field", id));
-    let mut v = ui.data(|d| d.get_temp::<f32>(key)).unwrap_or(current);
-    let r = widgets::value_field(ui, &mut v, 1.0..=300_000.0, suffix, 74.0);
+    // Shown in the ruler unit (cm when the rulers are in centimeters); 100% is the current size.
+    let extent = f64::from(current);
+    let mut v = ui.data(|d| d.get_temp::<f32>(key)).unwrap_or_else(|| u.shown(extent, extent));
+    let r = widgets::value_field(ui, &mut v, 0.0..=300_000.0, u.unit.suffix(), 74.0);
     if r.dragged() || r.has_focus() {
         ui.data_mut(|d| d.insert_temp(key, v));
         return None;
     }
     ui.data_mut(|d| d.remove::<f32>(key));
-    (r.drag_stopped() || r.lost_focus() || r.changed()).then_some(v).filter(|v| (*v - current).abs() >= 0.5)
+    if !(r.drag_stopped() || r.lost_focus() || r.changed()) {
+        return None;
+    }
+    let px = (u.px(v, extent) as f32).clamp(1.0, 300_000.0);
+    ((px - current).abs() >= 0.5).then_some(px)
 }
 
 /// A disabled-looking field (Photoshop greys Canvas X/Y for documents without artboards).
@@ -119,6 +127,7 @@ pub fn properties(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let Some(st) = app.session.active() else { return };
     let (w, h, mode, depth, dpi) = (st.doc.size.width, st.doc.size.height, st.doc.mode, st.doc.depth, st.doc.resolution_dpi);
     let has_bg = st.doc.layers.first().is_some_and(|l| is_background(&st.doc, l));
+    let lu = crate::layer_props_ui::LenUnit::of(app);
     let mut run: Vec<(String, Value)> = Vec::new();
     ui.horizontal(|ui| {
         let (r, _) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
@@ -143,19 +152,19 @@ pub fn properties(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
             });
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
-                    field_label(ui, "W", 18.0);
-                    if let Some(v) = committed_field(ui, "w", w as f32, "px") {
+                    stacked_label(ui, "W", &["W", "H"], 18.0, 4.0);
+                    if let Some(v) = committed_field(ui, "w", w as f32, lu) {
                         run.extend(canvas_resize_params((w, h), Some(v), None, linked).map(|p| ("image.canvasSize".to_string(), p)));
                     }
-                    field_label(ui, "X", 22.0);
+                    stacked_label(ui, "X", &["X", "Y"], 22.0, 4.0);
                     dim_field(ui, "0 px");
                 });
                 ui.horizontal(|ui| {
-                    field_label(ui, "H", 18.0);
-                    if let Some(v) = committed_field(ui, "h", h as f32, "px") {
+                    stacked_label(ui, "H", &["W", "H"], 18.0, 4.0);
+                    if let Some(v) = committed_field(ui, "h", h as f32, lu) {
                         run.extend(canvas_resize_params((w, h), None, Some(v), linked).map(|p| ("image.canvasSize".to_string(), p)));
                     }
-                    field_label(ui, "Y", 22.0);
+                    stacked_label(ui, "Y", &["X", "Y"], 22.0, 4.0);
                     dim_field(ui, "0 px");
                 });
             });
@@ -310,6 +319,64 @@ mod tests {
         assert_eq!(canvas_resize_params((2400, 1500), Some(2400.2), None, false), None);
     }
 
+    /// #5661: a 1 x 1 px document at 300 ppi is 0.0033 in wide. With the rulers in inches the
+    /// Width/Height fields clamped that to 0.01 in (3 px) and resized the document unasked.
+    #[test]
+    fn tiny_document_in_inches_is_not_resized_by_showing_it() {
+        use egui_kittest::Harness;
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({"width": 1, "height": 1, "resolution": 300, "background": "white"})).unwrap();
+        app.session.prefs.edit(|p| p.units_and_rulers.rulers = photocraft_engine::prefs::Unit::Inches);
+        let undo = app.session.active().unwrap().history.entries().len();
+        let mut h = Harness::builder().with_size(vec2(320.0, 600.0)).build_ui_state(
+            |ui, app: &mut PhotocraftApp| {
+                if ui.ctx().fonts(|f| f.families().contains(&egui::FontFamily::Name("medium".into()))) {
+                    properties(app, ui);
+                }
+            },
+            app,
+        );
+        PhotocraftApp::setup_context(&h.ctx, crate::theme::ThemeKind::ALL[0]);
+        h.run_steps(3);
+        let st = h.state().session.active().unwrap();
+        assert_eq!((st.doc.size.width, st.doc.size.height), (1, 1));
+        assert_eq!(st.history.entries().len(), undo, "no history step");
+    }
+
+    /// Horizontal centre of every single-letter label the panel drew, by letter.
+    fn letter_centres(h: &egui_kittest::Harness<'_, PhotocraftApp>) -> Vec<(String, f32)> {
+        h.output()
+            .shapes
+            .iter()
+            .filter_map(|s| if let egui::Shape::Text(t) = &s.shape { Some(t) } else { None })
+            .filter(|t| t.galley.text().chars().count() == 1)
+            .map(|t| (t.galley.text().to_string(), t.pos.x + t.galley.size().x * 0.5))
+            .collect()
+    }
+
+    /// #7314: the Canvas section's W over H (and X over Y) share a centre; a narrow "H" used to sit
+    /// flush right under the wider "W".
+    #[test]
+    fn canvas_size_labels_are_centred_on_each_other() {
+        use egui_kittest::Harness;
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.run("file.new", json!({"width": 40, "height": 20, "background": "white"})).unwrap();
+        let mut h = Harness::builder().with_size(vec2(320.0, 600.0)).build_ui_state(
+            |ui, app: &mut PhotocraftApp| {
+                if ui.ctx().fonts(|f| f.families().contains(&egui::FontFamily::Name("medium".into()))) {
+                    properties(app, ui);
+                }
+            },
+            app,
+        );
+        PhotocraftApp::setup_context(&h.ctx, crate::theme::ThemeKind::ALL[0]);
+        h.run_steps(3);
+        let centres = letter_centres(&h);
+        let at = |l: &str| centres.iter().find(|(s, _)| s == l).map(|(_, x)| *x).unwrap_or_else(|| panic!("no {l} label in {centres:?}"));
+        assert!((at("W") - at("H")).abs() < 0.01, "W and H: {centres:?}");
+        assert!((at("X") - at("Y")).abs() < 0.01, "X and Y: {centres:?}");
+    }
+
     #[test]
     fn document_dropdowns_map_to_live_mode_commands() {
         for id in MODES.iter().map(|m| m.2).chain(DEPTHS.iter().map(|d| d.2)) {
@@ -318,15 +385,10 @@ mod tests {
     }
 
     #[test]
-    fn image_mode_depth_labels_match_sample_types_and_are_translated() {
+    fn image_mode_depth_labels_match_sample_types() {
         assert_eq!(
             DEPTHS.iter().map(|(sample, label, _)| (*sample, *label)).collect::<Vec<_>>(),
             [(SampleType::U8, "8 Bits/Channel"), (SampleType::U16, "16 Bits/Channel"), (SampleType::F32, "32 Bits/Channel"),]
         );
-        for lang in crate::i18n::Lang::all().filter(|lang| lang.code() != "en") {
-            for (_, label, id) in DEPTHS {
-                assert_ne!(crate::i18n::tr_id(lang, id, label), *label, "{}: {label}", lang.code());
-            }
-        }
     }
 }

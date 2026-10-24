@@ -45,13 +45,45 @@ const IDS: [&str; 7] = [
     "view.show.showExtrasOptions",
 ];
 
+/// Window › Workspace items of saved workspaces: `window.workspace.saved.<index>`, an index into
+/// [`saved_names`].
+pub const SAVED: &str = "window.workspace.saved.";
+
 /// Menu ids handled here (live menu items).
 pub fn handles(id: &str) -> bool {
-    IDS.contains(&id)
+    IDS.contains(&id) || id.starts_with(SAVED)
+}
+
+/// Saved workspace names, in menu order.
+pub fn saved_names(app: &PhotocraftApp) -> Vec<String> {
+    app.session.prefs().workspaces.keys().cloned().collect()
+}
+
+fn saved_name(app: &PhotocraftApp, id: &str) -> Option<String> {
+    let i = id.strip_prefix(SAVED)?.parse::<usize>().ok()?;
+    app.session.prefs().workspaces.keys().nth(i).cloned()
+}
+
+/// The top-bar workspace switcher's options as (key, label): the presets, then saved workspaces.
+pub fn switcher_options(app: &PhotocraftApp) -> Vec<(String, String)> {
+    // Keys stay English (`apply_workspace` matches them); the dropdown shows the preset labels
+    // in the UI language.
+    let presets = [
+        ("Essentials", tl!("Essentials")),
+        ("Photography", tl!("Photography")),
+        ("Painting", tl!("Painting")),
+        ("Graphic and Web", tl!("Graphic and Web")),
+        ("Pixel Art", tl!("Pixel Art")),
+        ("Motion", tl!("Motion")),
+    ];
+    let mut opts: Vec<(String, String)> = presets.iter().map(|(k, l)| ((*k).to_string(), (*l).to_string())).collect();
+    opts.extend(saved_names(app).into_iter().map(|n| (n.clone(), n)));
+    opts
 }
 
 pub fn checked(app: &PhotocraftApp, id: &str) -> Option<bool> {
     match id {
+        i if i.starts_with(SAVED) => Some(saved_name(app, i).is_some_and(|n| n == app.ui.workspace)),
         "window.panel.modifierKeys" => Some(app.ui.shell.modifier_keys),
         "window.workspace.lockWorkspace" => Some(app.session.prefs().workspace_locked),
         "view.pixelAspectRatio.custom" => Some(app.ui.view.pixel_aspect.starts_with("custom:")),
@@ -140,6 +172,10 @@ pub fn menu(app: &mut PhotocraftApp, id: &str, params: &Value) -> Option<Result<
         }
         "window.workspace.deleteWorkspace" => delete_workspace(app, params),
         "window.workspace.select" => select_workspace(app, params),
+        i if i.starts_with(SAVED) => match saved_name(app, i) {
+            Some(name) => select_workspace(app, &json!({"name": name})),
+            None => Err(format!("no saved workspace for `{i}`")),
+        },
         "view.pixelAspectRatio.custom" if no_params(params) => open(app, "customPar", json!({"name": "", "ratio": 1.0})),
         "view.pixelAspectRatio.custom" => custom_par(app, params),
         "view.show.showExtrasOptions" if no_params(params) => {
@@ -174,7 +210,13 @@ fn new_workspace(app: &mut PhotocraftApp, p: &Value) -> Result<Value, String> {
         return Err(format!("\"{name}\" is a built-in workspace"));
     }
     let prefs = app.session.prefs().clone();
-    let mut ws = json!({"panels": app.ui.panels, "dockTabs": app.ui.dock_tabs, "dock": app.ui.dock});
+    let mut ws = json!({"panels": app.ui.panels, "dockTabs": app.ui.dock_tabs, "dock": app.ui.dock, "timelineOpen": app.ui.timeline.open, "docking": app.ui.docking, "dockingHidden": app.ui.docking_hidden, "dockingCollapsed": app.ui.docking_collapsed});
+    // The icon rail and menu bar flags belong to an embedding app's session, not to a saved
+    // layout: a workspace never brings back a window without its menus.
+    if let Some(panels) = ws.get_mut("panels").and_then(Value::as_object_mut) {
+        panels.remove("rail");
+        panels.remove("menu_bar");
+    }
     if p.get("keyboardShortcuts").and_then(Value::as_bool) == Some(true) {
         ws["shortcuts"] = json!(prefs.shortcuts);
     }
@@ -307,6 +349,29 @@ pub fn dialog_command(kind: &str, f: &Map<String, Value>) -> Option<(&'static st
     })
 }
 
+/// The title of a dialog kind.
+pub fn title(kind: &str) -> &'static str {
+    match kind {
+        "newWorkspace" => "New Workspace",
+        "deleteWorkspace" => "Delete Workspace",
+        "customPar" => "Save Pixel Aspect Ratio",
+        "preview32" => "32-bit Preview Options",
+        _ => "Show Extras Options",
+    }
+}
+
+/// OK on the open dialog (its button, or `ui.dialog.confirm {"dialog": "shell"}`): runs its
+/// command, then closes it; on an error the dialog stays open.
+pub fn confirm(app: &mut PhotocraftApp, ctx: &egui::Context) -> Result<Value, String> {
+    let (kind, f) = app.ui.shell.dialog.clone().ok_or("no dialog is open")?;
+    let (id, p) = dialog_command(&kind, &f).ok_or_else(|| format!("unknown dialog `{kind}`"))?;
+    let r = crate::menus::invoke(app, ctx, id, p);
+    if r.is_ok() {
+        app.ui.shell.dialog = None;
+    }
+    r
+}
+
 /// Draws the Modifier Keys panel and the open dialog.
 pub fn windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
     if app.ui.shell.modifier_keys {
@@ -336,13 +401,7 @@ pub fn windows(app: &mut PhotocraftApp, ctx: &egui::Context) {
 fn dialog(app: &mut PhotocraftApp, ctx: &egui::Context) {
     let Some((kind, mut f)) = app.ui.shell.dialog.clone() else { return };
     let t = Tokens::get(ctx);
-    let title = match kind.as_str() {
-        "newWorkspace" => "New Workspace",
-        "deleteWorkspace" => "Delete Workspace",
-        "customPar" => "Save Pixel Aspect Ratio",
-        "preview32" => "32-bit Preview Options",
-        _ => "Show Extras Options",
-    };
+    let title = title(&kind);
     let names: Vec<String> = app.session.prefs().workspaces.keys().cloned().collect();
     let mut result: Option<bool> = None;
     egui::Window::new(title).id(egui::Id::new("shell-dialog")).collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0)).show(
@@ -400,6 +459,9 @@ fn dialog(app: &mut PhotocraftApp, ctx: &egui::Context) {
                     number(ui, &mut f, "ratio", tl!("Factor:"), 0.1..=10.0);
                 }
                 "preview32" => {
+                    // A slider fills its available width. Keep its field above it, so the
+                    // field cannot grow an auto-sized window beyond that width each frame.
+                    ui.set_width((ctx.content_rect().width() - 32.0).clamp(0.0, 320.0));
                     let mut m = f.get("method").and_then(Value::as_str).unwrap_or("exposureGamma").to_string();
                     if crate::widgets::dropdown(
                         ui,
@@ -411,8 +473,12 @@ fn dialog(app: &mut PhotocraftApp, ctx: &egui::Context) {
                         f.insert("method".into(), json!(m));
                     }
                     ui.add_enabled_ui(m == "exposureGamma", |ui| {
-                        number(ui, &mut f, "exposure", tl!("Exposure:"), -20.0..=20.0);
-                        number(ui, &mut f, "gamma", tl!("Gamma:"), 0.1..=9.99);
+                        for (key, label, range) in [("exposure", tl!("Exposure:"), -20.0..=20.0), ("gamma", tl!("Gamma:"), 0.1..=9.99)] {
+                            let mut v = f.get(key).and_then(Value::as_f64).unwrap_or(0.0) as f32;
+                            if crate::widgets::slider_row(ui, label, &mut v, range, "", None).changed() {
+                                f.insert(key.into(), json!(v));
+                            }
+                        }
                     });
                 }
                 _ => {
@@ -440,15 +506,10 @@ fn dialog(app: &mut PhotocraftApp, ctx: &egui::Context) {
     );
     match result {
         Some(true) => {
-            if let Some((id, p)) = dialog_command(&kind, &f) {
-                match crate::menus::invoke(app, ctx, id, p) {
-                    Ok(_) => app.ui.shell.dialog = None,
-                    Err(e) => {
-                        app.ui.status = e;
-                        app.ui.status_error = true;
-                        app.ui.shell.dialog = Some((kind, f));
-                    }
-                }
+            app.ui.shell.dialog = Some((kind, f));
+            if let Err(e) = confirm(app, ctx) {
+                app.ui.status = e;
+                app.ui.status_error = true;
             }
         }
         Some(false) => app.ui.shell.dialog = None,
@@ -466,6 +527,83 @@ mod tests {
     }
 
     #[test]
+    fn saved_workspaces_preserve_host_chrome_on_select_and_reset() {
+        for (menu_bar, rail) in [(false, false), (false, true), (true, false), (true, true)] {
+            for legacy_flags in [false, true] {
+                let (mut app, ctx) = app();
+                app.ui.panels.history = true;
+                app.ui.panels.navigator = true;
+                app.ui.timeline.open = true;
+                crate::menus::invoke(&mut app, &ctx, "window.workspace.newWorkspace", json!({"name": "Host layout"})).unwrap();
+                let saved = app.session.prefs().workspaces["Host layout"].clone();
+                assert!(saved["panels"].get("menu_bar").is_none() && saved["panels"].get("rail").is_none());
+                if legacy_flags {
+                    app.session.prefs.edit(|p| {
+                        let panels = &mut p.workspaces.get_mut("Host layout").unwrap()["panels"];
+                        panels["menu_bar"] = json!(!menu_bar);
+                        panels["rail"] = json!(!rail);
+                    });
+                }
+                app.ui.panels.menu_bar = menu_bar;
+                app.ui.panels.rail = rail;
+                crate::menus::invoke(&mut app, &ctx, "window.workspace.painting", json!({})).unwrap();
+                crate::menus::invoke(&mut app, &ctx, "window.workspace.select", json!({"name": "Host layout"})).unwrap();
+                assert_eq!((app.ui.panels.menu_bar, app.ui.panels.rail), (menu_bar, rail), "select: legacy_flags={legacy_flags}");
+                let restored = json!({"dock": app.ui.dock, "dockTabs": app.ui.dock_tabs, "timelineOpen": app.ui.timeline.open});
+                for key in ["dock", "dockTabs", "timelineOpen"] {
+                    assert_eq!(restored[key], saved[key], "select restores {key}");
+                }
+                assert!(app.ui.panels.history && app.ui.panels.navigator);
+                app.ui.panels.menu_bar = !menu_bar;
+                app.ui.panels.rail = !rail;
+                app.ui.panels.history = false;
+                app.ui.panels.navigator = false;
+                app.ui.timeline.open = false;
+                crate::menus::invoke(&mut app, &ctx, "window.workspace.resetWorkspace", json!({})).unwrap();
+                assert_eq!((app.ui.panels.menu_bar, app.ui.panels.rail), (!menu_bar, !rail), "reset: legacy_flags={legacy_flags}");
+                let restored = json!({"dock": app.ui.dock, "dockTabs": app.ui.dock_tabs, "timelineOpen": app.ui.timeline.open});
+                for key in ["dock", "dockTabs", "timelineOpen"] {
+                    assert_eq!(restored[key], saved[key], "reset restores {key}");
+                }
+                assert!(app.ui.panels.history && app.ui.panels.navigator);
+            }
+        }
+    }
+
+    #[test]
+    fn saved_workspace_keeps_host_menu_and_rail_hidden_in_the_rendered_ui() {
+        let mut failures = Vec::new();
+        for theme in crate::theme::ThemeKind::ALL {
+            for width in [800.0, 1200.0] {
+                let builder = egui_kittest::Harness::builder().with_size(egui::vec2(width, 800.0)).with_max_steps(64);
+                let mut h = builder.build_eframe(move |cc| {
+                    PhotocraftApp::setup_context(&cc.egui_ctx, theme);
+                    let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+                    app.run("prefs.set", json!({"path": "interface.theme", "value": theme.id()})).unwrap();
+                    app.ui.theme = theme;
+                    app.ui.panels.menu_bar = false;
+                    app.ui.panels.rail = false;
+                    app
+                });
+                let ctx = h.ctx.clone();
+                crate::menus::invoke(h.state_mut(), &ctx, "window.workspace.newWorkspace", json!({"name": "Embedded"})).unwrap();
+                crate::menus::invoke(h.state_mut(), &ctx, "window.workspace.select", json!({"name": "Embedded"})).unwrap();
+                h.run_steps(4);
+                assert_eq!(h.state().ui.theme, theme, "the fixture renders the requested theme");
+                for name in ["title_bar", "rail"] {
+                    if egui::containers::panel::PanelState::load(&h.ctx, egui::Id::new(name)).is_some() {
+                        failures.push(format!("{theme:?}, width={width}: {name} is drawn"));
+                    }
+                }
+                if h.state().ui.panels.menu_bar || h.state().ui.panels.rail {
+                    failures.push(format!("{theme:?}, width={width}: host flags were overwritten"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "saved workspaces expose host chrome: {failures:?}");
+    }
+
+    #[test]
     fn new_select_delete_workspaces() {
         let (mut app, ctx) = app();
         let inv = |app: &mut PhotocraftApp, id: &str, p: Value| crate::menus::invoke(app, &ctx, id, p);
@@ -478,6 +616,8 @@ mod tests {
         });
         inv(&mut app, "window.workspace.newWorkspace", json!({"name": "Retouch", "keyboardShortcuts": true})).unwrap();
         assert_eq!(app.ui.workspace, "Retouch");
+        let saved = &app.session.prefs().workspaces["Retouch"]["panels"];
+        assert!(saved.get("menu_bar").is_none() && saved.get("rail").is_none(), "embedding-only flags are not saved");
         assert!(inv(&mut app, "window.workspace.newWorkspace", json!({"name": "Painting"})).is_err());
         assert!(inv(&mut app, "window.workspace.newWorkspace", json!({"name": " "})).is_err());
         // The current workspace can't be deleted.
@@ -503,6 +643,40 @@ mod tests {
         let mut s2 = photocraft_engine::Session::new();
         s2.load_prefs_json(&json).unwrap();
         assert!(s2.prefs().workspaces.contains_key("Mine"));
+    }
+
+    #[test]
+    fn saved_workspaces_are_listed_checked_and_selectable() {
+        let (mut app, ctx) = app();
+        let ws_items =
+            |app: &PhotocraftApp| crate::menus::menu_items(app).into_iter().filter(|i| i.path == ["Window", "Workspace"] && i.id != "---").collect::<Vec<_>>();
+        assert!(!ws_items(&app).iter().any(|i| i.id.starts_with(SAVED)));
+        app.ui.panels.history = true;
+        crate::menus::invoke(&mut app, &ctx, "window.workspace.newWorkspace", json!({"name": "Retouch"})).unwrap();
+        crate::menus::invoke(&mut app, &ctx, "window.workspace.newWorkspace", json!({"name": "Comp"})).unwrap();
+        // Listed right after the presets, in name order; only the current one is checked.
+        let items = ws_items(&app);
+        let motion = items.iter().position(|i| i.id == "window.workspace.motion").unwrap();
+        let saved: Vec<(&str, Option<bool>, bool)> = items[motion + 1..].iter().take(2).map(|i| (i.label.as_str(), i.checked, i.enabled)).collect();
+        assert_eq!(saved, [("Comp", Some(true), true), ("Retouch", Some(false), true)]);
+        assert!(items.iter().filter(|i| !i.id.starts_with(SAVED)).all(|i| i.checked != Some(true) || i.id == "window.workspace.lockWorkspace"));
+        assert!(crate::menus::is_live(&format!("{SAVED}1")));
+        // Switch to a preset, then back through the menu item.
+        crate::menus::invoke(&mut app, &ctx, "window.workspace.painting", json!({})).unwrap();
+        assert!(!app.ui.panels.history);
+        let retouch = ws_items(&app).into_iter().find(|i| i.label == "Retouch").unwrap();
+        crate::menus::invoke(&mut app, &ctx, &retouch.id, json!({})).unwrap();
+        assert_eq!(app.ui.workspace, "Retouch");
+        assert!(app.ui.panels.history);
+        assert_eq!(checked(&app, &retouch.id), Some(true));
+        // Stale or malformed ids fail instead of panicking.
+        for bad in ["9", "-1", "x", ""] {
+            assert!(crate::menus::invoke(&mut app, &ctx, &format!("{SAVED}{bad}"), json!({})).is_err(), "{bad}");
+        }
+        // The top-bar switcher lists them after the presets.
+        let keys: Vec<String> = switcher_options(&app).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys[6..], ["Comp", "Retouch"]);
+        assert!(keys.contains(&app.ui.workspace));
     }
 
     #[test]
@@ -581,6 +755,33 @@ mod tests {
         let after = serde_json::to_value(app.ui.view.show).unwrap();
         for (k, _) in extras_options() {
             assert_eq!(after[k].as_bool(), before[k].as_bool().map(|b| !b), "{k}");
+        }
+    }
+
+    #[test]
+    fn thirty_two_bit_preview_window_fits_and_stops_growing() {
+        use egui_kittest::{Harness, kittest::Queryable};
+
+        for (size, scale) in [(vec2(760.0, 480.0), 1.0), (vec2(420.0, 360.0), 2.0)] {
+            for theme in crate::theme::ThemeKind::ALL {
+                let (mut app, _) = app();
+                app.run("file.new", json!({"width": 20, "height": 20, "depth": 32})).unwrap();
+                let mut h = Harness::builder().with_size(size).with_pixels_per_point(scale).build_ui_state(|ui, app| windows(app, ui.ctx()), app);
+                PhotocraftApp::setup_context(&h.ctx, theme);
+                let ctx = h.ctx.clone();
+                crate::menus::invoke(h.state_mut(), &ctx, "view.thirtyTwoBitPreviewOptions", json!({})).unwrap();
+                h.run_steps(4);
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                let first = h.ctx.memory(|m| m.area_rect(egui::Id::new("shell-dialog"))).unwrap();
+                h.run_steps(20);
+                let last = h.ctx.memory(|m| m.area_rect(egui::Id::new("shell-dialog"))).unwrap();
+                assert!(screen.contains_rect(last), "{theme:?} at {size:?}: dialog {last:?} must fit");
+                assert!((last.width() - first.width()).abs() < 1.0, "{theme:?}: width grew from {first:?} to {last:?}");
+                for label in ["Exposure:", "Gamma:", "OK", "Cancel"] {
+                    let rect = h.get_by_label(label).rect();
+                    assert!(last.contains_rect(rect) && screen.contains_rect(rect), "{label} must remain visible: {rect:?}");
+                }
+            }
         }
     }
 

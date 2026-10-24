@@ -79,6 +79,52 @@ fn a_job_applies_as_one_undo_step_and_matches_the_inline_result() {
 }
 
 #[test]
+fn free_transform_runs_as_a_job_with_the_inline_result() {
+    let quad = json!({"quad": [[20, 10], [280, 30], [260, 190], [40, 170]]});
+    let mut inline = session(300, 200);
+    inline.execute("edit.transform", quad.clone()).unwrap();
+
+    let mut s = session(300, 200);
+    let steps = s.active().unwrap().history.past_len();
+    let id = job(s.start("edit.transform", quad).unwrap());
+    let e = wait_event(&mut s, id);
+    assert!(matches!(e.outcome, JobOutcome::Done(_)), "{e:?}");
+    assert_eq!(e.label, "Free Transform");
+    assert_eq!(s.active().unwrap().history.past_len(), steps + 1, "one undo step");
+    assert_eq!(pixels(&s), pixels(&inline), "same pixels as the synchronous command");
+}
+
+#[test]
+fn warp_runs_as_a_job_with_the_inline_result() {
+    let arc = json!({"style": "arc", "bend": 30});
+    let mut inline = session(300, 200);
+    inline.execute("edit.transform.warp", arc.clone()).unwrap();
+
+    let mut s = session(300, 200);
+    let steps = s.active().unwrap().history.past_len();
+    let id = job(s.start("edit.transform.warp", arc).unwrap());
+    let e = wait_event(&mut s, id);
+    assert!(matches!(e.outcome, JobOutcome::Done(_)), "{e:?}");
+    assert_eq!(e.label, "Warp");
+    assert_eq!(s.active().unwrap().history.past_len(), steps + 1, "one undo step");
+    assert_eq!(pixels(&s), pixels(&inline), "same pixels as the synchronous command");
+}
+
+#[test]
+fn a_cancelled_warp_leaves_the_document_unchanged() {
+    let mut s = session(1600, 1200);
+    let doc_before = s.active().unwrap().doc.clone();
+    let steps = s.active().unwrap().history.past_len();
+    let id = job(s.start("edit.transform.warp", json!({"style": "flag", "bend": 40})).unwrap());
+    assert!(s.cancel_job(id));
+    assert_eq!(wait_event(&mut s, id).outcome, JobOutcome::Cancelled);
+    s.join_cancelled_jobs();
+    let st = s.active().unwrap();
+    assert!(Arc::ptr_eq(&st.doc, &doc_before), "the document snapshot was not replaced");
+    assert_eq!(st.history.past_len(), steps);
+}
+
+#[test]
 fn cancel_leaves_the_document_byte_identical() {
     let mut s = session(1600, 1200);
     let doc_before = s.active().unwrap().doc.clone();
@@ -122,6 +168,23 @@ fn a_panic_in_the_worker_becomes_an_error_and_the_document_is_unchanged() {
     let JobOutcome::Failed(msg) = &e.outcome else { panic!("{e:?}") };
     assert!(msg.contains("internal error"), "{msg}");
     assert!(Arc::ptr_eq(&s.active().unwrap().doc, &doc_before));
+    // The session still works.
+    s.execute("filter.blur.gaussianBlur", json!({"radius": 1})).unwrap();
+}
+
+#[test]
+fn a_panic_in_a_command_becomes_an_error_and_the_document_is_unchanged() {
+    // REL-3: the last-resort guard in `jobs::dispatch` catches a panic that escapes `run`,
+    // reports it as an error and leaves the document (and its history) untouched.
+    let mut s = session(64, 64);
+    let doc_before = s.active().unwrap().doc.clone();
+    let (rev, steps) = (s.active().unwrap().revision, s.active().unwrap().history.past_len());
+    let msg = s.execute("test.panic", json!({})).unwrap_err().to_string();
+    assert!(msg.contains("internal error"), "{msg}");
+    assert!(msg.contains("test.panic"), "{msg}");
+    let st = s.active().unwrap();
+    assert!(Arc::ptr_eq(&st.doc, &doc_before), "the document snapshot was not replaced");
+    assert_eq!((st.revision, st.history.past_len()), (rev, steps));
     // The session still works.
     s.execute("filter.blur.gaussianBlur", json!({"radius": 1})).unwrap();
 }
@@ -221,6 +284,23 @@ fn a_running_job_locks_its_document_but_not_others() {
 }
 
 #[test]
+fn jobs_list_puts_running_jobs_before_ended_ones() {
+    let mut s = session(64, 64);
+    let gate = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let done = gated_job(&mut s, &gate);
+    assert!(matches!(wait_event(&mut s, done).outcome, JobOutcome::Done(_)));
+    // A second document, so the next job doesn't wait on the first one's.
+    s.execute("file.new", json!({"width": 8, "height": 8})).unwrap();
+    let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let running = gated_job(&mut s, &gate);
+    let r = s.execute("jobs.list", json!({})).unwrap();
+    let listed: Vec<_> = r["jobs"].as_array().unwrap().iter().map(|j| (j["id"].clone(), j["state"].clone())).collect();
+    assert_eq!(listed, [(json!(running.0), json!("running")), (json!(done.0), json!("done"))], "{r}");
+    gate.store(true, std::sync::atomic::Ordering::Relaxed);
+    wait_event(&mut s, running);
+}
+
+#[test]
 fn background_job_finishes_bookkeeping_on_edited_document_after_tab_switch() {
     let mut s = session(64, 64);
     let edited_doc = s.active().unwrap().doc.id;
@@ -270,6 +350,56 @@ fn background_job_finishes_bookkeeping_on_edited_document_after_tab_switch() {
 
     assert!(s.set_active(0));
     assert!(s.is_enabled("edit.fade"), "Fade must be available on the document that was edited");
+}
+
+/// #7382: a background filter on a targeted alpha channel or the Quick Mask, finished while another
+/// document is shown, leaves Fade on that channel of the edited document: at 0 % it restores the
+/// channel exactly and leaves the layer alone.
+#[test]
+fn background_filter_on_a_channel_fades_that_channel_after_a_tab_switch() {
+    use crate::edit_menu_cmds::FadeTarget;
+    for quick_mask in [false, true] {
+        let mut s = session(32, 24);
+        let edited_doc = s.active().unwrap().doc.id;
+        if quick_mask {
+            s.execute("select.editInQuickMaskMode", json!({"on": true})).unwrap();
+        } else {
+            s.execute("channel.new", json!({"fill": "black"})).unwrap();
+            s.execute("channel.target", json!({"channel": 0})).unwrap();
+        }
+        // A pattern for the blur to change.
+        s.edit("pattern", |doc, _| {
+            let c = if quick_mask { doc.quick_mask.as_mut() } else { doc.channels.first_mut() };
+            let c = c.ok_or_else(|| EngineError::Other("no channel".into()))?;
+            c.surface.fill_rect(photocraft_geom::Rect::new(0, 0, 32, 24), &[0.0]);
+            c.surface.fill_rect(photocraft_geom::Rect::new(8, 6, 20, 16), &[1.0]);
+            Ok(())
+        })
+        .unwrap();
+        let channel = |s: &Session, d: usize| {
+            let doc = &s.documents()[d].doc;
+            let c = if quick_mask { doc.quick_mask.as_ref() } else { doc.channels.first() };
+            let c = c.unwrap();
+            (0..24).flat_map(|y| (0..32).map(move |x| (x, y))).map(|(x, y)| c.surface.pixel(x, y)[0]).collect::<Vec<f32>>()
+        };
+        let layer = |s: &Session| {
+            let st = &s.documents()[0];
+            st.doc.layer(st.active_layer.unwrap()).unwrap().surface().unwrap().pixel(5, 5)
+        };
+        let (pattern, pixels) = (channel(&s, 0), layer(&s));
+        let id = job(s.start("filter.blur.gaussianBlur", json!({"radius": 2})).unwrap());
+        s.execute("file.new", json!({"width": 8, "height": 8})).unwrap();
+        let event = wait_event(&mut s, id);
+        assert!(matches!(event.outcome, JobOutcome::Done(_)), "{event:?}");
+        assert_ne!(channel(&s, 0), pattern, "quick mask {quick_mask}: the blur changed the channel");
+        let fade = s.edit_state.fade.clone().unwrap();
+        assert_eq!(fade.doc, edited_doc);
+        assert_eq!(fade.target, if quick_mask { FadeTarget::QuickMask } else { FadeTarget::Channel(0) });
+        assert!(s.set_active(0));
+        s.execute("edit.fade", json!({"opacity": 0})).unwrap();
+        assert_eq!(channel(&s, 0), pattern, "quick mask {quick_mask}: Fade at 0 % restores the channel");
+        assert_eq!(layer(&s), pixels, "quick mask {quick_mask}: the layer is left alone");
+    }
 }
 
 #[test]
@@ -322,6 +452,27 @@ fn content_aware_fill_and_scale_run_as_jobs() {
 }
 
 #[test]
+fn smart_filter_edits_run_as_jobs() {
+    let mut inline = session(160, 120);
+    let mut s = session(160, 120);
+    for t in [&mut inline, &mut s] {
+        t.execute("filter.convertForSmartFilters", json!({})).unwrap();
+        t.execute("filter.blur.gaussianBlur", json!({"radius": 3})).unwrap();
+        t.execute("filter.blur.motionBlur", json!({"angle": 45, "distance": 8})).unwrap();
+    }
+    inline.execute("layer.smartFilter.setVisible", json!({"index": 0})).unwrap();
+    let before = pixels(&s);
+    let steps = s.active().unwrap().history.past_len();
+    let id = job(s.start("layer.smartFilter.setVisible", json!({"index": 0})).unwrap());
+    let e = wait_event(&mut s, id);
+    assert!(matches!(e.outcome, JobOutcome::Done(_)), "{e:?}");
+    assert_eq!(s.active().unwrap().history.past_len(), steps + 1, "one undo step");
+    assert_eq!(pixels(&s), pixels(&inline), "same pixels as the synchronous command");
+    assert!(s.undo());
+    assert_eq!(pixels(&s), before);
+}
+
+#[test]
 fn content_aware_move_runs_as_a_job() {
     let mut inline = session(160, 120);
     let mut s = session(160, 120);
@@ -348,6 +499,27 @@ fn content_aware_move_runs_as_a_job() {
 }
 
 #[test]
+fn remove_runs_as_a_job() {
+    let mut inline = session(160, 120);
+    let mut s = session(160, 120);
+    let p = json!({"points": [[60, 50], [100, 70]], "size": 24});
+    inline.execute("paint.remove", p.clone()).unwrap();
+    let before = pixels(&s);
+    let id = job(s.start("paint.remove", p.clone()).unwrap());
+    let e = wait_event(&mut s, id);
+    let JobOutcome::Done(v) = &e.outcome else { panic!("{e:?}") };
+    assert!(v["damage"].is_array(), "{v}");
+    assert_eq!(pixels(&s), pixels(&inline), "same result as the synchronous command");
+    // Cancelled at once: the document stays as it was.
+    s.undo();
+    let id = job(s.start("paint.remove", p).unwrap());
+    assert!(s.cancel_job(id));
+    s.join_cancelled_jobs();
+    assert_eq!(wait_event(&mut s, id).outcome, JobOutcome::Cancelled);
+    assert_eq!(pixels(&s), before);
+}
+
+#[test]
 fn open_runs_as_a_job_and_cancel_adds_nothing() {
     let mut src = session(40, 30);
     let doc = (*src.active().unwrap().doc).clone();
@@ -369,6 +541,59 @@ fn open_runs_as_a_job_and_cancel_adds_nothing() {
 
     let id = job(s.start_open("missing.psd", OpenSource::Path("/no/such/file.psd".into())).unwrap());
     assert!(matches!(wait_event(&mut s, id).outcome, JobOutcome::Failed(_)));
+}
+
+/// Ask When Opening: a file whose profile doesn't match is decoded but not added; the shell takes
+/// it once the prompt is answered. Without Ask it opens as usual.
+#[test]
+fn an_open_that_asks_about_its_profile_holds_the_document_back() {
+    let mut src = session(8, 8);
+    let mut doc = (*src.active().unwrap().doc).clone();
+    doc.icc_profile = Some(photocraft_cms::Builtin::from_id("adobe-rgb-compat").unwrap().profile().to_bytes());
+    let bytes = Arc::new(photocraft_io::export(&doc, "x.png", &Default::default()).unwrap().bytes);
+    src.close(0);
+    let mut s = Session::new();
+    s.execute("edit.colorSettings", json!({"askOnMismatch": true, "policyRgb": "preserve"})).unwrap();
+    let id = job(s.start_open("x.png", OpenSource::Bytes(Arc::clone(&bytes))).unwrap());
+    let JobOutcome::Done(v) = wait_event(&mut s, id).outcome else { panic!() };
+    assert!(s.documents().is_empty(), "held back, not opened");
+    assert_eq!((v["color"]["mismatch"].as_bool(), v["color"]["ask"].as_bool(), v["color"]["action"].as_str()), (Some(true), Some(true), Some("preserve")));
+    let held = v["held"].as_u64().unwrap();
+    let (taken, _) = s.take_held_open(held).expect("the held document");
+    assert!(taken.icc_profile.is_some());
+    assert!(s.take_held_open(held).is_none(), "taken once");
+
+    s.execute("edit.colorSettings", json!({"askOnMismatch": false})).unwrap();
+    let id = job(s.start_open("x.png", OpenSource::Bytes(bytes)).unwrap());
+    let JobOutcome::Done(v) = wait_event(&mut s, id).outcome else { panic!() };
+    assert!(v.get("held").is_none());
+    assert_eq!(s.documents().len(), 1);
+}
+
+#[test]
+fn warm_layer_bounds_visits_every_layer_and_can_be_cancelled() {
+    let mut s = session(40, 30);
+    s.execute("layer.groupLayers", json!({})).unwrap();
+    s.execute("layer.new.layer", json!({})).unwrap();
+    let doc = s.active().unwrap().doc.clone();
+    fn count(layers: &[photocraft_doc::Layer]) -> usize {
+        layers.iter().map(|l| 1 + l.children().map_or(0, count)).sum()
+    }
+    assert!(doc.layers.iter().any(|l| l.children().is_some_and(|c| !c.is_empty())), "a group with a layer in it");
+    let mut checks = 0;
+    warm_layer_bounds(&doc, || {
+        checks += 1;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(checks, count(&doc.layers), "one check per layer, nested ones included");
+    let mut checks = 0;
+    let r = warm_layer_bounds(&doc, || {
+        checks += 1;
+        if checks > 1 { Err(EngineError::Cancelled) } else { Ok(()) }
+    });
+    assert!(matches!(r, Err(EngineError::Cancelled)));
+    assert_eq!(checks, 2, "stops at the first failed check");
 }
 
 #[test]
@@ -436,4 +661,69 @@ fn cancel_takes_effect_within_200_ms_on_24_mp() {
         eprintln!("{cmd}: worst cancel latency {worst:.1} ms");
         assert!(worst < 200.0, "{cmd}: cancel took {worst:.1} ms");
     }
+}
+
+#[test]
+fn an_inline_job_ctx_lets_another_thread_cancel_inline_work() {
+    // A live filter preview runs the filter inline in a private session; when the dialog's
+    // parameters change, the stale computation is cancelled through this context.
+    let mut s = session(96, 64);
+    let before = pixels(&s);
+    let revision = s.active().unwrap().revision;
+    let ctx = JobCtx::new();
+    ctx.cancel();
+    s.set_inline_job_ctx(Some(ctx.clone()));
+    for (id, p) in [("filter.blur.gaussianBlur", json!({"radius": 40})), ("filter.blur.motionBlur", json!({"distance": 40}))] {
+        assert!(matches!(s.execute(id, p), Err(EngineError::Cancelled)), "{id}");
+        assert_eq!(pixels(&s), before, "{id}: the document is unchanged");
+        assert_eq!(s.active().unwrap().revision, revision, "{id}: no edit recorded");
+    }
+    // Not cancelled: the same session runs as before.
+    s.set_inline_job_ctx(Some(JobCtx::new()));
+    s.execute("filter.blur.gaussianBlur", json!({"radius": 4})).unwrap();
+    assert_ne!(pixels(&s), before);
+    s.set_inline_job_ctx(None);
+    s.execute("filter.blur.gaussianBlur", json!({"radius": 2})).unwrap();
+}
+
+/// The command ids an action holds.
+fn action_steps(s: &mut Session, name: &str) -> Vec<String> {
+    let a = s.execute("actions.get", json!({"action": name})).unwrap();
+    a["steps"].as_array().unwrap().iter().map(|step| step[0].as_str().unwrap().to_string()).collect()
+}
+
+/// A job's result is recorded only by the recording it was started in: one started later keeps
+/// its own steps around it but doesn't pick up the older edit (#7289).
+#[test]
+fn a_job_lands_in_the_recording_it_was_started_in_only() {
+    // Started while recording A, applied after A stopped and B started.
+    let mut s = session(40, 30);
+    s.execute("actions.record", json!({"name": "A"})).unwrap();
+    let id = job(s.start("filter.blur.gaussianBlur", json!({"radius": 1})).unwrap());
+    s.execute("actions.stop", json!({})).unwrap();
+    s.execute("actions.record", json!({"name": "B"})).unwrap();
+    // B's own steps before and after the result lands stay in B (a new document, so the job's
+    // document is unchanged and its result applies).
+    s.execute("file.new", json!({"width": 8, "height": 8})).unwrap();
+    s.wait_job(id).unwrap();
+    s.execute("image.adjustments.desaturate", json!({})).unwrap();
+    s.execute("actions.stop", json!({})).unwrap();
+    assert!(action_steps(&mut s, "A").is_empty());
+    assert_eq!(action_steps(&mut s, "B"), ["file.new", "image.adjustments.desaturate"]);
+
+    // Started before any recording, applied while B records.
+    let mut s = session(40, 30);
+    let id = job(s.start("filter.blur.gaussianBlur", json!({"radius": 1})).unwrap());
+    s.execute("actions.record", json!({"name": "B"})).unwrap();
+    s.wait_job(id).unwrap();
+    s.execute("actions.stop", json!({})).unwrap();
+    assert!(action_steps(&mut s, "B").is_empty());
+
+    // Started and applied while A records: A has it, as before.
+    let mut s = session(40, 30);
+    s.execute("actions.record", json!({"name": "A"})).unwrap();
+    let id = job(s.start("filter.blur.gaussianBlur", json!({"radius": 1})).unwrap());
+    s.wait_job(id).unwrap();
+    s.execute("actions.stop", json!({})).unwrap();
+    assert_eq!(action_steps(&mut s, "A"), ["filter.blur.gaussianBlur"]);
 }

@@ -13,6 +13,9 @@ use serde_json::{Value, json};
 use crate::commands::CommandSpec;
 use crate::{EngineError, Result, Session};
 
+mod validation;
+pub(crate) use validation::validate_params;
+
 fn f(p: &Value, k: &str, d: f32) -> f32 {
     p.get(k).and_then(Value::as_f64).map_or(d, |v| v as f32)
 }
@@ -26,6 +29,10 @@ fn b(p: &Value, k: &str, d: bool) -> bool {
 }
 fn s<'a>(p: &'a Value, k: &str, d: &'a str) -> &'a str {
     p.get(k).and_then(Value::as_str).unwrap_or(d)
+}
+fn seed(p: &Value) -> u32 {
+    // New calls accept the entire documented u32 range; keep legacy record decoding otherwise.
+    p.get("seed").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).unwrap_or_else(|| i(p, "seed", 0) as u32)
 }
 fn undefined(p: &Value) -> UndefinedAreas {
     match s(p, "undefinedAreas", "wrap") {
@@ -45,7 +52,22 @@ fn preserve(p: &Value) -> Preserve {
 fn preset(id: &str) -> Option<(&'static str, FilterParams)> {
     Some(match id {
         "filter.blur.blur" => ("Blur", FilterParams::GaussianBlur { radius: 0.6 }),
-        "filter.blur.blurMore" => ("Blur More", FilterParams::GaussianBlur { radius: 1.4 }),
+        // Photoshop 27.11's Blur More is the 3×3 kernel [1 2 1; 2 2 2; 1 2 1] / 14 (its response
+        // to a single white pixel, exactly).
+        "filter.blur.blurMore" => (
+            "Blur More",
+            FilterParams::Custom {
+                kernel: vec![
+                    0.0, 0.0, 0.0, 0.0, 0.0, //
+                    0.0, 1.0, 2.0, 1.0, 0.0, //
+                    0.0, 2.0, 2.0, 2.0, 0.0, //
+                    0.0, 1.0, 2.0, 1.0, 0.0, //
+                    0.0, 0.0, 0.0, 0.0, 0.0,
+                ],
+                scale: 14.0,
+                offset: 0.0,
+            },
+        ),
         "filter.sharpen.sharpen" => ("Sharpen", FilterParams::UnsharpMask { amount: 60.0, radius: 0.5, threshold: 0.0 }),
         "filter.sharpen.sharpenMore" => ("Sharpen More", FilterParams::UnsharpMask { amount: 150.0, radius: 0.6, threshold: 0.0 }),
         "filter.sharpen.sharpenEdges" => ("Sharpen Edges", FilterParams::UnsharpMask { amount: 100.0, radius: 0.8, threshold: 6.0 }),
@@ -55,7 +77,8 @@ fn preset(id: &str) -> Option<(&'static str, FilterParams)> {
 }
 
 /// Builds the algorithm parameters for a filter command id from JSON params
-/// (Photoshop dialog units).
+/// (Photoshop dialog units). Stored smart filters and previews retain their tolerant decoding;
+/// new command invocations pass through `validate_params` before any document changes.
 pub fn params_for(id: &str, p: &Value) -> Option<FilterParams> {
     if let Some((_, fp)) = preset(id) {
         return Some(fp);
@@ -94,7 +117,7 @@ pub fn params_for(id: &str, p: &Value) -> Option<FilterParams> {
             amount: f(p, "amount", 12.5).clamp(0.1, 400.0),
             distribution: if s(p, "distribution", "uniform") == "gaussian" { Distribution::Gaussian } else { Distribution::Uniform },
             monochromatic: b(p, "monochromatic", false),
-            seed: i(p, "seed", 0) as u32,
+            seed: seed(p),
         },
         "filter.noise.median" => FilterParams::Median { radius: f(p, "radius", 1.0).clamp(1.0, 500.0) },
         "filter.noise.dustAndScratches" => {
@@ -131,7 +154,7 @@ pub fn params_for(id: &str, p: &Value) -> Option<FilterParams> {
                 _ => WaveType::Sine,
             },
             undefined: undefined(p),
-            seed: i(p, "seed", 0) as u32,
+            seed: seed(p),
         },
         "filter.distort.ripple" => FilterParams::Ripple {
             amount: f(p, "amount", 100.0).clamp(-999.0, 999.0),
@@ -151,8 +174,9 @@ pub fn params_for(id: &str, p: &Value) -> Option<FilterParams> {
 /// Runs filter command `id` with JSON `params` on `surf` (the pixel function behind every
 /// `filter.*` command; smart filters re-run it on re-render). `bounds` frames distortions;
 /// `selection` limits the result. Like layer filters, neighbourhood filters repeat the edge pixels
-/// of `canvas` ∪ the surface's content instead of fading in transparency, and the output is
-/// clipped to it. `None` for ids that aren't pixel filters.
+/// `None` for ids that aren't pixel filters. `Err` when the requesting session's authority denies
+/// the filter's params (an ambient path the session may not read): the caller must surface the
+/// error rather than render unfiltered pixels.
 pub fn apply_filter_to_surface(
     id: &str,
     params: &Value,
@@ -160,28 +184,36 @@ pub fn apply_filter_to_surface(
     bounds: photocraft_geom::Rect,
     selection: Option<&photocraft_raster::Surface>,
     canvas: photocraft_geom::Rect,
-) -> Option<photocraft_raster::Surface> {
+) -> Result<Option<photocraft_raster::Surface>> {
+    // Replays bypass command dispatch; nested paths must still obey the requesting session's
+    // authority, including adjustment LUTs and plug-ins, before any resolver can read them.
+    crate::jobs::authorize_render_command(id, params)?;
     // Liquify / Puppet Warp / Perspective Warp smart filters (distort_cmds).
     if let Some(out) = crate::distort_cmds::apply_to_surface(id, params, surf, canvas) {
-        return Some(out);
+        return Ok(Some(out));
     }
     // Lens Correction / Adaptive Wide Angle / Camera Raw smart filters (lens_cmds).
     if let Some(out) = crate::lens_cmds::apply_to_surface(id, params, surf, canvas) {
-        return Some(out);
+        return Ok(Some(out));
     }
     // Image › Adjustments recorded as smart filters (Levels, Curves, Shadows/Highlights… from PSD).
     if let Some(kind) = id.strip_prefix("image.adjustments.") {
-        return crate::adjust_cmds::adjust_as_filter(kind, params, surf);
+        return Ok(crate::adjust_cmds::adjust_as_filter(kind, params, surf));
     }
     // WebAssembly plug-in smart filters (plugin_cmds).
     if id == crate::plugin_cmds::RUN {
-        return crate::plugin_cmds::apply_to_surface(id, params, surf, selection, canvas);
+        return Ok(crate::plugin_cmds::apply_to_surface(id, params, surf, selection, canvas));
     }
-    let fp = params_for(id, params)?;
+    let Some(mut fp) = params_for(id, params) else { return Ok(None) };
+    // A map that can no longer be read (moved or deleted since) leaves the pixels alone, like an
+    // unknown filter; the command itself already refused an unreadable map when it was added.
+    if crate::filters_ext::resolve_map_path(&mut fp, params).is_err() {
+        return Ok(None);
+    }
     let sel_bounds = selection.map(photocraft_raster::Surface::content_bounds);
     let content = surf.content_bounds();
     let area = algo::output_area(&fp, content, bounds, sel_bounds);
-    Some(algo::apply_in(surf, &fp, area, bounds, selection, canvas.union(&content)))
+    Ok(Some(algo::apply_in(surf, &fp, area, bounds, selection, canvas.union(&content))))
 }
 
 pub(crate) fn has_filterable_layer(s: &Session) -> std::result::Result<(), String> {
@@ -200,8 +232,12 @@ pub(crate) fn has_filterable_layer(s: &Session) -> std::result::Result<(), Strin
 }
 
 pub(crate) fn run_filter(s: &mut Session, id: &str, p: &Value) -> Result<Value> {
+    validate_params(id, p)?;
     // Session state some filters read (colours) becomes explicit params; external inputs resolve here.
-    let prepared = crate::filters_ext::prepare(s, id, p);
+    let mut prepared = crate::filters_ext::prepare(s, id, p);
+    if id == "filter.distort.displace" {
+        prepared = crate::filters_ext::displace_request(&prepared);
+    }
     let p = &prepared;
     let mut fp = params_for(id, p).ok_or_else(|| EngineError::Other(format!("unknown filter {id}")))?;
     crate::filters_ext::resolve(s, &mut fp, p)?;
@@ -229,30 +265,60 @@ pub(crate) fn run_filter(s: &mut Session, id: &str, p: &Value) -> Result<Value> 
             };
             let selection = doc.selection.clone();
             let sel_bounds = selection.as_ref().map(photocraft_raster::Surface::content_bounds);
-            // Distortions centre on the selection when there is one, else the canvas.
+            // Distortions centre on the selection when there is one, else the canvas. Clouds and
+            // Fibers place and size their pattern by the canvas either way; the selection masks them.
             let doc_bounds = doc.bounds();
-            let bounds = sel_bounds.filter(|b| !b.is_empty()).unwrap_or(doc_bounds);
+            let bounds = if fp.sizes_by_canvas() { doc_bounds } else { sel_bounds.filter(|b| !b.is_empty()).unwrap_or(doc_bounds) };
             // Neighbourhood filters repeat edge pixels at the canvas edge (or past it, where the
             // layer has off-canvas pixels) instead of fading in transparency, as Photoshop does.
             if let Some(surf) = crate::channel_cmds::channel_surface_for_filter(doc, Some(layer), &p)? {
-                let content = surf.content_bounds();
+                let content = doc_bounds.union(&surf.content_bounds());
                 let area = algo::output_area(&fp, content, bounds, sel_bounds);
                 *surf = filter(surf, &fp, area, bounds, selection.as_ref(), doc_bounds.union(&content))?;
                 return Ok(fp.clone());
+            }
+            // Filters that make pixels transparent (Color to Alpha) turn the Background into a
+            // normal layer first, as the erasers do: it can't hold transparency.
+            if fp.makes_transparency() {
+                crate::extra_cmds::background_to_layer_for_mask(doc, layer);
             }
             let locks = doc.effective_locks(layer);
             let l = doc.layer_mut(layer).ok_or(EngineError::NoLayer(layer))?;
             if locks.pixels || locks.all {
                 return Err(EngineError::Other(format!("Could not complete your request because the layer \"{}\" is locked", l.name)));
             }
+            // Putting the old alpha back (below) would leave unmixed colours fully opaque.
+            if locks.transparency && fp.makes_transparency() && matches!(l.content, LayerContent::Raster(_)) {
+                return Err(EngineError::Other(format!("Could not complete your request because the transparency of layer \"{}\" is locked", l.name)));
+            }
             let mut fp = fp.clone();
             crate::filters_ext::resolve_in_layer(&mut fp, l, bounds);
             let surf = match &mut l.content {
                 LayerContent::Raster(surf) => surf,
                 LayerContent::Smart(_) => {
+                    // A smart filter re-renders from its params alone, without the document's
+                    // channels, so Lens Blur's alpha-channel depth would be lost (#7400).
+                    if matches!(fp, FilterParams::LensBlur { depth: algo::DepthSource::Channel, .. }) {
+                        return Err(EngineError::Other("Lens Blur can't read an alpha channel as depth on a Smart Object: rasterize the layer first".into()));
+                    }
+                    // A smart filter re-renders from its params alone: a Displace map read from an
+                    // open document, which the re-render can't read again, is kept in them, as
+                    // Photoshop embeds it (#7423). A `mapPath` stays a path, read next to the
+                    // document on each re-render.
+                    let params = match &fp {
+                        FilterParams::Displace { map: Some(map), .. }
+                            if photocraft_io::smart_map::displace_embedded_map(&params).is_none() && crate::filters_ext::map_path(&params).is_none() =>
+                        {
+                            photocraft_io::smart_map::displace_embed_map(&params, map).ok_or_else(|| {
+                                EngineError::Other(
+                                    "Displace: the displacement map is too large to keep in a Smart Object's filter: rasterize the layer first".into(),
+                                )
+                            })?
+                        }
+                        _ => params.clone(),
+                    };
                     // Non-destructive: record the filter and re-render the smart object from its source.
-                    let sf =
-                        SmartFilter { command: id.clone(), params: params.clone(), blend: photocraft_color::BlendMode::Normal, opacity: 1.0, visible: true };
+                    let sf = SmartFilter { command: id.clone(), params, blend: photocraft_color::BlendMode::Normal, opacity: 1.0, visible: true };
                     return crate::smart_cmds::add_smart_filter(doc, layer, sf, selection.as_ref()).map(|()| fp);
                 }
                 _ => return Err(EngineError::Other("not a pixel layer".into())),
@@ -262,7 +328,7 @@ pub(crate) fn run_filter(s: &mut Session, id: &str, p: &Value) -> Result<Value> 
             let area = algo::output_area(&fp, content, bounds, sel_bounds);
             *surf = filter(surf, &fp, area, bounds, selection.as_ref(), doc_bounds.union(&content))?;
             if let Some(before) = &before {
-                keep_alpha(before, surf);
+                keep_alpha(before, surf, &|| ctx.cancelled())?;
             }
             Ok(fp)
         },
@@ -271,25 +337,56 @@ pub(crate) fn run_filter(s: &mut Session, id: &str, p: &Value) -> Result<Value> 
 }
 
 /// Lock transparency: put the layer's alpha back after a filter, in the tiles it changed.
-fn keep_alpha(old: &photocraft_raster::Surface, new: &mut photocraft_raster::Surface) {
+///
+/// The tiles are independent, so they are fixed in parallel, each in a scratch surface of its
+/// own, and `cancelled` is asked before each one: on a 24 MP layer (a Background, whose
+/// transparency is locked) a serial pass took about 400 ms that a cancelled job had to sit out
+/// (#6205). `Err(Cancelled)` leaves `new` holding all its tiles, some of them not yet fixed.
+pub(crate) fn keep_alpha(old: &photocraft_raster::Surface, new: &mut photocraft_raster::Surface, cancelled: &(dyn Fn() -> bool + Sync)) -> Result<()> {
+    use photocraft_raster::Surface;
+    use rayon::prelude::*;
     if old.format() != new.format() || !new.format().alpha {
-        return;
+        return Ok(());
     }
     let mut coords: Vec<_> = new.tiles().filter(|(c, t)| old.tile(**c).is_none_or(|o| !std::sync::Arc::ptr_eq(o, t))).map(|(c, _)| *c).collect();
     coords.extend(old.tiles().filter(|(c, _)| new.tile(**c).is_none()).map(|(c, _)| *c));
-    let n = new.channels();
-    for c in coords {
-        let r = c.rect();
-        let o = old.read_region(r);
-        let mut v = new.read_region(r);
-        for (pn, po) in v.chunks_exact_mut(n).zip(o.chunks_exact(n)) {
-            if let (Some(a), Some(b)) = (pn.last_mut(), po.last()) {
-                *a = *b;
+    let (fmt, n) = (new.format(), new.channels());
+    let default = new.default_pixel();
+    // Each changed tile alone in a surface (a tile `new` lacks is taken as its default pixel, as
+    // `write_region` would create it).
+    let mut tiles: Vec<(photocraft_geom::Rect, Surface)> = coords
+        .iter()
+        .map(|c| {
+            let mut s = Surface::with_default(fmt, &default);
+            s.put_tiles(new.take_tiles(c.rect()));
+            (c.rect(), s)
+        })
+        .collect();
+    let fixed = tiles
+        .par_iter_mut()
+        .map(|(r, s)| {
+            if cancelled() {
+                return false;
             }
-        }
-        new.write_region(r, &v);
+            let o = old.read_region(*r);
+            let mut v = s.read_region(*r);
+            for (pn, po) in v.chunks_exact_mut(n).zip(o.chunks_exact(n)) {
+                if let (Some(a), Some(b)) = (pn.last_mut(), po.last()) {
+                    *a = *b;
+                }
+            }
+            s.write_region(*r, &v);
+            true
+        })
+        .reduce(|| true, |a, b| a && b);
+    for (_, s) in tiles {
+        new.put_tiles(s.tiles().map(|(c, t)| (*c, t.clone())));
+    }
+    if !fixed {
+        return Err(EngineError::Cancelled);
     }
     new.prune();
+    Ok(())
 }
 
 macro_rules! filter_cmd {
@@ -392,7 +489,7 @@ pub fn specs() -> Vec<CommandSpec> {
 /// The most recent filter command in the session journal, retargeted at the active layer: dialogs
 /// such as the Filter Gallery record the layer they ran on, and Last Filter applies to the
 /// current layer, as in Photoshop (#1270).
-fn last_filter(s: &Session) -> Option<(String, Value)> {
+pub fn last_filter(s: &Session) -> Option<(String, Value)> {
     let (id, mut params) = s.journal.iter().rev().find(|(id, _)| params_for(id, &Value::Null).is_some() && id.starts_with("filter.")).cloned()?;
     if let Value::Object(m) = &mut params {
         m.remove("layer");
@@ -416,6 +513,29 @@ mod tests {
         let d = s.active().unwrap();
         let l = d.doc.layer(d.active_layer.unwrap()).unwrap();
         l.surface().unwrap().read_region(photocraft_geom::Rect::new(0, 0, 48, 32))
+    }
+
+    fn mask_session(reveal_selection: bool) -> Session {
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 16, "height": 16, "background": "#ff0000"})).unwrap();
+        if reveal_selection {
+            s.execute("select.all", json!({})).unwrap();
+            s.execute("layer.layerMask.revealSelection", json!({})).unwrap();
+        } else {
+            s.execute("layer.layerMask.revealAll", json!({})).unwrap();
+        }
+        s
+    }
+
+    fn mask_pixels(s: &Session) -> Vec<f32> {
+        let d = s.active().unwrap();
+        let mask = d.doc.layer(d.active_layer.unwrap()).unwrap().mask.as_ref().unwrap();
+        mask.surface.read_region(d.doc.bounds())
+    }
+
+    fn canvas_pixels(s: &Session) -> Vec<f32> {
+        let d = s.active().unwrap();
+        d.doc.layer(d.active_layer.unwrap()).unwrap().surface().unwrap().read_region(d.doc.bounds())
     }
 
     fn paint_pattern(s: &mut Session) {
@@ -545,6 +665,68 @@ mod tests {
     }
 
     #[test]
+    fn solarize_and_add_noise_process_untouched_reveal_all_masks() {
+        for (id, params) in [
+            ("filter.stylize.solarize", json!({"target": "mask"})),
+            ("filter.noise.addNoise", json!({"amount": 100, "seed": 1, "monochromatic": true, "target": "mask"})),
+        ] {
+            let mut reveal_all = mask_session(false);
+            let mut reveal_selection = mask_session(true);
+            let all_mask = reveal_all.active().unwrap().doc.layer(reveal_all.active().unwrap().active_layer.unwrap()).unwrap().mask.as_ref().unwrap();
+            assert!(all_mask.surface.content_bounds().is_empty(), "{id}: Reveal All stores its white canvas in the default pixel");
+            let initial_all = mask_pixels(&reveal_all);
+            let initial_selection = mask_pixels(&reveal_selection);
+            assert_eq!(initial_all, initial_selection, "{id}: masks start with equal white values");
+            assert_eq!(initial_all, vec![1.0; 16 * 16], "{id}: the full canvas starts revealed");
+            let pixels_before = canvas_pixels(&reveal_all);
+
+            reveal_all.execute(id, params.clone()).unwrap();
+            reveal_selection.execute(id, params).unwrap();
+
+            let actual = mask_pixels(&reveal_all);
+            let expected = mask_pixels(&reveal_selection);
+            assert!(
+                actual == expected,
+                "{id}: Reveal All differs from Reveal Selection: first={:?}/{:?}, changed pixels={}/{}",
+                actual[0],
+                expected[0],
+                actual.iter().filter(|&&v| v != 1.0).count(),
+                expected.iter().filter(|&&v| v != 1.0).count()
+            );
+            assert_eq!(canvas_pixels(&reveal_all), pixels_before, "{id}: the mask target must leave layer pixels unchanged");
+            if id == "filter.stylize.solarize" {
+                assert!(actual.iter().all(|&v| v == 0.0), "Solarize maps the white mask to black");
+            } else {
+                assert!(actual.iter().any(|&v| v != 1.0), "seeded Add Noise changes the Reveal All mask");
+            }
+        }
+    }
+
+    #[test]
+    fn minimum_signed_offset_matches_its_wrapped_distance() {
+        for depth in [8, 16, 32] {
+            let make_session = || {
+                let mut s = Session::new();
+                s.execute("file.new", json!({"width": 48, "height": 32, "depth": depth})).unwrap();
+                s.execute("layer.new.layer", json!({})).unwrap();
+                paint_pattern(&mut s);
+                s
+            };
+            let mut actual = make_session();
+            let before = active_pixels(&actual);
+            actual.execute("filter.other.offset", json!({"horizontal": i32::MIN, "vertical": i32::MIN})).unwrap();
+            let mut expected = make_session();
+            expected.execute("filter.other.offset", json!({"horizontal": i32::MIN.rem_euclid(48), "vertical": i32::MIN.rem_euclid(32)})).unwrap();
+            let after = active_pixels(&actual);
+            assert_eq!(after, active_pixels(&expected), "depth {depth}");
+            assert_ne!(after, before);
+            actual.execute("edit.undo", json!({})).unwrap();
+            assert_eq!(active_pixels(&actual), before);
+            actual.execute("edit.redo", json!({})).unwrap();
+            assert_eq!(active_pixels(&actual), after);
+        }
+    }
+    #[test]
     fn huge_offsets_clamp_instead_of_wrapping() {
         // 3e9 wrapped to a negative offset through `as i32`; it saturates now, so it
         // equals the maximal in-range offset instead of shifting the other way.
@@ -570,6 +752,31 @@ mod tests {
         paint_pattern(&mut s2);
         s2.execute("filter.other.offset", json!({"horizontal": 6})).unwrap();
         assert_eq!(active_pixels(&s2), twice);
+    }
+
+    #[test]
+    fn recorded_last_filter_replays_the_filter_it_repeated() {
+        // #3089: the action holds the filter with its settings, not a "repeat whatever ran
+        // last" step that fails in a new session.
+        let mut s = session();
+        paint_pattern(&mut s);
+        s.execute("filter.other.offset", json!({"horizontal": 3})).unwrap();
+        s.execute("actions.record", json!({"name": "Again"})).unwrap();
+        s.execute("filter.lastFilter", json!({})).unwrap();
+        s.execute("actions.stop", json!({})).unwrap();
+        let steps = s.execute("actions.get", json!({"action": "Again"})).unwrap()["steps"].clone();
+        assert_eq!(steps, json!([["filter.other.offset", {"horizontal": 3}]]));
+        let action = s.actions.list[0].clone();
+
+        let mut fresh = session();
+        paint_pattern(&mut fresh);
+        fresh.actions.list.push(action);
+        let played = fresh.execute("actions.play", json!({"action": "Again"})).unwrap();
+        assert!(played.get("failed").is_none(), "{played}");
+        let mut direct = session();
+        paint_pattern(&mut direct);
+        direct.execute("filter.other.offset", json!({"horizontal": 3})).unwrap();
+        assert_eq!(active_pixels(&fresh), active_pixels(&direct));
     }
 
     #[test]
@@ -651,6 +858,7 @@ mod tests {
             let l = Layer::new(
                 "so",
                 LayerContent::Smart(SmartObject {
+                    contents_id: photocraft_doc::SmartContentsId::fresh(),
                     source: SmartSource::Linked { path: String::new() },
                     transform: photocraft_geom::Affine::IDENTITY,
                     smart_filters: vec![],
@@ -674,5 +882,136 @@ mod tests {
         assert_eq!(sm.smart_filters[0].command, "filter.blur.gaussianBlur");
         assert_eq!(sm.smart_filters[0].params["radius"], json!(2));
         assert!(sm.cache.as_ref().unwrap().pixel(10, 5)[3] > 0.0, "cache was blurred");
+    }
+
+    /// The serial `keep_alpha` before #6205, kept as the oracle for the parallel one.
+    fn keep_alpha_serial(old: &photocraft_raster::Surface, new: &mut photocraft_raster::Surface) {
+        if old.format() != new.format() || !new.format().alpha {
+            return;
+        }
+        let mut coords: Vec<_> = new.tiles().filter(|(c, t)| old.tile(**c).is_none_or(|o| !std::sync::Arc::ptr_eq(o, t))).map(|(c, _)| *c).collect();
+        coords.extend(old.tiles().filter(|(c, _)| new.tile(**c).is_none()).map(|(c, _)| *c));
+        let n = new.channels();
+        for c in coords {
+            let r = c.rect();
+            let o = old.read_region(r);
+            let mut v = new.read_region(r);
+            for (pn, po) in v.chunks_exact_mut(n).zip(o.chunks_exact(n)) {
+                if let (Some(a), Some(b)) = (pn.last_mut(), po.last()) {
+                    *a = *b;
+                }
+            }
+            new.write_region(r, &v);
+        }
+        new.prune();
+    }
+
+    /// A layer before and after a filter: tiles the filter changed, one it left shared, one it
+    /// emptied (only in `old`) and one it added (only in `new`).
+    fn alpha_pair(sample: photocraft_color::SampleType) -> (photocraft_raster::Surface, photocraft_raster::Surface) {
+        use photocraft_geom::Rect;
+        use photocraft_raster::Surface;
+        let fmt = photocraft_color::PixelFormat { mode: photocraft_color::ColorMode::Rgb, sample, alpha: true };
+        let pattern = |r: Rect, k: f32| -> Vec<f32> {
+            (0..r.width() as usize * r.height() as usize * 4).map(|i| ((i as f32 * 0.37 + k).sin() * 0.5 + 0.5).clamp(0.0, 1.0)).collect()
+        };
+        let mut old = Surface::new(fmt);
+        let r = Rect::new(-40, -20, 700, 300);
+        old.write_region(r, &pattern(r, 0.0));
+        let mut new = old.clone();
+        let changed = Rect::new(-40, -20, 400, 300);
+        new.write_region(changed, &pattern(changed, 1.3));
+        let emptied = photocraft_geom::TileCoord::containing(600, 100).rect();
+        drop(new.take_tiles(emptied));
+        let added = Rect::new(800, 0, 900, 50);
+        new.write_region(added, &pattern(added, 2.1));
+        (old, new)
+    }
+
+    #[test]
+    fn keep_alpha_matches_the_serial_pass_at_every_depth() {
+        use photocraft_color::SampleType;
+        for sample in [SampleType::U8, SampleType::U16, SampleType::F32] {
+            let (old, new) = alpha_pair(sample);
+            let mut want = new.clone();
+            keep_alpha_serial(&old, &mut want);
+            let mut got = new.clone();
+            keep_alpha(&old, &mut got, &|| false).unwrap();
+            assert!(got == want, "{sample:?}: parallel keep_alpha differs from the serial pass");
+            assert_ne!(got, new, "{sample:?}: alpha was put back");
+        }
+    }
+
+    #[test]
+    fn keep_alpha_stops_when_cancelled_and_keeps_the_tiles() {
+        let (old, new) = alpha_pair(photocraft_color::SampleType::U8);
+        let mut got = new.clone();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let cancel = || calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 2;
+        assert!(matches!(keep_alpha(&old, &mut got, &cancel), Err(EngineError::Cancelled)));
+        // The cancel was seen inside the pass (after some tiles), and no tile went missing.
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) > 2);
+        assert!(new.tiles().all(|(c, _)| got.tile(*c).is_some()));
+    }
+
+    /// #7423: Displace on a Smart Object keeps its map (read from an open document) in the smart
+    /// filter, as Photoshop embeds it, so the filter displaces and keeps displacing when the
+    /// object re-renders. A map chosen again replaces it.
+    #[test]
+    fn displace_on_a_smart_object_embeds_its_map() {
+        let mut s = Session::new();
+        // Documents 0 and 1: a white and a black displacement map.
+        s.execute("file.new", json!({"width": 8, "height": 8, "background": "white"})).unwrap();
+        s.execute("file.new", json!({"width": 8, "height": 8, "background": "black"})).unwrap();
+        s.execute("file.new", json!({"width": 48, "height": 32, "background": "transparent"})).unwrap();
+        s.edit("square", |doc, active| {
+            let fmt = doc.pixel_format();
+            let surf = doc.layer_mut(active.unwrap()).unwrap().surface_mut().unwrap();
+            surf.fill_rect(photocraft_geom::Rect::new(10, 10, 20, 12), &photocraft_raster::from_rgba(&fmt, [1.0, 0.0, 0.0, 1.0]));
+            Ok(())
+        })
+        .unwrap();
+        s.execute("layer.smartObjects.convertToSmartObject", json!({})).unwrap();
+        let original = {
+            let d = s.active().unwrap();
+            let LayerContent::Smart(sm) = &d.doc.layer(d.active_layer.unwrap()).unwrap().content else { panic!("not a smart object") };
+            sm.cache.as_ref().unwrap().read_region(d.doc.bounds())
+        };
+        let smart = |s: &Session| {
+            let d = s.active().unwrap();
+            let LayerContent::Smart(sm) = &d.doc.layer(d.active_layer.unwrap()).unwrap().content else { panic!("not a smart object") };
+            (sm.smart_filters[0].params.clone(), sm.cache.as_ref().unwrap().read_region(d.doc.bounds()))
+        };
+        let first_value = |params: &Value| photocraft_io::smart_map::displace_embedded_map(params).expect("an embedded map").data[0];
+
+        s.execute("filter.distort.displace", json!({"horizontal": 10, "vertical": 0, "mapDocument": 0})).unwrap();
+        let (params, displaced) = smart(&s);
+        assert!(params.get("mapDocument").is_none(), "{params}");
+        assert_eq!(first_value(&params), 1.0, "the white map");
+        assert_ne!(displaced, original, "the smart object is displaced");
+        // Re-rendered from its params alone (the filter hidden and shown again): still displaced.
+        s.execute("layer.smartFilter.setVisible", json!({"index": 0, "visible": false})).unwrap();
+        assert_eq!(smart(&s).1, original);
+        s.execute("layer.smartFilter.setVisible", json!({"index": 0, "visible": true})).unwrap();
+        assert_eq!(smart(&s).1, displaced);
+
+        // Another map chosen for the filter replaces the embedded one.
+        s.execute("layer.smartFilter.setParams", json!({"index": 0, "params": {"mapDocument": 1}})).unwrap();
+        let (params, again) = smart(&s);
+        assert!(params.get("mapDocument").is_none(), "{params}");
+        assert_eq!(first_value(&params), 0.0, "the black map");
+        assert_ne!(again, displaced, "displaced the other way");
+
+        // The stored params passed back whole (the old embedded map included) with another map
+        // named: the named map wins, for the filter's own edit and for a new Displace alike.
+        let mut back = params.as_object().unwrap().clone();
+        back.insert("mapDocument".into(), json!(0));
+        s.execute("layer.smartFilter.setParams", json!({"index": 0, "params": back.clone()})).unwrap();
+        assert_eq!(first_value(&smart(&s).0), 1.0, "the white map, not the embedded black one");
+        back.insert("mapDocument".into(), json!(1));
+        s.execute("filter.distort.displace", Value::Object(back)).unwrap();
+        let d = s.active().unwrap();
+        let LayerContent::Smart(sm) = &d.doc.layer(d.active_layer.unwrap()).unwrap().content else { panic!("not a smart object") };
+        assert_eq!(first_value(&sm.smart_filters[1].params), 0.0, "the black map, not the passed-back white one");
     }
 }

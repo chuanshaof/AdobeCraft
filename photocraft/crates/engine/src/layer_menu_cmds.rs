@@ -5,7 +5,7 @@
 
 use photocraft_algo::selection::Region;
 use photocraft_color::{BlendMode, ColorMode};
-use photocraft_doc::{BlendIf, BlendRange, Document, Effect, Knockout, Layer, LayerContent, LayerId, LayerMask, SmartSource, StackMode};
+use photocraft_doc::{BlendIf, BlendRange, Document, Effect, Effects, Knockout, Layer, LayerContent, LayerId, LayerMask, SmartSource, StackMode};
 use photocraft_geom::Rect;
 use photocraft_raster::{Surface, from_rgba_into, to_rgba};
 use serde_json::{Value, json};
@@ -127,13 +127,33 @@ fn edit_rgba(s: &mut Session, label: &str, grow: i32, f: impl FnOnce(&mut Vec<[f
 fn apply_mask(s: &mut Session, p: &Value) -> Result<Value> {
     let id = layer_param(s, p)?;
     s.edit("Apply Layer Mask", |doc, _| {
+        // Applying a feathered mask must bake the same softened coverage the compositor
+        // displays. LayerMask::values_into accounts for density but not feather (#3044).
+        let feathered = {
+            let layer = doc.layer(id).ok_or(EngineError::NoLayer(id))?;
+            if layer.mask.as_ref().is_some_and(|m| m.enabled && photocraft_compose::masks::feather_sigma(m.feather) > 0.0) {
+                // Do not bake an independent vector mask that remains attached after Apply.
+                let mut mask_only = layer.clone();
+                mask_only.vector_mask = None;
+                // Cover off-canvas pixels too: outside its area the combined mask is only the
+                // mask's default value, which would hide moved-off content (#3043).
+                let area = layer.surface().map_or(doc.bounds(), |surf| doc.bounds().union(&surf.content_bounds()));
+                photocraft_compose::masks::combined_mask(&mask_only, area)
+            } else {
+                None
+            }
+        };
         let mask = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?.mask.take().ok_or_else(|| other("the layer has no layer mask"))?;
         let surf = crate::commands::paint_surface(doc, id, &Value::Null)?;
         let r = surf.content_bounds();
         if !r.is_empty() {
             let mut px = read_rgba(surf, r);
             let mut m = Vec::new();
-            mask.values_into(r, &mut m);
+            if let Some(ref softened) = feathered {
+                softened.read_region_into(r, &mut m);
+            } else {
+                mask.values_into(r, &mut m);
+            }
             for (q, k) in px.iter_mut().zip(&m) {
                 q[3] *= k;
             }
@@ -148,10 +168,12 @@ fn apply_mask(s: &mut Session, p: &Value) -> Result<Value> {
 fn mask_from_transparency(s: &mut Session, p: &Value) -> Result<Value> {
     let id = layer_param(s, p)?;
     s.edit("From Transparency", |doc, _| {
-        let bounds = doc.bounds();
+        let depth = doc.depth;
         let surf = crate::commands::paint_surface(doc, id, &Value::Null)?;
-        let r = surf.content_bounds().intersect(&bounds);
-        let mut mask = LayerMask::hide_all();
+        // Masks are attached to layer coordinates, including pixels temporarily off-canvas.
+        // Clipping to document bounds loses their alpha permanently when moved back (#3043).
+        let r = surf.content_bounds();
+        let mut mask = crate::commands::mask_at_depth(LayerMask::hide_all(), depth)?;
         if !r.is_empty() {
             let mut px = read_rgba(surf, r);
             let alpha: Vec<f32> = px.iter().map(|q| q[3]).collect();
@@ -162,6 +184,7 @@ fn mask_from_transparency(s: &mut Session, p: &Value) -> Result<Value> {
             }
             write_rgba(surf, r, &px);
         }
+        crate::extra_cmds::background_to_layer_for_mask(doc, id);
         doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?.mask = Some(mask);
         Ok(Value::Null)
     })
@@ -169,7 +192,7 @@ fn mask_from_transparency(s: &mut Session, p: &Value) -> Result<Value> {
 
 /// Layer › Layer Mask › Hide Selection: a mask that hides the selected area.
 fn hide_selection(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = layer_param(s, p)?;
+    let ids = crate::layer_multi_cmds::mask_targets(s, p)?;
     s.edit("Add Layer Mask", |doc, _| {
         let sel = doc.selection.clone().ok_or_else(|| other("no selection"))?;
         let bounds = doc.bounds();
@@ -177,11 +200,14 @@ fn hide_selection(s: &mut Session, p: &Value) -> Result<Value> {
         for x in &mut v {
             *x = 1.0 - *x;
         }
-        let mut mask = LayerMask::reveal_all();
+        let mut mask = crate::commands::mask_at_depth(LayerMask::reveal_all(), doc.depth)?;
         mask.surface.write_region(bounds, &v);
         mask.surface.prune();
-        crate::extra_cmds::background_to_layer_for_mask(doc, id);
-        doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?.mask = Some(mask);
+        for id in ids {
+            crate::commands::check_all_unlocked(doc, id)?;
+            crate::extra_cmds::background_to_layer_for_mask(doc, id);
+            doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?.mask = Some(mask.clone());
+        }
         doc.selection = None;
         Ok(Value::Null)
     })
@@ -194,6 +220,7 @@ fn mask_all_objects(s: &mut Session, p: &Value) -> Result<Value> {
     let id = layer_param(s, p)?;
     let d = s.active().ok_or(EngineError::NoDocument)?;
     let doc = d.doc.clone();
+    crate::commands::check_all_unlocked(&doc, id)?;
     let layer = doc.layer(id).ok_or(EngineError::NoLayer(id))?;
     let region: Option<Region> = match layer.surface() {
         Some(surf) if matches!(layer.content, LayerContent::Raster(_)) => {
@@ -212,10 +239,11 @@ fn mask_all_objects(s: &mut Session, p: &Value) -> Result<Value> {
     let region = region.ok_or_else(|| other("no objects were found"))?;
     let bbox = region.bbox;
     s.edit("Mask All Objects", |doc, _| {
-        let mut mask = LayerMask::hide_all();
+        let mut mask = crate::commands::mask_at_depth(LayerMask::hide_all(), doc.depth)?;
         let v: Vec<f32> = region.mask.iter().map(|m| f32::from(*m) / 255.0).collect();
         mask.surface.write_region(bbox, &v);
         mask.surface.prune();
+        crate::extra_cmds::background_to_layer_for_mask(doc, id);
         doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?.mask = Some(mask);
         Ok(())
     })?;
@@ -350,23 +378,57 @@ fn reveal_in_finder(s: &mut Session, p: &Value) -> Result<Value> {
     let SmartSource::Linked { path } = &sm.source else {
         return Err(other("embedded smart objects have no file to reveal"));
     };
-    let (program, args) = reveal_command(path);
-    if p.get("dryRun").and_then(Value::as_bool).unwrap_or(false) {
+    // The path is stored in the document: shown only when it would be followed.
+    let file =
+        crate::doc_path::resolve_in(path, d.path.as_deref().map(std::path::Path::new)).map_err(|why| crate::doc_path::refusal("the linked file", path, why))?;
+    reveal(&file.to_string_lossy(), p.get("dryRun").and_then(Value::as_bool).unwrap_or(false))
+}
+
+/// Show `path` in the platform file manager ([`reveal_command`] + [`spawn`]); `dry_run` answers
+/// the program and arguments instead (tests). Shared by the smart-object command and the document
+/// tab's Reveal in Finder (UI-217-6).
+pub(crate) fn reveal(path: &str, dry_run: bool) -> Result<Value> {
+    let (program, args) = reveal_command(path)?;
+    if dry_run {
         return Ok(json!({"program": program, "args": args}));
     }
+    ensure_folder(program, &args)?;
     spawn(program, &args)?;
     Ok(json!({"path": path}))
 }
 
+/// `xdg-open` opens whatever it is given in its default application, so it only gets a folder: a
+/// linked path such as `tool.jar/a.png` would otherwise launch `tool.jar` instead of showing it.
+fn ensure_folder(program: &str, args: &[String]) -> Result<()> {
+    if program != "xdg-open" {
+        return Ok(());
+    }
+    match args.first() {
+        Some(dir) if std::path::Path::new(dir).is_dir() => Ok(()),
+        Some(dir) => Err(other(format!("{dir} is not a folder, so it can't be shown in the file manager"))),
+        None => Err(other("no folder to show in the file manager")),
+    }
+}
+
 /// The file-manager invocation that selects `path` on this platform.
-pub fn reveal_command(path: &str) -> (&'static str, Vec<String>) {
-    if cfg!(target_os = "macos") {
-        ("open", vec!["-R".into(), path.into()])
-    } else if cfg!(target_os = "windows") {
-        ("explorer", vec![format!("/select,{path}")])
-    } else {
-        let parent = std::path::Path::new(path).parent().map_or_else(|| ".".to_string(), |p| p.to_string_lossy().into_owned());
-        ("xdg-open", vec![parent])
+pub fn reveal_command(path: &str) -> Result<(&'static str, Vec<String>)> {
+    reveal_command_on(std::env::consts::OS, path)
+}
+
+/// [`reveal_command`] on the platform `os` (a `std::env::consts::OS` value).
+fn reveal_command_on(os: &str, path: &str) -> Result<(&'static str, Vec<String>)> {
+    match os {
+        // `--` ends the options: a path starting with `-` is not read as one.
+        "macos" => Ok(("open", vec!["-R".into(), "--".into(), path.into()])),
+        // Explorer splits `/select,` arguments at commas and reads quotes itself, so such a path
+        // would select something else.
+        "windows" if path.contains([',', '"']) => Err(other(format!("{path} can't be shown in Explorer: its path contains a comma or a quotation mark"))),
+        // Keep the switch outside the path's quotes: Explorer parses its own command line.
+        "windows" => Ok(("explorer", vec!["/select,".into(), path.replace('/', "\\")])),
+        _ => {
+            let parent = std::path::Path::new(path).parent().map_or_else(|| ".".to_string(), |p| p.to_string_lossy().into_owned());
+            Ok(("xdg-open", vec![parent]))
+        }
     }
 }
 
@@ -582,8 +644,14 @@ fn blend_range(v: &Value) -> Option<BlendRange> {
 
 fn global_light(s: &mut Session, p: &Value) -> Result<Value> {
     let cur = s.active().ok_or(EngineError::NoDocument)?.doc.global_light;
-    let angle = num(p, "angle", cur.angle);
-    let altitude = num(p, "altitude", cur.altitude).clamp(0.0, 90.0);
+    // Read as f64 and reject what f32 can't hold: 1e39 would become inf, and rem_euclid NaN.
+    let f32_param = |key: &str, default: f32| match p.get(key).and_then(Value::as_f64) {
+        None => Ok(default),
+        Some(v) if v.is_finite() && v.abs() <= f64::from(f32::MAX) => Ok(v as f32),
+        Some(_) => Err(bad("layer.layerStyle.globalLight", format!("{key} must be a finite number"))),
+    };
+    let angle = f32_param("angle", cur.angle)?;
+    let altitude = f32_param("altitude", cur.altitude)?.clamp(0.0, 90.0);
     let angle = (angle + 180.0).rem_euclid(360.0) - 180.0;
     s.edit("Global Light", |doc, _| {
         doc.global_light.angle = angle;
@@ -603,6 +671,68 @@ fn scale_effects(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(())
     })?;
     Ok(Value::Null)
+}
+
+/// Dragging a layer's fx onto another layer in the Layers panel: all its effects (or just the one
+/// at `effect`) move there, or with `copy` are copied. Moving all effects replaces the target's
+/// style, as pasting a layer style does; a single effect replaces the target's effect of the same
+/// kind, else is added.
+fn transfer_effects(s: &mut Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "layer.layerStyle.transferEffects";
+    let id_of = |key: &str| p.get(key).and_then(Value::as_u64).map(LayerId).ok_or_else(|| bad(CMD, format!("`{key}` must be a layer id")));
+    let from = id_of("from")?;
+    let to = id_of("to")?;
+    if from == to {
+        return Err(bad(CMD, "the effects are already on that layer"));
+    }
+    let copy = p.get("copy").and_then(Value::as_bool).unwrap_or(false);
+    let index = match p.get("effect") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.as_u64().and_then(|i| usize::try_from(i).ok()).ok_or_else(|| bad(CMD, "`effect` must be an effect index"))?),
+    };
+    let d = s.active().ok_or(EngineError::NoDocument)?;
+    let src = d.doc.layer(from).ok_or(EngineError::NoLayer(from))?;
+    d.doc.layer(to).ok_or(EngineError::NoLayer(to))?;
+    let payload = match index {
+        Some(i) => {
+            let e = src.effects.items.get(i).cloned().ok_or_else(|| bad(CMD, format!("the layer has no effect {i}")))?;
+            Effects { enabled: true, items: vec![e], psd_raw: None, reference: None }
+        }
+        None => Effects { psd_raw: None, ..src.effects.clone() },
+    };
+    if payload.items.is_empty() {
+        return Err(bad(CMD, "the layer has no layer effects"));
+    }
+    let label = if copy { "Copy Layer Effects" } else { "Move Layer Effects" };
+    s.edit(label, |doc, _| {
+        let dst = doc.layer_mut(to).ok_or(EngineError::NoLayer(to))?;
+        dst.effects.psd_raw = None;
+        if index.is_some() {
+            dst.effects.enabled = true;
+            for e in payload.items {
+                let same = dst.effects.items.iter().position(|x| std::mem::discriminant(x) == std::mem::discriminant(&e));
+                match same.and_then(|i| dst.effects.items.get_mut(i)) {
+                    Some(slot) => *slot = e,
+                    None => dst.effects.items.push(e),
+                }
+            }
+        } else {
+            dst.effects = payload;
+        }
+        if !copy {
+            let src = doc.layer_mut(from).ok_or(EngineError::NoLayer(from))?;
+            match index {
+                Some(i) if i < src.effects.items.len() => {
+                    src.effects.items.remove(i);
+                    src.effects.psd_raw = None;
+                }
+                Some(_) => {}
+                None => src.effects = Effects::default(),
+            }
+        }
+        Ok(())
+    })?;
+    Ok(json!({"from": from.0, "to": to.0}))
 }
 
 /// Effects drawn beneath the layer (they become separate layers below it, unclipped).
@@ -778,11 +908,16 @@ fn export_layer(s: &mut Session, p: &Value, cmd: &str, png_only: bool) -> Result
         return Err(bad(cmd, "Quick Export as PNG writes .png files"));
     }
     let scale = num(p, "scale", 100.0).clamp(1.0, 1000.0);
+    // Export As › Resample; checked even at 100 % so a typo never goes unnoticed.
+    let resample = match p.get("resample") {
+        None | Some(Value::Null) => crate::export_preset_cmds::DEFAULT_RESAMPLE,
+        Some(v) => crate::export_preset_cmds::export_resample(v.as_str().ok_or_else(|| bad(cmd, "`resample` must be a string"))?).map_err(|e| bad(cmd, e))?,
+    };
     if (scale - 100.0).abs() > 1e-3 {
         let mut tmp = Session::new();
         tmp.add_document(ldoc, None);
         let w = (tmp.active().map_or(1, |d| d.doc.size.width) as f32 * scale / 100.0).round().max(1.0);
-        tmp.execute("image.imageSize", json!({"width": w}))?;
+        tmp.execute("image.imageSize", json!({"width": w, "resample": resample}))?;
         ldoc = (*tmp.active().ok_or(EngineError::NoDocument)?.doc).clone();
     }
     let out = photocraft_io::export(&ldoc, path, &Default::default()).map_err(|e| other(e.to_string()))?;
@@ -810,7 +945,14 @@ pub fn specs() -> Vec<CommandSpec> {
     vec![
         spec!("layer.layerMask.apply", "Apply", ["Layer", "Layer Mask"], r##"{"layer":id?}"##, has_raster_with_mask, apply_mask),
         spec!("layer.layerMask.fromTransparency", "From Transparency", ["Layer", "Layer Mask"], r##"{"layer":id?}"##, has_raster, mask_from_transparency),
-        spec!("layer.layerMask.hideSelection", "Hide Selection", ["Layer", "Layer Mask"], r##"{"layer":id?}"##, has_selection_layer, hide_selection),
+        spec!(
+            "layer.layerMask.hideSelection",
+            "Hide Selection",
+            ["Layer", "Layer Mask"],
+            r##"{"layer":id?} (no layer: every selected layer that can take a mask)"##,
+            has_selection_layer,
+            hide_selection
+        ),
         spec!("layer.maskAllObjects", "Mask All Objects", ["Layer"], r##"{"layer":id?}"##, has_layer, mask_all_objects),
         spec!("layer.matting.defringe", "Defringe…", ["Layer", "Matting"], r##"{"width":1..200=1}"##, has_raster, matting_defringe),
         spec!("layer.matting.removeBlackMatte", "Remove Black Matte", ["Layer", "Matting"], "{}", has_raster, |s, _| remove_matte(s, false)),
@@ -847,7 +989,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "layer.layerStyle.blendingOptions",
             "Blending Options…",
             ["Layer", "Layer Style"],
-            r##"{"layer":id?,"blend":"normal|multiply|…"?,"opacity":0..100?,"fillOpacity":0..100?,"blendIf":{"channel":"gray|red|green|blue|cyan|…"|index="gray","thisLayer":[black,white]|[blackLo,blackHi,whiteLo,whiteHi]?,"underlying":[…]?}|[{…},…]|null?,"channels":[bool,…]?,"knockout":"none|shallow|deep"?,"blendInteriorEffectsAsGroup":bool?,"blendClippedLayersAsGroup":bool?,"transparencyShapesLayer":bool?,"layerMaskHidesEffects":bool?,"vectorMaskHidesEffects":bool?} (Blend If values 0..255; split points fade; null resets. Advanced Blending: channels = which colour channels blend (R G B / C M Y K / L a b); Photoshop's defaults are knockout none, interior effects off, clipped layers as group on, transparency shapes on, masks hide effects off)"##,
+            r##"{"layer":id?,"blend":"normal|multiply|…"?,"opacity":0..100?,"fillOpacity":0..100?,"blendIf":{"channel":"gray|red|green|blue|cyan|…"|index="gray","thisLayer":[black,white]|[blackLo,blackHi,whiteLo,whiteHi]?,"underlying":[…]?}|[{…},…]|null?,"channels":[bool,…]?,"knockout":"none|shallow|deep"?,"blendInteriorEffectsAsGroup":bool?,"blendClippedLayersAsGroup":bool?,"transparencyShapesLayer":bool?,"layerMaskHidesEffects":bool?,"vectorMaskHidesEffects":bool?} (Blend If values 0..255; split points fade; null resets. Advanced Blending: channels = which colour channels blend (R G B / C M Y K / L a b); PhotoCraft's defaults are knockout none, interior effects off, clipped layers as group on, transparency shapes on, masks hide effects off)"##,
             has_layer,
             blending_options
         ),
@@ -861,6 +1003,14 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         spec!("layer.layerStyle.createLayer", "Create Layer", ["Layer", "Layer Style"], r##"{"layer":id?}"##, has_effects, create_layer),
         spec!("layer.layerStyle.scaleEffects", "Scale Effects…", ["Layer", "Layer Style"], r##"{"scale":1..1000=100}"##, has_effects, scale_effects),
+        spec!(
+            "layer.layerStyle.transferEffects",
+            "Move Layer Effects",
+            [],
+            r##"{"from":id,"to":id,"effect":index? (default: all effects),"copy":bool=false}"##,
+            has_doc,
+            transfer_effects
+        ),
         CommandSpec {
             id: "layer.layerContentOptions",
             label: "Layer Content Options…",
@@ -881,7 +1031,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "layer.exportAs",
             "Export As…",
             ["Layer"],
-            r##"{"layer":id?,"path":text,"scale":1..1000=100} (format from the path's extension)"##,
+            r##"{"layer":id?,"path":text,"scale":1..1000=100,"resample":"bicubicAutomatic|bicubic|bicubicSmoother|bicubicSharper|bilinear|nearest"="bicubicAutomatic"} (format from the path's extension; the document is not resampled)"##,
             has_layer,
             |s, p| export_layer(s, p, "layer.exportAs", false)
         ),

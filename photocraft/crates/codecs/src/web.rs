@@ -185,8 +185,10 @@ pub fn encode_gif_animated(width: u32, height: u32, frames: &[GifFrame], loop_fo
             return Err(gif_err("every frame's palette must have 1..=256 entries covering its indices"));
         }
         let bits = (1..=8u8).find(|b| (1usize << b) >= f.palette.len()).unwrap_or(8);
-        // Graphic Control Extension: disposal 1 (leave), delay, optional transparency.
-        let packed = if f.transparent.is_some() { 0x05 } else { 0x04 };
+        // Graphic Control Extension: delay and optional transparency. Every frame covers the whole
+        // image, so an opaque one is left in place (disposal 1), while one with a transparent index
+        // is cleared afterwards (disposal 2): otherwise the frames before it show through.
+        let packed = if f.transparent.is_some() { 0x09 } else { 0x04 };
         out.extend([0x21, 0xF9, 0x04, packed]);
         out.extend(f.delay_cs.to_le_bytes());
         out.push(f.transparent.unwrap_or(0));
@@ -283,7 +285,8 @@ pub fn decode_wbmp(bytes: &[u8]) -> Result<(u32, u32, Vec<bool>), CodecError> {
 }
 
 /// JPEG from 8-bit RGB (`rgb.len() == 3·w·h`): quality 1..=100, optional progressive scans and
-/// optimised Huffman tables (Save for Web's "Optimized"), optional ICC profile, density and XMP.
+/// optimised Huffman tables (Save for Web's "Optimized"), optional ICC profile, density, EXIF and
+/// XMP. EXIF that doesn't fit in one segment is left out (see [`jpeg_exif_fits`]).
 #[allow(clippy::too_many_arguments)]
 pub fn encode_jpeg_rgb8(
     width: u32,
@@ -294,6 +297,7 @@ pub fn encode_jpeg_rgb8(
     optimized: bool,
     icc: Option<&[u8]>,
     dpi: Option<f32>,
+    exif: Option<&[u8]>,
     xmp: Option<&str>,
 ) -> Result<Vec<u8>, CodecError> {
     let e = |e: jpeg_encoder::EncodingError| CodecError::encode(Format::Jpeg, e);
@@ -305,7 +309,9 @@ pub fn encode_jpeg_rgb8(
     }
     let mut out = Vec::new();
     let mut enc = jpeg_encoder::Encoder::new(&mut out, quality.clamp(1, 100));
-    let subsampled = quality < 90;
+    // Like Photoshop's Save for Web: 4:2:0 chroma up to quality 50, 4:4:4 from 51 (measured on
+    // Photoshop 2025's output; its Save As keeps 4:2:0 at every quality).
+    let subsampled = quality <= 50;
     enc.set_progressive(progressive);
     // jpeg-encoder 0.6 writes corrupt baseline scans when optimised Huffman tables meet 4:2:0
     // (both zune-jpeg and image-rs decode them green); progressive output is fine.
@@ -315,7 +321,14 @@ pub fn encode_jpeg_rgb8(
         let v = d.round().min(65535.0) as u16;
         enc.set_density(jpeg_encoder::Density::Inch { x: v, y: v });
     }
+    let ppi = dpi.filter(|d| *d >= 1.0).map(|d| (d, d));
+    // Upright, without the source's thumbnail, at the JFIF resolution, as Save As writes it.
+    if let Some(seg) = exif.and_then(|x| crate::codecs::jpeg::exif_segment(x, ppi)) {
+        enc.add_app_segment(1, &seg).map_err(e)?;
+    }
     if let Some(x) = xmp {
+        // Its `tiff:` resolution, if any, says what the JFIF density says (#1691).
+        let x = crate::resolution::export_xmp(x, ppi);
         let mut seg = b"http://ns.adobe.com/xap/1.0/\0".to_vec();
         seg.extend_from_slice(x.as_bytes());
         enc.add_app_segment(1, &seg).map_err(e)?;
@@ -325,6 +338,11 @@ pub fn encode_jpeg_rgb8(
     }
     enc.encode(rgb, w16, h16, jpeg_encoder::ColorType::Rgb).map_err(e)?;
     Ok(out)
+}
+
+/// Whether [`encode_jpeg_rgb8`] can write `exif` at `dpi` (it must fit in one APP1 segment).
+pub fn jpeg_exif_fits(exif: &[u8], dpi: Option<f32>) -> bool {
+    crate::codecs::jpeg::exif_segment(exif, dpi.filter(|d| *d >= 1.0).map(|d| (d, d))).is_some()
 }
 
 #[cfg(test)]
@@ -339,6 +357,24 @@ mod tests {
 
     fn pattern(w: usize, h: usize, n: usize) -> Vec<u8> {
         (0..w * h).map(|i| (((i % w) * 7 + (i / w) * 13 + (i * i) % 5) % n) as u8).collect()
+    }
+
+    /// The luma sampling factors (h, v) of a baseline or progressive JPEG.
+    fn luma_sampling(bytes: &[u8]) -> Option<(u8, u8)> {
+        let i = bytes.windows(2).position(|w| w[0] == 0xFF && matches!(w[1], 0xC0..=0xC2))?;
+        let f = *bytes.get(i + 11)?;
+        Some((f >> 4, f & 15))
+    }
+
+    #[test]
+    fn jpeg_chroma_is_full_above_quality_50() {
+        let rgb: Vec<u8> = (0..16 * 16 * 3).map(|i| (i * 37 % 256) as u8).collect();
+        for (q, want) in [(1, (2, 2)), (50, (2, 2)), (51, (1, 1)), (60, (1, 1)), (89, (1, 1)), (100, (1, 1))] {
+            for progressive in [false, true] {
+                let bytes = encode_jpeg_rgb8(16, 16, &rgb, q, progressive, false, None, None, None, None).unwrap();
+                assert_eq!(luma_sampling(&bytes), Some(want), "quality {q} progressive {progressive}");
+            }
+        }
     }
 
     #[test]
@@ -404,13 +440,24 @@ mod tests {
     #[test]
     fn progressive_jpeg_decodes() {
         let rgb: Vec<u8> = (0..64 * 48 * 3).map(|i| (i % 251) as u8).collect();
-        let base = encode_jpeg_rgb8(64, 48, &rgb, 80, false, false, None, Some(72.0), Some("<x:xmpmeta/>")).unwrap();
-        let prog = encode_jpeg_rgb8(64, 48, &rgb, 80, true, true, None, None, None).unwrap();
+        let base = encode_jpeg_rgb8(64, 48, &rgb, 80, false, false, None, Some(72.0), None, Some("<x:xmpmeta/>")).unwrap();
+        let prog = encode_jpeg_rgb8(64, 48, &rgb, 80, true, true, None, None, None, None).unwrap();
         assert_ne!(base, prog);
         assert_eq!(crate::decode(&base).unwrap().meta.xmp.as_deref(), Some("<x:xmpmeta/>"));
         // SOF2 marks a progressive frame.
         assert!(prog.windows(2).any(|w| w == [0xFF, 0xC2]));
         assert_eq!(crate::decode(&prog).unwrap().dimensions(), (64, 48));
+    }
+
+    /// #1691: the XMP resolution of a Save for Web JPEG says what its JFIF density says.
+    #[test]
+    fn web_jpeg_xmp_resolution_follows_the_density() {
+        let rgb = vec![100u8; 8 * 8 * 3];
+        let xmp = r#"<rdf:Description tiff:XResolution="300/1" tiff:YResolution="300/1"/>"#;
+        let out = encode_jpeg_rgb8(8, 8, &rgb, 80, false, false, None, Some(72.0), None, Some(xmp)).unwrap();
+        let img = crate::decode(&out).unwrap();
+        assert_eq!(img.meta.dpi, Some((72.0, 72.0)));
+        assert_eq!(img.meta.xmp.as_deref().and_then(crate::xmp_resolution), Some((72.0, 72.0)));
     }
 }
 
@@ -426,7 +473,7 @@ mod subsampling_tests {
         let rgb: Vec<u8> = (0..w * h).flat_map(|i| [((i % w) * 4) as u8, 76, ((i / w) * 5) as u8]).collect();
         for q in [30, 60, 95] {
             for (prog, opt) in [(false, false), (false, true), (true, false), (true, true)] {
-                let bytes = encode_jpeg_rgb8(w, h, &rgb, q, prog, opt, None, None, None).unwrap();
+                let bytes = encode_jpeg_rgb8(w, h, &rgb, q, prog, opt, None, None, None, None).unwrap();
                 let ours = crate::decode(&bytes).unwrap().convert(crate::ChannelLayout::Rgb, crate::SampleType::U8);
                 let err = ours.data().iter().zip(&rgb).map(|(a, b)| i32::from(*a).abs_diff(i32::from(*b))).max().unwrap();
                 assert!(err < 24, "q{q} progressive={prog} optimized={opt}: max error {err}");
@@ -454,6 +501,19 @@ mod anim_tests {
         // First frame still decodes.
         let img = crate::decode(&g).unwrap();
         assert_eq!(img.dimensions(), (2, 2));
+    }
+
+    #[test]
+    fn transparent_frames_are_cleared_before_the_next() {
+        let frame = |transparent| GifFrame { indices: vec![0, 1, 1, 1], palette: vec![[0, 0, 0], [255, 0, 0]], transparent, delay_cs: 4 };
+        // The Graphic Control Extension's packed byte follows its 0x21 0xF9 0x04 introducer.
+        let packed = |g: &[u8]| g.windows(4).find(|w| w[..3] == [0x21, 0xF9, 0x04]).map(|w| w[3]).unwrap();
+        let opaque = encode_gif_animated(2, 2, &[frame(None)], false).unwrap();
+        assert_eq!(packed(&opaque), 0x04, "disposal 1, no transparency");
+        let clear = encode_gif_animated(2, 2, &[frame(Some(0))], false).unwrap();
+        assert_eq!(packed(&clear), 0x09, "disposal 2 with the transparency flag");
+        let px = crate::decode(&clear).unwrap().to_rgba8();
+        assert_eq!((px[3], &px[4..8]), (0, &[255, 0, 0, 255][..]), "index 0 transparent, index 1 red");
     }
 
     #[test]

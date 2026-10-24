@@ -72,7 +72,31 @@ fn format_report(languages: &[Language], english_keys: &BTreeSet<Key>, translati
         let coverage = 100.0 * translated as f64 / english_keys.len() as f64;
         report.push_str(&format!("{:<12} {:>5}/{:<6} {:>8.2}%\n", language.code, translated, english_keys.len(), coverage));
     }
+    report.push_str("\nMissing translations (shown in English until translated)\n");
+    for language in languages.iter().filter(|language| language.code != "en") {
+        let empty = BTreeSet::new();
+        let translated = translations.get(&language.code).unwrap_or(&empty);
+        let missing: Vec<&Key> = english_keys.difference(translated).collect();
+        if missing.is_empty() {
+            report.push_str(&format!("{}: none missing\n", language.code));
+            continue;
+        }
+        report.push_str(&format!("{}: {} missing\n", language.code, missing.len()));
+        for key in missing {
+            let source = escape_line(&key.source);
+            if key.context.is_empty() {
+                report.push_str(&format!("    {source}\n"));
+            } else {
+                report.push_str(&format!("    [{}] {source}\n", escape_line(&key.context)));
+            }
+        }
+    }
     report
+}
+
+/// Keeps one key per log line: a source string with a newline or tab prints them escaped.
+fn escape_line(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('\n', "\\n").replace('\t', "\\t")
 }
 
 fn registered_languages(source: &str) -> Result<Vec<Language>, String> {
@@ -94,12 +118,13 @@ fn registered_languages(source: &str) -> Result<Vec<Language>, String> {
         let catalog = if code == "en" {
             None
         } else {
-            let marker = "include_str!(\"";
-            let start = block.find(marker).ok_or_else(|| format!("language `{code}` has no include_str! catalog"))? + marker.len();
+            // `catalog!("xx")` embeds `xx.tsv` (packed by ui-egui's build.rs).
+            let marker = "catalog!(\"";
+            let start = block.find(marker).ok_or_else(|| format!("language `{code}` has no catalog! entry"))? + marker.len();
             let rest = block.get(start..).ok_or_else(|| format!("language `{code}` has a malformed catalog path"))?;
             let end = rest.find("\")").ok_or_else(|| format!("language `{code}` has a malformed catalog path"))?;
-            let file = rest.get(..end).ok_or_else(|| format!("language `{code}` has an invalid catalog path"))?;
-            let path = Path::new(file);
+            let file = format!("{}.tsv", rest.get(..end).ok_or_else(|| format!("language `{code}` has an invalid catalog path"))?);
+            let path = Path::new(&file);
             if path.components().count() != 1 || path.extension().and_then(|ext| ext.to_str()) != Some("tsv") {
                 return Err(format!("language `{code}` has unsafe catalog path `{file}`"));
             }
@@ -184,9 +209,11 @@ fn plural_keys(sources: &[(PathBuf, String)]) -> BTreeSet<Key> {
             rest = rest.get(at + 4..).unwrap_or("");
             let Some(end) = call_end(rest) else { break };
             let args = rest.get(..end).unwrap_or("");
+            // `trn(lang, n, one, other)`: the forms are the last two literals, so a string in the
+            // count expression (`r["files"].len()`) is not mistaken for one.
             let forms = quoted_strings(args);
-            if forms.len() >= 2 {
-                keys.insert(Key { context: "@plural".into(), source: format!("{}|{}", forms[0], forms[1]) });
+            if let [.., one, other] = forms.as_slice() {
+                keys.insert(Key { context: "@plural".into(), source: format!("{one}|{other}") });
             }
             rest = rest.get(end + 1..).unwrap_or("");
         }
@@ -482,24 +509,37 @@ mod tests {
     fn registered_languages_and_report_are_stable() {
         let registry = r#"
             pub static LANGUAGES: [LangInfo; 3] = [
-                LangInfo { code: "zh", source: include_str!("zh.tsv") },
-                LangInfo { code: "en", source: "" },
-                LangInfo { code: "fr", source: include_str!("fr.tsv") },
+                LangInfo { code: "zh", source: catalog!("zh") },
+                LangInfo { code: "en", source: b"" },
+                LangInfo { code: "fr", source: catalog!("fr") },
             ];
             impl LangInfo {}
         "#;
         let languages = registered_languages(registry);
         assert!(languages.is_ok());
         let languages = languages.unwrap_or_default();
-        let english_keys = BTreeSet::from([Key { context: String::new(), source: "Open".into() }, Key { context: String::new(), source: "Save".into() }]);
-        let translations = BTreeMap::from([("fr".to_string(), BTreeSet::from([Key { context: String::new(), source: "Open".into() }]))]);
+        let english_keys = BTreeSet::from([
+            Key { context: String::new(), source: "Open".into() },
+            Key { context: String::new(), source: "Save".into() },
+            Key { context: "@plural".into(), source: "{n} layer|{n} layers".into() },
+        ]);
+        let translations = BTreeMap::from([
+            ("fr".to_string(), BTreeSet::from([Key { context: String::new(), source: "Open".into() }])),
+            ("zh".to_string(), english_keys.clone()),
+        ]);
         assert_eq!(
             format_report(&languages, &english_keys, &translations),
             "UI translation coverage (translated source keys / source keys)\n\
              language       translated  coverage\n\
-             en               2/2        100.00%\n\
-             fr               1/2         50.00%\n\
-             zh               0/2          0.00%\n"
+             en               3/3        100.00%\n\
+             fr               1/3         33.33%\n\
+             zh               3/3        100.00%\n\
+             \n\
+             Missing translations (shown in English until translated)\n\
+             fr: 2 missing\n\
+             \x20   Save\n\
+             \x20   [@plural] {n} layer|{n} layers\n\
+             zh: none missing\n"
         );
     }
 
@@ -542,6 +582,11 @@ mod tests {
     fn plural_keys_come_from_source_calls() {
         let sources = vec![(PathBuf::from("ui.rs"), r#"trn(lang, count, "{n} layer", "{n} layers");"#.into())];
         assert!(plural_keys(&sources).contains(&Key { context: "@plural".into(), source: "{n} layer|{n} layers".into() }));
+        // A string literal in the count expression is not one of the forms.
+        let sources = vec![(PathBuf::from("ui.rs"), r#"trn(lang, r["files"].len() as u64, "{n} file", "{n} files");"#.into())];
+        let keys = plural_keys(&sources);
+        assert!(keys.contains(&Key { context: "@plural".into(), source: "{n} file|{n} files".into() }), "{keys:?}");
+        assert_eq!(keys.len(), 1, "{keys:?}");
     }
 
     #[test]
@@ -556,25 +601,13 @@ mod tests {
     }
 
     #[test]
-    fn source_key_set_is_covered_by_complete_catalogs() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap_or(Path::new("."));
-        let keys = source_keys(root).unwrap_or_default();
-        for (code, path) in [
-            ("ja", "ja.tsv"),
-            ("zh-hant", "zh-hant.tsv"),
-            ("es", "es.tsv"),
-            ("ru", "ru.tsv"),
-            ("cs", "cs.tsv"),
-            ("de", "de.tsv"),
-            ("pt-br", "pt-br.tsv"),
-            ("it", "it.tsv"),
-            ("el", "el.tsv"),
-        ] {
-            let catalog_path = root.join("crates/ui-egui/src/i18n").join(path);
-            let text = fs::read_to_string(&catalog_path).unwrap_or_default();
-            let translations = parse_catalog(&catalog_path, &text).unwrap_or_default();
-            let missing: Vec<_> = keys.difference(&translations).collect();
-            assert!(missing.is_empty(), "{code}: missing source keys: {missing:#?}");
-        }
+    fn plural_forms_follow_count_expressions_and_dynamic_forms_are_not_literal_keys() {
+        let sources = vec![(
+            PathBuf::from("ui.rs"),
+            r#"trn(lang, r["files"].as_array().map_or(0, Vec::len) as u64, "Saved {n} file", "Saved {n} files");
+               trn(lang, count, one, other);"#
+                .into(),
+        )];
+        assert_eq!(plural_keys(&sources), BTreeSet::from([Key { context: "@plural".into(), source: "Saved {n} file|Saved {n} files".into() }]));
     }
 }

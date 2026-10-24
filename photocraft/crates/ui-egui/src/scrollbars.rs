@@ -71,32 +71,59 @@ impl Span {
     }
 }
 
-/// Clamp one axis of the view centre with Overscroll off: the image can't leave its edges; an
-/// image smaller than the view is centred.
+/// Clamp one axis of the view centre with Overscroll off, as Photoshop 25.4 does: an image larger
+/// than the view can't leave its edges, and one smaller than the view stays inside it, where
+/// zooming put it (zooming out around the pointer doesn't re-centre it; Fit on Screen does).
 pub fn clamp_axis(center: f32, len: f32, size: f32, zoom: f32) -> f32 {
     if !(zoom.is_finite() && zoom > 0.0 && len.is_finite() && len > 0.0 && size.is_finite() && size > 0.0) {
         return center;
     }
-    let half = size / zoom / 2.0;
-    if 2.0 * half >= len {
-        len / 2.0
-    } else if center.is_finite() {
-        center.clamp(half, len - half)
-    } else {
-        len / 2.0
+    if !center.is_finite() {
+        return len / 2.0;
     }
+    let half = size / zoom / 2.0;
+    // Larger: the view stays within the image. Smaller: the image stays within the view.
+    let (a, b) = (half, len - half);
+    center.clamp(a.min(b), a.max(b))
 }
 
-/// Apply Preferences › Tools › Overscroll (off) to `view` for a canvas of `size` points. True
-/// when the view moved (the caller then repaints).
-pub fn clamp_view(view: &mut View, size: egui::Vec2) -> bool {
+/// Apply Preferences › Tools › Overscroll (off) to `view` for a canvas of `size` points on a
+/// display with `ppp` physical pixels per point. True when the view moved (then repaint).
+pub fn clamp_view(view: &mut View, size: egui::Vec2, ppp: f32) -> bool {
+    clamp_view_with_aspect(view, size, ppp, 1.0)
+}
+
+/// Clamp against the displayed image bounds, so rotated tool auto-scroll is not undone by
+/// the next frame's Overscroll-off clamp. `size` is the unmodified screen-space canvas size.
+pub fn clamp_view_with_aspect(view: &mut View, size: egui::Vec2, ppp: f32, aspect: f32) -> bool {
     let [w, h] = view.doc_size;
     if w == 0 || h == 0 {
         return false;
     }
-    let c = [clamp_axis(view.center[0], w as f32, size.x, view.zoom), clamp_axis(view.center[1], h as f32, size.y, view.zoom)];
+    let zoom = view.zoom / if ppp.is_finite() && ppp > 0.0 { ppp } else { 1.0 };
+    let aspect = if aspect.is_finite() && aspect > 0.0 { aspect } else { 1.0 };
+    let c = if view.rotation.abs() < 1e-8 {
+        [clamp_axis(view.center[0], w as f32, size.x / aspect, zoom), clamp_axis(view.center[1], h as f32, size.y, zoom)]
+    } else {
+        if !zoom.is_finite() || zoom <= 0.0 || !size.is_finite() || size.x <= 0.0 || size.y <= 0.0 {
+            return false;
+        }
+        let center = [
+            if view.center[0].is_finite() { view.center[0] } else { w as f32 / 2.0 },
+            if view.center[1].is_finite() { view.center[1] } else { h as f32 / 2.0 },
+        ];
+        let xf = crate::canvas::ViewXform { rect: egui::Rect::from_min_size(Pos2::ZERO, size), zoom, center, flip: false, rotation: view.rotation, aspect };
+        let image = xf.image_bounds(view.doc_size);
+        if !image.is_finite() {
+            return false;
+        }
+        let offset = xf.rect.center() - image.min;
+        let delta = vec2(clamp_axis(offset.x, image.width(), size.x, 1.0), clamp_axis(offset.y, image.height(), size.y, 1.0)) - offset;
+        let d = xf.unmap_vec(delta) / zoom;
+        [center[0] + d.x, center[1] + d.y]
+    };
     // Ignore sub-pixel float noise so the clamp never keeps requesting frames.
-    let moved = (c[0] - view.center[0]).abs() > 1e-3 || (c[1] - view.center[1]).abs() > 1e-3;
+    let moved = !view.center[0].is_finite() || !view.center[1].is_finite() || (c[0] - view.center[0]).abs() > 1e-3 || (c[1] - view.center[1]).abs() > 1e-3;
     if moved {
         view.center = c;
     }
@@ -123,15 +150,19 @@ pub fn bar_rects(rect: Rect, horizontal: bool, vertical: bool) -> (Option<Rect>,
 
 /// Show the scrollbars of the canvas `rect` and apply their drags and page clicks to `view`.
 /// `flip` is View › Flip Horizontal (the bar then runs the other way through the image);
-/// `overscroll` is Preferences › Tools › Overscroll.
+/// `aspect` is the displayed pixel aspect ratio (a document pixel is that many points wider per
+/// point of height); `overscroll` is Preferences › Tools › Overscroll.
 /// Returns true when the pointer is over a bar (the canvas then leaves the pointer alone).
-pub fn show(ui: &Ui, rect: Rect, view: &mut View, flip: bool, overscroll: bool, key: Id) -> bool {
+pub fn show(ui: &Ui, rect: Rect, view: &mut View, flip: bool, aspect: f32, overscroll: bool, key: Id) -> bool {
     let [w, h] = view.doc_size;
-    let zoom = view.zoom;
+    // `Span` works in egui points; `View::zoom` is device pixels per document pixel.
+    let ppp = ui.ctx().pixels_per_point();
+    let zoom = view.zoom / if ppp.is_finite() && ppp > 0.0 { ppp } else { 1.0 };
     // Horizontal axis in "screen order": with the view flipped, run the image backwards.
     let hx = |c: f32| if flip { w as f32 - c } else { c };
     let with_extent = |s: Span| (s, s.extent(overscroll));
-    let ex = Span::of(w as f32, hx(view.center[0]), rect.width(), zoom).map(with_extent);
+    let aspect = if aspect.is_finite() && aspect > 0.0 { aspect } else { 1.0 };
+    let ex = Span::of(w as f32, hx(view.center[0]), rect.width() / aspect, zoom).map(with_extent);
     let ey = Span::of(h as f32, view.center[1], rect.height(), zoom).map(with_extent);
     if ex.is_none() && ey.is_none() {
         return false;
@@ -278,12 +309,27 @@ mod tests {
         assert_eq!(clamp_axis(-400.0, 1000.0, 500.0, 1.0), 250.0);
         assert_eq!(clamp_axis(4000.0, 1000.0, 500.0, 1.0), 750.0);
         assert_eq!(clamp_axis(600.0, 1000.0, 500.0, 1.0), 600.0);
-        // Smaller than the view: centred.
-        assert_eq!(clamp_axis(-90.0, 1000.0, 500.0, 0.2), 500.0);
-        let mut v = View { zoom: 1.0, center: [-500.0, 20.0], fit_pending: false, fill_pending: false, doc_size: [1000, 800], rotation: 0.0 };
-        assert!(clamp_view(&mut v, vec2(500.0, 400.0)));
+        // Smaller than the view (2500 doc px of view for 1000 of image): it stays where it is
+        // while it is inside the view, and is pushed back in at the edges.
+        assert_eq!(clamp_axis(-90.0, 1000.0, 500.0, 0.2), -90.0);
+        assert_eq!(clamp_axis(-400.0, 1000.0, 500.0, 0.2), -250.0, "the image's right edge on the view's");
+        assert_eq!(clamp_axis(1400.0, 1000.0, 500.0, 0.2), 1250.0, "its left edge on the view's");
+        assert_eq!(clamp_axis(500.0, 1000.0, 1000.0, 1.0), 500.0, "exactly the view's size: centred");
+        let mut v = View {
+            zoom: 1.0,
+            center: [-500.0, 20.0],
+            fit_pending: false,
+            fill_pending: false,
+            doc_size: [1000, 800],
+            rotation: 0.0,
+            zoom_animating: false,
+            zoom_anchor: None,
+            display_camera: None,
+            zoom_transition: None,
+        };
+        assert!(clamp_view(&mut v, vec2(500.0, 400.0), 1.0));
         assert_eq!(v.center, [250.0, 200.0]);
-        assert!(!clamp_view(&mut v, vec2(500.0, 400.0)), "stable: no repaint loop");
+        assert!(!clamp_view(&mut v, vec2(500.0, 400.0), 1.0), "stable: no repaint loop");
     }
 
     #[test]
@@ -299,8 +345,19 @@ mod tests {
         let (at, len) = s.thumb((0.0, 1000.0), 0.0);
         assert!(at.is_finite() && len.is_finite());
         assert_eq!(s.doc_per_point((0.0, 1000.0), 0.0), 0.0);
-        let mut v = View { zoom: 1.0, center: [0.0, 0.0], fit_pending: false, fill_pending: false, doc_size: [0, 0], rotation: 0.0 };
-        assert!(!clamp_view(&mut v, vec2(500.0, 400.0)));
+        let mut v = View {
+            zoom: 1.0,
+            center: [0.0, 0.0],
+            fit_pending: false,
+            fill_pending: false,
+            doc_size: [0, 0],
+            rotation: 0.0,
+            zoom_animating: false,
+            zoom_anchor: None,
+            display_camera: None,
+            zoom_transition: None,
+        };
+        assert!(!clamp_view(&mut v, vec2(500.0, 400.0), 1.0));
     }
 
     mod canvas {
@@ -390,7 +447,8 @@ mod tests {
                     assert!(c1[0] < c0[0] - 10.0, "{c0:?} -> {c1:?}");
                 } else {
                     assert!((len - (r.width() - THICKNESS)).abs() < 1.0, "the thumb fills the track: {len}");
-                    assert_eq!(c1, c0, "Overscroll off keeps a fitting image centred");
+                    // Within float error: the fit zoom is not a round number for every canvas height.
+                    assert!((c1[0] - c0[0]).abs() < 0.01 && (c1[1] - c0[1]).abs() < 0.01, "Overscroll off keeps a fitting image centred: {c0:?} -> {c1:?}");
                 }
             }
         }
@@ -458,10 +516,16 @@ mod tests {
                 } else {
                     assert!((x - w / 2.0).abs() < 1e-3, "clamped to the left edge: {x}");
                 }
-                // Zoomed out below fit: centred.
+                // Zoomed out below fit (Photoshop): the image is not re-centred, it stays where it
+                // is while it fits in the view, and is pushed back in at the view's edge.
                 set_view(&mut h, 0.1, [-50.0, 9000.0]);
                 if !overscroll {
-                    assert_eq!(view(&h).center, [1000.0, 750.0]);
+                    let r = h.state().last_canvas_rect;
+                    let (hw, hh) = (r.width() / 0.1 / 2.0, r.height() / 0.1 / 2.0);
+                    let c = view(&h).center;
+                    assert_eq!(c[0], -50.0, "inside the view: left alone");
+                    assert!((c[1] - hh).abs() < 1e-2, "pushed back in: the image's top on the view's: {c:?}");
+                    assert!(c[0] - hw <= 0.0 && c[0] + hw >= 2000.0 && c[1] - hh <= 0.0 && c[1] + hh >= 1500.0, "{c:?}");
                 }
             }
         }

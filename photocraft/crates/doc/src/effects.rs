@@ -37,6 +37,16 @@ pub struct Gradient {
     pub offset: (f32, f32),
 }
 
+/// Editable colour stops behind a Gradient Overlay's baked render stops.
+/// Older documents have no interpolation record and keep their existing appearance.
+/// Writers must rebake `gradient.stops` from this record, or clear it when replacing the curve.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GradientInterpolation {
+    pub method: String,
+    pub smoothness: f32,
+    pub stops: Vec<(f32, Color)>,
+}
+
 impl Default for Gradient {
     fn default() -> Self {
         Gradient {
@@ -58,7 +68,24 @@ pub enum Contour {
     #[default]
     Linear,
     /// Custom curve (input → output), both `0..=1`.
-    Custom { name: String, points: Vec<CurvePoint> },
+    Custom {
+        name: String,
+        points: Vec<CurvePoint>,
+        /// Corner (non-continuous) flags, parallel to `points`: the curve bends sharply at a
+        /// corner point instead of passing smoothly through it. Missing entries are smooth.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        corners: Vec<bool>,
+    },
+}
+
+impl Contour {
+    /// Whether point `i` of a custom contour is a corner.
+    pub fn is_corner(&self, i: usize) -> bool {
+        match self {
+            Contour::Linear => false,
+            Contour::Custom { corners, .. } => corners.get(i).copied().unwrap_or(false),
+        }
+    }
 }
 
 /// Paint used by strokes and glows.
@@ -149,6 +176,9 @@ pub struct StrokeFx {
     pub size: f32,
     pub position: StrokePosition,
     pub paint: FxPaint,
+    /// Overprint (PSD `overprint`).
+    #[serde(default)]
+    pub overprint: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -196,6 +226,9 @@ pub struct Bevel {
     pub altitude: f32,
     pub use_global_light: bool,
     pub gloss_contour: Contour,
+    /// Gloss Contour › Anti-aliased (PSD `antialiasGloss`).
+    #[serde(default)]
+    pub gloss_anti_alias: bool,
     pub highlight: FxCommon,
     pub highlight_color: Color,
     pub shadow: FxCommon,
@@ -255,6 +288,8 @@ pub enum Effect {
         common: FxCommon,
         gradient: Gradient,
         dither: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interpolation: Option<GradientInterpolation>,
     },
     PatternOverlay {
         common: FxCommon,
@@ -276,6 +311,36 @@ pub enum Effect {
 }
 
 impl Effect {
+    /// This effect with its colours in `mode`'s model ([`Color::in_mode`]): a layer's effect
+    /// colours are in its document's mode, as Image › Mode keeps them.
+    pub fn in_mode(mut self, mode: photocraft_color::ColorMode) -> Effect {
+        let cc = |c: &mut Color| *c = c.in_mode(mode);
+        let paint = |p: &mut FxPaint| match p {
+            FxPaint::Color(c) => cc(c),
+            FxPaint::Gradient(g) => g.stops.iter_mut().for_each(|s| cc(&mut s.1)),
+            FxPaint::Pattern { .. } => {}
+        };
+        match &mut self {
+            Effect::DropShadow(s) | Effect::InnerShadow(s) => cc(&mut s.color),
+            Effect::OuterGlow(g) | Effect::InnerGlow(g) => paint(&mut g.paint),
+            Effect::Stroke(s) => paint(&mut s.paint),
+            Effect::ColorOverlay { color, .. } => cc(color),
+            Effect::GradientOverlay { gradient, interpolation, .. } => {
+                gradient.stops.iter_mut().for_each(|s| cc(&mut s.1));
+                if let Some(source) = interpolation {
+                    source.stops.iter_mut().for_each(|s| cc(&mut s.1));
+                }
+            }
+            Effect::Satin(s) => cc(&mut s.color),
+            Effect::BevelEmboss(b) => {
+                cc(&mut b.highlight_color);
+                cc(&mut b.shadow_color);
+            }
+            Effect::PatternOverlay { .. } => {}
+        }
+        self
+    }
+
     /// Whether this instance is switched on.
     pub fn enabled(&self) -> bool {
         match self {
@@ -285,6 +350,18 @@ impl Effect {
             Effect::ColorOverlay { common, .. } | Effect::GradientOverlay { common, .. } | Effect::PatternOverlay { common, .. } => common.enabled,
             Effect::Satin(s) => s.common.enabled,
             Effect::BevelEmboss(b) => b.enabled,
+        }
+    }
+
+    /// Switches this instance on or off, keeping its settings.
+    pub fn set_enabled(&mut self, on: bool) {
+        match self {
+            Effect::DropShadow(s) | Effect::InnerShadow(s) => s.common.enabled = on,
+            Effect::OuterGlow(g) | Effect::InnerGlow(g) => g.common.enabled = on,
+            Effect::Stroke(s) => s.common.enabled = on,
+            Effect::ColorOverlay { common, .. } | Effect::GradientOverlay { common, .. } | Effect::PatternOverlay { common, .. } => common.enabled = on,
+            Effect::Satin(s) => s.common.enabled = on,
+            Effect::BevelEmboss(b) => b.enabled = on,
         }
     }
 

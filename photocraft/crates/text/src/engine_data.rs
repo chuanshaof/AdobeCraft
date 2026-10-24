@@ -46,7 +46,8 @@ impl Value {
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Value::Int(i) => Some(*i as f64),
-            Value::Real(r) => Some(*r),
+            // `inf`, `nan` and `1e999` parse as reals but are never a valid style number.
+            Value::Real(r) if r.is_finite() => Some(*r),
             _ => None,
         }
     }
@@ -227,6 +228,25 @@ pub fn write(v: &Value) -> Vec<u8> {
     out
 }
 
+/// Serializes `/key value` pairs without an enclosing dictionary: the layout of the document's
+/// `Txt2` block (see [`crate::psd::build_txt2`]), which `parse_txt2` wraps in `<< >>` to parse.
+pub fn write_bare(items: &[(String, Value)]) -> Vec<u8> {
+    let mut out = b"\n\n".to_vec();
+    for (k, v) in items {
+        out.push(b'/');
+        out.extend_from_slice(k.as_bytes());
+        if is_container(v) {
+            out.push(b'\n');
+            indent(&mut out, 1);
+        } else {
+            out.push(b' ');
+        }
+        write_value(v, 1, &mut out);
+        out.push(b'\n');
+    }
+    out
+}
+
 fn indent(out: &mut Vec<u8>, n: usize) {
     out.extend(std::iter::repeat_n(b'\t', n));
 }
@@ -322,6 +342,9 @@ fn format_real(r: f64) -> String {
     if matches!(s.as_str(), "0." | "-0.") {
         return "0.0".into();
     }
+    if s.ends_with('.') {
+        s.push('0');
+    }
     if let Some(rest) = s.strip_prefix("0.") {
         s = format!(".{rest}");
     } else if let Some(rest) = s.strip_prefix("-0.") {
@@ -335,6 +358,18 @@ mod tests {
     use super::*;
 
     const SAMPLE: &[u8] = b"\n\n<<\n\t/EngineDict\n\t<<\n\t\t/Editor\n\t\t<<\n\t\t\t/Text (\xFE\xFF\x00H\x00i\x00\\)\x00\r)\n\t\t>>\n\t\t/Nums [ 1.0 .5 -2 0 ]\n\t\t/Flag true\n\t\t/Kind /Roman\n\t\t/Runs [\n\t\t<<\n\t\t\t/A 1\n\t\t>>\n\t\t]\n\t>>\n>>";
+
+    #[test]
+    fn format_real_never_ends_with_bare_dot() {
+        assert_eq!(format_real(5.000001), "5.0");
+        assert_eq!(format_real(12.000004), "12.0");
+        assert_eq!(format_real(-5.000001), "-5.0");
+        assert_eq!(format_real(1e20), "100000000000000000000.0");
+        assert_eq!(format_real(0.5), ".5");
+        assert_eq!(format_real(-0.25), "-.25");
+        assert_eq!(format_real(1e-9), "0.0");
+        assert_eq!(format_real(3.0), "3.0");
+    }
 
     #[test]
     fn parses_sample() {

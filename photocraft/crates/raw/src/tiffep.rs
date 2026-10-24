@@ -7,10 +7,12 @@
 //!
 //! Black and white levels use DNG-style tags when the camera writes them,
 //! then the vendor's publicly documented tags (Nikon maker note BlackLevel,
-//! Sony raw-IFD BlackLevel), else 0 with a warning. The white level falls
-//! back to the clipping point found in the data. The as-shot white balance
-//! comes from the documented vendor tags (Nikon WB_RBLevels, Sony
-//! WB_RGGBLevels); otherwise it is estimated.
+//! Sony raw-IFD BlackLevel), else 0 with a warning — cRAW files without a
+//! BlackLevel tag (the first generation of cRAW bodies) get the 512 that their
+//! tone curve gives the black code. The white level falls back to the clipping
+//! point found in the data. The as-shot white balance comes from the documented
+//! vendor tags (Nikon WB_RBLevels, Sony WB_RGGBLevels); otherwise it is
+//! estimated.
 
 use crate::cr2::clip_level;
 use crate::error::{RawError, Result};
@@ -64,7 +66,7 @@ pub(crate) fn cfa(t: &Tiff, raw: &Ifd, ifds: &[Ifd]) -> Option<Cfa> {
 
 /// Nikon maker note: "Nikon\0", version, then an embedded TIFF header whose
 /// offsets are relative to itself.
-fn nikon_maker_note<'a>(t: &Tiff<'a>, ifds: &[Ifd]) -> Option<(Tiff<'a>, Ifd)> {
+pub(crate) fn nikon_maker_note<'a>(t: &Tiff<'a>, ifds: &[Ifd]) -> Option<(Tiff<'a>, Ifd)> {
     let e = ifds.iter().find_map(|i| i.get(tag::MAKER_NOTE).copied())?;
     let b = t.raw(&e)?;
     if !b.starts_with(b"Nikon\0") {
@@ -74,6 +76,18 @@ fn nikon_maker_note<'a>(t: &Tiff<'a>, ifds: &[Ifd]) -> Option<(Tiff<'a>, Ifd)> {
     let inner = Tiff::new(t.data.get(base..)?)?;
     let ifd = inner.ifd_at(inner.first_ifd, 0)?;
     Some((inner, ifd))
+}
+
+/// ExifTool's public Nikon tag documentation: legacy 0x93, or a u16 at offset
+/// 10 of MakerNotes0x51. The latter is used by Z6/Z7, despite TIFF Compression
+/// remaining 34713 even for uncompressed sensor data.
+fn nikon_compression(nikon: Option<&(Tiff<'_>, Ifd)>) -> Option<u32> {
+    let (t, m) = nikon?;
+    t.tag_uint(m, 0x0093).or_else(|| {
+        let b = t.raw(m.get(0x0051)?)?;
+        let v: [u8; 2] = b.get(10..12)?.try_into().ok()?;
+        Some(u32::from(if t.le { u16::from_le_bytes(v) } else { u16::from_be_bytes(v) }))
+    })
 }
 
 /// Four levels listed in R, G, G, B order, placed at their 2×2 CFA positions
@@ -124,10 +138,16 @@ pub(crate) fn decode(t: &Tiff, format: RawFormat, limits: &Limits) -> Result<Sen
         return Err(RawError::unsupported(format!("{}: no CFA image found", format.name())));
     };
     let nikon = if format == RawFormat::Nef { nikon_maker_note(t, &ifds) } else { None };
-    let plane = if format == RawFormat::Arw && sony::is_craw(t, &raw) {
+    let craw = format == RawFormat::Arw && sony::is_craw(t, &raw);
+    let plane = if craw {
         sony::read_craw(t, &raw, limits)?
     } else if format == RawFormat::Nef && t.tag_uint(&raw, tag::COMPRESSION) == Some(nefc::NIKON_COMPRESSION) {
-        nefc::read_compressed(t, &raw, nikon.as_ref(), limits)?
+        match nikon_compression(nikon.as_ref()) {
+            Some(6) => nefc::read_packed(t, &raw, 12, limits)?,
+            Some(10) => nefc::read_packed(t, &raw, 14, limits)?,
+            Some(13 | 14) => return Err(RawError::unsupported("Nikon High Efficiency / High Efficiency* NEF")),
+            _ => nefc::read_compressed(t, &raw, nikon.as_ref(), limits)?,
+        }
     } else {
         read_plane(t, &raw, limits, JpegLayout::Quads)?
     };
@@ -159,6 +179,13 @@ pub(crate) fn decode(t: &Tiff, format: RawFormat, limits: &Limits) -> Result<Sen
         BlackLevels::uniform(*b as f32)
     } else if let Some(v) = rggb_by_position(&cfa, &vendor_black) {
         BlackLevels { rows: 2, cols: 2, values: v.to_vec(), delta_h: Vec::new(), delta_v: Vec::new() }
+    } else if craw {
+        // cRAW files of the first generation (an ILCE-7 writes none) carry no
+        // BlackLevel tag; the tone curve maps the black code to 512, so their
+        // decoded data has a 512 black level (see `sony.rs`). Other tag-less
+        // bodies sit higher (a DSC-RX0's darkest samples are near 800), so 512
+        // is a floor, still far closer than 0.
+        BlackLevels::uniform(512.0)
     } else if nikon.is_some() {
         // Nikon bodies that write no BlackLevel tag subtract the black level in camera: a D3200
         // NEF's darkest samples are 0–4 (noise around zero), median 81 of 4095.
@@ -185,6 +212,17 @@ pub(crate) fn decode(t: &Tiff, format: RawFormat, limits: &Limits) -> Result<Sen
     .filter(|m| m.iter().all(|v| (0.25..8.0).contains(v)));
     // DNG-style DefaultCropOrigin / DefaultCropSize (some vendors write them in the raw IFD).
     let mut crop = full;
+    // Nikon's documented CropArea (0x45) is left, top, width, height in sensor
+    // coordinates. Z6/Z7/D780 record their image borders here; do not infer a
+    // crop from a scaled JPEG or apply a body's dimensions to another mode.
+    if let Some((n, m)) = &nikon
+        && let [x, y, w, h] = n.tag_uints(m, 0x0045).as_slice()
+    {
+        let r = Rect::new(*x as usize, *y as usize, *w as usize, *h as usize);
+        if !r.is_empty() && r.intersect(&full) == r {
+            crop = r;
+        }
+    }
     if let ([ox, oy], [cw, ch]) = (t.tag_floats(&raw, tag::DEFAULT_CROP_ORIGIN).as_slice(), t.tag_floats(&raw, tag::DEFAULT_CROP_SIZE).as_slice()) {
         let f = |v: f64| if v.is_finite() && v >= 0.0 { v.round() as usize } else { 0 };
         let r = Rect::new(f(*ox), f(*oy), f(*cw), f(*ch)).intersect(&full);
@@ -209,13 +247,14 @@ pub(crate) fn decode(t: &Tiff, format: RawFormat, limits: &Limits) -> Result<Sen
         crop,
         color: Default::default(),
         camera_wb,
-        orientation: ifd0.and_then(|i| t.tag_uint(&i, tag::ORIENTATION)).map(|o| o as u16).filter(|o| (1..=8).contains(o)).unwrap_or(1),
+        orientation: crate::tiff::orientation(ifd0.and_then(|i| t.tag_uint(&i, tag::ORIENTATION))),
         baseline_exposure: 0.0,
         gain_maps: Vec::new(),
         tone_curve: Vec::new(),
+        black_point: 0.0,
         warnings,
     };
-    crate::cameras::apply(&mut sensor);
+    crate::cameras::apply(&mut sensor, plane.bits);
     Ok(sensor)
 }
 

@@ -107,7 +107,14 @@ pub fn parse_cube(text: &str) -> Result<LutFile, LutError> {
     let (mut dmin, mut dmax) = ([0.0f32; 3], [1.0f32; 3]);
     let mut rows: Vec<f32> = Vec::new();
     for line in text.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
+        // A '#' inside a quoted TITLE is part of the title, not a comment.
+        let raw = line.trim_start();
+        let skip = if raw.starts_with("TITLE") { raw.find('"').and_then(|q| raw[q + 1..].find('"').map(|e| q + e + 2)) } else { None }.unwrap_or(0);
+        let line = match raw[skip..].find('#') {
+            Some(i) => &raw[..skip + i],
+            None => raw,
+        }
+        .trim();
         if line.is_empty() {
             continue;
         }
@@ -214,7 +221,14 @@ pub fn parse_look(text: &str) -> Result<LutFile, LutError> {
     };
     let size: usize = tag("size").and_then(|s| s.parse().ok()).ok_or_else(|| LutError("no <size> in .look".into()))?;
     let (entries, _) = checked_data_len(size)?;
-    let hex: Vec<u8> = tag("data").ok_or_else(|| LutError("no <data> in .look".into()))?.bytes().filter(u8::is_ascii_hexdigit).collect();
+    let hex: Vec<u8> = tag("data").ok_or_else(|| LutError("no <data> in .look".into()))?.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if hex.iter().any(|b| !b.is_ascii_hexdigit()) {
+        return err("invalid hexadecimal <data> in .look");
+    }
+    // Each float needs eight hex digits; as_chunks would silently discard a partial value.
+    if !hex.len().is_multiple_of(8) {
+        return err("incomplete float in .look <data>");
+    }
     let nib = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
     let bytes: Vec<u8> = hex.as_chunks::<2>().0.iter().map(|p| nib(p[0]) << 4 | nib(p[1])).collect();
     let floats: Vec<f32> = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
@@ -230,6 +244,10 @@ pub fn write_cube(l: &LutFile) -> String {
         s.push_str(&format!("TITLE \"{}\"\n", l.title.replace('"', "'")));
     }
     s.push_str(&format!("LUT_3D_SIZE {}\n", l.size));
+    if l.domain_min != [0.0; 3] || l.domain_max != [1.0; 3] {
+        s.push_str(&format!("DOMAIN_MIN {} {} {}\n", l.domain_min[0], l.domain_min[1], l.domain_min[2]));
+        s.push_str(&format!("DOMAIN_MAX {} {} {}\n", l.domain_max[0], l.domain_max[1], l.domain_max[2]));
+    }
     for c in l.data.as_chunks::<3>().0 {
         s.push_str(&format!("{:.6} {:.6} {:.6}\n", c[0], c[1], c[2]));
     }
@@ -245,7 +263,7 @@ fn smooth(x: f32) -> f32 {
     x * x * (3.0 - 2.0 * x)
 }
 
-/// Generated looks shipped with Photocraft (procedural, CC0): `(id, label)`.
+/// Generated looks shipped with PhotoCraft (procedural, CC0): `(id, label)`.
 pub const BUILTIN: [(&str, &str); 8] = [
     ("warm", "Warm Filter"),
     ("cool", "Cool Filter"),
@@ -300,6 +318,32 @@ pub fn builtin(id: &str) -> Option<LutFile> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cube_title_with_hash_round_trips() {
+        let l = LutFile::from_fn("Look #3", 2, |c| c);
+        assert_eq!(parse_cube(&write_cube(&l)).unwrap().title, "Look #3");
+        let t = "TITLE \"A #b\" # note\nLUT_3D_SIZE 2 # c\n# comment\n";
+        let rows = "0 0 0 # x\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n";
+        let p = parse_cube(&format!("{t}{rows}")).unwrap();
+        assert_eq!(p.title, "A #b");
+    }
+
+    #[test]
+    fn write_cube_keeps_non_default_domain() {
+        let mut l = LutFile::identity(2);
+        l.domain_min = [0.1; 3];
+        l.domain_max = [0.9; 3];
+        let back = parse_cube(&write_cube(&l)).unwrap();
+        assert_eq!(back.domain_min, [0.1; 3]);
+        assert_eq!(back.domain_max, [0.9; 3]);
+        l.domain_min = [0.0, 0.0, 0.5];
+        l.domain_max = [1.0; 3];
+        let back = parse_cube(&write_cube(&l)).unwrap();
+        assert_eq!(back.domain_min, [0.0, 0.0, 0.5]);
+        assert_eq!(back.domain_max, [1.0; 3]);
+        assert!(!write_cube(&LutFile::identity(2)).contains("DOMAIN"));
+    }
 
     #[test]
     fn cube_domain_is_kept_and_validated() {
@@ -417,6 +461,38 @@ DOMAIN_MAX 0.5 1 1
         let hex: String = id.data.iter().flat_map(|v| v.to_le_bytes()).map(|b| format!("{b:02X}")).collect();
         let xml = format!("<?xml version=\"1.0\"?><look><LUT><size>\"2\"</size><data>\"{hex}\"</data></LUT></look>");
         assert_eq!(parse("a.look", xml.as_bytes()).unwrap().data, id.data);
+    }
+
+    #[test]
+    fn look_rgb_and_rgba_allow_whitespace_in_hex_data() {
+        let id = LutFile::identity(2);
+        for channels in [3, 4] {
+            let mut hex = String::new();
+            for rgb in id.data.as_chunks::<3>().0 {
+                for value in rgb.iter().copied().chain((channels == 4).then_some(1.0)) {
+                    for byte in value.to_le_bytes() {
+                        hex.push_str(&format!("{byte:02x} \t\r\n"));
+                    }
+                }
+            }
+            let xml = format!("<look><size>2</size><data>\"{hex}\"</data></look>");
+            assert_eq!(parse("valid.look", xml.as_bytes()).unwrap().data, id.data);
+        }
+    }
+
+    #[test]
+    fn look_rejects_partial_floats_and_invalid_hex() {
+        let id = LutFile::identity(2);
+        let hex: String = id.data.iter().flat_map(|v| v.to_le_bytes()).map(|b| format!("{b:02X}")).collect();
+        for suffix in ["0", "00", "0000", "000000", "G", "é"] {
+            let xml = format!("<look><size>2</size><data>{hex}{suffix}</data></look>");
+            assert!(parse("bad.look", xml.as_bytes()).is_err(), "accepted malformed suffix {suffix:?}");
+        }
+        let invalid = hex.replacen('0', "G", 1);
+        let xml = format!("<look><size>2</size><data>{invalid}</data></look>");
+        assert!(parse("bad.look", xml.as_bytes()).unwrap_err().0.contains("invalid hexadecimal"));
+        let xml = format!("<look><size>2</size><data>{hex}00</data></look>");
+        assert!(parse("bad.look", xml.as_bytes()).unwrap_err().0.contains("incomplete float"));
     }
 
     #[test]

@@ -102,7 +102,8 @@ pub fn dab_rect(d: &Dab) -> Rect {
 
 /// Rasterize one dab's coverage.
 pub fn footprint(d: &Dab, index: usize, hardness: f32) -> Footprint {
-    let rect = dab_rect(d);
+    // A soft tip paints past its nominal radius.
+    let rect = crate::render::rect_around(d, crate::tip_reach(d.radius, hardness).max(d.radius));
     let (cx, cy) = (d.center.x as f32, d.center.y as f32);
     let mut cov = Vec::with_capacity(rect.width() as usize * rect.height() as usize);
     for y in rect.y0..rect.y1 {
@@ -129,6 +130,24 @@ pub fn stroke_coverage(stroke: &Stroke) -> (Rect, Vec<f32>) {
     r.dense_coverage()
 }
 
+/// [`stroke_coverage`] that admits the **rendered** extent before it is made dense: `None` when the
+/// stroke covers more than `max_pixels`.
+///
+/// Rendering itself is tiled, so it holds only the tiles the dabs touch. The bounds are read from
+/// those tiles, after tips, dynamics and scattering have placed every dab, so this is the stroke's
+/// real extent rather than an estimate from the input points. Only then is the `width × height`
+/// buffer allocated, which is what callers need bounded.
+pub fn stroke_coverage_within(stroke: &Stroke, max_pixels: u64) -> Option<(Rect, Vec<f32>)> {
+    let mut r = crate::StrokeRenderer::new(&stroke.brush, None, 1.0);
+    r.push(&stroke.points);
+    r.finish();
+    let b = r.bounds();
+    if u64::from(b.width()).saturating_mul(u64::from(b.height())) > max_pixels {
+        return None;
+    }
+    Some(r.dense_coverage())
+}
+
 /// Index of the alpha channel, if the format has one.
 #[inline]
 pub fn alpha_index(fmt: &PixelFormat) -> Option<usize> {
@@ -142,15 +161,20 @@ pub fn over_native(fmt: &PixelFormat, dst: &mut [f32], src: &[f32], k: f32, lock
     match alpha_index(fmt) {
         Some(a) => {
             let (da, sa) = (dst[a], src[a] * k);
+            if lock_transparency {
+                // Alpha kept: source atop, the colour moves by the source alpha alone (#5783).
+                for c in 0..a {
+                    dst[c] += (src[c] - dst[c]) * sa;
+                }
+                return;
+            }
             let oa = sa + da * (1.0 - sa);
             if oa > 0.0 {
                 for c in 0..a {
                     dst[c] = (src[c] * sa + dst[c] * da * (1.0 - sa)) / oa;
                 }
             }
-            if !lock_transparency {
-                dst[a] = oa;
-            }
+            dst[a] = oa;
         }
         None => {
             for c in 0..dst.len() {
@@ -201,10 +225,8 @@ pub fn apply_coverage(
         } else {
             let d = to_rgba(&fmt, px);
             let s = to_rgba(&fmt, src);
-            let mut o = photocraft_color::blend::composite(blend, d, s, k);
-            if lock_transparency {
-                o[3] = d[3];
-            }
+            let o =
+                if lock_transparency { photocraft_color::blend::composite_atop(blend, d, s, k) } else { photocraft_color::blend::composite(blend, d, s, k) };
             let mut enc = [0.0f32; 8];
             from_rgba_into(&fmt, o, &mut enc);
             px.copy_from_slice(&enc[..n]);
@@ -423,6 +445,7 @@ fn premultiply(px: &mut [f32], alpha: Option<usize>) {
 mod tests {
     use super::*;
     use crate::{BrushSettings, StrokePoint};
+    use photocraft_geom::Point;
 
     fn stroke(points: &[(f64, f64)], size: f32, hardness: f32) -> Stroke {
         Stroke {
@@ -458,6 +481,23 @@ mod tests {
             let p = s.pixel(20, 20);
             assert!(p[..n - 1].iter().all(|v| (v - 0.8).abs() < 1e-2) && p[n - 1] == 1.0, "{fmt:?} {p:?}");
             assert!((s.pixel(40, 40)[0] - 0.2).abs() < 1e-2);
+        }
+    }
+
+    #[test]
+    fn coverage_composite_under_lock_blends_source_atop() {
+        // Locked half-transparent white, black at coverage 0.5: colour halfway, alpha kept (#5783).
+        for fmt in [PixelFormat::RGBA8, PixelFormat::RGBA16, PixelFormat::RGBA32F] {
+            for mode in [BlendMode::Normal, BlendMode::Multiply] {
+                let mut s = Surface::new(fmt);
+                s.fill_rect(Rect::new(0, 0, 4, 4), &[1.0, 1.0, 1.0, 0.5]);
+                let r = Rect::new(0, 0, 4, 4);
+                let mut paint = Region::new(r, 4);
+                paint.data.chunks_mut(4).for_each(|p| p.copy_from_slice(&[0.0, 0.0, 0.0, 1.0]));
+                apply_coverage(&mut s, r, &[1.0; 16], 0.5, None, true, &paint, mode);
+                let p = s.rgba(1, 1);
+                assert!((p[0] - 0.5).abs() < 0.01 && (p[3] - 0.5).abs() < 0.01, "{fmt:?} {mode:?} {p:?}");
+            }
         }
     }
 
@@ -550,5 +590,41 @@ mod tests {
         let mut d = [0.5, 0.5];
         mix_premultiplied(&mut d, &[1.0, 1.0], 7, 0.5);
         assert_eq!(d, [0.5, 0.5]);
+    }
+
+    #[test]
+    fn footprint_stays_inside_the_tips_reach() {
+        let radius = 10.5f32;
+        for hardness in [1.0, 0.5, 0.0] {
+            let dab = Dab::round(Point::new(32.0, 32.0), radius, 1.0);
+            let fp = footprint(&dab, 0, hardness);
+            let mut painted = 0usize;
+            let mut farthest = 0.0f64;
+            for y in fp.rect.y0..fp.rect.y1 {
+                for x in fp.rect.x0..fp.rect.x1 {
+                    let dist = ((x as f64 + 0.5 - dab.center.x).powi(2) + (y as f64 + 0.5 - dab.center.y).powi(2)).sqrt();
+                    if fp.at(x, y) <= 0.0 {
+                        continue;
+                    }
+                    painted += 1;
+                    farthest = farthest.max(dist);
+                    let reach = f64::from(crate::tip_reach(radius, hardness));
+                    assert!(
+                        dist < reach.max(radius as f64) + 0.5,
+                        "hardness {hardness}: pixel ({x}, {y}) at {dist} px from \
+                         the centre is painted past the Full Size ring of \
+                         {radius} px"
+                    );
+                }
+            }
+            assert!(painted > 0, "hardness {hardness}: nothing painted");
+            if hardness == 1.0 {
+                assert!(
+                    farthest > radius as f64,
+                    "a hard tip painted only {farthest} px out, so the Full \
+                     Size ring at {radius} px is never reached"
+                );
+            }
+        }
     }
 }

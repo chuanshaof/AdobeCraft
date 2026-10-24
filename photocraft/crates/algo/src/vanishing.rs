@@ -114,6 +114,73 @@ impl VpPlane {
         });
         Lifted { focal: f, center: c, pts }
     }
+
+    /// Turn of each corner (`sin` of the angle between consecutive edges, positive when the
+    /// corners run clockwise on screen); `None` when an edge is shorter than a pixel or a corner
+    /// is not finite.
+    fn turns(&self) -> Option<[f64; 4]> {
+        let q = &self.corners;
+        if q.iter().flatten().any(|v| !v.is_finite() || v.abs() > 1e9) {
+            return None;
+        }
+        let e = |i: usize| [q[(i + 1) % 4][0] - q[i][0], q[(i + 1) % 4][1] - q[i][1]];
+        let mut out = [0.0; 4];
+        for (i, t) in out.iter_mut().enumerate() {
+            let (a, b) = (e(i), e((i + 1) % 4));
+            let (la, lb) = (a[0].hypot(a[1]), b[0].hypot(b[1]));
+            if la < 1.0 || lb < 1.0 {
+                return None;
+            }
+            *t = (a[0] * b[1] - a[1] * b[0]) / (la * lb);
+        }
+        Some(out)
+    }
+
+    /// How usable the plane is, the way Photoshop colours its grid: [`PlaneCheck::Invalid`] for
+    /// a quad that isn't convex (self-intersecting, a corner pushed inside, a near-straight or
+    /// near-zero corner), [`PlaneCheck::Questionable`] for a convex quad whose perspective can't
+    /// come from a camera centred at `center` (or with a corner sharper than 10°), else
+    /// [`PlaneCheck::Valid`].
+    pub fn check(&self, center: [f64; 2]) -> PlaneCheck {
+        let Some(t) = self.turns() else { return PlaneCheck::Invalid };
+        let same_sign = t.iter().all(|v| *v > 0.0) || t.iter().all(|v| *v < 0.0);
+        let min = t.iter().fold(f64::MAX, |m, v| m.min(v.abs()));
+        if !same_sign || min < 1f64.to_radians().sin() || self.homography().is_none() {
+            return PlaneCheck::Invalid;
+        }
+        if min < 10f64.to_radians().sin() {
+            return PlaneCheck::Questionable;
+        }
+        // Both vanishing points finite but no real focal length fits them.
+        let q = &self.corners;
+        let (v1, v2) = (meet(q[0], q[1], q[3], q[2]), meet(q[0], q[3], q[1], q[2]));
+        let finite = |v: V3| v[2].abs() > 1e-9 * (v[0].abs() + v[1].abs()).max(1.0);
+        if finite(v1) && finite(v2) && self.focal(center).is_none() {
+            return PlaneCheck::Questionable;
+        }
+        PlaneCheck::Valid
+    }
+
+    /// The same quad with its corners clockwise on screen, starting at the top-left one
+    /// (the order [`paste`] and [`Scene::tear_off`] expect), however they were clicked.
+    pub fn normalized(&self) -> VpPlane {
+        let mut q = self.corners;
+        if self.turns().is_some_and(|t| t.iter().sum::<f64>() < 0.0) {
+            q = [q[0], q[3], q[2], q[1]];
+        }
+        let first = (0..4).min_by(|&a, &b| (q[a][0] + q[a][1]).total_cmp(&(q[b][0] + q[b][1]))).unwrap_or(0);
+        VpPlane { corners: [q[first], q[(first + 1) % 4], q[(first + 2) % 4], q[(first + 3) % 4]] }
+    }
+}
+
+/// Plane validity ([`VpPlane::check`]): Photoshop draws a valid plane's grid blue, a doubtful
+/// one yellow and an invalid one red.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PlaneCheck {
+    Valid,
+    Questionable,
+    Invalid,
 }
 
 impl Lifted {
@@ -228,22 +295,22 @@ fn quad_mask(h: &Homography, area: Rect) -> Vec<f32> {
 /// Pastes `src` (content in `src_rect`) onto plane `i` with its top-left at plane coordinates
 /// `at` (0..1) and its width `width` (fraction of the plane's width), aspect preserved in the
 /// plane's metric. Returns the warped image clipped to the plane (transparent elsewhere).
-pub fn paste(scene: &Scene, i: usize, src: &Surface, src_rect: Rect, at: [f64; 2], width: f64) -> Option<Surface> {
-    let (h, lu, lv) = scene.frame(i)?;
+pub fn paste(scene: &Scene, i: usize, src: &Surface, src_rect: Rect, at: [f64; 2], width: f64) -> Result<Option<Surface>, photocraft_raster::AllocationError> {
+    let Some((h, lu, lv)) = scene.frame(i) else { return Ok(None) };
     let (sw, sh) = (src_rect.width() as f64, src_rect.height() as f64);
     if sw <= 0.0 || sh <= 0.0 {
-        return None;
+        return Ok(None);
     }
     // Source px → plane (u, v): u spans `width`, v keeps the metric aspect.
     let su = width / sw;
     let sv = width * lu / lv / sw;
     let to_plane = Homography([su, 0.0, at[0] - src_rect.x0 as f64 * su, 0.0, sv, at[1] - src_rect.y0 as f64 * sv, 0.0, 0.0, 1.0]);
     let full = h.mul(&to_plane);
-    let mut out = warp_surface(src, src_rect, &full, Interp::Bicubic);
+    let mut out = warp_surface(src, src_rect, &full, Interp::Bicubic)?;
     // Clip to the plane.
     let b = out.content_bounds();
     if b.is_empty() {
-        return Some(out);
+        return Ok(Some(out));
     }
     let mask = quad_mask(&h, b);
     let fmt = out.format();
@@ -254,7 +321,7 @@ pub fn paste(scene: &Scene, i: usize, src: &Surface, src_rect: Rect, at: [f64; 2
     }
     out.write_region(b, &data);
     out.prune();
-    Some(out)
+    Ok(Some(out))
 }
 
 /// Perspective clone stamp: one stroke of dabs at image points `points` on the destination
@@ -278,20 +345,40 @@ pub fn clone_stroke(scene: &Scene, surf: &mut Surface, source: [f64; 2], points:
     let src_copy = surf.clone();
     let fmt = surf.format();
     let n = fmt.channels();
+    // Scratch for `sample`: the dab's source pixels, the four bilinear corners, the result.
+    let mut win = Window { area: Rect::new(0, 0, 0, 0), data: Vec::new() };
+    let (mut corners, mut s) = (vec![0.0f32; 4 * n], vec![0.0f32; n]);
     let mut dabs = 0;
     for p in points {
         let mc = metric(&hd_inv, lud, lvd, *p);
         // Image-space footprint: map a metric circle's bounding points.
-        let mut bb = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
-        for k in 0..16 {
-            let a = k as f64 / 16.0 * std::f64::consts::TAU;
-            let (u, v) = ((mc[0] + r_m * a.cos()) / lud, (mc[1] + r_m * a.sin()) / lvd);
-            let (x, y) = hd.apply(u, v);
-            bb = [bb[0].min(x), bb[1].min(y), bb[2].max(x), bb[3].max(y)];
-        }
-        let area = Rect::new(bb[0].floor() as i32, bb[1].floor() as i32, (bb[2].ceil() as i32).saturating_add(1), (bb[3].ceil() as i32).saturating_add(1));
+        let footprint = |h: &Homography, lu: f64, lv: f64, c: [f64; 2]| {
+            let mut bb = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+            for k in 0..16 {
+                let a = k as f64 / 16.0 * std::f64::consts::TAU;
+                let (x, y) = h.apply((c[0] + r_m * a.cos()) / lu, (c[1] + r_m * a.sin()) / lv);
+                bb = [bb[0].min(x), bb[1].min(y), bb[2].max(x), bb[3].max(y)];
+            }
+            Rect::new(bb[0].floor() as i32, bb[1].floor() as i32, (bb[2].ceil() as i32).saturating_add(1), (bb[3].ceil() as i32).saturating_add(1))
+        };
+        let area = footprint(&hd, lud, lvd, mc);
         if area.is_empty() || area.width() > 4096 || area.height() > 4096 {
             continue;
+        }
+        // The source footprint, read once; `sample` reads any pixel outside it from the surface.
+        // Skipped when it dwarfs the destination (cloning from near to far in strong perspective):
+        // decoding it would cost more than the few per-pixel reads it saves.
+        win.area = footprint(&hs, lus, lvs, [mc[0] + offset[0], mc[1] + offset[1]]).inflate(2);
+        let dest_px = u64::from(area.width()) * u64::from(area.height());
+        if win.area.is_empty()
+            || win.area.width() > 4096
+            || win.area.height() > 4096
+            || u64::from(win.area.width()) * u64::from(win.area.height()) > 4 * dest_px
+        {
+            win.area = Rect::new(0, 0, 0, 0);
+            win.data.clear();
+        } else {
+            src_copy.read_region_into(win.area, &mut win.data);
         }
         let mut data = surf.read_region(area);
         let w = area.width() as usize;
@@ -309,7 +396,7 @@ pub fn clone_stroke(scene: &Scene, surf: &mut Surface, source: [f64; 2], points:
             // Source pixel at the same metric offset.
             let sm = [m[0] + offset[0], m[1] + offset[1]];
             let (sx, sy) = hs.apply(sm[0] / lus, sm[1] / lvs);
-            let s = sample(&src_copy, sx - 0.5, sy - 0.5, n);
+            sample(&src_copy, &win, sx - 0.5, sy - 0.5, &mut corners, &mut s);
             for c in 0..n {
                 px[c] += (s[c] - px[c]) * k;
             }
@@ -323,11 +410,42 @@ pub fn clone_stroke(scene: &Scene, surf: &mut Surface, source: [f64; 2], points:
     dabs
 }
 
-fn sample(s: &Surface, x: f64, y: f64, n: usize) -> Vec<f32> {
+/// Pixels of `area` read from the source surface (`read_region` layout).
+struct Window {
+    area: Rect,
+    data: Vec<f32>,
+}
+
+/// Bilinear sample of `s` at (`x`, `y`) into `out` (one pixel), with `corners` (resized to four
+/// pixels) as reused scratch. A footprint inside `win` is read from it, any other with one region
+/// read from `s`.
+fn sample(s: &Surface, win: &Window, x: f64, y: f64, corners: &mut Vec<f32>, out: &mut [f32]) {
+    let n = out.len();
     let (x0, y0) = (x.floor() as i32, y.floor() as i32);
     let (tx, ty) = ((x - x0 as f64) as f32, (y - y0 as f64) as f32);
-    let r = s.read_region(Rect::new(x0, y0, x0 + 2, y0 + 2));
-    (0..n).map(|c| (r[c] * (1.0 - tx) + r[n + c] * tx) * (1.0 - ty) + (r[2 * n + c] * (1.0 - tx) + r[3 * n + c] * tx) * ty).collect()
+    let (x1, y1) = (x0.saturating_add(1), y0.saturating_add(1));
+    let foot = Rect::new(x0, y0, x1.saturating_add(1), y1.saturating_add(1));
+    if !win.area.contains_rect(&foot) && foot.width() == 2 && foot.height() == 2 {
+        // Outside the window (or none): one region read looks the tile up once, where four
+        // `read_pixel` calls would look it up four times. Same corner order as below.
+        s.read_region_into(foot, corners);
+    } else {
+        corners.resize(4 * n, 0.0);
+        let w = win.area.width() as usize;
+        for (k, (px, py)) in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)].into_iter().enumerate() {
+            let dst = &mut corners[k * n..(k + 1) * n];
+            if win.area.contains(px, py) {
+                let o = ((py - win.area.y0) as usize * w + (px - win.area.x0) as usize) * n;
+                dst.copy_from_slice(&win.data[o..o + n]);
+            } else {
+                s.read_pixel(px, py, dst);
+            }
+        }
+    }
+    let r = corners;
+    for (c, o) in out.iter_mut().enumerate() {
+        *o = (r[c] * (1.0 - tx) + r[n + c] * tx) * (1.0 - ty) + (r[2 * n + c] * (1.0 - tx) + r[3 * n + c] * tx) * ty;
+    }
 }
 
 #[cfg(test)]
@@ -364,6 +482,25 @@ mod tests {
     }
 
     #[test]
+    fn plane_check_and_corner_order() {
+        let c = [400.0, 300.0];
+        assert_eq!(floor_quad(500.0, c).check(c), PlaneCheck::Valid);
+        let square = VpPlane { corners: [[10.0, 10.0], [110.0, 10.0], [110.0, 110.0], [10.0, 110.0]] };
+        assert_eq!(square.check(c), PlaneCheck::Valid, "fronto-parallel");
+        let bowtie = VpPlane { corners: [[10.0, 10.0], [110.0, 110.0], [110.0, 10.0], [10.0, 110.0]] };
+        assert_eq!(bowtie.check(c), PlaneCheck::Invalid);
+        let dent = VpPlane { corners: [[10.0, 10.0], [110.0, 10.0], [40.0, 40.0], [10.0, 110.0]] };
+        assert_eq!(dent.check(c), PlaneCheck::Invalid, "concave");
+        let sliver = VpPlane { corners: [[10.0, 10.0], [300.0, 10.0], [300.0, 40.0], [200.0, 40.0]] };
+        assert_eq!(sliver.check(c), PlaneCheck::Questionable, "a corner sharper than 10°");
+        let nan = VpPlane { corners: [[f64::NAN, 10.0], [110.0, 10.0], [110.0, 110.0], [10.0, 110.0]] };
+        assert_eq!(nan.check(c), PlaneCheck::Invalid);
+        // Clicked counter-clockwise from the bottom-right: clockwise from the top-left.
+        let ccw = VpPlane { corners: [[110.0, 110.0], [110.0, 10.0], [10.0, 10.0], [10.0, 110.0]] };
+        assert_eq!(ccw.normalized(), square);
+    }
+
+    #[test]
     fn tear_off_is_perpendicular_and_shares_the_edge() {
         let c = [400.0, 300.0];
         let mut sc = Scene::new(floor_quad(500.0, c), c, None, 800.0);
@@ -384,7 +521,7 @@ mod tests {
         let sc = Scene::new(floor_quad(500.0, c), c, None, 800.0);
         let mut img = Surface::new(PixelFormat::RGBA8);
         img.fill_rect(Rect::new(0, 0, 100, 50), &[1.0, 0.0, 0.0, 1.0]);
-        let out = paste(&sc, 0, &img, Rect::new(0, 0, 100, 50), [0.25, 0.25], 0.5).unwrap();
+        let out = paste(&sc, 0, &img, Rect::new(0, 0, 100, 50), [0.25, 0.25], 0.5).unwrap().unwrap();
         // The pasted rectangle lands inside the plane, around plane (0.5, 0.5).
         let h = sc.planes[0].homography().unwrap();
         let (x, y) = h.apply(0.5, 0.5);
@@ -400,5 +537,48 @@ mod tests {
         let n = clone_stroke(&sc, &mut s, [sx, sy], &[[dx, dy]], 10.0, 0.8, 1.0);
         assert_eq!(n, 1);
         assert!(s.rgba(dx as i32, dy as i32)[0] > 0.8, "{:?}", s.rgba(dx as i32, dy as i32));
+    }
+
+    #[test]
+    fn sample_at_the_edge_of_i32_does_not_overflow() {
+        let s = Surface::new(PixelFormat::RGBA8);
+        let win = Window { area: Rect::new(0, 0, 0, 0), data: Vec::new() };
+        let (mut corners, mut out) = (Vec::new(), [1.0; 4]);
+        sample(&s, &win, 3e9, 3e9, &mut corners, &mut out);
+        assert_eq!(out, [0.0; 4]);
+    }
+
+    #[test]
+    fn sample_interpolates_across_tile_edges() {
+        let mut s = Surface::new(PixelFormat::RGBA8);
+        let (a, b) = ([1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]);
+        // Left of x = 256 is red, right is blue; the 2×2 footprint straddles the tile edge.
+        s.fill_rect(Rect::new(0, 0, 256, 512), &a);
+        s.fill_rect(Rect::new(256, 0, 512, 512), &b);
+        let (mut corners, mut out) = (Vec::new(), [0.0; 4]);
+        let want = [0.75, 0.0, 0.25, 1.0];
+        // From the surface, from a window holding the footprint, and from one holding half of it.
+        for area in [Rect::new(0, 0, 0, 0), Rect::new(250, 250, 260, 260), Rect::new(250, 250, 256, 260)] {
+            let mut win = Window { area, data: Vec::new() };
+            s.read_region_into(area, &mut win.data);
+            sample(&s, &win, 255.25, 255.5, &mut corners, &mut out);
+            assert!(out.iter().zip(want).all(|(o, w)| (o - w).abs() < 1e-6), "{area:?}: {out:?}");
+        }
+        // Four different corners, one per tile, so both axes of the corner order count.
+        let mut q = Surface::new(PixelFormat::RGBA8);
+        for (x, y, px) in [(255, 255, [1.0, 0.0, 0.0, 1.0]), (256, 255, [0.0, 1.0, 0.0, 1.0]), (255, 256, [0.0, 0.0, 1.0, 1.0]), (256, 256, [1.0; 4])] {
+            q.fill_rect(Rect::new(x, y, x + 1, y + 1), &px);
+        }
+        let want = [0.375, 0.25, 0.75, 1.0];
+        for area in [Rect::new(0, 0, 0, 0), Rect::new(250, 250, 260, 260)] {
+            let mut win = Window { area, data: Vec::new() };
+            q.read_region_into(area, &mut win.data);
+            sample(&q, &win, 255.25, 255.75, &mut corners, &mut out);
+            assert!(out.iter().zip(want).all(|(o, w)| (o - w).abs() < 1e-6), "{area:?}: {out:?}");
+        }
+        // Outside every tile, the default (transparent) pixel.
+        let win = Window { area: Rect::new(0, 0, 0, 0), data: Vec::new() };
+        sample(&s, &win, -10.5, -10.5, &mut corners, &mut out);
+        assert_eq!(out, [0.0; 4]);
     }
 }

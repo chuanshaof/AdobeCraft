@@ -133,6 +133,11 @@ fn parse_entries(data: &[u8]) -> Option<Vec<Entry>> {
     for _ in 0..count {
         let start = r.p;
         let len = r.u32()? as usize;
+        // The length counts itself and the type: anything shorter would put the cursor back on
+        // this entry, and a hostile count would then loop until memory runs out.
+        if len < 8 {
+            return None;
+        }
         let end = start.checked_add(len)?;
         let raw = data.get(start..end)?;
         let kind = r.take(4)?;
@@ -229,8 +234,14 @@ pub fn notes_from_blocks(doc: &Document) -> Vec<Note> {
     doc.metadata.psd_global_blocks.iter().find(|(_, k, _)| *k == ANNO).and_then(|(_, _, d)| parse_anno(d)).unwrap_or_default()
 }
 
-/// Global blocks to write: the raw `Anno` block while it still describes `doc.notes`, else a
-/// regenerated one in its place (appended when new, dropped when the last note is deleted).
+/// Whether the document holds an `Anno` block that doesn't parse (its notes can't be shown).
+pub fn anno_unreadable(doc: &Document) -> bool {
+    doc.metadata.psd_global_blocks.iter().find(|(_, k, _)| *k == ANNO).is_some_and(|(_, _, d)| parse_entries(d).is_none())
+}
+
+/// Global blocks to write: the raw `Anno` block while it still describes `doc.notes` (or doesn't
+/// parse and no note was added), else a regenerated one in its place (appended when new, dropped
+/// when the last note is deleted).
 pub fn export_blocks(doc: &Document, mut blocks: Vec<photocraft_doc::PsdGlobalBlock>) -> Vec<photocraft_doc::PsdGlobalBlock> {
     let at = blocks.iter().position(|(_, k, _)| *k == ANNO);
     let raw = at.map(|i| blocks[i].2.clone());
@@ -246,7 +257,9 @@ pub fn export_blocks(doc: &Document, mut blocks: Vec<photocraft_doc::PsdGlobalBl
                 Note { color: y.color, ..x.clone() } == *y && cx.iter().zip(cy).all(|(p, q)| (p - q).abs() < 1.0 / 512.0)
             })
     };
-    if parsed.as_deref().zip(want.as_deref()).is_some_and(|(p, w)| same(p, w)) || (raw.is_none() && doc.notes.is_empty()) {
+    // With no notes, a block we can't read is kept as is: it isn't "the last note deleted", and
+    // dropping it would delete the annotations it holds (issue #944).
+    if parsed.as_deref().zip(want.as_deref()).is_some_and(|(p, w)| same(p, w)) || (entries.is_none() && doc.notes.is_empty()) {
         return blocks;
     }
     let extra: Vec<Vec<u8>> = entries.unwrap_or_default().into_iter().filter_map(|e| if let Entry::Raw(r) = e { Some(r) } else { None }).collect();
@@ -393,6 +406,41 @@ mod tests {
         d.notes.clear();
         assert!(export_blocks(&d, out).is_empty());
         assert!(parse_anno(&[0, 2, 0, 1, 0, 0, 0, 9]).is_none());
+    }
+
+    /// Issue #944: an `Anno` block that doesn't parse was taken for "no notes" and dropped on save.
+    #[test]
+    fn export_blocks_keeps_an_unreadable_block() {
+        let mut d = Document::new("n", photocraft_doc::Size::new(10, 10), photocraft_doc::ColorMode::Rgb, photocraft_doc::SampleType::U8);
+        let bad: Vec<photocraft_doc::PsdGlobalBlock> = vec![(*b"8BIM", ANNO, Arc::new(vec![0, 2, 0, 1, 0, 0, 0, 9]))];
+        d.metadata.psd_global_blocks = bad.clone();
+        assert!(anno_unreadable(&d) && notes_from_blocks(&d).is_empty());
+        let out = export_blocks(&d, bad.clone());
+        assert_eq!(out.len(), 1);
+        assert!(Arc::ptr_eq(&out[0].2, &bad[0].2));
+        // A note added by the user still writes a fresh block in its place.
+        d.notes.push(Note { text: "new".into(), ..Default::default() });
+        let out = export_blocks(&d, bad);
+        assert_eq!(parse_anno(&out[0].2).unwrap()[0].text, "new");
+        // A readable block is not reported.
+        d.metadata.psd_global_blocks = out;
+        assert!(!anno_unreadable(&d));
+    }
+
+    /// An entry length below 8 (its own `u32` plus the type) put the cursor back on the same
+    /// entry, so a count of 0xFFFFFFFF looped ~4.3e9 times and ran out of memory.
+    #[test]
+    fn short_entry_length_is_unreadable_not_a_loop() {
+        for len in [0u8, 4, 7] {
+            for kind in [b"sndA", b"txtA"] {
+                let mut b = vec![0, 2, 0, 1, 0, 0, 0, 3, 0, 0, 0, len];
+                b.extend_from_slice(kind);
+                b.extend_from_slice(&[0; 64]);
+                assert!(parse_entries(&b).is_none(), "len {len} {kind:?}");
+            }
+        }
+        let hostile = [0, 2, 0, 1, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, b's', b'n', b'd', b'A'];
+        assert!(parse_anno(&hostile).is_none());
     }
 
     #[test]

@@ -10,9 +10,11 @@
 //! resampling. The params are the data in every case (strokes, pins and planes are small
 //! compared with a field or a mesh, and replay is deterministic), so nothing needs a blob.
 
+use std::cell::RefCell;
+
 use photocraft_algo::liquify::{LiquifyField, LiquifyStroke, apply_liquify, auto_cell};
 use photocraft_algo::perspective::{PerspectiveMap, Plane, Straighten, straighten};
-use photocraft_algo::puppet::{PuppetDensity, PuppetMode, PuppetPin, PuppetWarp, puppet_warp};
+use photocraft_algo::puppet::{PuppetDensity, PuppetMode, PuppetPin, PuppetWarp, puppet_warp, puppet_warp_with_mask};
 use photocraft_algo::transform::Interp;
 use photocraft_algo::warp::{warp_mesh_gray, warp_mesh_surface};
 use photocraft_color::PixelFormat;
@@ -213,26 +215,18 @@ fn smart_layer(s: &Session) -> std::result::Result<(), String> {
     }
 }
 
-/// Unlocks a Background layer for an operation that exposes transparency (as Photoshop does).
-fn float_background(l: &mut Layer) {
-    if l.locks.position && l.name == "Background" {
-        l.locks.position = false;
-        l.locks.transparency = false;
-        l.name = "Layer 0".into();
-    }
-}
-
 fn check_locks(l: &Layer, group: Locks, position: bool) -> Result<()> {
     let locks = l.locks.union(group);
     if locks.all || locks.pixels || (position && locks.position) {
-        return Err(EngineError::Other(format!("layer \"{}\" is locked", l.name)));
+        return Err(EngineError::Other(format!("Could not complete your request because the layer \"{}\" is locked", l.name)));
     }
     Ok(())
 }
 
 /// Shared driver: a smart object records `cmd` as a smart filter; a pixel layer is edited in
 /// place by `f(surface, selection)`.
-type MaskFn<'a> = Option<&'a dyn Fn(&Surface) -> Surface>;
+/// Deforms a linked layer mask the same way, limited to the selection when there is one.
+type MaskFn<'a> = Option<&'a dyn Fn(&Surface, Option<&Surface>) -> Result<Surface>>;
 /// Deforms a layer's pixels (with the selection and canvas); an `Err` leaves the layer as it was.
 type LayerFn<'a> = &'a dyn Fn(&Surface, Option<&Surface>, Rect) -> Result<Surface>;
 
@@ -246,24 +240,28 @@ fn run_on_layer(s: &mut Session, cmd: &str, label: &str, p: &Value, moves: bool,
         let canvas = doc.bounds();
         let selection = doc.selection.clone();
         let group = crate::transform_cmds::group_locks(doc, id);
+        // A Background gains transparency when the distortion moves pixels (as in Photoshop).
+        if moves {
+            crate::extra_cmds::background_to_layer(doc, id);
+        }
         let l = doc.layer_mut(id).ok_or(EngineError::NoLayer(id))?;
         if let LayerContent::Smart(_) = l.content {
+            // As filters do: a pixel or full lock refuses the smart filter (the position lock
+            // doesn't, since the smart object itself stays put).
+            check_locks(l, group, false)?;
             let sf = SmartFilter { command: cmd.to_string(), params: params.clone(), blend: photocraft_color::BlendMode::Normal, opacity: 1.0, visible: true };
             return crate::smart_cmds::add_smart_filter(doc, id, sf, selection.as_ref());
-        }
-        if moves {
-            float_background(l);
         }
         check_locks(l, group, moves)?;
         let LayerContent::Raster(surf) = &mut l.content else {
             return Err(EngineError::Other(format!("{label} needs a pixel layer (rasterize it first)")));
         };
         *surf = f(surf, selection.as_ref(), canvas)?;
-        // A linked layer mask follows a geometric warp.
+        // A linked layer mask follows a geometric warp, only where the pixels moved (#3083).
         if let (Some(mf), Some(m)) = (mask, l.mask.as_mut())
             && m.linked
         {
-            m.surface = mf(&m.surface);
+            m.surface = mf(&m.surface, selection.as_ref())?;
         }
         Ok(())
     })?;
@@ -309,7 +307,7 @@ fn liquify(s: &mut Session, p: &Value) -> Result<Value> {
 fn deform_selected(surf: &Surface, sel: Option<&Surface>, f: &dyn Fn(&Surface) -> Result<Surface>) -> Result<Surface> {
     match sel {
         Some(sel) => {
-            let (lifted, mut rest) = crate::transform_cmds::split_selected(surf, sel);
+            let (lifted, mut rest) = crate::transform_cmds::split_selected(surf, sel)?;
             let moved = f(&lifted)?;
             crate::transform_cmds::composite_over(&mut rest, &moved);
             rest.prune();
@@ -332,7 +330,23 @@ fn puppet(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
     }
     let it = interp(p);
     let too_far = || bad(cmd, "the pins stretch the content too far: the result would cover more than 2^30 pixels");
-    run_on_layer(s, cmd, "Puppet Warp", p, true, &|surf, sel, _| deform_selected(surf, sel, &|x| puppet_surface(x, &w, it).ok_or_else(too_far)), None)
+    // A linked layer mask moves with the pixels on the same mesh (#4910): the layer's warp
+    // solves the mesh once and leaves the moved mask here for the mask step.
+    let linked = s.active().and_then(|d| d.doc.layer(id)).and_then(|l| l.mask.as_ref()).filter(|m| m.linked).map(|m| m.surface.clone());
+    let moved_mask: RefCell<Option<Surface>> = RefCell::new(None);
+    let layer_fn = |surf: &Surface, sel: Option<&Surface>, _: Rect| {
+        deform_selected(surf, sel, &|x| {
+            let b = x.content_bounds();
+            if b.is_empty() {
+                return Ok(x.clone());
+            }
+            let (out, mask) = puppet_warp_with_mask(x, b, &w, it, linked.as_ref()).ok_or_else(too_far)?;
+            *moved_mask.borrow_mut() = mask;
+            Ok(out)
+        })
+    };
+    let mask_fn = |m: &Surface, _: Option<&Surface>| Ok(moved_mask.borrow_mut().take().unwrap_or_else(|| m.clone()));
+    run_on_layer(s, cmd, "Puppet Warp", p, true, &layer_fn, Some(&mask_fn))
 }
 
 fn perspective(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
@@ -344,9 +358,14 @@ fn perspective(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
     }
     let it = interp(p);
     let map = PerspectiveMap::new(&planes);
-    let mask_fn = |m: &Surface| match &map {
-        Some(map) => warp_mesh_gray(m, &|x, y| map.map(x, y), Interp::Bilinear),
-        None => m.clone(),
+    let mask_fn = |m: &Surface, sel: Option<&Surface>| {
+        let Some(map) = &map else { return Ok(m.clone()) };
+        let f = |x, y| map.map(x, y);
+        let whole = |m: &Surface| Ok(warp_mesh_gray(m, &f, Interp::Bilinear));
+        match sel {
+            Some(sel) => crate::transform_cmds::move_gray_selected(m, sel, &|lifted, src| Ok(warp_mesh_surface(lifted, src, &f, Interp::Bilinear)), &whole),
+            None => whole(m),
+        }
     };
     let mut r = run_on_layer(
         s,

@@ -247,8 +247,37 @@ pub fn busy(ctx: &Context) -> bool {
 }
 pub fn cancel(ctx: &Context) {
     let r = runtime(ctx);
-    lock(&r).answer = Some(Ok(None));
+    let mut state = lock(&r);
+    if state.owner.is_some() {
+        state.answer = Some(Ok(None));
+    } else {
+        // A request can be queued by the button before tick starts the capture service.
+        // Dropping that request cancels it without leaving an answer for the next pick.
+        state.request = None;
+    }
+    drop(state);
     ctx.request_repaint();
+}
+
+/// The picker window: hidden until its snapshot has been painted (#3210).
+fn viewport_builder(ctx: &Context, image: &ScreenImage) -> egui::ViewportBuilder {
+    let mut builder = egui::ViewportBuilder::default()
+        .with_title(tl!("PhotoCraft — Screen Color Picker"))
+        .with_decorations(false)
+        .with_resizable(false)
+        .with_position(image.position / ctx.zoom_factor())
+        .with_inner_size(image.size / ctx.zoom_factor())
+        // Not `AlwaysOnTop` here: a monitor-sized window created topmost makes the DX12 backend
+        // fail its swapchain creation (0x887A0001) and the app panics. The level is raised once
+        // the first frame has been painted, in `show`.
+        // Do not expose the native window's empty first frame over the desktop.
+        // The viewport is made visible after its snapshot has been painted below.
+        .with_visible(false)
+        .with_clamp_size_to_monitor_size(false);
+    if let Some(monitor) = image.monitor {
+        builder = builder.with_monitor(monitor);
+    }
+    builder
 }
 pub fn show(ctx: &Context) {
     let r = runtime(ctx);
@@ -260,18 +289,11 @@ pub fn show(ctx: &Context) {
         let Snapshot { image, texture, conversion } = snapshot;
         let shared = r.clone();
         let vid = egui::ViewportId::from_hash_of(("screen-color", generation, n));
-        let mut builder = egui::ViewportBuilder::default()
-            .with_title("PhotoCraft — Screen Color Picker")
-            .with_decorations(false)
-            .with_resizable(false)
-            .with_position(image.position / ctx.zoom_factor())
-            .with_inner_size(image.size / ctx.zoom_factor())
-            .with_window_level(egui::WindowLevel::AlwaysOnTop)
-            .with_clamp_size_to_monitor_size(false);
-        if let Some(monitor) = image.monitor {
-            builder = builder.with_monitor(monitor);
-        }
-        ctx.show_viewport_deferred(vid, builder, move |ui, _| {
+        let builder = viewport_builder(ctx, &image);
+        // Immediate, so it paints inside the main window's own frame: as a deferred viewport the
+        // main window stopped being redrawn on Windows (OpenGL) once the picker was up, so a click
+        // or Esc was never turned into an answer and the overlay could not be left.
+        ctx.show_viewport_immediate(vid, builder, move |ui, _| {
             {
                 let s = lock(&shared);
                 if s.generation != generation || s.owner.is_none() {
@@ -279,51 +301,79 @@ pub fn show(ctx: &Context) {
                     return;
                 }
             }
-            if ui.ctx().input(|i| i.viewport().close_requested() || i.key_pressed(egui::Key::Escape)) {
-                lock(&shared).answer = Some(Ok(None));
-                ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
-                return;
+            frame(ui, &shared, &image, &texture, conversion.as_deref());
+            // Showing a new native viewport before this frame is painted can briefly cover
+            // the screen with the window's default white clear color.
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            // Once per picker window (`show` runs every frame, so a local flag would resend it):
+            // raise it, and take the keyboard so Esc reaches the picker: a window shown later
+            // isn't always given focus by the OS, and the picker covers the screen (#4291).
+            let raised = Id::new(("screen-picker-raised", ui.ctx().viewport_id()));
+            if !ui.ctx().data_mut(|d| std::mem::replace(d.get_temp_mut_or_default::<bool>(raised), true)) {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
             }
-            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
-                let rect = ui.max_rect();
-                ui.painter().image(texture.id(), rect, Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0)), Color32::WHITE);
-                let response = ui.interact(rect, ui.id().with("screen-sample"), Sense::click());
-                ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
-                let Some(pos) = ui.ctx().pointer_hover_pos() else {
-                    return;
-                };
-                let Some((x, y)) = image.at(rect, pos) else {
-                    return;
-                };
-                let zoom = {
-                    let delta = ui.input(|i| {
-                        i.raw
-                            .events
-                            .iter()
-                            .filter_map(|e| match e {
-                                egui::Event::MouseWheel { delta, .. } => Some(delta.y),
-                                _ => None,
-                            })
-                            .sum::<f32>()
-                    });
-                    let mut s = lock(&shared);
-                    if delta > 0.0 {
-                        s.zoom = (s.zoom + 2).min(24);
-                    }
-                    if delta < 0.0 {
-                        s.zoom = s.zoom.saturating_sub(2).max(4);
-                    }
-                    s.zoom
-                };
-                let picked = image.sample(x, y, conversion.as_deref());
-                loupe(ui, &image, rect, pos, (x, y), zoom, picked.as_ref().ok().copied());
-                if response.clicked() {
-                    lock(&shared).answer = Some(picked.map(Some));
-                    ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
-                }
-            });
         });
     }
+}
+
+/// What the picker resolves to: the colour from a pick, or `Ok(None)` to cancel.
+type Answer = Result<Option<[f32; 3]>, String>;
+
+/// One frame of a picker window over its snapshot `image`. The picker covers the whole screen
+/// and stays on top, so every way out must work (#4291): Esc, closing the window, a right-click,
+/// and a left click (or a press and release that moved) anywhere, which picks the pixel under
+/// it, or cancels when there's none to sample. Nothing it gets leaves the user stuck in it.
+fn frame(ui: &mut egui::Ui, shared: &Shared, image: &ScreenImage, texture: &egui::TextureHandle, conversion: Option<&photocraft_cms::Transform>) {
+    let ctx = ui.ctx().clone();
+    let answer = |a: Answer| {
+        lock(shared).answer = Some(a);
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+    };
+    if ctx.input(|i| i.viewport().close_requested() || i.key_pressed(egui::Key::Escape) || i.pointer.secondary_released()) {
+        answer(Ok(None));
+        return;
+    }
+    egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+        let rect = ui.max_rect();
+        ui.painter().image(texture.id(), rect, Rect::from_min_max(Pos2::ZERO, egui::pos2(1.0, 1.0)), Color32::WHITE);
+        let response = ui.interact(rect, ui.id().with("screen-sample"), Sense::click_and_drag());
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        let released = response.clicked() || response.drag_stopped();
+        let pixel = ui.ctx().pointer_latest_pos().and_then(|pos| Some((pos, image.at(rect, pos)?)));
+        let Some((pos, (x, y))) = pixel else {
+            // No pixel under the pointer to sample: a click still ends the picker.
+            if released {
+                answer(Ok(None));
+            }
+            return;
+        };
+        let zoom = {
+            let delta = ui.input(|i| {
+                i.raw
+                    .events
+                    .iter()
+                    .filter_map(|e| match e {
+                        egui::Event::MouseWheel { delta, .. } => Some(delta.y),
+                        _ => None,
+                    })
+                    .sum::<f32>()
+            });
+            let mut s = lock(shared);
+            if delta > 0.0 {
+                s.zoom = (s.zoom + 2).min(24);
+            }
+            if delta < 0.0 {
+                s.zoom = s.zoom.saturating_sub(2).max(4);
+            }
+            s.zoom
+        };
+        let picked = image.sample(x, y, conversion);
+        loupe(ui, image, rect, pos, (x, y), zoom, picked.as_ref().ok().copied());
+        if released {
+            answer(picked.map(Some));
+        }
+    });
 }
 fn loupe(ui: &egui::Ui, image: &ScreenImage, screen: Rect, pos: Pos2, pixel: (usize, usize), zoom: usize, rgb: Option<[f32; 3]>) {
     let (x, y) = pixel;
@@ -376,6 +426,17 @@ mod tests {
         }
     }
     #[test]
+    fn screen_picker_viewport_starts_hidden_until_its_snapshot_is_painted() {
+        let builder = viewport_builder(&Context::default(), &image());
+        assert_eq!(builder.visible, Some(false));
+    }
+    #[test]
+    fn screen_picker_viewport_is_not_created_always_on_top() {
+        // Creating the monitor-sized window topmost fails DX12 swapchain creation (Windows).
+        let builder = viewport_builder(&Context::default(), &image());
+        assert_eq!(builder.window_level, None);
+    }
+    #[test]
     fn pixel_mapping_handles_display_edges_negative_origins_and_hidpi() {
         let i = image();
         let rect = Rect::from_min_size(i.position, i.size);
@@ -404,6 +465,67 @@ mod tests {
         i.profile = Some(photocraft_cms::Builtin::LabD50.profile().to_bytes().as_ref().clone());
         assert!(i.conversion().is_err());
     }
+    /// The picker window's frame over [`image`] (red | azure) filling a 200 × 100 window, with its
+    /// own runtime: what the frame answered after `act`.
+    fn picker_answer(act: impl FnOnce(&mut egui_kittest::Harness<'_>)) -> Option<Answer> {
+        let shared: Shared = Arc::default();
+        let inner = shared.clone();
+        let texture: std::cell::OnceCell<egui::TextureHandle> = std::cell::OnceCell::new();
+        let image = image();
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(200.0, 100.0)).build_ui(move |ui| {
+            let tex = texture.get_or_init(|| {
+                ui.ctx().load_texture("test-snapshot", egui::ColorImage::new([2, 1], vec![Color32::RED, Color32::BLUE]), TextureOptions::NEAREST)
+            });
+            frame(ui, &inner, &image, tex, None);
+        });
+        h.run();
+        act(&mut h);
+        h.run();
+        lock(&shared).answer.take()
+    }
+    /// #4291: the picker covers the screen and stays on top, so every input ends it: Esc, a
+    /// right-click, a click (the pixel under it), a press dragged before its release (the pixel
+    /// where it's released).
+    #[test]
+    fn every_way_out_of_the_picker_ends_it() {
+        let left = egui::pos2(40.0, 50.0);
+        let right = egui::pos2(160.0, 50.0);
+        assert_eq!(picker_answer(|h| h.hover_at(left)), None, "hovering alone keeps it open");
+        assert_eq!(
+            picker_answer(|h| {
+                h.hover_at(left);
+                h.run();
+                h.drag_at(left);
+                h.run();
+                h.drop_at(left);
+            }),
+            Some(Ok(Some([1.0, 0.0, 0.0]))),
+            "a click picks the pixel under it"
+        );
+        assert_eq!(
+            picker_answer(|h| {
+                h.drag_at(left);
+                h.run();
+                h.hover_at(right);
+                h.run();
+                h.drop_at(right);
+            }),
+            Some(Ok(Some([0.0, 128.0 / 255.0, 1.0]))),
+            "a press dragged across picks where it's released, instead of being ignored"
+        );
+        assert_eq!(
+            picker_answer(|h| {
+                h.hover_at(left);
+                h.run();
+                h.event(egui::Event::PointerButton { pos: left, button: egui::PointerButton::Secondary, pressed: true, modifiers: Default::default() });
+                h.run();
+                h.event(egui::Event::PointerButton { pos: left, button: egui::PointerButton::Secondary, pressed: false, modifiers: Default::default() });
+            }),
+            Some(Ok(None)),
+            "a right-click cancels"
+        );
+        assert_eq!(picker_answer(|h| h.key_press(egui::Key::Escape)), Some(Ok(None)), "Esc cancels");
+    }
     fn app() -> PhotocraftApp {
         let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
         app.run("file.new", serde_json::json!({"width":8,"height":8})).unwrap();
@@ -420,6 +542,31 @@ mod tests {
         assert!(tick(app, ctx));
         (owner, tx, cancelled)
     }
+    #[test]
+    fn cancel_while_queued_does_not_start_or_poison_the_next_pick() {
+        let ctx = Context::default();
+        let mut app = app();
+        let launched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = launched.clone();
+        app.services.screen_pick = Some(Box::new(move |_| {
+            started.store(true, std::sync::atomic::Ordering::Relaxed);
+            let (_tx, rx) = std::sync::mpsc::channel();
+            Pending { receiver: rx, cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)) }
+        }));
+        let owner = Id::new("queued");
+        lock(&runtime(&ctx)).request = Some(owner);
+        cancel(&ctx);
+        assert!(!tick(&mut app, &ctx));
+        assert!(!launched.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(take(&ctx, owner), None);
+        // An idle Cancel must not be retained as the reply to a future request.
+        cancel(&ctx);
+        let (owner, tx, _) = queued(&mut app, &ctx);
+        tx.send(Ok(Capture::Color(Some([0.2, 0.4, 0.6])))).unwrap();
+        assert!(!tick(&mut app, &ctx));
+        assert_eq!(take(&ctx, owner), Some([0.2, 0.4, 0.6]));
+    }
+
     #[test]
     fn cancellation_wins_over_a_simultaneously_completed_pick() {
         let mut app = app();

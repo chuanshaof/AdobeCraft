@@ -19,12 +19,50 @@
 # kept. Full-width punctuation (，。：) inside sentences; half-width parentheses and the " · "
 # separators as in the English.
 
+# Layer Mask Display Options (the layer mask rubylith's colour and opacity)
+	Mask Options…	遮色片選項…
+	Layer Mask Display Options…	圖層遮色片顯示選項…
+
+# Channel Options and New Spot Channel (#3761)
+	Channel Color	色版顏色
+	Color Indicates:	色彩指示：
+	Solidity:	硬度：
+	Masked Areas	遮色片區域
+	Selected Areas	選取區域
+	Spot Color	特別色
+	Ink Characteristics	油墨特性
+
+# Guide layout dialog
+
+# Custom print paper (#3820)
+	Paper Width	紙張寬度
+	Paper Height	紙張高度
+	Columns	欄
+	Rows	列
+	Number	數量
+	Margin	邊界
+	Top:	上:
+	Left:	左:
+	Bottom:	下:
+	Right:	右:
+	Target:	目標:
+	Selected Artboards	選取的工作區域
+	Center Columns	欄置中
+	Clear Existing Guides	清除現有參考線
+	Invalid guide layout	參考線版面配置無效
+	Leave empty for automatic size	留白以自動設定大小
+	5 Columns, 3 Rows	5欄，3列
+	8 Columns	8欄
+	12 Columns	12欄
+
 	File	檔案
 	Edit	編輯
 	Image	影像
 	Layer	圖層
 	Type	文字
 	Select	選取
+	Selected	已選取
+	Scope	範圍
 	Top Left	左上
 	Top Right	右上
 	Bottom Left	左下
@@ -38,8 +76,15 @@
 	New from Clipboard	從剪貼簿新增
 	Open…	開啟…
 	Open As…	開啟為…
+	Open EXR Parts…	開啟 EXR 分段…
+	Add beauty precomp from the AOVs	從 AOV 預合成美麗通道
+	Both	兩者
+	Left	左
+	Right	右
 	Open Recent	最近開啟的檔案
 	Clear Recent Files	清除最近檔案
+	Remove from Recent	從最近檔案中移除
+	Remove {name} from Recent	從最近檔案中移除 {name}
 	Close	關閉
 	Minimize	最小化
 	Maximize	最大化
@@ -49,6 +94,8 @@
 	Save	儲存
 	Save As…	另存新檔…
 	Save a Copy…	儲存拷貝…
+	{name} can't keep everything in this document	{name} 無法保留此文件中的所有內容
+	Choose a format that keeps it, such as Photoshop (PSD), or save a copy.	請選擇能保留全部內容的格式，例如 Photoshop (PSD)，或儲存拷貝。
 	Revert	回復
 	Export	匯出
 	Quick Export as PNG	快速匯出為 PNG
@@ -86,7 +133,17 @@
 	Script Events Manager…	指令碼事件管理員…
 	Import	匯入
 	Browse…	瀏覽…
+	Source Files	來源檔案
+	Use:	使用:
+	Files	檔案
+	Folder	資料夾
+	Add Open Files	增加開啟的檔案
+	Sort By Name	依名稱排序
+	Attempt to Automatically Align Source Images	嘗試自動對齊來源影像
+	Create Smart Object after Loading Layers	載入圖層後建立智慧型物件
 	Reveal in Finder	在 Finder 中顯示
+	Show in Explorer	在檔案總管中顯示
+	Show in Folder	在資料夾中顯示
 	File Info…	檔案資訊…
 	Print…	列印…
 	Print One Copy	列印一份拷貝
@@ -108,6 +165,8 @@
 	Search…	搜尋…
 	Check Spelling…	拼字檢查…
 	Find and Replace Text…	尋找並取代文字…
+	Add to Dictionary	加入字典
+	No Spelling Suggestions	沒有拼字建議
 	Fill…	填滿…
 	Stroke…	筆畫…
 	Content-Aware Fill…	內容感知填滿…
@@ -122,6 +181,8 @@
 	Transform Again on a Copy	複製並再次變形
 	Scale	縮放
 	Rotate	旋轉
+	Set horizontal skew	設定水平傾斜
+	Set vertical skew	設定垂直傾斜
 	Skew	傾斜
 	Distort	扭曲
 	Perspective	透視
@@ -262,6 +323,8 @@
 	Layer via Cut	剪下的圖層
 	Layer From Background…	從背景建立圖層…
 	Layer from Background…	從背景建立圖層…
+	Background from Layer	從圖層建立背景
+	Background From Layer	從圖層建立背景
 	New Shape Layer	新增形狀圖層
 	New Type Layer	新增文字圖層
 	New Fill Layer	新增填滿圖層
@@ -279,6 +342,7 @@
 	Blending Options…	混合選項…
 	Bevel & Emboss…	斜角和浮雕…
 	Use Global Light	使用全域光
+	Overprint	疊印
 	Inner Shadow…	內陰影…
 	Inner Glow…	內光暈…
 	Satin…	緞面…
@@ -332,6 +396,7 @@
 	Update Modified Content	更新修改過的內容
 	Update All Modified Content	更新所有修改過的內容
 	Stack Mode	堆疊模式
+	Choose Stack Mode:	選擇堆疊模式：
 	Entropy	熵
 	Kurtosis	峰度
 	Maximum	最大
@@ -366,6 +431,7 @@
 	Select Linked Layers	選取連結的圖層
 	Merge Layers	合併圖層
 	Merge Down	向下合併圖層
+	Merge Group	合併群組
 	Merge Visible	合併可見圖層
 	Stamp Visible	蓋印可見圖層
 	Select Layer Above	選取上方圖層
@@ -475,6 +541,12 @@
 	Color Range…	顏色範圍…
 	Focus Area…	焦點區域…
 	Select and Mask…	選取並遮住…
+# Select and Mask dialog labels
+	Smart Radius	智慧型半徑
+	Shift Edge	移動邊緣
+	Decontaminate	淨化
+	Output	輸出
+	Refine Edge	調整邊緣
 	Modify	修改
 	Border…	邊界…
 	Smooth…	平滑…
@@ -496,6 +568,13 @@
 	Blur	模糊
 	Blur Gallery	模糊收藏館
 	Field Blur…	區域模糊…
+# Field Blur pins (#3373)
+	No pin selected	未選取圖釘
+	Click the image to add a pin; drag a pin to move it, or its ring to change its blur. Delete removes the selected pin.	按一下影像即可新增圖釘；拖移圖釘可移動它，拖移其圓環可變更模糊程度。按 Delete 鍵刪除所選圖釘。
+	Drag the handles on the outline to resize and turn it, the square to round its corners, and the dots inside to set where the blur starts.	拖移輪廓上的控點可調整大小並旋轉，拖移方塊可將角變圓，拖移內部的點可設定模糊開始的位置。
+	Drag the pin to move the band, or its ring to change its blur. Drag the solid lines to widen the sharp band, the dashed lines to set the transition, and the dots to turn it.	拖移圖釘可移動條帶，拖移其圓環可變更模糊程度。拖移實線可加寬清晰條帶，拖移虛線可設定過渡，拖移圓點可旋轉。
+	Drag the handles on the outline to resize and turn it; the ring sets the blur angle.	拖移輪廓上的控點可調整大小並旋轉；圓環設定模糊角度。
+	Blur Angle	模糊角度
 	Iris Blur…	光圈模糊…
 	Tilt-Shift…	傾斜偏移…
 	Path Blur…	路徑模糊…
@@ -589,6 +668,10 @@
 	100%	100%
 	200%	200%
 	75%	75%
+	80%	80%
+	85%	85%
+	90%	90%
+	95%	95%
 	125%	125%
 	150%	150%
 	175%	175%
@@ -670,18 +753,36 @@
 	New Workspace…	新增工作區…
 	Delete Workspace…	刪除工作區…
 	Reset Workspace	重設工作區
+	Reset Tool	重設工具
+	Reset All Tools	重設所有工具
+	Reset all tools to their default settings?	要將所有工具重設為預設設定嗎？
 	Lock Workspace	鎖定工作區
 	Theme	主題
 	Pro Theme	專業主題
 	Pro Medium Gray Theme	專業中灰主題
+	Pro Light Gray Theme	專業淺灰主題
+	Pro Light Theme	專業淺色主題
 	Studio Theme	工作室主題
 	Studio Light Theme	工作室淺色主題
+	Adwaita Light Theme	Adwaita 淺色主題
+	Adwaita Dark Theme	Adwaita 深色主題
 	Classic Theme	經典主題
+	Solarized dark	Solarized 深色
+	Solarized Dark Theme	Solarized 深色主題
+	Breeze dark	Breeze 深色
+	Breeze Dark Theme	Breeze 深色主題
+	Breeze light	Breeze 淺色
+	Breeze Light Theme	Breeze 淺色主題
+	Soft dark	柔和深色
+	Soft light	柔和淺色
+	Soft Dark Theme	柔和深色主題
+	Soft Light Theme	柔和淺色主題
 	Next Theme	下一個主題
 	Actions	動作
 	Brush Settings	筆刷設定
 	Brushes	筆刷
 	Channels	色版
+	Channel	色版
 	Character	字元
 	Character Styles	字元樣式
 	Clone Source	仿製來源
@@ -726,6 +827,8 @@
 	Split Warp Horizontally	水平分割彎曲
 	Split Warp Vertically	垂直分割彎曲
 	Statistics…	統計資料…
+	Refine Strokes	調整筆畫
+	Edits	編輯
 @plural	{n} item|{n} items	{n} 個項目
 	Auto	自動
 	(print to the printer)	(列印至印表機)
@@ -760,7 +863,7 @@
 	All Caps	全部大寫
 	All Slices	所有切片
 	All User Slices	所有使用者切片
-	All shortcuts reset to Photoshop defaults.	所有快速鍵已重設為 Photoshop 預設值。
+	All shortcuts reset to PhotoCraft defaults.	所有快速鍵已重設為 PhotoCraft 預設值。
 	Alt	Alt
 	Always use pressure for opacity	一律以壓力控制不透明度
 	Always use pressure for size	一律以壓力控制大小
@@ -774,6 +877,9 @@
 	Appearance	外觀
 	Appearance (Layer Style)	外觀 (圖層樣式)
 	Apply Layer Mask	套用圖層遮色片
+	Add Mask to Selection	增加遮色片至選取範圍
+	Subtract Mask from Selection	從選取範圍中減去遮色片
+	Intersect Mask with Selection	遮色片與選取範圍相交
 	Apply Per Tip	依筆尖套用
 	Apply next selected layer comp	套用下一個選取的圖層構圖
 	Apply previous selected layer comp	套用上一個選取的圖層構圖
@@ -789,15 +895,25 @@
 	Background	背景
 	Background Color	背景色
 	Background Contents	背景內容
+	Custom background color	自訂背景色
 	Balance	平衡
 	Baseline	基線
 	Baseline shift	基線位移
 	Basic	基本
 	Before (Y)	之前 (Y)
+	Save Settings…	儲存設定…
+	Load Settings…	載入設定…
+	Save these settings as a Camera Raw .xmp file	將這些設定儲存為 Camera Raw .xmp 檔案
+	Load settings from a Camera Raw .xmp file	從 Camera Raw .xmp 檔案載入設定
+	Loaded Camera Raw settings from {file}	已從 {file} 載入 Camera Raw 設定
+	Loaded Camera Raw settings from {file} ({n} not supported)	已從 {file} 載入 Camera Raw 設定（{n} 項不支援）
 	Begin recording	開始記錄
 	Bend:	彎曲：
 	Bicubic	雙三次
 	Bicubic (smooth gradients)	雙三次 (平滑漸層)
+	Automatic	自動
+	Bicubic Smoother (enlargement)	雙三次 (較平滑) (放大)
+	Bicubic Sharper (reduction)	雙三次 (較銳利) (縮小)
 	Bilinear	雙線性
 	Black	黑色
 	Black & White	黑白
@@ -808,7 +924,6 @@
 	Blending Options	混合選項
 	Blue	藍色
 	Blue, Red, Yellow	藍色、紅色、黃色
-	Both	兩者
 	Both Axes	兩軸
 	Bottom	下
 	Brightness	亮度
@@ -822,6 +937,7 @@
 	Camera Raw isn't open	Camera Raw 未開啟
 	Cancel	取消
 	Cancel (Esc)	取消 (Esc)
+	Manage submitted jobs in the system print queue	在系統列印佇列中管理已提交的工作
 	Cancel any current edits (Esc)	取消目前所有編輯 (Esc)
 	Cancel current crop operation  (Esc)	取消目前的裁切作業 (Esc)
 	Cancel transform (Esc)	取消變形 (Esc)
@@ -855,6 +971,7 @@
 	Click to zoom in  ·  {key}-click to zoom out  ·  drag right/left to zoom in/out	按一下放大  ·  {key}+按一下縮小  ·  向右/向左拖曳以放大/縮小
 	Click with the Note tool to add a note.	使用註解工具按一下以新增註解。
 	Click: corner · Drag: smooth · Click first point: close · {key} finish · Esc cancel	按一下：轉角 · 拖曳：平滑 · 按一下第一點：閉合 · {key} 完成 · Esc 取消
+	Click: corner · Drag: smooth · {alt}-drag: break handle · Click or drag first point: close · {key} finish · Esc cancel	按一下：轉角 · 拖曳：平滑 · {alt}+拖曳：分離控制點 · 按一下或拖曳第一點：閉合 · {key} 完成 · Esc 取消
 	Clip to layer below	剪裁至下方圖層
 	Clipped	已剪裁
 	Close Style Options	關閉樣式選項
@@ -886,12 +1003,14 @@
 	Contiguous	連續的
 	Contrast	對比
 	Control:	控制：
-	Convert document's colors to the working space	將文件顏色轉換為工作空間
 	Convert to sRGB	轉換為 sRGB
 	Copies	份數
 	Copper	銅色
 	Copyright	版權
 	Copyright and Contact Info	版權與聯絡資訊
+	Copyright Info URL	版權資訊 URL
+	Copyright Notice	版權聲明
+	Document Title	文件標題
 	Corner Crop Marks	角落裁切標記
 	Corner radius	圓角半徑
 	Correction	校正
@@ -941,6 +1060,7 @@
 	Delete Group	刪除群組
 	Delete Layer Mask	刪除圖層遮色片
 	Delete Layers	刪除圖層
+	Add Shortcut	新增快速鍵
 	Delete Shortcut	刪除快速鍵
 	Delete Timeline	刪除時間軸
 	Delete Tool Preset	刪除工具預設集
@@ -948,6 +1068,17 @@
 	Delete current channel	刪除目前色版
 	Delete current state	刪除目前狀態
 	Delete effect layer	刪除效果圖層
+
+# Layers-panel trash confirmation
+	Delete layer ‘{name}’?	刪除圖層「{name}」？
+	Delete {count} layers? {names}	刪除 {count} 個圖層？{names}
+	Delete layer?	刪除圖層？
+	The document is closed	文件已關閉
+	The document or selected layers changed. Please request deletion again.	文件或所選圖層已變更。請重新要求刪除。
+	Missing delete command	缺少刪除指令
+	Invalid delete command	無效的刪除指令
+	Layer deleted, but confirmation preference could not be saved: {error}	圖層已刪除，但無法儲存確認設定：{error}
+
 	Delete layer	刪除圖層
 	Delete layer comp	刪除圖層構圖
 	Delete note	刪除註解
@@ -979,7 +1110,7 @@
 	Done	完成
 	Dots	點
 	Drag a rectangle around the object	在物件周圍拖曳出矩形
-	Drag on the image to add a constraint; Shift for horizontal/vertical; right-click to delete.	在影像上拖曳以新增限制線；按住 Shift 可限制水平/垂直；按右鍵可刪除。
+	Drag on the image to add a constraint; Shift for horizontal/vertical; right-click a constraint to change or delete it.	在影像上拖曳以新增限制線；按住 Shift 可限制水平/垂直；在限制線上按右鍵可變更或刪除。
 	Drag to move the active shape's path or the Work Path	拖曳以移動作用中形狀的路徑或工作路徑
 	Click: select anchor · Drag: move anchor, handle or segment · {shift}-click: add · {alt}-click: whole subpath	按一下：選取錨點 · 拖曳：移動錨點、把手或線段 · {shift}-按一下：增加 · {alt}-按一下：整個子路徑
 	Draw with the Pen tool (P) or make a work path from a selection.	使用筆型工具 (P) 繪製，或從選取範圍建立工作路徑。
@@ -1081,7 +1212,10 @@
 	Ignore All	全部略過
 	Image Size	影像尺寸
 	Import Brushes…	匯入筆刷…
-	Import Photoshop brushes (.abr)	匯入 Photoshop 筆刷 (.abr)
+	Gradient Preset Options	漸層預設選項
+	Import .GRD	匯入 .GRD
+	Choose a gradient file (.grd).	請選擇漸層檔案 (.grd)。
+	Import brushes (.abr)	匯入筆刷 (.abr)
 	Import Presets	匯入預設集
 	Imported	已匯入
 	Indent First	首行縮排
@@ -1116,13 +1250,13 @@
 	Leading	行距
 	Leading (set to the font size × auto-leading when Auto)	行距 (自動時設為字體大小 × 自動行距)
 	Leave as is (don't color manage)	保持原樣 (不進行色彩管理)
-	Left	左
 	Left align text	文字靠左對齊
 	Length:	長度：
 	Level	層級
 	Levels	色階
 	Lighten	變亮
 	Lightness	明亮
+	Result	結果
 	Lights	燈光
 	Limits:	限制：
 	Linear Gradient	線性漸層
@@ -1131,7 +1265,6 @@
 	Liquify is not open	液化未開啟
 	Load	載入
 	Load 3D LUT…	載入 3D LUT…
-	Load Photoshop brushes (.abr)	載入 Photoshop 筆刷 (.abr)
 	Load channel as selection	將色版載入為選取範圍
 	Load…	載入…
 	Localized Color Clusters	局部色彩群集
@@ -1220,6 +1353,8 @@
 	Override Pressure	覆寫壓力
 	Override Rotation	覆寫旋轉
 	Override Tilt	覆寫傾斜
+	Override Tilt X	覆寫傾斜 X
+	Override Tilt Y	覆寫傾斜 Y
 	PRESET DETAILS	預設集詳細資料
 	PSD	PSD
 	Paint Overlay	繪畫覆蓋
@@ -1289,6 +1424,7 @@
 	Record ● a sequence of edits, then play ▶ it on any document.	錄製 ● 一連串編輯，然後在任何文件上播放 ▶。
 	Red	紅色
 	Redefine style by current selection	依目前選取項目重新定義樣式
+	Refine	調整
 	Reflected Gradient	反射性漸層
 	Registration Marks	對齊標記
 	Regular	標準
@@ -1298,15 +1434,28 @@
 	Remove All Pins	移除所有圖釘
 	Remove Background	移除背景
 	Remove Planes	移除平面
+	Remove Tool	移除工具
 	Remove stop	移除色標
 	Remove variable	移除變數
 	Rename	重新命名
 	Rename Group…	重新命名群組…
 	Rename Layer…	重新命名圖層…
+	Rename Path…	重新命名路徑…
 	Rename Tool Preset…	重新命名工具預設集…
 	Rename…	重新命名…
 	Resample	重新取樣
 	Reset All to Defaults	全部重設為預設值
+	Import Shortcuts…	匯入快速鍵…
+	Load a keyboard shortcut set saved as .kys	載入儲存為 .kys 的鍵盤快速鍵集
+	Imported {n} shortcuts from {file}. Click OK to keep them.	已從 {file} 匯入 {n} 個快速鍵。按一下「確定」即可保留。
+	{n} commands are not in PhotoCraft.	{n} 個命令在 PhotoCraft 中不存在。
+	Keyboard shortcuts imported	已匯入鍵盤快速鍵
+	Your keyboard shortcut set {set} is in use here: {n} shortcuts differ from the defaults. Edit › Keyboard Shortcuts shows them; Reset All to Defaults undoes this.	此處正在使用你的鍵盤快速鍵集 {set}：{n} 個快速鍵與預設值不同。可在「編輯 › 鍵盤快速鍵」中查看；「全部重設為預設值」可復原。
+	Import keyboard shortcuts?	匯入鍵盤快速鍵？
+	PhotoCraft found your keyboard shortcut set {set} from another image editor on this computer: {n} of its shortcuts differ from PhotoCraft's. Import it?	PhotoCraft 在這台電腦上找到你在其他影像編輯器中的鍵盤快速鍵集 {set}：其中 {n} 個快速鍵與 PhotoCraft 不同。要匯入嗎？
+	Edit › Keyboard Shortcuts › Reset All to Defaults undoes an import.	「編輯 › 鍵盤快速鍵 › 全部重設為預設值」可復原匯入。
+	Don't Import	不匯入
+	The keyboard shortcut set was not imported: {error}	未匯入鍵盤快速鍵集：{error}
 	Reset Section	重設區段
 	Reset Transform	重設變形
 	Reset to defaults	重設為預設值
@@ -1315,7 +1464,6 @@
 	Restore All	全部還原
 	Restore Defaults	還原預設值
 	Restrictive (Web)	限制 (網頁)
-	Right	右
 	Right align text	文字靠右對齊
 	Rigid	剛性
 	Rotate:	旋轉：
@@ -1360,6 +1508,7 @@
 	Set shape fill type	設定形狀填滿類型
 	Set shape stroke type	設定形狀筆畫類型
 	Set the text color	設定文字顏色
+	Create warped text	建立彎曲文字
 	Shadows	陰影
 	Shape:	形狀：
 	Sharpening	銳利化
@@ -1398,6 +1547,9 @@
 	Stroke	筆畫
 	Stroke Catch-up	筆畫追補
 	Stroke:	筆畫：
+	Location	位置
+	Location:	位置：
+	Preserve Transparency	保留透明區域
 	Style	樣式
 	Style Options	樣式選項
 	Style Options…	樣式選項…
@@ -1442,7 +1594,6 @@
 	Use Default	使用預設值
 	Use Legacy	使用舊版
 	Use Measurement Scale	使用測量比例
-	Use the embedded profile (instead of the working space)	使用內嵌描述檔 (而非工作空間)
 	Variables bind a layer's visibility, text or pixels to a named data slot.	變數可將圖層的可見度、文字或像素繫結至具名的資料欄位。
 	Vertical scale	垂直縮放
 	Vibrance	自然飽和度
@@ -1459,6 +1610,7 @@
 	White Balance: As Shot	白平衡：原始拍攝
 	Whites	白色
 	Width	寬度
+	Slant	傾斜
 	Width:	寬度：
 	Work Path	工作路徑
 	Yellow	黃色
@@ -1476,6 +1628,9 @@
 	↑↓ navigate   {key} run   esc close	↑↓ 瀏覽   {key} 執行   esc 關閉
 	Version {version}	版本 {version}
 	New Document	新增文件
+	New Document With Mask	含遮色片的新增文件
+	New Layer With Mask	含遮色片的新增圖層
+	New Layer	新增圖層
 	Saved	已儲存
 	Save Preset…	儲存預設…
 	Preset Name	預設集名稱
@@ -1496,6 +1651,8 @@
 	Blur Tool	模糊工具
 	Bold	粗體
 	Brush	筆刷
+	Pencil	鉛筆
+	Block	區塊
 	Brush Pose	筆刷姿勢
 	Brush Tip Shape	筆尖形狀
 	Brush Tool	筆刷工具
@@ -1524,7 +1681,7 @@
 	Current Tool	目前工具
 	Custom Shape Tool	自訂形狀工具
 	Cyans	青色系
-	Default Photoshop Size	預設 Photoshop 尺寸
+	Default PhotoCraft Size	預設 PhotoCraft 尺寸
 	Delete Workspace	刪除工作區
 	Diamond	菱形
 	Dimensions:	尺寸：
@@ -1545,6 +1702,8 @@
 	Efficiency: 100%	效率：100%
 	Ellipse Tool	橢圓工具
 	Elliptical Marquee Tool	橢圓選取畫面工具
+	Single Row Marquee Tool	單列選取畫面工具
+	Single Column Marquee Tool	單欄選取畫面工具
 	Emboss	浮雕
 	Eraser	橡皮擦
 	Eraser Tool	橡皮擦工具
@@ -1567,6 +1726,8 @@
 	Highlights from:	亮部起點：
 	History Brush Tool	步驟記錄筆刷工具
 	Horizontal Type Tool	水平文字工具
+	Horizontal Type Mask Tool	水平文字遮色片工具
+	Vertical Type Mask Tool	垂直文字遮色片工具
 	Image Size:	影像尺寸：
 	Inches	英吋
 	Indexed	索引色
@@ -1601,6 +1762,8 @@
 	Millimeters	公釐
 	Mobile	行動裝置
 	Move Tool	移動工具
+	Could not use the move tool because the layer is locked.	無法使用移動工具，因為圖層已鎖定。
+	Could not complete the Free Transform command because the layer is locked.	無法完成「任意變形」指令，因為圖層已鎖定。
 	Multiply	色彩增值
 	My Brushes	我的筆刷
 	Neutrals	中間色
@@ -1619,10 +1782,15 @@
 	Paints from the document's opening state	從文件開啟時的狀態繪製
 	Path Selection Tool	路徑選取工具
 	Direct Selection Tool	直接選取工具
+	Add Anchor Point Tool	增加錨點工具
+	Delete Anchor Point Tool	刪除錨點工具
+	Click a segment to add an anchor point · {alt}-click an anchor to delete it	按一下線段以增加錨點 · {alt}-按一下錨點：刪除錨點
+	Click an anchor point to delete it · {alt}-click a segment to add one	按一下錨點將其刪除 · {alt}-按一下線段：增加錨點
 	Pattern Overlay	圖樣覆蓋
 	Pen Pressure	筆壓
 	Pen Tilt	筆傾斜
 	Pen Tool	筆型工具
+	Convert Point Tool	轉換錨點工具
 	Photo	相片
 	PhotoCraft website	PhotoCraft 網站
 	Picas	派卡
@@ -1638,6 +1806,8 @@
 	Postcard	明信片
 	Poster	海報
 	Pro (Dark)	Pro (深色)
+	Pro (Light)	Pro (淺色)
+	Pro (Light Gray)	Pro (淺灰)
 	Pro (Medium Gray)	Pro (中灰)
 	Protect Texture	保護紋理
 	Purple	紫色
@@ -1645,6 +1815,7 @@
 	Quick Selection Tool	快速選取工具
 	Radial	放射狀
 	Rasterize Layer	點陣化圖層
+	Rasterize Layers	點陣化圖層
 	Ratio	比例
 	Recent	最近
 	Rectangle Tool	矩形工具
@@ -1708,6 +1879,7 @@
 	Invalid {mode} profile	無效的 {mode} 描述檔
 	Unnamed {mode} profile	未命名的 {mode} 描述檔
 	{w} px x {h} px ({ppi} ppi)	{w} px x {h} px ({ppi} ppi)
+	{w} {unit} x {h} {unit} ({ppi} ppi)	{w} {unit} x {h} {unit} ({ppi} ppi)
 	Resolution: {dpi} pixels/inch	解析度：{dpi} 像素/英吋
 	Doc: {w} × {h} px	文件：{w} × {h} px
 	Frame {current} / {total}	影格 {current} / {total}
@@ -1744,6 +1916,9 @@
 	Cache tile size	快取拼貼大小
 	Camera Raw Defaults	Camera Raw 預設值
 	Canvas border	畫布邊框
+	Show canvas dots	顯示畫布圓點
+	Clip thumbnails to layer bounds	將縮圖裁切至圖層邊界
+	Clip Thumbnails to Layer Bounds	將縮圖裁切至圖層邊界
 	Canvas color	畫布顏色
 	Canvas custom color	畫布自訂顏色
 	Color picker	檢色器
@@ -1831,11 +2006,14 @@
 	Preserve details	保留細節
 	Print resolution	列印解析度
 	Pro	Pro
+	Pro light	Pro 淺色
+	Pro light gray	Pro 淺灰
 	Pro medium	Pro 中灰
 	Pro photo	ProPhoto
 	Quick export format	快速匯出格式
 	Quick export location	快速匯出位置
 	Recent file count	最近檔案數量
+	LUT folder	LUT 資料夾
 	Recent files	最近檔案
 	Recent fonts	最近使用的字體
 	Recover on launch	啟動時復原
@@ -1858,6 +2036,8 @@
 	Show only crosshair while painting	繪圖時僅顯示十字線
 	Show slice numbers	顯示切片編號
 	Show tooltips	顯示工具提示
+	Enable animations	啟用動畫
+	Show highlight on rollover	滑鼠懸停時顯示醒目提示
 	Show bounding box when dragging layer	拖曳圖層時顯示邊界框
 	System title bar	系統標題列
 	Show transformation values	顯示變形數值
@@ -1869,6 +2049,8 @@
 	Standard	標準
 	Studio	Studio
 	Studio light	Studio 淺色
+	Adwaita	Adwaita
+	Adwaita dark	Adwaita 深色
 	Subdivisions	細分
 	System	系統
 	Text engine	文字引擎
@@ -1918,6 +2100,7 @@
 	Collapse group  ({key}-click: all groups)	收合群組 ({key}+按一下：全部群組)
 	Create new brush from the current settings	以目前設定建立新筆刷
 	Create new brush from these settings	以這些設定建立新筆刷
+	Update the current brush with these settings	以這些設定更新目前筆刷
 	Delete brush	刪除筆刷
 	Drag the arrow to set the angle, the dots to set the roundness	拖曳箭頭設定角度，拖曳圓點設定圓度
 	Expand	展開
@@ -1925,7 +2108,8 @@
 	Expand group  ({key}-click: all groups)	展開群組 ({key}+按一下：全部群組)
 	Fade steps	淡出步數
 	Hide the layer's effects  ({key}-click: all layers)	隱藏圖層效果 ({key}+按一下：所有圖層)
-	Import Brushes… (.abr)	匯入筆刷… (.abr)
+	Import Brushes… (.abr or image)	匯入筆刷… (.abr 或影像)
+	Import Brush from Image…	從影像匯入筆刷…
 	Move Group Down	下移群組
 	Move Group Up	上移群組
 	Reset the brush to the defaults	將筆刷重設為預設值
@@ -1958,6 +2142,7 @@
 	Create Warped Text	建立彎曲文字
 	Rasterize Smart Object	點陣化智慧型物件
 	Rasterize Fill Content	點陣化填滿內容
+	Rasterize Layer Style	點陣化圖層樣式
 	Unlock: picking a preset replaces these settings	解除鎖定：選擇預設集會取代這些設定
 	Lock: keep these settings when picking another preset	鎖定：選擇其他預設集時保留這些設定
 	Diameter:	直徑：
@@ -1969,18 +2154,31 @@
 	Rename Brush…	重新命名筆刷…
 	Delete Brush	刪除筆刷
 	New Brush Preset…	新增筆刷預設集…
+	Capture Brush Size in Preset	在預設集中擷取筆刷尺寸
+	Include Tool Settings	包含工具設定
+	Include Color	包含顏色
+	Enter a name for the brush preset	請輸入筆刷預設集的名稱
+	A brush preset with this name already exists	已有相同名稱的筆刷預設集
 	Brush Preset Options	筆刷預設集選項
 	Group name	群組名稱
 	Brush name	筆刷名稱
-	Grid view	格狀檢視
-	List view	清單檢視
+	Brush Name	筆刷名稱
+	Brush Stroke	筆刷筆畫
+	Brush Tip	筆刷筆尖
 	Off: the speed of the pointer sets the spacing	關：由指標速度決定間距
 	Tilt Scale	傾斜縮放
 	Brush Projection	筆刷投影
 	Apply the pen's tilt and rotation to the tip shape	將筆的傾斜和旋轉套用至筆尖形狀
 	Mixer Brush	混合器筆刷
 	Mixer Brush Tool	混合器筆刷工具
+	Color Replacement Tool	顏色取代工具
+	Color Replacement	顏色取代
 	Wet	濕度
+	Current Brush Load	目前筆刷載入
+	Load Brush	載入筆刷
+	Clean Brush	清理筆刷
+	Load the brush after each stroke	每次描邊後載入筆刷
+	Clean the brush after each stroke	每次描邊後清理筆刷
 	Mix	混合
 	Wetness Jitter	濕度快速變換
 	Mix Jitter	混合快速變換
@@ -1993,7 +2191,13 @@
 	Align with layer	與圖層對齊
 	Reset Alignment	重設對齊
 	Centre the gradient (offset 0, 0)	置中漸層 (位移 0, 0)
-	The current gradient (pick one in Window › Gradients)	目前的漸層 (請在 視窗 › 漸層 挑選)
+# Gradient Editor window, opened from the options bar's gradient swatch.
+	Gradient Editor	漸層編輯器
+	Gradient picker	漸層挑選器
+	Save As Preset	儲存為預設
+	The gradient the Gradient tool paints with	漸變工具所使用的漸變
+	Adds the current gradient to the Gradients panel	將目前漸變新增至「漸層」面板
+	Gradient stops	漸層色標
 	Select a type layer to edit its character and paragraph settings.	選取文字圖層以編輯其字元和段落設定。
 	Text color	文字顏色
 	Type Options	文字選項
@@ -2021,10 +2225,24 @@
 	No path to make a selection from: draw one with the Pen tool or select one in the Paths panel.	沒有可用來建立選取範圍的路徑：請使用鋼筆工具繪製，或在路徑面板中選取一個路徑。
 	Cancel opening	取消開啟
 	Cancelled opening {name}	已取消開啟 {name}
+	Damaged Photoshop document	已損毀的 Photoshop 文件
+	The document “{name}” may be damaged.	文件「{name}」可能已損毀。
+	Some layers, pixels or masks could not be read. Do you want to continue opening it?	無法讀取部分圖層、像素或遮色片。是否繼續開啟？
+	If you continue, saving over the original may permanently discard unreadable data. Save a copy to keep the original.	如果繼續，覆寫儲存原始檔案可能會永久捨棄無法讀取的資料。請儲存拷貝以保留原始檔案。
+	Continue	繼續
+	The document “{name}” does not have an embedded {mode} profile.	文件「{name}」沒有嵌入的 {mode} 描述檔。
+	The document “{name}” has an embedded color profile that does not match the current {mode} working space.	文件「{name}」嵌入的色彩描述檔與目前的 {mode} 工作空間不符。
+	Working: {working}	工作空間：{working}
 	Developing {name}	正在處理 {name}
 	Cancelled {label}	已取消 {label}
 	Esc to cancel	按 Esc 取消
+	Opened {name}	已開啟 {name}
 	Opening {name}	正在開啟 {name}
+	Saved {name}	已儲存 {name}
+	Saving {name}	正在儲存 {name}
+	Saving {percent}	正在儲存 {percent}
+	A save to {name} is still running; try again when it finishes	仍在儲存到 {name}；請在完成後再試一次
+	{label} is writing the file and can no longer be cancelled	{label} 正在寫入檔案，已無法取消
 	Opening {name}…	正在開啟 {name}…
 	Opening…	正在開啟…
 	Reading…	正在讀取…
@@ -2042,6 +2260,8 @@
 	GPU acceleration could not continue. Your documents are unchanged.	GPU 加速無法繼續。您的文件未變更。
 	PhotoCraft is using the CPU image compositor. The window may still use your graphics adapter.	PhotoCraft 正使用 CPU 合成影像。視窗仍可能使用您的顯示卡。
 	Retry GPU requires a restart. Save your work first.	重試 GPU 需要重新啟動。請先儲存您的工作。
+	Retry GPU tries the graphics processor again now.	重試 GPU 會立即再次嘗試使用圖形處理器。
+	GPU acceleration resumed.	已恢復 GPU 加速。
 	Keep Using CPU	繼續使用 CPU
 	Retry GPU	重試 GPU
 	Advanced	進階
@@ -2072,6 +2292,9 @@ cameraRaw	Blending	混合
 	Patch Tool	修補工具
 	Patch:	修補：
 	Lasso around an area, then drag the selection	用套索圈出區域，然後拖曳選取範圍
+	Transform On Drop	放下時變形
+	Scale or rotate the moved area, then press {key}	縮放或旋轉移動的區域，然後按 {key}
+	Now drag the selection onto another area	現在將選取範圍拖曳到另一個區域
 	Edit Type	編輯文字
 
 
@@ -2093,6 +2316,14 @@ cameraRaw	Blending	混合
 	Structure:	結構：
 	Content-Aware Move Tool	內容感知移動工具
 	TIFF Options	TIFF 選項
+	Targa Options	Targa 選項
+	JPEG Options	JPEG 選項
+	Image Options	影像選項
+	Format Options	格式選項
+	Baseline ("Standard")	基線（「標準」）
+	Baseline Optimized	基線已最佳化
+	24 bits/pixel	24 位元/像素
+	32 bits/pixel	32 位元/像素
 	Including layers will increase file size.	包含圖層會增加檔案大小。
 	Discard Layers and Save a Copy	放棄圖層並儲存拷貝
 	Don't show again	不再顯示
@@ -2154,11 +2385,17 @@ cameraRaw	Blending	混合
 
 # Shared screen eyedropper and text Color Picker (#1128).
 	Color Picker (Text Color)	檢色器（文字顏色）
+	Color Picker ({name})	檢色器（{name}）
+	Color Picker (Fill Color)	檢色器（填滿顏色）
+	Fill color	填滿顏色
+	Color Picker (Stroke Color)	檢色器（筆畫顏色）
+	Stroke color	筆畫顏色
 	Pick screen color	選取螢幕顏色
 	Sample a pixel anywhere on the screen	在螢幕任意位置取樣像素
 	Click to pick · Esc to cancel	按一下選取 · Esc 取消
 	Pick a screen pixel or press Esc to cancel	選取螢幕像素或按 Esc 取消
 	Scroll to zoom	捲動以縮放
+	Drag to pan · Scroll to zoom · Double-click to fit	拖曳以平移 · 捲動以縮放 · 按兩下以符合視窗
 	Show/Hide All Panels	顯示/隱藏所有面板
 	Show/Hide Panels	顯示/隱藏面板
 	Could not open	無法開啟
@@ -2177,6 +2414,21 @@ cameraRaw	Blending	混合
 	Domed	圓頂
 	Domed (Inverted)	圓頂（反轉）
 	Diagonal (Descending)	對角線（下降）
+	Contour Editor	輪廓編輯器
+	Anti-aliased	消除鋸齒
+	Corner	角點
+	Gloss Contour	光澤輪廓
+	Contour	輪廓
+	Cone - Inverted	錐形 - 反轉
+	Cove - Deep	凹槽 - 深
+	Cove - Shallow	凹槽 - 淺
+	Gaussian	高斯
+	Half Round	半圓
+	Ring	環形
+	Ring - Double	環形 - 雙
+	Rolling Slope - Descending	滾動斜坡 - 遞減
+	Rounded Steps	圓角梯形
+	Sawtooth 1	鋸齒 1
 
 	Red Eye Tool	紅眼工具
 	Red Eye	紅眼
@@ -2202,9 +2454,9 @@ cameraRaw	Blending	混合
 	Violet	紫羅蘭色
 	Reset	重設
 	Large document: redrawing on the CPU	大型文件：正在以 CPU 重繪
+	Redrawing	正在重繪
 	This redraw took {seconds} s on the CPU.	此次 CPU 重繪耗時 {seconds} 秒。
 	Edits that change the whole document, such as a layer's blend mode, opacity or visibility, redraw all of it.	變更整份文件的編輯（例如圖層的混合模式、不透明度或可見度）會重繪整份文件。
-	Its layers don't fit the GPU memory budget. Raising Memory usage in Preferences › Performance raises the budget, up to a quarter of this computer's memory.	圖層超出 GPU 記憶體預算。在 偏好設定 › 效能 中提高記憶體使用量可增加預算，最多為本機記憶體的四分之一。
 	The GPU compositor wasn't used: {reason}	未使用 GPU 合成器：{reason}
 fontWeight	Thin	極細
 fontWeight	ExtraLight	特細
@@ -2225,3 +2477,571 @@ fontWeight	Italic	斜體
 	Rotate View Tool	旋轉檢視工具
 	Reset View	重設檢視
 	Drag around the centre to rotate the view  ·  Shift constrains to 15°	繞中心拖曳以旋轉檢視  ·  Shift 限制為 15°
+
+# Painting symmetry presets.
+	Dual Axis	雙軸
+	Diagonal	對角線
+	Transform Symmetry	變形對稱軸
+
+# Eyedropper Sample Size and Sample (#1649).
+	Point Sample	取樣點
+	3 by 3 Average	3 × 3 平均
+	5 by 5 Average	5 × 5 平均
+	11 by 11 Average	11 × 11 平均
+	31 by 31 Average	31 × 31 平均
+	51 by 51 Average	51 × 51 平均
+	101 by 101 Average	101 × 101 平均
+	Sample Size:	取樣大小：
+	All Layers No Adjustments	所有圖層（不含調整）
+	Current & Below No Adjustments	目前及以下（不含調整）
+	Show Sampling Ring	顯示取樣環
+
+# Color Picker warnings
+	Out of gamut for printing: click for the nearest printable colour	超出列印色域：按一下以使用最接近的可列印顏色
+	Not a web colour: click for the nearest web colour	不是網頁顏色：按一下以使用最接近的網頁顏色
+	Color to Alpha…	顏色轉為 Alpha…
+	Transparency Threshold	透明度臨界值
+	Opacity Threshold	不透明度臨界值
+	PhotoCraft — Screen Color Picker	PhotoCraft — 螢幕取色器
+
+	Rasterize svg groups deeper than	點陣化超過此深度的 SVG 群組
+	0 turns this threshold off; SVG groups nested deeper than 100 levels are always rasterized.	設為 0 可關閉此臨界值；巢狀超過 100 層的 SVG 群組一律會點陣化。
+	Rule of Thirds	三等分
+	Triangle	三角形
+	Golden Ratio	黃金比例
+	Golden Spiral	黃金螺旋
+	Auto Show Overlay	自動顯示覆蓋
+	Always Show Overlay	永遠顯示覆蓋
+	Never Show Overlay	永不顯示覆蓋
+	Cycle Overlay	循環切換覆蓋
+	Cycle Orientation	循環切換方向
+	Set the overlay options for the Crop tool	設定裁切工具的覆蓋選項
+	Alt-click went to the desktop, which moves windows with Alt-drag. Set its window-move key to Super, or latch Alt in Window › Modifier Keys.	Alt 按一下被桌面環境攔截了，它用 Alt 拖曳來移動視窗。請把桌面的視窗移動鍵改為 Super，或在 視窗 › 輔助鍵 中鎖定 Alt。
+
+# Shared Layer Style color picker
+	Color Picker (Layer Style Color)	檢色器（圖層樣式顏色）
+	Auto Hide Notifications	自動隱藏通知
+	Notification Duration (seconds)	通知持續時間（秒）
+	Bundle Arrow-Key Nudges	合併方向鍵微移
+	Nudge Bundle Pause (ms)	微移合併間隔（毫秒）
+	Appearance Mode	外觀模式
+	Dark Theme	深色主題
+	Light Theme	淺色主題
+	Pro Medium	Pro Medium
+	Studio Light	Studio Light
+	Next Appearance Mode	下一個外觀模式
+	Sync with system	與系統同步
+	Active	目前使用
+	Color Picker (Solid Color)	檢色器（純色）
+	Straighten the image by drawing a line on it	在影像上繪製一條線以拉直影像
+	Set additional Crop options	設定其他裁切選項
+	Show Cropped Area	顯示裁切區域
+	Enable Crop Shield	啟用裁切遮蔽
+	Match Canvas	符合畫布
+	Auto Adjust Opacity	自動調整不透明度
+	Crop Shield color	裁切遮蔽顏色
+	Color Picker (Crop Shield Color)	檢色器（裁切遮蔽顏色）
+	From Center	從中心
+	Link radii	連結半徑
+	Star Ratio:	星形比例：
+	Create Rectangle	建立矩形
+	Create Ellipse	建立橢圓
+	Create Triangle	建立三角形
+	Create Polygon	建立多邊形
+	Pressure curve	壓力曲線
+	Click to add a point, right-click to remove	按一下新增點，按右鍵移除點
+	Some brush presets could not be loaded	部分筆刷預設集無法載入
+	Retry saving presets	重試儲存預設集
+	Brush preset changes are not saved: {error}	筆刷預設集的變更尚未儲存：{error}
+	Keep this tab open to retain your brushes.	請保持此分頁開啟以保留您的筆刷。
+	Browser storage is unavailable; brushes are session-only. Keep this tab open to retain them.	瀏覽器儲存空間無法使用；筆刷僅在本次工作階段有效。請保持此分頁開啟以保留它們。
+	Saving brush presets… Keep this tab open until saving finishes.	正在儲存筆刷預設集… 請保持此分頁開啟，直到儲存完成。
+	Reflect	反射
+	Glow	光暈
+	Negation	否定
+	XOR	XOR
+	Color Burn (Paint.NET)	加深顏色 (Paint.NET)
+	Color Dodge (Paint.NET)	加亮顏色 (Paint.NET)
+	Stroke Options	筆畫選項
+	Solid	實線
+	Dashed	虛線
+	Dotted	點線
+	Alignment	對齊
+	Caps	端點
+	Butt / Flat	平頭
+	Corners	轉角
+	Miter	斜接
+	Round	圓角
+	Bevel	斜角
+	Miter limit	斜接限制
+	Dashed line	虛線
+	Dash	線段
+	Gap	間隔
+	Dash / gap lengths × stroke width	線段 / 間隔長度 × 筆畫寬度
+	Add pair	新增一對
+	Remove pair	移除一對
+	Dash offset	虛線偏移
+	Open paths use centered strokes	開放路徑使用置中筆畫
+	Use finite lengths and a positive pattern total	請使用有限長度和正數圖樣總長度
+	No subject found — try Object Selection or the Lasso	找不到主體 — 請嘗試物件選取工具或套索工具
+	Quick Selection found nothing there	快速選取在該處找不到任何內容
+	Object Selection found nothing there — try a tighter rectangle	物件選取在該處找不到任何內容 — 請嘗試更緊密的矩形
+	No subject found — try a rectangle around the object	找不到主體 — 請嘗試在物件周圍繪製矩形
+	Auto Erase	自動擦除
+	Click the first point or press {key} to close · {del} removes a point · Esc cancels	按一下第一個點或按 {key} 封閉 · {del} 刪除一個點 · Esc 取消
+	Click, then move along an edge · click to fasten a point · {alt}-click for a straight segment · double-click to close	按一下，然後沿著邊緣移動 · 按一下固定一個點 · {alt}-按一下畫直線區段 · 按兩下封閉
+	Follows only edges this close to the pointer ([ and ] change it)	只追蹤離指標這麼近的邊緣（用 [ 和 ] 調整）
+	Higher values follow only edges that contrast sharply with their surroundings	數值越高，只追蹤與周圍對比強烈的邊緣
+	How often fastening points are placed by themselves	自動放置固定點的頻率
+	Scrubby Zoom	細微縮放
+	{mode} Color · {bits} bit	{mode} 色彩 · {bits} 位元
+	Drag a crop box · drag inside to move · edges resize ({ratio} ratio, {centre} centre) · Space moves while drawing · arrows nudge · X swaps orientation · {commit} commits · Esc cancels	拖移繪製裁切框 · 在框內拖移以移動 · 拖移邊緣調整大小（{ratio} 比例，{centre} 中心）· 繪製時按 Space 移動 · 方向鍵微移 · X 切換方向 · {commit} 確認 · Esc 取消
+	Appearance Settings…	外觀設定…
+	Add to favorites	加入最愛
+	Remove from favorites	從最愛移除
+# File Info ▸ Camera Data (read-only EXIF fields; "Make" is the camera maker, not the verb).
+	Camera Data	相機資料
+cameraData	Make	製造商
+cameraData	Model	型號
+cameraData	Date Taken	拍攝日期
+cameraData	Exposure	曝光時間
+cameraData	F-Stop	光圈值
+cameraData	ISO Speed	ISO 感光度
+cameraData	Focal Length	焦距
+cameraData	Focal Length (35 mm)	焦距（35 公釐等效）
+cameraData	Lens	鏡頭
+# Shared panel docking
+	Activate Panel	啟用面板
+	Change Panel Group	變更面板群組
+	Change Panel Layout	變更面板配置
+	Close Panel	關閉面板
+	Dock Panel	停駐面板
+	Float Panel	浮動面板
+	Move Panel	移動面板
+	Group with	與此面板分組
+	Panel menu	面板選單
+	Resize panel window	調整面板視窗大小
+	Resize panels	調整面板大小
+	Use Classic Mode	使用傳統模式
+	Auto Center Preview	自動置中預視
+	Next Document	下一個文件
+	Previous Document	上一個文件
+	W x H x Resolution	寬 x 高 x 解析度
+	Front Image	前面的影像
+	Frame Tool	影格工具
+	Create a new rectangular frame	建立新的矩形影格
+	Create a new elliptical frame	建立新的橢圓形影格
+	Include in playback	包含在播放中
+	Perspective Crop Tool	透視裁切工具
+	Show Grid	顯示格點
+	Drag a box or click four corners · drag the corners onto the edges of a skewed shape · {commit} commits · Esc cancels	拖曳方框或按一下四個角 · 將角拖曳到傾斜形狀的邊緣 · {commit} 確認 · Esc 取消
+	Artboard Tool	工作區域工具
+	Make Portrait	設為直向
+	Make Landscape	設為橫向
+	Add New Artboard	新增工作區域
+	W	寬
+	H	高
+	Freeform Pen Tool	自由筆型工具
+	Curvature Pen Tool	曲線筆工具
+	Curve Fit:	曲線擬合：
+	Drag: draw freehand · {alt}-click: straight segment · Release on the start point: close	拖曳：手繪 · {alt}-按一下：直線段 · 在起點放開：閉合
+	Click: smooth point · Double-click: corner · Drag a point: move · Click first point: close · {key} finish	按一下：平滑點 · 按兩下：轉角 · 拖曳點：移動 · 按一下第一點：閉合 · {key} 完成
+	Scale:	縮放：
+	Snap to Origin	靠齊原點
+	Search settings…	搜尋設定…
+	No matching settings	沒有符合的設定
+# Edit › Content-Aware Fill workspace
+	Sampling Brush Tool	取樣筆刷工具
+	Sampling Area Overlay	取樣區域覆蓋
+	Show Sampling Area	顯示取樣區域
+	Indicates	指示
+	Sampling Area	取樣區域
+	Excluded Area	排除區域
+	Sampling Area Options	取樣區域選項
+	Rectangular	矩形
+	Fill Settings	填色設定
+	Rotation Adaptation	旋轉調整
+	Very High	非常高
+	High	高
+	Low	低
+	Full	完全
+	Mirror	鏡像
+	Output Settings	輸出設定
+	Output To	輸出至
+	Duplicate Layer	複製圖層
+	Contract	縮減
+
+	Animation Options	動畫選項
+	Entire Document	整份文件
+	Filter Options	篩選選項
+	Layer Bounds	圖層邊界
+	Layers Panel Options	圖層面板選項
+	Lock Layers	鎖定圖層
+	New Artboard…	新增工作區域…
+	New Group	新增群組
+	New Group…	新增群組…
+	New Layer…	新增圖層…
+	Panel Options…	面板選項…
+	Prevent Auto-Nesting	防止自動巢狀
+	Show Layers	顯示圖層
+	Thumbnail Contents	縮圖內容
+	Thumbnail Size	縮圖大小
+	Use Default Masks on Fill Layers	在填色圖層使用預設遮色片
+	Expand New Effects	展開新效果
+	Add “copy” to Copied Layers and Groups	為複製的圖層和群組加上「副本」
+	Preview on canvas when reordering layers	重新排列圖層時在畫布上預覽
+	Show layer mask badges	顯示圖層遮色片標記
+
+# Smart Filter editors
+	Blending Options ({filter})	混合選項 ({filter})
+	Hide the layer's effects and Smart Filters  ({key}-click: all layers)	隱藏圖層效果和智慧型濾鏡  （{key} 點擊：所有圖層）
+	Show the layer's effects and Smart Filters  ({key}-click: all layers)	顯示圖層效果和智慧型濾鏡  （{key} 點擊：所有圖層）
+	Wait for the current job to finish.	請等待目前的工作完成。
+	The document or Smart Filter changed. Reopen its dialog.	文件或智慧型濾鏡已變更。請重新開啟其對話框。
+	Opacity must be between 0% and 100%.	不透明度必須介於 0% 和 100% 之間。
+	Dissolve is approximated: it blends without Photoshop's dither.	「溶解」為近似效果：混合時沒有 Photoshop 的仿色。
+	Loading fonts…	正在載入字體…
+	Response curve	回應曲線
+	Tool	工具
+	Simulate Pressure	模擬壓力
+	Stroke Path…	筆畫路徑…
+	Background Eraser	背景橡皮擦
+	Clone Stamp	仿製印章
+	Healing Brush	修復筆刷
+	Spot Healing Brush	污點修復筆刷
+	History Brush	步驟記錄筆刷
+	Smudge	指尖
+	Dodge	加亮
+	Burn	加深
+	Sponge	海綿
+	Amount:	總量：
+	Protect:	保護：
+	Protect skin tones	保護膚色
+	Edit points to modify the curve	編輯點以修改曲線
+	Draw to modify the curve	繪製以修改曲線
+curves	Smooth	平滑
+	Smooth the curve values	平滑曲線數值
+	Drag to draw the curve · {key}-click draws a straight line	拖曳以繪製曲線 · 按住 {key} 按一下可繪製直線
+	Edit Plane	編輯平面
+	Create Plane	建立平面
+	Grid Size:	格點大小：
+	Vanishing Point: click four corners to create a plane	消失點：按一下四個角以建立平面
+	Vanishing Point is not active	消失點未啟用
+	Apply Vanishing Point ({key})	套用消失點 ({key})
+	Fix the red plane first: its corners must form a convex quad	請先修正紅色平面：其四個角必須構成凸四邊形
+# Select and Mask view modes (#1754)
+	Onion Skin	洋蔥皮
+	Marching Ants	螞蟻線
+	On Black	黑底
+	On White	白底
+	On Layers	圖層上
+	Show Edge	顯示邊緣
+	Show Original	顯示原始
+	F cycles the views; hold X to see the image	按 F 切換檢視；按住 X 檢視影像
+# Select and Mask Refine Edge Brush (#2972)
+	Refine Edge Brush (R)	調整邊緣筆刷 (R)
+	Expand Detection Area	擴展偵測區域
+	Restore Original Edge	恢復原始邊緣
+	Paint over hair or fur on the image; Alt paints the other mode	在影像中的頭髮或毛髮上塗抹；按住 Alt 以另一種模式塗抹
+	Clear Brush Strokes	清除筆刷筆觸
+	Show rulers	顯示尺標
+	New Crop Preset…	新增裁切預設集…
+	Delete Crop Preset…	刪除裁切預設集…
+	Select the crop presets to delete:	選取要刪除的裁切預設集：
+	Select the crop presets to delete	選取要刪除的裁切預設集
+	Enter a name for the crop preset	輸入裁切預設集的名稱
+	There is no crop size or ratio to save	沒有可儲存的裁切尺寸或比例
+	Presentation	呈現
+
+# Color Sampler (added with the i18n coverage repair)
+	Click to place · Alt-click or drag off-canvas to remove	按一下以放置 · Alt 按一下或拖曳至畫布外以移除
+	No document open	未開啟任何文件
+	{n} of {max} sample points	{max} 個取樣點中的 {n} 個
+
+# History panel menu (#2966)
+	Step Forward	向前一步
+	Step Backward	向後一步
+	Clear History	清除步驟記錄
+	New Snapshot…	新增快照…
+	History Options…	步驟記錄選項…
+# Print dialog (#2697)
+	Emulsion Down	感光乳劑面朝下
+	Functions	功能
+	Print Resolution:	列印解析度：
+	Use Previous Layer to Create Clipping Mask	使用上一個圖層建立剪裁遮色片
+	Fill with {mode}-neutral color (white)	使用{mode}中性色填滿（白色）
+	Fill with {mode}-neutral color (black)	使用{mode}中性色填滿（黑色）
+	Fill with {mode}-neutral color (50% gray)	使用{mode}中性色填滿（50% 灰色）
+	(No neutral color exists for {mode} mode.)	（{mode}模式沒有中性色。）
+	Apply mask to layer before removing?	移除之前將遮色片套用到圖層嗎？
+	The layer or its mask changed. Drag the mask onto the Trash again.	圖層或其遮色片已變更。請再次將遮色片拖曳到垃圾桶。
+	Delete the vector mask?	要刪除向量遮色片嗎？
+# Counted status messages and labels (#3454; adapted from PR #3821)
+@plural	Exported {n} swatch to {file}|Exported {n} swatches to {file}	已將 {n} 個色票匯出至 {file}
+@plural	Imported {n} brush from {group}|Imported {n} brushes from {group}	已從 {group} 匯入 {n} 個筆刷
+@plural	Imported {n} swatch from {file}|Imported {n} swatches from {file}	已從 {file} 匯入 {n} 個色票
+@plural	Played {n} step|Played {n} steps	已播放 {n} 個步驟
+@plural	Updated {n} linked smart object changed on disk|Updated {n} linked smart objects changed on disk	已更新 {n} 個在磁碟上變更的連結智慧型物件
+@plural	Saved for Web: {n} file|Saved for Web: {n} files	儲存為網頁用：{n} 個檔案
+@plural	{n} layer recorded by this comp was deleted. Update the comp, or clear the warning.|{n} layers recorded by this comp were deleted. Update the comp, or clear the warning.	此構圖記錄的 {n} 個圖層已刪除。請更新構圖，或清除警告。
+@plural	{n} plane|{n} planes	{n} 個平面
+@plural	{n} preset|{n} presets	{n} 個預設集
+@plural	{n} sample point removed|{n} sample points removed	已移除 {n} 個取樣點
+@plural	{n} slice|{n} slices	{n} 個切片
+@plural	{n} step|{n} steps	{n} 個步驟
+@plural	{warning} (+{n} more brush preset warning)|{warning} (+{n} more brush preset warnings)	{warning} (另有 {n} 個筆刷預設集警告)
+@plural	{what} with {n} warning|{what} with {n} warnings	{what} ({n} 個警告)
+# View › Guides › New Guide… › Color
+	Light Blue	淺藍色
+	Light Red	淺紅色
+	Medium Blue	中藍色
+	Light Gray	淺灰色
+	Stop	停止
+	Object Finder	物件尋找器
+	No object found there — drag a rectangle around it	那裡找不到物件 — 請在其周圍拖曳矩形
+	The active layer has no pixels here — turn on Sample All Layers or select a layer with pixels	作用中圖層在此處沒有像素 — 請開啟「取樣全部圖層」或選取有像素的圖層
+	Remove after each stroke	每次描邊後移除
+	Apply the removal ({key})	套用移除 ({key})
+	Strokes to remove: {n} (Enter applies, Esc cancels)	待移除的描邊：{n}（Enter 套用，Esc 取消）
+	Load Contours…	載入等高線…
+	Replace Contours…	取代等高線…
+	Save Contours…	儲存等高線…
+	Delete Contour	刪除等高線
+	Loaded contours from {file}	已從 {file} 載入等高線
+	Saved contours to {file}	已將等高線儲存到 {file}
+	Show home recent files	在主畫面上顯示最近的檔案
+	Clear Brush Controls	清除筆刷控制項
+	Reset All Locked Settings	重設所有鎖定的設定
+	Copy Texture to Other Tools	複製紋理至其他工具
+
+# Actions panel: Load/Save Actions (.atn) and kept Photoshop steps
+	Load Actions…	載入動作…
+	Save Actions…	儲存動作…
+	New Action…	新增動作…
+	Start Recording	開始錄製
+	Stop Recording	停止錄製
+	{name} (Photoshop)	{name}（Photoshop）
+	{message} ({note})	{message}（{note}）
+@plural	Loaded {n} action from {file}|Loaded {n} actions from {file}	已從 {file} 載入 {n} 個動作
+@plural	{n} step has no PhotoCraft equivalent yet|{n} steps have no PhotoCraft equivalent yet	{n} 個步驟在 PhotoCraft 中尚無對應功能
+@plural	Saved {n} action to {file}|Saved {n} actions to {file}	已將 {n} 個動作儲存到 {file}
+@plural	{n} step with no Photoshop equivalent left out|{n} steps with no Photoshop equivalent left out	已略過 {n} 個沒有 Photoshop 對應功能的步驟
+
+	File Naming	檔案命名
+	Starting serial	起始序號
+# Actions panel: set folders, dialog toggle, Insert Stop
+	Insert Stop…	插入停止…
+	Save Set…	儲存組合…
+	Message:	訊息:
+	Allow Continue	允許繼續
+	Show dialog during playback	播放時顯示對話框
+	Select an action first	請先選取一個動作
+	Action playback stopped	動作播放已停止
+	Step {step} is waiting for its dialog	步驟 {step} 正在等待其對話框
+@plural	{n} action|{n} actions	{n} 個動作
+	Background (Default)	背景（預設）
+	Content-Aware Fill	內容感知填滿
+# Batch / Image Processor
+	Include All Subfolders	包含所有子資料夾
+	Auto Add/Delete	自動增加/刪除
+
+# Native Windows printing qualification
+	Don't also tick Mirror Image in Print Settings…: the two flips cancel out.	請勿同時勾選列印設定中的鏡像：兩次翻轉會互相抵消。
+	Print Settings…	列印設定…
+	Remember to turn off the printer's own colour management in Print Settings…	請記得在列印設定中關閉印表機本身的色彩管理…
+	Sent to {printer}	已傳送至 {printer}
+	set in Print Settings…	在列印設定中設定…
+	ICO is limited to 256 × 256 pixels	ICO 最大為 256 × 256 像素
+# PhotoCraft release checks.
+	Check for Updates…	檢查更新…
+	PhotoCraft Updates	PhotoCraft 更新
+	Checking for updates…	正在檢查更新…
+	Open the release page to choose an installer for your system.	開啟發佈頁，選擇適合您系統的安裝程式。
+	Open Download Page	開啟下載頁面
+	PhotoCraft is up to date.	PhotoCraft 已是最新版本。
+	Could not check for updates.	無法檢查更新。
+	Updates have not been checked yet.	尚未檢查更新。
+	Check Again	重新檢查
+	Automatically Check for Updates	自動檢查更新
+	Installed version: {version}	已安裝版本：{version}
+	PhotoCraft {version} is available.	PhotoCraft {version} 已發佈。
+# History panel › History Brush source (#2966)
+	Paints from the History panel's source state	從步驟記錄面板的來源狀態繪畫
+	Sets the source for the history brush	設定步驟記錄筆刷的來源
+# Bevel & Emboss shading controls.
+	Highlight Mode	亮部模式
+	Highlight Color	亮部顏色
+	Highlight Opacity	亮部不透明度
+	Shadow Mode	陰影模式
+	Shadow Color	陰影顏色
+	Shadow Opacity	陰影不透明度
+# Embedded Profile Mismatch: profile names beside the choices, Remember this choice
+	Use the embedded profile ({profile})	使用內嵌描述檔 ({profile})
+	Convert to the working space ({profile})	轉換為工作空間 ({profile})
+	Remember this choice for future images	之後開啟的影像都使用此選擇
+	Turn the prompt back on with Ask On Mismatch in Edit › Color Settings.	可在 編輯 › 色彩設定 中開啟 Ask On Mismatch，重新顯示此提示。
+	Button Mode	按鈕模式
+	Button Mode On	按鈕模式 開
+
+# Darken / Lighten Interface (⇧⌘F1 / ⇧⌘F2)
+	Darken Interface	介面變暗
+	Lighten Interface	介面變亮
+# Bevel & Emboss Technique.
+	Technique	方法
+	Chisel Hard	雕刻清晰
+	Chisel Soft	雕刻柔和
+	Open color-less EXR as ACEScg	將無色彩空間資訊的 EXR 以 ACEScg 開啟
+	Do not append "copy" to filename when saving a copy	儲存副本時不在檔名後加上「copy」
+# Export As metadata and profile options
+	Color Profile	色彩描述檔
+	EXIF	EXIF
+
+# View › Guides › right-click a guide
+	Edit Selected Guides	編輯所選參考線
+	Clear Selected Guides	清除所選參考線
+	Make Selection	建立選取範圍
+	Bicubic Automatic	雙三次 (自動)
+	Bicubic Smoother	雙三次 (較平滑)
+	Bicubic Sharper	雙三次 (較銳利)
+	Pasting from other apps is unavailable	無法從其他應用程式貼上
+	PhotoCraft can't reach the system clipboard in this session. On Wayland, a Flatpak sandbox hides the protocol that images from other apps are read through.	PhotoCraft 在此工作階段中無法存取系統剪貼簿。在 Wayland 上，Flatpak 沙盒會隱藏讀取其他應用程式影像所用的協定。
+	To paste from other apps, start PhotoCraft under XWayland: `{command}`	若要從其他應用程式貼上，請在 XWayland 下啟動 PhotoCraft：`{command}`
+	Nothing to paste: PhotoCraft can't read the system clipboard here	沒有可貼上的內容：PhotoCraft 在此無法讀取系統剪貼簿
+	Delete this set	刪除此組合
+	New Set…	新增組合…
+	PhotoCraft Defaults	PhotoCraft 預設值
+	Save a list of these shortcuts as a web page	將這些快速鍵的清單儲存為網頁
+	Save the changes to this set	將變更儲存到此組合
+	Save these shortcuts as a .kys file	將這些快速鍵儲存為 .kys 檔案
+	Save these shortcuts as a new set	將這些快速鍵儲存為新組合
+	Set deleted.	已刪除組合。
+	Set saved.	已儲存組合。
+	Set:	組合：
+	Summarize…	摘要…
+	There are too many sets: delete one first.	組合太多：請先刪除一個。
+	set name	組合名稱
+	{set} (modified)	{set}（已修改）
+	Random	隨機
+	Show file name in title	標題中顯示檔案名稱
+
+# Image › Mode › Bitmap (#5559)
+	50% Threshold	50% 臨界值
+	Pattern Dither	圖樣混色
+	Diffusion Dither	擴散混色
+	Halftone Screen	半色調網屏
+	Custom Pattern	自訂圖樣
+	Frequency:	頻率：
+	Lines/Inch	線/英吋
+	Lines/Centimeter	線/公分
+	Ellipse	橢圓
+	Cross	十字
+	Method	方法
+	Accept and Go to Conflict	接受並前往衝突
+	Changes undone.	已還原變更。
+	Choose a new shortcut for this command, or leave it without one.	為此指令選擇新的快速鍵，或保持沒有快速鍵。
+	Put this command's shortcuts back as they were	將此指令的快速鍵恢復原狀
+	Take the shortcut from the other command and select it	從另一個指令移除該快速鍵並選取它
+	Undo Changes	還原變更
+	{shortcut} is reserved by the system and can't be assigned.	{shortcut} 由系統保留，無法指定。
+	Low-Latency Drawing (vsync off, applies at next launch)	低延遲繪圖（關閉垂直同步，下次啟動時生效）
+# Free Transform: a new layer while the box is open (#5859)
+	Reference point location	參考點位置
+	Free Transform is still being applied; try again when it has finished.	任意變形仍在套用中；請在完成後再試一次。
+	The transform couldn't be applied.	無法套用變形。
+# Preferences › Performance › GPU Memory; the status bar and slow-redraw notice
+	Its layers need {needed} of GPU memory; the budget leaves them {budget}.	其圖層需要 {needed} GPU 記憶體；預算只留給它們 {budget}。
+	Set GPU Memory in Preferences › Performance to what your graphics card can hold, at most 3/8 of its memory. Automatic follows Memory Usage, within a quarter of this computer's memory and 3/8 of the card's, and doesn't count the document against a card whose memory is known. The status bar shows GPU Memory Full while they don't fit.	在 偏好設定 › 效能 中將 GPU 記憶體設為顯示卡能容納的大小，最多為其記憶體的 3/8。自動會跟隨記憶體使用量，不超過本機記憶體的四分之一和顯示卡記憶體的 3/8，且在記憶體已知的顯示卡上不把文件計入。在圖層放不下期間，狀態列會顯示「GPU 記憶體已滿」。
+	GPU Memory Full	GPU 記憶體已滿
+	The layers need {needed} of GPU memory and may hold {budget}, so edits that redraw the whole document do it on the CPU. Click to set GPU Memory.	圖層需要 {needed} GPU 記憶體，但只能佔用 {budget}，因此重繪整份文件的編輯會在 CPU 上進行。按一下以設定 GPU 記憶體。
+	GPU memory budget: {budget}	GPU 記憶體預算：{budget}
+	Graphics memory: {size}	顯示記憶體：{size}
+	This document's layers: {needed} of {budget} for layers	此文件的圖層：圖層可用 {budget} 中的 {needed}
+	This document's layers need {needed} but may hold {budget}: whole-document redraws use the CPU	此文件的圖層需要 {needed}，但只能佔用 {budget}：整份文件的重繪使用 CPU
+	GPU Memory (MB, 0 = Automatic)	GPU 記憶體（MB，0 = 自動）
+	{path}: the path is not valid Unicode; save under another name.	{path}：路徑不是有效的 Unicode；請以其他名稱儲存。
+	Replace	取代
+	{name} was changed by another app after it was opened or saved here.	{name} 在此處開啟或儲存後已被其他 App 更改。
+	Replace it with this document, or cancel and use File › Save As to keep both.	以此文件取代它，或取消並使用「檔案 › 另存新檔」以保留兩者。
+	Decrease Brush Size	縮小筆刷大小
+	Increase Brush Size	放大筆刷大小
+	Decrease Brush Hardness	降低筆刷硬度
+	Increase Brush Hardness	提高筆刷硬度
+	Demosaic	去馬賽克
+	How the camera's colour filter mosaic is filled in. It is applied when the file opens; the preview shows the method it was opened with.	如何填補相機彩色濾鏡陣列的馬賽克。在開啟檔案時套用；預覽顯示開啟時所用的方法。
+	AHD (adaptive homogeneity)	AHD（自適應同質性）
+	Malvar–He–Cutler	Malvar–He–Cutler
+	Hirakawa–Parks: the cleanest edges and the least colour fringing, the slowest.	Hirakawa–Parks：邊緣最乾淨、色邊最少，速度最慢。
+	Gradient-corrected interpolation: sharp and fast, with some colour fringing on fine detail.	梯度校正插值：銳利且快速，細節處有些許色邊。
+	The fastest and the softest, with colour fringing on fine detail.	最快也最柔和，細節處有色邊。
+	“{name}” already exists. Replace it?	「{name}」已存在。要取代它嗎？
+	The name in the save dialog was “{name}”.	儲存對話框中的名稱是「{name}」。
+	Move Up	上移
+	Move Down	下移
+	Previous Brush	上一個筆刷
+	Next Brush	下一個筆刷
+	First Brush	第一個筆刷
+	Last Brush	最後一個筆刷
+	Preview size	Preview size
+	Memory Usage	記憶體使用量
+	Per-document RAM limit (MB)	每個文件的 RAM 上限 (MB)
+	Installed RAM: {ram} MB; this limit: {percent}%	已安裝 RAM：{ram} MB；此上限：{percent}%
+	Limits each open document's pixels plus History. Oldest undo states are discarded when the limit is exceeded.	限制每個開啟文件的像素加歷史記錄。超出上限時會捨棄最舊的復原狀態。
+	Applies immediately when saved. Memory is not reserved in advance.	儲存後立即套用。不會預先保留記憶體。
+	With GPU Memory set to Automatic, this also limits the GPU layer budget. That budget is capped at one quarter of installed RAM and, when known, three eighths of the graphics card's memory, with a 512 MB minimum. Raising this limit beyond those caps does not increase the GPU budget.	當 GPU 記憶體為自動時，這也會限制 GPU 圖層預算。上限為安裝 RAM 的四分之一，以及（若已知）顯示卡記憶體的八分之三，最低 512 MB。超過這些上限不會增加 GPU 預算。
+	Use	使用
+	In Front	前面
+	Behind	後面
+	Blend	混合
+
+# DDS Options (#1327)
+	DDS Options	DDS 選項
+	Compression	壓縮
+	Generate Mipmaps	產生 Mipmap
+
+# Color Table (.act) dialog
+	There is no color table to save.	沒有可儲存的色表。
+@plural	Saved {n} color to {file}|Saved {n} colors to {file}	已將 {n} 種顏色儲存至 {file}
+
+# Graphics Adapter preference (#1885)
+	GPU adapter	GPU 介面卡
+
+# Styles panel: Import / Export Styles (.asl)
+	Import Styles…	匯入樣式…
+	Export Selected Styles…	匯出所選樣式…
+	Export Styles…	匯出樣式…
+	{file} is not a style library (.asl)	{file} 不是樣式庫 (.asl)
+@plural	Imported {n} style from {file}|Imported {n} styles from {file}	已從 {file} 匯入 {n} 個樣式
+@plural	Exported {n} style to {file}|Exported {n} styles to {file}	已將 {n} 個樣式匯出至 {file}
+# Actions: a step dialog holds a suspended recording (#7365)
+	Confirm or cancel the open action step dialog first	請先確認或取消開啟中的動作步驟對話框
+	Pro Medium Gray	專業中灰
+	Solarized	Solarized
+	Breeze	Breeze
+	Pro Light Gray	專業淺灰
+	Pro Light	專業淺色
+	Resize Windows to Fit	調整視窗大小以符合
+	EXR	EXR
+# Paragraph direction (TYPE-218-2)
+	Automatic paragraph direction	自動段落方向
+	Left-to-right paragraph direction	由左至右的段落方向
+	Right-to-left paragraph direction	由右至左的段落方向
+	Not rendered: this adjustment ({key}) is kept as imported.	未算繪：此調整（{key}）依匯入時的原樣保留。
+# Print preview image (#8236)
+	Print preview image	Print preview image
+# Color panel menu: modes, copy commands and colour ramps (#6000)
+	Hue Cube	色相立方體
+	Brightness Cube	亮度立方體
+	Color Wheel	色輪
+	Grayscale Slider	灰階滑桿
+	RGB Sliders	RGB 滑桿
+	HSB Sliders	HSB 滑桿
+	CMYK Sliders	CMYK 滑桿
+	Lab Sliders	Lab 滑桿
+	Web Color Sliders	網頁色彩滑桿
+	Copy Color as HTML	將色彩複製為 HTML
+	Copy Color's Hex Code	複製色彩的十六進位碼
+	RGB Spectrum	RGB 色譜
+	CMYK Spectrum	CMYK 色譜
+	Grayscale Ramp	灰階色帶
+	Current Colors	目前色彩
+	Make Ramp Web Safe	讓色帶成為網頁安全色
