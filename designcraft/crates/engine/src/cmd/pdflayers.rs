@@ -42,6 +42,22 @@ pub fn specs() -> Vec<CommandSpec> {
                 if ids.iter().all(|id| placed_pdf(s, *id).is_none()) {
                     return Err(bad("object.layerOptions", "select a placed PDF"));
                 }
+                // Validate every selected PDF before editing any item or recording undo.
+                // Repeated placements of the same source need only one rewrite check.
+                if !hidden.is_empty() {
+                    let mut checked = std::collections::HashSet::new();
+                    for id in &ids {
+                        if let Some(data) = placed_pdf(s, *id)
+                            && checked.insert(std::sync::Arc::as_ptr(&data))
+                            && designcraft_render::pdf_hide_layers(&data, &hidden).is_none()
+                        {
+                            return Err(bad(
+                                "object.layerOptions",
+                                "the selected PDF layers could not be hidden; use the file defaults or replace the unsupported PDF",
+                            ));
+                        }
+                    }
+                }
                 s.edit(|d, _| {
                     for id in &ids {
                         if let Some(it) = d.item_mut(*id) {
@@ -63,29 +79,275 @@ pub(crate) mod tests {
 
     /// A one-page PDF (100×100 pt) with two layers: "Blue" (left half) and "Red" (right half).
     pub(crate) fn two_layer_pdf() -> Vec<u8> {
+        two_layer_pdf_generation(0)
+    }
+
+    fn two_layer_pdf_generation(generation: i32) -> Vec<u8> {
+        two_layer_pdf_options(generation, "", "")
+    }
+
+    fn two_layer_pdf_options(generation: i32, config: &str, trailer: &str) -> Vec<u8> {
         let content = "/OC /a BDC 0 0 1 rg 0 0 50 100 re f EMC /OC /b BDC 1 0 0 rg 50 0 50 100 re f EMC";
         let objs = [
-            "<</Type/Catalog/Pages 2 0 R/OCProperties<</OCGs[5 0 R 6 0 R]/D<</Order[5 0 R 6 0 R]>>>>>>".to_string(),
+            format!(
+                "<</Type/Catalog/Lang(en-GB)/Metadata 7 0 R/OutputIntents[8 0 R]/Pages 2 0 R/OCProperties<</OCGs[5 0 R 6 0 R]/D<</Order[5 0 R 6 0 R]/Name(Default)/Locked[5 0 R]{config}>>>>>>"
+            ),
             "<</Type/Pages/Kids[3 0 R]/Count 1>>".to_string(),
             "<</Type/Page/Parent 2 0 R/MediaBox[0 0 100 100]/Resources<</Properties<</a 5 0 R/b 6 0 R>>>>/Contents 4 0 R>>".to_string(),
             format!("<</Length {}>>\nstream\n{content}\nendstream", content.len()),
             "<</Type/OCG/Name(Blue)>>".to_string(),
             "<</Type/OCG/Name(Red)>>".to_string(),
+            "<</Type/Metadata/Subtype/XML/Length 4>>\nstream\n<x/>\nendstream".to_string(),
+            "<</Type/OutputIntent/S/GTS_PDFX/OutputConditionIdentifier(Test)>>".to_string(),
         ];
         let mut out = b"%PDF-1.7\n".to_vec();
         let mut offs = Vec::new();
         for (i, o) in objs.iter().enumerate() {
             offs.push(out.len());
-            out.extend_from_slice(format!("{} 0 obj\n{o}\nendobj\n", i + 1).as_bytes());
+            out.extend_from_slice(format!("{} {generation} obj\n{}\nendobj\n", i + 1, o.replace(" 0 R", &format!(" {generation} R"))).as_bytes());
         }
         let x = out.len();
         let mut t = format!("xref\n0 {}\n0000000000 65535 f\r\n", objs.len() + 1);
         for o in offs {
-            t.push_str(&format!("{o:010} 00000 n\r\n"));
+            t.push_str(&format!("{o:010} {generation:05} n\r\n"));
         }
-        t.push_str(&format!("trailer\n<</Size {}/Root 1 0 R>>\nstartxref\n{x}\n%%EOF\n", objs.len() + 1));
+        t.push_str(&format!("trailer\n<</Size {}/Root 1 {generation} R{trailer}>>\nstartxref\n{x}\n%%EOF\n", objs.len() + 1));
         out.extend_from_slice(t.as_bytes());
         out
+    }
+
+    #[test]
+    fn pdf_layer_update_preserves_catalog_configuration_and_generations() {
+        for generation in [0, 1] {
+            let original = two_layer_pdf_generation(generation);
+            let updated = designcraft_render::pdf_hide_layers(&original, &["Red".into()]).unwrap();
+            assert_eq!(designcraft_render::pdf_layers(&updated), vec![("Blue".into(), true), ("Red".into(), false)]);
+            let appended = std::str::from_utf8(&updated[original.len()..]).unwrap();
+            for token in [
+                "/Lang(en-GB)".to_string(),
+                format!("/Metadata 7 {generation} R"),
+                format!("/OutputIntents[8 {generation} R]"),
+                format!("/Locked[5 {generation} R]"),
+                "/Name(Default)".into(),
+                format!("/Root 1 {generation} R"),
+            ] {
+                assert!(appended.contains(&token), "missing {token}: {appended}");
+            }
+            assert!(!appended.contains("9999000"));
+            let all_on = designcraft_render::pdf_hide_layers(&updated, &[]).unwrap();
+            assert!(designcraft_render::pdf_layers(&all_on).iter().all(|(_, visible)| *visible));
+        }
+    }
+
+    #[test]
+    fn pdf_layer_update_accepts_xref_streams_and_rejects_unsupported_updates() {
+        let original = two_layer_pdf();
+        let text = std::str::from_utf8(&original).unwrap();
+        let offset: usize = text.rsplit_once("startxref").unwrap().1.split_whitespace().next().unwrap().parse().unwrap();
+        let mut stream_pdf = original[..offset].to_vec();
+        let mut entries = vec![0, 0, 0, 0, 0, 255, 255];
+        for number in 1..=9 {
+            let at = if number == 9 { offset } else { text.find(&format!("{number} 0 obj")).unwrap() };
+            entries.push(1);
+            entries.extend_from_slice(&u32::try_from(at).unwrap().to_be_bytes());
+            entries.extend_from_slice(&[0, 0]);
+        }
+        stream_pdf.extend_from_slice(format!("9 0 obj\n<</Type/XRef/Size 10/Root 1 0 R/W[1 4 2]/Length {}>>\nstream\n", entries.len()).as_bytes());
+        stream_pdf.extend_from_slice(&entries);
+        stream_pdf.extend_from_slice(format!("\nendstream\nendobj\nstartxref\n{offset}\n%%EOF\n").as_bytes());
+        let updated = designcraft_render::pdf_hide_layers(&stream_pdf, &["Red".into()]).unwrap();
+        assert_eq!(designcraft_render::pdf_layers(&updated), vec![("Blue".into(), true), ("Red".into(), false)]);
+        for unsupported in ["/Encrypt 7 0 R", "/Encrypt << /Filter /Standard >>", "/XRefStm 0"] {
+            let altered = text.replace("/Size 9", &format!("{unsupported}/Size 9"));
+            assert!(designcraft_render::pdf_hide_layers(altered.as_bytes(), &["Red".into()]).is_none());
+        }
+    }
+
+    #[test]
+    fn pdf_layer_update_follows_forward_prev_and_rejects_cycles() {
+        let original = two_layer_pdf();
+        let text = std::str::from_utf8(&original).unwrap();
+        let first = original.len();
+        let link = |prev: usize| format!("xref\n0 1\n0000000000 65535 f\ntrailer<</Size 9/Root 1 0 R/Prev {prev:010}>>\n");
+        let main = first + link(0).len();
+        let mut forward = original.clone();
+        forward.extend_from_slice(link(main).as_bytes());
+        let old: usize = text.rsplit_once("startxref").unwrap().1.split_whitespace().next().unwrap().parse().unwrap();
+        forward.extend_from_slice(text[old..].split("startxref").next().unwrap().as_bytes());
+        forward.extend_from_slice(format!("startxref\n{first}\n%%EOF\n").as_bytes());
+        let updated = designcraft_render::pdf_hide_layers(&forward, &["Red".into()]).unwrap();
+        assert_eq!(designcraft_render::pdf_layers(&updated), vec![("Blue".into(), true), ("Red".into(), false)]);
+        let mut cyclic = original;
+        cyclic.extend_from_slice(link(first).as_bytes());
+        cyclic.extend_from_slice(format!("startxref\n{first}\n%%EOF\n").as_bytes());
+        assert!(designcraft_render::pdf_hide_layers(&cyclic, &[]).is_none());
+    }
+
+    fn add_pdf_revision(bytes: &mut Vec<u8>) {
+        let text = std::str::from_utf8(bytes).unwrap();
+        let prev: usize = text.rsplit_once("startxref").unwrap().1.split_whitespace().next().unwrap().parse().unwrap();
+        let xref = bytes.len();
+        bytes.extend_from_slice(
+            format!("xref\n0 1\n0000000000 65535 f\r\ntrailer\n<</Size 9/Root 1 0 R/Prev {prev}>>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+        );
+    }
+
+    fn place(s: &mut Session, bytes: &[u8], x: f64) -> serde_json::Value {
+        s.execute("file.place", &json!({"base64": super::super::file::base64_encode(bytes), "name": "layers.pdf", "x": x, "y": 0, "width": 100}))
+            .unwrap()["id"]
+            .clone()
+    }
+
+    fn pixel(s: &Session, x: u32) -> [u8; 4] {
+        let mut renderer = designcraft_render::Renderer::new();
+        renderer.threads = 0;
+        renderer.render_page(&s.doc().unwrap().doc, &s.cache, 0, 1.0, false, &Default::default()).unwrap().pixel(x, 50)
+    }
+
+    #[test]
+    fn null_encryption_entry_keeps_layer_editing_rendering_and_export_working() {
+        for generation in [0, 1] {
+            let bytes = two_layer_pdf_options(generation, "", "/Encrypt null");
+            let mut s = Session::new();
+            s.execute("file.new", &json!({"width": 100, "height": 100, "pages": 1})).unwrap();
+            let id = place(&mut s, &bytes, 0.0);
+            s.execute("object.layerOptions", &json!({"ids": [id], "hidden": ["Red"]})).unwrap();
+            assert_eq!(s.execute("object.pdfLayers", &json!({"id": id})).unwrap()[1]["visible"], false);
+            assert_eq!(pixel(&s, 25), [0, 0, 255, 255]);
+            assert_eq!(pixel(&s, 75), [255, 255, 255, 255]);
+            s.execute("file.exportPdf", &json!({})).unwrap();
+            s.execute("edit.undo", &json!({})).unwrap();
+            assert_eq!(pixel(&s, 75), [255, 0, 0, 255]);
+            s.execute("edit.redo", &json!({})).unwrap();
+            assert_eq!(pixel(&s, 75), [255, 255, 255, 255]);
+        }
+    }
+
+    #[test]
+    fn unrewritable_layer_choices_are_rejected_atomically_without_an_undo_step() {
+        let mut unsupported = two_layer_pdf();
+        for _ in 0..32 {
+            add_pdf_revision(&mut unsupported);
+        }
+        assert_eq!(designcraft_render::pdf_layers(&unsupported).len(), 2);
+        assert!(designcraft_render::pdf_hide_layers(&unsupported, &["Red".into()]).is_none());
+        let mut s = Session::new();
+        s.execute("file.new", &json!({"width": 200, "height": 100, "pages": 1})).unwrap();
+        let good = place(&mut s, &two_layer_pdf(), 0.0);
+        let bad = place(&mut s, &unsupported, 100.0);
+        s.execute("object.layerOptions", &json!({"ids": [good], "hidden": ["Blue"]})).unwrap();
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert!(!s.doc().unwrap().history.redo.is_empty());
+        let before = s.execute("file.serialize", &json!({})).unwrap();
+        let undo = s.doc().unwrap().history.undo.len();
+        let redo = s.doc().unwrap().history.redo.len();
+        for ids in [json!([good, bad]), json!([bad, good])] {
+            let err = s.execute("object.layerOptions", &json!({"ids": ids, "hidden": ["Red"]})).unwrap_err();
+            assert!(err.to_string().contains("could not be hidden"));
+            assert_eq!(s.execute("file.serialize", &json!({})).unwrap(), before);
+            assert_eq!(s.doc().unwrap().history.undo.len(), undo);
+            assert_eq!(s.doc().unwrap().history.redo.len(), redo);
+            for id in [&good, &bad] {
+                assert_eq!(s.execute("object.pdfLayers", &json!({"id": id})).unwrap()[1]["visible"], true);
+            }
+        }
+        assert_eq!(pixel(&s, 75), [255, 0, 0, 255]);
+        assert_eq!(pixel(&s, 175), [255, 0, 0, 255]);
+        // A persisted/relinked choice can be unrewritable. Reset must still work.
+        let bad_id = serde_json::from_value(bad.clone()).unwrap();
+        std::sync::Arc::make_mut(&mut s.doc_mut().unwrap().doc).item_mut(bad_id).unwrap().pdf_hidden_layers = vec!["Red".into()];
+        assert_eq!(pixel(&s, 175), [255, 255, 255, 255], "stale hidden content must not reappear on canvas");
+        assert!(s.execute("file.exportPdf", &json!({})).is_err());
+        s.execute("object.layerOptions", &json!({"ids": [good, bad], "hidden": []})).unwrap();
+        assert_eq!(s.execute("object.pdfLayers", &json!({"id": bad})).unwrap()[1]["visible"], true);
+        s.execute("file.exportPdf", &json!({})).unwrap();
+    }
+
+    #[test]
+    fn unreadable_non_null_prev_entries_refuse_layer_rewrites() {
+        for prev in ["7 0 R", "-1", "false", "<<>>", "[]", "/Unknown", "(unknown)"] {
+            let bytes = two_layer_pdf_options(0, "", &format!("/Prev {prev}"));
+            assert_eq!(designcraft_render::pdf_layers(&bytes).len(), 2, "reader control: {prev}");
+            assert!(designcraft_render::pdf_hide_layers(&bytes, &["Red".into()]).is_none(), "must not truncate unknown history: {prev}");
+        }
+        for trailer in ["", "/Prev null"] {
+            let bytes = two_layer_pdf_options(0, "", trailer);
+            assert!(designcraft_render::pdf_hide_layers(&bytes, &["Red".into()]).is_some(), "end-of-chain control: {trailer}");
+        }
+        let mut revised = two_layer_pdf();
+        let prev =
+            std::str::from_utf8(&revised).unwrap().rsplit_once("startxref").unwrap().1.split_whitespace().next().unwrap().parse::<usize>().unwrap();
+        add_pdf_revision(&mut revised);
+        let real_prev = std::str::from_utf8(&revised).unwrap().replace(&format!("/Prev {prev}>>"), &format!("/Prev {prev}.0>>"));
+        assert!(real_prev.contains(&format!("/Prev {prev}.0>>")));
+        for bytes in [revised, real_prev.into_bytes()] {
+            assert!(designcraft_render::pdf_hide_layers(&bytes, &["Red".into()]).is_some(), "readable integer/real history must still work");
+        }
+    }
+
+    #[test]
+    fn fake_null_trailer_cannot_bypass_hybrid_rejection() {
+        for real_guard in ["", "/XRefStm 0"] {
+            let bytes = two_layer_pdf_options(0, "", real_guard);
+            let text = std::str::from_utf8(&bytes).unwrap();
+            for fake in ["/Encrypt null", ""] {
+                let comment = format!("% trailer <</Size 9/Root 1 0 R{fake}>>\n");
+                let inside = text.replacen("xref\n", &format!("xref\n{comment}"), 1);
+                assert!(inside.contains(&format!("xref\n{comment}")));
+                // Repair-only comments inside a table are always refused, guard or not.
+                assert_eq!(designcraft_render::pdf_layers(inside.as_bytes()).len(), 2);
+                assert!(designcraft_render::pdf_hide_layers(inside.as_bytes(), &["Red".into()]).is_none());
+                // Before xref or after the dictionary, the real trailer decides.
+                let leading = text.replacen("xref\n", &format!("{comment}xref\n"), 1);
+                let trailing = text.replacen("startxref\n", &format!("{comment}startxref\n"), 1);
+                for source in [leading, trailing] {
+                    assert_eq!(designcraft_render::pdf_layers(source.as_bytes()).len(), 2);
+                    assert_eq!(designcraft_render::pdf_hide_layers(source.as_bytes(), &["Red".into()]).is_some(), real_guard.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn content_all_still_measures_layerless_and_stub_properties() {
+        use designcraft_doc::PdfCrop;
+        for props in ["", "/OCProperties null", "/OCProperties<<>>", "/OCProperties<</OCGs[]/D<<>>>>"] {
+            let content = "0 0 1 rg 0 0 50 100 re f";
+            let objs = [
+                format!("<</Type/Catalog/Pages 2 0 R{props}>>"),
+                "<</Type/Pages/Kids[3 0 R]/Count 1>>".into(),
+                "<</Type/Page/Parent 2 0 R/MediaBox[0 0 100 100]/Contents 4 0 R>>".into(),
+                format!("<</Length {}>>\nstream\n{content}\nendstream", content.len()),
+            ];
+            let mut bytes = b"%PDF-1.7\n".to_vec();
+            let mut offsets = Vec::new();
+            for (i, body) in objs.iter().enumerate() {
+                offsets.push(bytes.len());
+                bytes.extend_from_slice(format!("{} 0 obj\n{body}\nendobj\n", i + 1).as_bytes());
+            }
+            let xref = bytes.len();
+            bytes.extend_from_slice(b"xref\n0 5\n0000000000 65535 f\r\n");
+            for at in offsets {
+                bytes.extend_from_slice(format!("{at:010} 00000 n\r\n").as_bytes());
+            }
+            bytes.extend_from_slice(format!("trailer\n<</Size 5/Root 1 0 R>>\nstartxref\n{xref}\n%%EOF\n").as_bytes());
+            assert!(designcraft_render::pdf_layers(&bytes).is_empty());
+            assert_eq!(designcraft_render::pdf_crop_box(&bytes, 0, PdfCrop::ContentAll).unwrap().1, (50.0, 100.0), "{props}");
+        }
+    }
+
+    #[test]
+    fn content_all_keeps_the_whole_page_when_layer_rewriting_is_unsupported() {
+        use designcraft_doc::PdfCrop;
+        let mut bytes = two_layer_pdf_options(0, "/BaseState/OFF/ON[5 0 R]", "");
+        assert_eq!(designcraft_render::pdf_crop_box(&bytes, 0, PdfCrop::ContentVisible).unwrap().1, (50.0, 100.0));
+        assert_eq!(designcraft_render::pdf_crop_box(&bytes, 0, PdfCrop::ContentAll).unwrap().1, (100.0, 100.0));
+        for _ in 0..32 {
+            add_pdf_revision(&mut bytes);
+        }
+        assert!(designcraft_render::pdf_hide_layers(&bytes, &[]).is_none());
+        assert_eq!(designcraft_render::pdf_crop_box(&bytes, 0, PdfCrop::ContentVisible).unwrap().1, (50.0, 100.0));
+        assert_eq!(designcraft_render::pdf_crop_box(&bytes, 0, PdfCrop::ContentAll).unwrap(), ([0.0, 0.0, 1.0, 1.0], (100.0, 100.0)));
     }
 
     #[test]

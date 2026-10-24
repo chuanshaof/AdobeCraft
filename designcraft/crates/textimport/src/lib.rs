@@ -1,6 +1,6 @@
 //! Text import (File › Place of text files): plain text, Word documents (`.docx`) and RTF become
 //! a frameless [`Story`] with paragraph and character styles, local bold/italic/underline/size,
-//! footnotes (Word) and tables (Word), ready to flow into text frames.
+//! footnotes, tables and bullets/numbering (Word), ready to flow into text frames.
 //!
 //! Word styles are imported by name (their font, size, bold/italic and space before/after become
 //! the style definition, like InDesign's "Use Word styles" import option). RTF keeps bold,
@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 mod docx;
+mod docx_numbering;
 pub mod export;
 mod rtf;
 pub mod tagged;
@@ -27,6 +28,33 @@ pub fn xlsx_records(bytes: &[u8], sheet: Option<&str>) -> Result<Vec<Vec<String>
 }
 
 use designcraft_doc::{CharAttrs, ParaAttrs, Story};
+
+/// Joins UTF-16 code units that arrive one at a time (RTF `\uN`, Tagged Text `<0xNNNN>`) into
+/// characters. A character past U+FFFF comes as two units, a surrogate pair: the first half
+/// waits for the second.
+#[derive(Default)]
+pub(crate) struct Utf16Units {
+    high: Option<u32>,
+}
+
+impl Utf16Units {
+    /// The character that `unit` is or completes. Half a pair without its partner is no character.
+    pub(crate) fn push(&mut self, unit: u32) -> Option<char> {
+        match (self.high.take(), unit) {
+            (Some(high), 0xDC00..=0xDFFF) => char::from_u32(0x10000 + ((high - 0xD800) << 10) + (unit - 0xDC00)),
+            (_, 0xD800..=0xDBFF) => {
+                self.high = Some(unit);
+                None
+            }
+            _ => char::from_u32(unit),
+        }
+    }
+
+    /// Other text came in between: a waiting first half has no partner.
+    pub(crate) fn reset(&mut self) {
+        self.high = None;
+    }
+}
 
 /// A paragraph or character style found in the source.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -86,7 +114,7 @@ pub fn import(name: &str, bytes: &[u8]) -> Result<Imported, ImportError> {
     if l.ends_with(".doc") {
         return Err(ImportError::Unsupported("legacy Word .doc (save it as .docx)".into()));
     }
-    Ok(plain(&String::from_utf8_lossy(bytes)))
+    Ok(plain(&tagged::decode(bytes)))
 }
 
 /// Plain text: line breaks become paragraphs (CRLF / CR normalised).
@@ -107,5 +135,15 @@ mod tests {
         assert_eq!(i.story.paras.len(), 3);
         assert!(is_text_file("Report.DOCX") && !is_text_file("a.png"));
         assert!(matches!(import("x.doc", b"\xD0\xCF"), Err(ImportError::Unsupported(_))));
+    }
+
+    #[test]
+    fn plain_text_utf16() {
+        let mut le = vec![0xFF, 0xFE];
+        le.extend("Hi there".encode_utf16().flat_map(u16::to_le_bytes));
+        assert_eq!(import("a.txt", &le).unwrap().story.text, "Hi there");
+        let mut be = vec![0xFE, 0xFF];
+        be.extend("Hi there".encode_utf16().flat_map(u16::to_be_bytes));
+        assert_eq!(import("a.txt", &be).unwrap().story.text, "Hi there");
     }
 }

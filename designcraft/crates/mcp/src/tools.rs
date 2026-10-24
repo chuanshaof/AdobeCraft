@@ -106,7 +106,8 @@ pub fn tool_definitions() -> Vec<Value> {
             "Run any DesignCraft command by id with JSON params (ids and params from list_commands). Examples: \
              {\"command\":\"frame.create\",\"params\":{\"rect\":[36,36,576,300],\"content\":\"text\",\"text\":\"Hello\"}} → {id, story}; \
              {\"command\":\"type.char\",\"params\":{\"size\":24}}; {\"command\":\"edit.undo\"}. Coordinates are points in spread space. \
-             In the desktop app UI-only commands (view.*, window.*, app.*) work too.",
+             In the desktop app the UI-only commands (view.*, window.*, help.*, edit.dynamicSpelling, and app.* except app.links, \
+             which works everywhere) work too.",
             obj(json!({"command": string("Command id, e.g. frame.create"), "params": params_schema()}), &["command"]),
             false,
         ),
@@ -117,7 +118,8 @@ pub fn tool_definitions() -> Vec<Value> {
              and message (earlier commands stay applied; use edit.undo to revert them). Later steps can use earlier results: a \
              parameter string \"$N.path\" is replaced by that value of step N's result (0-based; \"$last.path\" for the previous \
              step), e.g. after frame.create → {\"id\": 8, \"story\": 9}, {\"story\": \"$0.story\"} passes 9; \"${N.path}\" \
-             interpolates into longer strings. Give `commands`, or `script` text (one `command.id {json}` per line).",
+             interpolates into longer strings. Other strings starting with $ stay as written; \"$$\" is a literal $ \
+             (\"$$1\" passes the GREP group $1). Give `commands`, or `script` text (one `command.id {json}` per line).",
             obj(
                 json!({
                     "commands": {
@@ -137,16 +139,17 @@ pub fn tool_definitions() -> Vec<Value> {
             "inspect_document",
             "Inspect document",
             "Summary of the active document: settings, pages (index, name, bounds, margins, columns), spreads with items (id, kind, \
-             bounds, fill, stroke, story), stories (id, frames, length, overset, preview), layers, paragraph/character styles, \
-             swatches, selection, active tool.",
+             bounds, fill, stroke, story), stories (id, frames, length in UTF-8 bytes, overset, preview), layers, \
+             paragraph/character styles, swatches, selection, active tool.",
             empty(),
             true,
         ),
         tool(
             "get_story",
             "Get story",
-            "Full text of a story plus its frames, paragraph count, line count and overset position. Identify it by `story` id or \
-             by a text `frame` id (default: the selection).",
+            "Full text of a story plus its length, frames, paragraph count, line count and overset position (length and positions \
+             are UTF-8 byte offsets, the unit text.select takes). Identify it by `story` id or by a text `frame` id (default: the \
+             selection).",
             obj(json!({"story": int("Story id"), "frame": int("Text frame id")}), &[]),
             true,
         ),
@@ -173,8 +176,13 @@ pub fn tool_definitions() -> Vec<Value> {
                     "columns": {"type": "integer", "minimum": 1, "description": "Column count"},
                     "gutter": num("Column gutter (pt)"),
                     "margins": {"description": "Uniform margin (pt) or {top, bottom, inside, outside}", "anyOf": [{"type": "number"}, {"type": "object"}]},
-                    "bleed": num("Bleed on all sides (pt)"),
+                    "bleed": {"description": "Bleed on all sides (pt) or [top, bottom, inside, outside]", "anyOf": [{"type": "number"}, {"type": "array", "items": {"type": "number"}}]},
                     "title": string("Document title"),
+                    "intent": {"type": "string", "enum": ["print", "web", "mobile"], "description": "Document intent"},
+                    "units": string("Ruler units, e.g. \"points\", \"picas\", \"millimeters\""),
+                    "startPage": {"type": "integer", "minimum": 1, "description": "Number of the first page"},
+                    "slug": {"description": "Slug on all sides (pt) or [top, bottom, inside, outside]", "anyOf": [{"type": "number"}, {"type": "array", "items": {"type": "number"}}]},
+                    "primaryTextFrame": boolean("Put a primary text frame on the parent page"),
                     "sample": boolean("Open the sample magazine instead"),
                 }),
                 &[],
@@ -223,21 +231,21 @@ pub fn tool_definitions() -> Vec<Value> {
              also write it to `path`.",
             obj(
                 json!({
-                    "page": int("Page index, 0-based (default 0; in the desktop app default = the current page)"),
+                    "page": {"type": "integer", "minimum": 0, "description": "Page index, 0-based (default 0; in the desktop app default = the current page)"},
                     "scale": num("Pixels per point (default 1 = 72 ppi)"),
                     "bleed": boolean("Include the bleed area"),
                     "path": string("Also write the PNG here"),
                 }),
                 &[],
             ),
-            true,
+            false,
         ),
         tool(
             "export_png",
             "Export PNG",
             "Export one page as a PNG (or JPEG if the path ends in .jpg) file. Returns the path and pixel size.",
             obj(
-                json!({"path": string("Destination file"), "page": int("Page index, 0-based (default 0)"), "scale": num("Pixels per point (default 2)")}),
+                json!({"path": string("Destination file"), "page": {"type": "integer", "minimum": 0, "description": "Page index, 0-based (default 0; in the desktop app default = the current page)"}, "scale": num("Pixels per point (default 2)")}),
                 &["path"],
             ),
             false,
@@ -247,7 +255,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "Screenshot",
             &app_only("Capture the whole app window (menus, panels, canvas) and return it as a PNG image. Optionally also keep it at `path`."),
             obj(json!({"path": string("Also write the PNG here")}), &[]),
-            true,
+            false,
         ),
         // ----- input -----
         tool(
@@ -277,6 +285,7 @@ pub fn tool_definitions() -> Vec<Value> {
                             "y": num("y (pt)"),
                             "space": {"type": "string", "enum": ["doc", "screen"], "description": "Coordinate space (default doc)"},
                             "mods": mods_schema(),
+                            "clicks": {"type": "integer", "minimum": 1, "description": "On a down: presses in a row it completes (2 double, 3 triple…; default 1)"},
                         }), &["kind", "x", "y"]),
                     },
                     "mods": mods_schema(),
@@ -303,9 +312,28 @@ pub fn tool_definitions() -> Vec<Value> {
         tool(
             "type_text",
             "Type text",
-            "Type text at the text insertion point (as the keyboard would with the type tool), or into the focused dialog field in \
+            "Type text at the text insertion point, independently of the active tool, or into the focused dialog field in \
              the desktop app. Put a caret first with pointer (tool \"type\") or execute text.placeCaret / text.select.",
             obj(json!({"text": string("Text to type (\\n = new paragraph)")}), &["text"]),
+            false,
+        ),
+        tool(
+            "ime",
+            "Input method",
+            "Input method (IME) events at the Type tool's caret, as a system IME sends them: `preedit` is the marked text \
+             (shown in place, no undo step; an empty string cancels the composition), `active` the clause being converted \
+             in characters of it, `commit` the text the IME types in its place (one undo step). Example, Japanese: \
+             {preedit:\"にほん\", active:[3,3]} then {preedit:\"日本\", active:[0,2]} then {commit:\"日本\"}. Returns \
+             whether a composition is still open.",
+            obj(
+                json!({
+                    "preedit": string("Marked text (replaces the previous marked text; empty = cancel)"),
+                    "active": {"type": "array", "items": {"type": "integer", "minimum": 0}, "minItems": 2, "maxItems": 2,
+                               "description": "[start, end] of the clause being converted, in characters of preedit (start = end: the IME's cursor)"},
+                    "commit": string("Committed text, typed in place of the marked text"),
+                }),
+                &[],
+            ),
             false,
         ),
         tool(
@@ -334,7 +362,8 @@ pub fn tool_definitions() -> Vec<Value> {
                 json!({
                     "x": num("Start x"), "y": num("Start y"), "toX": num("End x"), "toY": num("End y"),
                     "steps": {"type": "integer", "minimum": 1, "description": "Intermediate moves (default 8)"},
-                    "shift": {"type": "boolean"}, "alt": {"type": "boolean"}, "cmd": {"type": "boolean"},
+                    "button": {"type": "string", "enum": ["left", "right"], "description": "Default left"},
+                    "shift": {"type": "boolean"}, "alt": {"type": "boolean"}, "cmd": {"type": "boolean"}, "ctrl": {"type": "boolean"},
                 }),
                 &["x", "y", "toX", "toY"],
             ),
@@ -359,14 +388,19 @@ pub fn tool_definitions() -> Vec<Value> {
             "ui_set",
             "Set UI state",
             &app_only(
-                "Change UI state: panel to open, brightness, rulers/guides/frameEdges/baselineGrid/textThreads, screenMode, zoom, page (1-based), fit (page|spread).",
+                "Change UI state: panel to open or close, brightness, status text, rulers/guides/frameEdges/baselineGrid/documentGrid/textThreads, \
+                 Control bar, dock expanded, screenMode, zoom, page (1-based), fit (page|spread).",
             ),
             obj(
                 json!({
                     "panel": string("Panel: properties, pages, layers, swatches, paragraphStyles, characterStyles, stroke, character, paragraph, textWrap, links"),
                     "brightness": {"type": "string", "enum": ["dark", "mediumDark", "mediumLight", "light"]},
                     "rulers": {"type": "boolean"}, "guides": {"type": "boolean"}, "frameEdges": {"type": "boolean"},
-                    "baselineGrid": {"type": "boolean"}, "textThreads": {"type": "boolean"},
+                    "baselineGrid": {"type": "boolean"}, "documentGrid": {"type": "boolean"}, "textThreads": {"type": "boolean"},
+                    "status": string("Status bar text"),
+                    "controlBar": boolean("Show the Control bar"),
+                    "closePanel": boolean("Close the panel that is showing"),
+                    "dockExpanded": boolean("Expand the panel dock (false: icons only)"),
                     "screenMode": {"type": "string", "enum": ["normal", "preview", "bleed", "slug", "presentation"]},
                     "zoom": num("1.0 = 100%"),
                     "page": {"type": "integer", "minimum": 1, "description": "Go to page (1-based)"},
@@ -407,6 +441,15 @@ fn need_ui(b: &dyn Backend, tool: &str) -> Result<(), String> {
 /// The given keys of `a` that are present, as a JSON object.
 fn pick(a: &Args, keys: &[&str]) -> Value {
     Value::Object(keys.iter().filter_map(|k| a.get(*k).filter(|v| !v.is_null()).map(|v| (k.to_string(), v.clone()))).collect())
+}
+
+/// Page omission selects a default, but an explicitly supplied null must reach validation.
+fn page_params(a: &Args, keys: &[&str]) -> Value {
+    let mut p = pick(a, keys);
+    if let Some(page) = a.get("page") {
+        p["page"] = page.clone();
+    }
+    p
 }
 
 fn command_params(v: Option<&Value>) -> Result<Value, String> {
@@ -463,12 +506,12 @@ fn story_id(b: &mut dyn Backend, a: &Args) -> Result<Value, String> {
 }
 
 fn render_page(b: &mut dyn Backend, a: &Args) -> Result<ToolResult, String> {
-    let r = b.call("ui.render", pick(a, &["page", "scale", "bleed"]))?;
+    let r = b.call("ui.render", page_params(a, &["page", "scale", "bleed"]))?;
     let b64 = r.get("pngBase64").and_then(Value::as_str).ok_or("renderer returned no image")?.to_string();
     let path = a.get("path").and_then(Value::as_str);
     if let Some(path) = path {
         let png = designcraft_engine::cmd::base64_decode(&b64);
-        std::fs::write(path, png).map_err(|e| format!("write {path}: {e}"))?;
+        b.write_file(path, &png)?;
     }
     Ok(ToolResult::image(b64, &json!({"width": r.get("width"), "height": r.get("height"), "path": path})))
 }
@@ -550,7 +593,7 @@ fn dispatch(b: &mut dyn Backend, name: &str, a: &Args) -> Result<ToolResult, Str
         "render_page" => render_page(b, a),
         "export_png" => {
             req_str(a, "path")?;
-            j(b.call("app.export", pick(a, &["path", "page", "scale"]))?)
+            j(b.call("app.export", page_params(a, &["path", "page", "scale"]))?)
         }
         "screenshot" => screenshot(b, a),
         "select_tool" => j(b.call("ui.tool.select", json!({"tool": req_str(a, "tool")?}))?),
@@ -560,10 +603,15 @@ fn dispatch(b: &mut dyn Backend, name: &str, a: &Args) -> Result<ToolResult, Str
             j(b.call("ui.key", pick(a, &["key", "shift", "alt", "cmd", "ctrl"]))?)
         }
         "type_text" => j(b.call("ui.text", json!({"text": req_str(a, "text")?}))?),
+        "ime" => j(b.call("ui.ime", pick(a, &["preedit", "active", "commit"]))?),
         "click" | "drag" => {
             need_ui(b, name)?;
-            let keys: &[&str] = &["x", "y", "toX", "toY", "steps", "button", "count", "shift", "alt", "cmd", "ctrl"];
-            j(b.call(if name == "click" { "ui.click" } else { "ui.drag" }, pick(a, keys))?)
+            let (method, keys): (_, &[&str]) = if name == "click" {
+                ("ui.click", &["x", "y", "button", "count", "shift", "alt", "cmd", "ctrl"])
+            } else {
+                ("ui.drag", &["x", "y", "toX", "toY", "steps", "button", "shift", "alt", "cmd", "ctrl"])
+            };
+            j(b.call(method, pick(a, keys))?)
         }
         "menu_list" => {
             need_ui(b, name)?;

@@ -36,7 +36,7 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
         if ui.small_button(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Graphic…"))).clicked()
             && let Err(e) = app.run("app.graphicCell", json!({}))
         {
-            app.status(format!("Table: {e}"));
+            app.status_error("Table", e);
         }
         if ui.small_button(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Text"))).clicked() {
             let _ = app.run("table.textCell", json!({}));
@@ -52,10 +52,10 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
             ("Col ←", "table.moveColumn", c0, c0.saturating_sub(1), c0 > 0),
             ("Col →", "table.moveColumn", c0, c0 + 1, c0 + 1 < nc),
         ] {
-            if ui.add_enabled(ok, egui::Button::new(crate::rtl::widget(ui, label)).small()).clicked()
+            if ui.add_enabled(ok, egui::Button::new(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, label))).small()).clicked()
                 && let Err(e) = app.run(id, json!({"from": from, "to": to}))
             {
-                app.status(format!("Table: {e}"));
+                app.status_error("Table", e);
             }
         }
     });
@@ -76,7 +76,15 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
                         }
                     }
                 });
-                if crate::icons::button(ui, "plus", 20.0, false, &format!("New {label}")).clicked() {
+                if crate::icons::button(
+                    ui,
+                    "plus",
+                    20.0,
+                    false,
+                    crate::i18n::tr(&app.ui.language, if kind == "cell" { "New Cell Style" } else { "New Table Style" }),
+                )
+                .clicked()
+                {
                     if kind == "cell" {
                         run(app, "style.cell.create", json!({"name": "Cell Style 1", "fromSelection": true}));
                     } else {
@@ -100,7 +108,7 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
                 run(app, "table.deleteRow", json!({"table": tid, "rows": [n, rows.len() - 1]}));
             }
         }
-        caption(ui, crate::i18n::tr(&app.ui.language, "Columns"));
+        caption(ui, crate::i18n::tr_context(&app.ui.language, "Columns", "table"));
         if let Some(v) = number(ui, "tp_cols", Some(cols.len() as f64), "", 52.0, 0) {
             let n = v.round().max(1.0) as usize;
             if n > cols.len() {
@@ -139,6 +147,14 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
         }
         ui.end_row();
     });
+    if ui
+        .button(crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Distribute Rows Evenly")))
+        .on_hover_text(crate::i18n::tr(&app.ui.language, "Equal fixed heights for the selected rows; cell text may become overset."))
+        .clicked()
+        && let Err(e) = app.run("table.distributeRows", json!({}))
+    {
+        app.status_error("Table", e);
+    }
     divider(ui);
     caption(ui, crate::i18n::tr(&app.ui.language, "Cell Text"));
     ui.horizontal(|ui| {
@@ -191,6 +207,16 @@ pub fn show(app: &mut DesignApp, ui: &mut egui::Ui) {
         }
     });
     divider(ui);
+    // Column order: right to left puts the first column on the right.
+    let rtl = info["options"]["direction"] == "rightToLeft";
+    ui.horizontal(|ui| {
+        caption(ui, crate::i18n::tr(&app.ui.language, "Direction"));
+        for (on, label, dir) in [(!rtl, "Left to Right", "leftToRight"), (rtl, "Right to Left", "rightToLeft")] {
+            if ui.selectable_label(on, crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, label))).clicked() && !on {
+                run(app, "table.options", json!({"direction": dir}));
+            }
+        }
+    });
     let mut alt = !info["options"]["altRows"].is_null();
     if ui.checkbox(&mut alt, crate::rtl::widget(ui, crate::i18n::tr(&app.ui.language, "Alternating Row Fills"))).changed() {
         let v = if alt { json!({"first": 1, "firstColor": "[Black]", "firstTint": 0.1, "next": 1, "nextColor": "[None]"}) } else { Value::Null };
