@@ -2,12 +2,13 @@
 //! `vectorcraft-pathops`: Offset Path, Outline Stroke, Simplify, Add Anchor Points, Split Into Grid,
 //! Clean Up and Divide Objects Below.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
 use vectorcraft_color::BlendMode;
 use vectorcraft_doc::appearance::{AppearanceItem, StrokeLayer};
-use vectorcraft_doc::{Appearance, Document, Node, NodeId, NodeKind, TextObject};
+use vectorcraft_doc::{AnchorRef, Appearance, Document, Node, NodeId, NodeKind, SegmentRef, TextObject};
 use vectorcraft_geom::{FillRule, PathData};
 use vectorcraft_pathops as po;
 use vectorcraft_pathops::{BoolOp, PathfinderOp};
@@ -22,7 +23,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Unite",
             ["Window", "Pathfinder"],
             None,
-            "{} operate on the selected objects (back → front) → {ids}",
+            "{ids?: [id…] (selected first; default: the selection)} operate on the selected objects (back → front) → {ids}",
             has_selection,
             |s, _| run_pf(s, PathfinderOp::Unite)
         ),
@@ -31,7 +32,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Minus Front",
             ["Window", "Pathfinder"],
             None,
-            "{} operate on the selected objects (back → front) → {ids}",
+            "{ids?: [id…] (selected first; default: the selection)} operate on the selected objects (back → front) → {ids}",
             has_selection,
             |s, _| run_pf(s, PathfinderOp::MinusFront)
         ),
@@ -40,7 +41,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Intersect",
             ["Window", "Pathfinder"],
             None,
-            "{} operate on the selected objects (back → front) → {ids}",
+            "{ids?: [id…] (selected first; default: the selection)} operate on the selected objects (back → front) → {ids}",
             has_selection,
             |s, _| run_pf(s, PathfinderOp::Intersect)
         ),
@@ -49,7 +50,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Exclude",
             ["Window", "Pathfinder"],
             None,
-            "{} operate on the selected objects (back → front) → {ids}",
+            "{ids?: [id…] (selected first; default: the selection)} operate on the selected objects (back → front) → {ids}",
             has_selection,
             |s, _| run_pf(s, PathfinderOp::Exclude)
         ),
@@ -58,7 +59,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Divide",
             ["Window", "Pathfinder"],
             None,
-            "{} operate on the selected objects (back → front) → {ids}",
+            "{ids?: [id…] (selected first; default: the selection)} operate on the selected objects (back → front) → {ids}",
             has_selection,
             |s, _| run_pf(s, PathfinderOp::Divide)
         ),
@@ -67,7 +68,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Trim",
             ["Window", "Pathfinder"],
             None,
-            "{} operate on the selected objects (back → front) → {ids}",
+            "{ids?: [id…] (selected first; default: the selection)} operate on the selected objects (back → front) → {ids}",
             has_selection,
             |s, _| run_pf(s, PathfinderOp::Trim)
         ),
@@ -76,7 +77,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Merge",
             ["Window", "Pathfinder"],
             None,
-            "{} operate on the selected objects (back → front) → {ids}",
+            "{ids?: [id…] (selected first; default: the selection)} operate on the selected objects (back → front) → {ids}",
             has_selection,
             |s, _| run_pf(s, PathfinderOp::Merge)
         ),
@@ -85,7 +86,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Crop",
             ["Window", "Pathfinder"],
             None,
-            "{} operate on the selected objects (back → front) → {ids}",
+            "{ids?: [id…] (selected first; default: the selection)} operate on the selected objects (back → front) → {ids}",
             has_multi,
             |s, _| run_pf(s, PathfinderOp::Crop)
         ),
@@ -94,7 +95,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Outline",
             ["Window", "Pathfinder"],
             None,
-            "{} operate on the selected objects (back → front) → {ids}",
+            "{ids?: [id…] (selected first; default: the selection)} operate on the selected objects (back → front) → {ids}",
             has_selection,
             |s, _| run_pf(s, PathfinderOp::Outline)
         ),
@@ -103,9 +104,18 @@ pub fn specs() -> Vec<CommandSpec> {
             "Minus Back",
             ["Window", "Pathfinder"],
             None,
-            "{} operate on the selected objects (back → front) → {ids}",
+            "{ids?: [id…] (selected first; default: the selection)} operate on the selected objects (back → front) → {ids}",
             has_selection,
             |s, _| run_pf(s, PathfinderOp::MinusBack)
+        ),
+        cmd!(
+            "object.pathfinder.trap",
+            "Trap…",
+            ["Window", "Pathfinder"],
+            None,
+            "{ids?: [id…] (selected first; default: the selection), thickness?: pt 0.01..5000 (0.25; how far the lighter colour reaches into the darker one across vertical edges), heightWidth?: % 1..1000 (100; the reach across horizontal edges as a percentage of the vertical one), tintReduction?: % 0..100 (40; the trap paints the lighter colour at this percentage of its tint), trapsWithProcessColor?: bool (false; a swatch (spot) colour's trap is painted with its CMYK process equivalent), reverseTraps?: bool (false; the darker colour spreads into the lighter one, except a rich black)} adds overprinting traps where the selected objects' visible areas of different solid colours meet, grouped directly above the topmost selected object and selected; the objects stay as they are → {ids}",
+            has_selection,
+            trap
         ),
         cmd!(
             "object.path.outlineStroke",
@@ -130,7 +140,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Simplify…",
             ["Object", "Path"],
             None,
-            "{tolerance?: pt (1), cornerAngle?: deg (30), straightLines?: bool} → {ids, before, after} anchor counts",
+            "{tolerance?: pt (1), level?: 0..100 (the Simplify slider, in place of tolerance: 0 fewest anchor points, 50 is 1 pt, every 10 levels halves or doubles it), auto?: bool (Auto-Simplify: the lowest level whose tolerance is at most 1/400 of the selection's longer side, or 100 when that side is under 12.5 pt), cornerAngle?: deg (30), straightLines?: bool, wholePaths?: bool (false: a path with segments direct-selected, or between direct-selected anchors, simplifies only each run of them between its end anchors, which stay as they are, and keeps the runs selected; true simplifies those paths whole)} → {ids, before, after} anchor counts, and the level used with level or auto",
             has_selection,
             simplify
         ),
@@ -149,7 +159,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Split Into Grid…",
             ["Object", "Path"],
             None,
-            "{rows?: 2, columns?: 2, gutter?: pt (12)} → {ids}",
+            "{rows?: 2, columns?: 2, gutter?: pt (12; rowGutter?, columnGutter?: one of the two), totalHeight?, totalWidth?: pt (the grid's size; the selected paths' when left out), height?, width?: pt (each row's and column's size, which then sets the total), addGuides?: false (ruler guides along the row and column edges)} one grid of rectangles over the selected paths replaces them, painted as the topmost one → {ids, guides: count}",
             has_selection,
             split_into_grid
         ),
@@ -203,10 +213,10 @@ struct Style {
 
 impl Style {
     fn of(n: &Node) -> Self {
-        Style { appearance: n.appearance.clone(), opacity: n.opacity, blend: n.blend }
+        Style { appearance: (*n.appearance).clone(), opacity: n.opacity, blend: n.blend }
     }
     fn apply(&self, n: &mut Node) {
-        n.appearance = self.appearance.clone();
+        n.appearance = self.appearance.clone().into();
         n.opacity = self.opacity;
         n.blend = self.blend;
     }
@@ -246,16 +256,30 @@ fn style_of(n: &Node) -> Style {
 /// Leaf shapes (paths, compound paths, text) of a subtree in paint order; guides and clipping
 /// paths are skipped.
 fn leaves(n: &Node, out: &mut Vec<Node>) {
+    each_leaf(n, &mut |l| out.push(l.clone()));
+}
+
+/// Calls `f` with each leaf shape of [`leaves`], in its order.
+fn each_leaf(n: &Node, f: &mut impl FnMut(&Node)) {
     match &n.kind {
         NodeKind::Path { guide: true, .. } | NodeKind::Path { clipping: true, .. } => {}
-        NodeKind::Path { .. } | NodeKind::Compound { .. } | NodeKind::Text(_) => out.push(n.clone()),
+        NodeKind::Path { .. } | NodeKind::Compound { .. } | NodeKind::Text(_) => f(n),
         NodeKind::Group { children, .. } | NodeKind::Layer { children, .. } => {
             for c in children {
-                leaves(c, out);
+                each_leaf(c, f);
             }
         }
         _ => {}
     }
+}
+
+/// How many shapes a Pathfinder operation takes from `n` selected alone: its leaf shapes, however
+/// deep its groups nest (an expanded stroke is a group inside the group, #1635).
+pub fn shape_count(n: &Node) -> usize {
+    // Counted without copying the shapes: the panel asks every frame.
+    let mut count = 0;
+    each_leaf(n, &mut |_| count += 1);
+    count
 }
 
 /// A node for `path`: a plain path for one subpath, else a compound path.
@@ -286,6 +310,73 @@ fn shape_node_styled(d: &mut Document, path: PathData, style: &Style) -> Node {
     n
 }
 
+/// Whether `ids` are separate objects, as [`Document::remove_many`] and [`Document::insert_beside`]
+/// take them: each one is in the tree and listed once, and none lies inside another listed one.
+pub(crate) fn separate(d: &Document, ids: &[NodeId]) -> bool {
+    let paths = d.index_paths(ids.iter().copied());
+    let mut found: Vec<_> = ids.iter().filter_map(|id| paths.get(id)).collect();
+    found.sort_unstable();
+    found.len() == ids.len() && found.windows(2).all(|w| !w[1].starts_with(w[0]))
+}
+
+/// Lists of nodes that go in place of objects, or directly above them; an empty list in place of
+/// an object removes it. When the objects are [`separate`], [`Beside::put`] holds each list and
+/// leaves the tree as it is, and [`Beside::finish`] inserts them all in one pass over the children
+/// of each parent ([`Document::insert_beside`]). Otherwise [`Beside::put`] inserts each list at
+/// once, where its object is at that moment.
+pub(crate) struct Beside {
+    replace: bool,
+    waiting: Option<Vec<(NodeId, Vec<Node>)>>,
+}
+
+impl Beside {
+    /// Lists that go in place of objects among `ids`.
+    pub(crate) fn replacing(d: &Document, ids: &[NodeId]) -> Self {
+        Beside { replace: true, waiting: separate(d, ids).then(Vec::new) }
+    }
+
+    /// Lists that go directly above objects among `ids`.
+    pub(crate) fn above(d: &Document, ids: &[NodeId]) -> Self {
+        Beside { replace: false, waiting: separate(d, ids).then(Vec::new) }
+    }
+
+    /// Put `nodes`, in their order, in place of object `id` or directly above it.
+    pub(crate) fn put(&mut self, d: &mut Document, id: NodeId, nodes: Vec<Node>) -> Result<()> {
+        if let Some(waiting) = &mut self.waiting {
+            waiting.push((id, nodes));
+            return Ok(());
+        }
+        let (parent, idx, _) = d.position(id).ok_or(EngineError::NoNode(id))?;
+        let at = if self.replace {
+            d.remove(id)?;
+            idx
+        } else {
+            idx + 1
+        };
+        for (k, n) in nodes.into_iter().enumerate() {
+            d.insert(parent, at + k, n)?;
+        }
+        Ok(())
+    }
+
+    /// Insert the lists that [`Beside::put`] held.
+    pub(crate) fn finish(self, d: &mut Document) -> Result<()> {
+        match self.waiting {
+            Some(waiting) if !waiting.is_empty() => Ok(d.insert_beside(waiting, self.replace)?),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Remove `ids` through a [`Beside`], which removes them in one pass when they are [`separate`].
+pub(crate) fn remove_each(d: &mut Document, ids: &[NodeId]) -> Result<()> {
+    let mut gone = Beside::replacing(d, ids);
+    for id in ids {
+        gone.put(d, *id, vec![])?;
+    }
+    gone.finish(d)
+}
+
 // ---------- Pathfinder ----------
 
 fn pf_label(op: PathfinderOp) -> &'static str {
@@ -300,22 +391,39 @@ fn pf_label(op: PathfinderOp) -> &'static str {
         PathfinderOp::Crop => "Crop",
         PathfinderOp::Outline => "Outline",
         PathfinderOp::MinusBack => "Minus Back",
+        PathfinderOp::HardMix => "Hard Mix",
+        PathfinderOp::SoftMix => "Soft Mix",
     }
 }
 
 fn run_pf(s: &mut Session, op: PathfinderOp) -> Result<Value> {
     let roots = selected_roots(s)?;
-    let Some(&top) = roots.last() else { return Err(EngineError::Other("nothing selected".into())) };
+    if roots.is_empty() {
+        return Err(EngineError::Other("nothing selected".into()));
+    }
     let shape_mode =
         matches!(op, PathfinderOp::Unite | PathfinderOp::MinusFront | PathfinderOp::Intersect | PathfinderOp::Exclude | PathfinderOp::MinusBack);
     let label = pf_label(op);
     let ids = s.edit(label, |d, sel| {
-        // Build the stack (back → front) with a style per entry.
+        // Build the stack (back → front); names are separate from paint/style identity.
         let mut styles: Vec<Style> = vec![];
         let mut shapes: Vec<po::Shape> = vec![];
-        let mut push = |path: PathData, rule: FillRule, st: Style| {
+        let mut names: Vec<Option<String>> = vec![];
+        let mut push = |mut path: PathData, rule: FillRule, mut st: Style, name: Option<String>| {
             if path.is_empty() {
                 return;
+            }
+            // Trim, Merge and Crop remove any strokes (and Merge then merges by fill alone), as the
+            // public Pathfinder documentation describes.
+            if matches!(op, PathfinderOp::Trim | PathfinderOp::Merge | PathfinderOp::Crop) {
+                st.appearance.items.retain(|i| !matches!(i, AppearanceItem::Stroke(_)));
+            }
+            if op == PathfinderOp::Divide && st.appearance.items.iter().any(|i| matches!(i, AppearanceItem::Fill(f) if !f.paint.is_none())) {
+                // Filled open contours keep their implicit closing edge. A zero-area line
+                // stays a cutter; normalised area also catches zero-signed-area self crossings.
+                for sub in path.subpaths.iter_mut().filter(|sp| !sp.closed) {
+                    sub.closed = po::encloses_area(sub) || po::area(&PathData::single(sub.clone()), rule) > 0.0;
+                }
             }
             let key = match styles.iter().position(|x| *x == st) {
                 Some(k) => k,
@@ -325,6 +433,7 @@ fn run_pf(s: &mut Session, op: PathfinderOp) -> Result<Value> {
                 }
             };
             shapes.push(po::Shape::new(path, rule, key as u64));
+            names.push(name);
         };
         for id in &roots {
             let n = d.node(*id).ok_or(EngineError::NoNode(*id))?;
@@ -334,17 +443,20 @@ fn run_pf(s: &mut Session, op: PathfinderOp) -> Result<Value> {
                 continue;
             }
             if shape_mode
+                && roots.len() > 1
                 && lv.len() > 1
                 && let Some(top) = lv.last()
             {
-                // A group acts as one shape (the union of its leaves) with its top leaf's style.
+                // Among other objects, a group acts as one shape (the union of its leaves) with
+                // its top leaf's style. Selected alone, its members are the shapes (#1450).
                 let parts: Vec<(PathData, FillRule)> = lv.iter().filter_map(node_path).collect();
                 let refs: Vec<(&PathData, FillRule)> = parts.iter().map(|(p, r)| (p, *r)).collect();
-                push(po::unite_all(&refs), FillRule::NonZero, style_of(top));
+                let name = n.name.clone().or_else(|| lv.iter().find_map(|l| l.name.clone()));
+                push(po::unite_all(&refs), FillRule::NonZero, style_of(top), name);
             } else {
                 for l in &lv {
                     if let Some((p, r)) = node_path(l) {
-                        push(p, r, style_of(l));
+                        push(p, r, style_of(l), n.name.clone().or_else(|| l.name.clone()));
                     }
                 }
             }
@@ -359,12 +471,18 @@ fn run_pf(s: &mut Session, op: PathfinderOp) -> Result<Value> {
         if results.iter().all(|r| r.path.is_empty()) {
             return Err(EngineError::Other(format!("{label} produced an empty result")));
         }
-        let (par, idx, _) = d.position(top).ok_or(EngineError::NoNode(top))?;
         let new_node = if shape_mode {
             let r =
                 results.into_iter().find(|r| !r.path.is_empty()).ok_or_else(|| EngineError::Other(format!("{label} produced an empty result")))?;
             let style = styles.get(r.key as usize).ok_or_else(|| EngineError::Other(format!("{label}: lost track of a shape's style")))?;
-            shape_node_styled(d, r.path, style)
+            let mut n = shape_node_styled(d, r.path, style);
+            n.name = match op {
+                // A subtraction keeps its surviving source's identity, even when unnamed.
+                PathfinderOp::MinusFront => names.first().cloned().flatten(),
+                PathfinderOp::MinusBack => names.last().cloned().flatten(),
+                _ => names.into_iter().flatten().next(),
+            };
+            n
         } else {
             let mut children = vec![];
             for r in results {
@@ -377,20 +495,78 @@ fn run_pf(s: &mut Session, op: PathfinderOp) -> Result<Value> {
                     // Outline: open edges stroked with the face's former fill.
                     let fill = st.appearance.fill_paint();
                     let paint = if fill.is_none() { st.appearance.stroke_paint() } else { fill };
-                    n.appearance = Appearance { items: vec![AppearanceItem::Stroke(StrokeLayer::new(paint, 1.0))], ..Default::default() };
+                    n.appearance = Appearance { items: vec![AppearanceItem::Stroke(StrokeLayer::new(paint, 1.0))], ..Default::default() }.into();
                 }
                 children.push(Arc::new(n));
             }
             let gid = d.alloc_id();
             Node::group(gid, children)
         };
-        let nid = new_node.id;
-        d.insert(par, idx + 1, new_node)?;
-        for id in &roots {
-            d.remove(*id)?;
-        }
+        let nid = d.wrap(&roots, |_| new_node)?;
         sel.set([nid]);
         Ok(vec![nid])
+    })?;
+    Ok(ids_json(&ids))
+}
+
+// ---------- Trap ----------
+
+/// Pathfinder panel › Trap ([`vectorcraft_render::effects::trap`]): the traps between the selected
+/// objects' leaf shapes, as one group of overprinting paths above the topmost selected object.
+fn trap(s: &mut Session, p: &Value) -> Result<Value> {
+    use vectorcraft_render::effects::trap::{TRAP_LABEL, TrapOptions, TrapSource, trap_appearance, traps};
+    const ID: &str = "object.pathfinder.trap";
+    let mut q = p.clone();
+    if let Some(t) = len_param(p, "thickness") {
+        if !(po::TRAP_MIN_WIDTH..=po::TRAP_MAX_WIDTH).contains(&t) {
+            return Err(bad(ID, "thickness must be from 0.01 to 5000 pt"));
+        }
+        q["thickness"] = json!(t);
+    }
+    if num_param(p, "heightWidth").is_some_and(|v| !(1.0..=1000.0).contains(&v)) {
+        return Err(bad(ID, "heightWidth must be from 1 to 1000 %"));
+    }
+    if num_param(p, "tintReduction").is_some_and(|v| !(0.0..=100.0).contains(&v)) {
+        return Err(bad(ID, "tintReduction must be from 0 to 100 %"));
+    }
+    // The effect-only settings stay at their defaults.
+    if let Some(o) = q.as_object_mut() {
+        o.remove("precision");
+        o.remove("removeRedundantPoints");
+    }
+    let options = TrapOptions::from_params(&q);
+    let roots = selected_roots(s)?;
+    if roots.is_empty() {
+        return Err(EngineError::Other("nothing selected".into()));
+    }
+    let ids = s.edit(TRAP_LABEL, |d, sel| {
+        let mut sources = vec![];
+        for id in &roots {
+            let n = d.node(*id).ok_or(EngineError::NoNode(*id))?;
+            each_leaf(n, &mut |l| {
+                if let Some((path, rule)) = node_path(l) {
+                    sources.push(TrapSource { path, rule, fill: style_of(l).appearance.fill_paint() });
+                }
+            });
+        }
+        if sources.iter().filter(|s| s.fill.color().is_some()).count() < 2 {
+            return Err(EngineError::Other("Trap: select two or more objects filled with solid colours".into()));
+        }
+        let made = traps(&sources, &options);
+        if made.is_empty() {
+            return Err(EngineError::Other("Trap: no edges of different colours meet among the selected objects".into()));
+        }
+        let mut children = Vec::with_capacity(made.len());
+        for piece in made {
+            let mut n = shape_node(d, piece.path, None);
+            n.appearance = trap_appearance(piece.paint).into();
+            children.push(Arc::new(n));
+        }
+        let gid = d.alloc_id();
+        let top = *roots.last().ok_or_else(|| EngineError::Other("nothing selected".into()))?;
+        d.insert_beside(vec![(top, vec![Node::group(gid, children)])], false)?;
+        sel.set([gid]);
+        Ok(vec![gid])
     })?;
     Ok(ids_json(&ids))
 }
@@ -414,7 +590,8 @@ fn offset_path(s: &mut Session, p: &Value) -> Result<Value> {
     let miter = num_param(p, "miterLimit").unwrap_or(4.0).clamp(1.0, 500.0);
     let roots = selected_roots(s)?;
     let ids = s.edit("Offset Path", |d, sel| {
-        let mut out = vec![];
+        let (mut out, mut above) = (vec![], vec![]);
+        let mut paths = false;
         for id in &roots {
             let Some(n) = d.node(*id).cloned() else { continue };
             let mut lv = vec![];
@@ -422,6 +599,7 @@ fn offset_path(s: &mut Session, p: &Value) -> Result<Value> {
             let mut made = vec![];
             for l in lv.iter().filter(|l| !matches!(l.kind, NodeKind::Text(_))) {
                 let Some((path, rule)) = node_path(l) else { continue };
+                paths = true;
                 let base = if matches!(l.kind, NodeKind::Compound { .. }) && path.is_closed() { po::normalize(&path, rule) } else { path };
                 let off = po::offset_path(&base, delta, join, miter);
                 if off.is_empty() {
@@ -441,12 +619,16 @@ fn offset_path(s: &mut Session, p: &Value) -> Result<Value> {
                 let gid = d.alloc_id();
                 Node::group(gid, made.into_iter().map(Arc::new).collect())
             };
-            let (par, idx, _) = d.position(*id).ok_or(EngineError::NoNode(*id))?;
-            out.push(d.insert(par, idx + 1, new)?);
+            out.push(new.id);
+            above.push((*id, vec![new]));
+        }
+        if out.is_empty() && paths {
+            return Err(EngineError::Other("Offset Path: the offset leaves nothing of the selected paths (an inset larger than the shapes)".into()));
         }
         if out.is_empty() {
             return Err(EngineError::Other("Offset Path: select paths".into()));
         }
+        d.insert_beside(above, false)?;
         sel.set(out.iter().copied());
         Ok(out)
     })?;
@@ -474,9 +656,9 @@ pub(crate) fn with_transparency(d: &mut Document, mut n: Node, opacity: f32, ble
     n
 }
 
-/// The art stroke `st` of a path (`path`, `rule`) paints, as fills: its brush art, or the
-/// outline of the stroke (as on the canvas) filled with the stroke's paint, opacity, blend mode
-/// and effects (a gradient along or across the stroke: gradient meshes in a clip group shaped
+/// The art stroke `st` of a path (`path`, `rule`) paints, as fills: its brush art (with the
+/// stroke's opacity, blend mode and raster effects), or the outline of the stroke (as on the canvas)
+/// filled with the stroke's paint, opacity, blend mode and effects (a gradient along or across the stroke: gradient meshes in a clip group shaped
 /// like the outline). `None` when it paints nothing.
 pub(crate) fn outlined_stroke(
     d: &mut Document,
@@ -486,14 +668,22 @@ pub(crate) fn outlined_stroke(
     st: &StrokeLayer,
 ) -> Option<Node> {
     if let Some(b) = st.brush.as_deref().and_then(|name| brushes.iter().find(|b| b.name == name)) {
-        let mut pieces = vectorcraft_brush::stroke_pieces(b, &path.to_bezpath(), st);
+        let mut pieces = vectorcraft_brush::stroke_pieces(d, b, &path.to_bezpath(), st);
         let art = match pieces.len() {
             0 => return None,
             1 => pieces.remove(0),
             _ => Node::group(NodeId(0), pieces.into_iter().map(Arc::new).collect()),
         };
         let art = d.reid(&art);
-        return Some(with_transparency(d, art, st.opacity, st.blend));
+        let mut art = with_transparency(d, art, st.opacity, st.blend);
+        let raster: Vec<_> = st.effects.iter().filter(|e| !vectorcraft_render::effects::is_geometry(&e.id)).cloned().collect();
+        if !raster.is_empty() {
+            if !art.appearance.effects.is_empty() {
+                art = Node::group(d.alloc_id(), vec![Arc::new(art)]);
+            }
+            art.appearance.effects = raster;
+        }
+        return Some(art);
     }
     let outline = vectorcraft_render::effects::stroke::outline_region(path, rule, st);
     if outline.is_empty() {
@@ -517,9 +707,9 @@ pub(crate) fn outlined_stroke(
         blend: st.blend,
         effects: st.effects.clone(),
         overprint: st.overprint,
-        ..vectorcraft_doc::appearance::FillLayer::new(st.paint.clone())
+        ..vectorcraft_doc::appearance::FillLayer::new(st.paint.stroke_as_fill())
     };
-    n.appearance = Appearance { items: vec![AppearanceItem::Fill(fill)], ..Default::default() };
+    n.appearance = Appearance { items: vec![AppearanceItem::Fill(fill)], ..Default::default() }.into();
     Some(n)
 }
 
@@ -554,28 +744,29 @@ pub(crate) fn outline_strokes(d: &mut Document, brushes: &[vectorcraft_brush::Br
 /// A plain copy of path `l` (new ids, no transparency, name or mask) painted with `items`.
 pub(crate) fn styled_copy(d: &mut Document, l: &Node, items: Vec<AppearanceItem>) -> Node {
     let mut f = d.reid(l);
-    f.appearance = Appearance { items, ..Default::default() };
+    f.appearance = Appearance { items, ..Default::default() }.into();
     f.opacity = 1.0;
     f.blend = BlendMode::Normal;
     f.name = None;
-    f.mask = None;
+    f.extras_mut().mask = None;
     if let NodeKind::Path { live, .. } = &mut f.kind {
         *live = None;
     }
     f
 }
 
-/// What stands for object `l` once its appearance became `parts` (paint order): the one part or a
-/// group of them, with `l`'s transparency, name, opacity mask and effects. `None` without parts.
+/// What stands for object `l` once its appearance became `parts` (paint order): the one part (in a
+/// group when it has effects of its own) or a group of them, with `l`'s transparency, name, opacity
+/// mask and effects. `None` without parts.
 pub(crate) fn assemble(d: &mut Document, l: &Node, mut parts: Vec<Node>) -> Option<Node> {
     let root = match parts.len() {
         0 => return None,
-        1 => parts.remove(0),
+        1 if parts[0].appearance.effects.is_empty() => parts.remove(0),
         _ => Node::group(d.alloc_id(), parts.into_iter().map(Arc::new).collect()),
     };
     let mut root = with_transparency(d, root, l.opacity, l.blend);
     root.name = l.name.clone();
-    root.mask = l.mask.clone();
+    root.extras_mut().mask = l.extras().mask.clone();
     root.appearance.effects = l.appearance.effects.clone();
     Some(root)
 }
@@ -595,9 +786,8 @@ pub(crate) fn replace_leaves(d: &mut Document, root: NodeId, mut f: impl FnMut(&
     let (mut replacement, mut changed) = (root, 0);
     for l in lv {
         let Some(new) = f(d, &l) else { continue };
-        let (par, idx, _) = d.position(l.id).ok_or(EngineError::NoNode(l.id))?;
-        let nid = d.insert(par, idx, new)?;
-        d.remove(l.id)?;
+        let nid = new.id;
+        *d.node_mut(l.id).ok_or(EngineError::NoNode(l.id))? = new;
         changed += 1;
         if l.id == root {
             replacement = nid;
@@ -643,47 +833,154 @@ fn path_ids(d: &Document, roots: &[NodeId]) -> Vec<NodeId> {
     out
 }
 
-fn edit_paths(s: &mut Session, label: &str, f: impl Fn(&PathData) -> PathData) -> Result<(Vec<NodeId>, usize, usize)> {
+/// The direct selection a path keeps after an edit of part of it: (its selected anchors, and its
+/// selected segments when they were picked as segments). `None` selects the path whole.
+type PartSelection = Option<(BTreeSet<AnchorRef>, Option<BTreeSet<SegmentRef>>)>;
+
+/// Replace each path under the selection ([`path_ids`]) by what `f` makes of it, given its
+/// direct-selected anchors and picked segments (none when it is selected whole): → (their ids, how
+/// many anchors they have before and after). A path that `f` would empty or returns unchanged is
+/// left as it is, with its live shape and its direct selection; a replaced path loses its live
+/// shape and has the direct selection `f` gives it.
+fn edit_paths(
+    s: &mut Session,
+    label: &str,
+    f: impl Fn(&PathData, Option<&BTreeSet<AnchorRef>>, Option<&BTreeSet<SegmentRef>>) -> (PathData, PartSelection),
+) -> Result<(Vec<NodeId>, usize, usize)> {
     let roots = selected_roots(s)?;
-    s.edit(label, |d, _| {
-        let ids = path_ids(d, &roots);
-        if ids.is_empty() {
-            return Err(EngineError::Other(format!("{label}: select paths")));
+    let st = s.doc()?;
+    let (d, sel) = (&st.doc, &st.selection);
+    let ids = path_ids(d, &roots);
+    if ids.is_empty() {
+        return Err(EngineError::Other(format!("{label}: select paths")));
+    }
+    let (mut before, mut after, mut changed) = (0, 0, vec![]);
+    for id in &ids {
+        let Some(NodeKind::Path { path, .. }) = d.node(*id).map(|n| &n.kind) else { continue };
+        before += path.anchor_count();
+        let (np, part) = f(path, sel.anchors.get(id), sel.segments.get(id));
+        if (np.is_empty() && !path.is_empty()) || np == *path {
+            after += path.anchor_count();
+            continue;
         }
-        let (mut before, mut after) = (0, 0);
-        for id in &ids {
-            if let Some(NodeKind::Path { path, live, .. }) = d.node_mut(*id).map(|n| &mut n.kind) {
-                before += path.anchor_count();
-                let np = f(path);
-                if np.is_empty() && !path.is_empty() {
-                    after += path.anchor_count();
-                    continue;
+        after += np.anchor_count();
+        changed.push((*id, np, part));
+    }
+    // When no path changes, the document and its undo history stay as they are.
+    if !changed.is_empty() {
+        s.edit(label, |d, sel| {
+            for (id, np, part) in changed {
+                if let Some(NodeKind::Path { path, live, .. }) = d.node_mut(id).map(|n| &mut n.kind) {
+                    // Refit and subdivision change what the old component indexes refer to: the
+                    // path is selected whole, or with the part `f` says.
+                    sel.anchors.remove(&id);
+                    sel.segments.remove(&id);
+                    if let Some((anchors, segments)) = part.filter(|(a, _)| a.len() < np.anchor_count()) {
+                        sel.anchors.insert(id, anchors);
+                        if let Some(segments) = segments {
+                            sel.segments.insert(id, segments);
+                        }
+                    }
+                    *path = np;
+                    *live = None;
                 }
-                after += np.anchor_count();
-                *path = np;
-                *live = None;
             }
-        }
-        Ok((ids, before, after))
-    })
+            Ok(())
+        })?;
+    }
+    Ok((ids, before, after))
+}
+
+/// The segments of `path` a direct selection picks: the `segments` picked as such, or else every
+/// segment with both its anchors among `anchors`. `None` when the path is selected whole, or when
+/// no segment of it is selected.
+fn selected_segments(
+    path: &PathData,
+    anchors: Option<&BTreeSet<AnchorRef>>,
+    segments: Option<&BTreeSet<SegmentRef>>,
+) -> Option<BTreeSet<SegmentRef>> {
+    let anchors = anchors?;
+    let picked: BTreeSet<SegmentRef> = match segments {
+        Some(segs) => segs.iter().copied().filter(|&(si, i)| path.subpaths.get(si).is_some_and(|sp| i < sp.segment_count())).collect(),
+        None => path
+            .subpaths
+            .iter()
+            .enumerate()
+            .flat_map(|(si, sp)| {
+                (0..sp.segment_count())
+                    .filter(move |&i| anchors.contains(&(si, i)) && anchors.contains(&(si, (i + 1) % sp.anchors.len())))
+                    .map(move |i| (si, i))
+            })
+            .collect(),
+    };
+    (!picked.is_empty()).then_some(picked)
+}
+
+/// Auto-Simplify's level for the selection: [`po::auto_simplify_level`] for the longer side of the
+/// selected objects' bounds. Object › Path › Simplify's slider opens at it, and
+/// `object.path.simplify {auto: true}` simplifies at it.
+pub fn auto_simplify_level(s: &Session) -> Result<f64> {
+    let roots = selected_roots(s)?;
+    let size = s.doc()?.doc.bounds_of(&roots, false).map_or(0.0, |b| b.width().max(b.height()));
+    Ok(po::auto_simplify_level(size))
 }
 
 fn simplify(s: &mut Session, p: &Value) -> Result<Value> {
+    // With auto, the slider's level is Auto-Simplify's for the selection's size; otherwise it is the level given.
+    let level = if bool_or(p, "auto", false) {
+        Some(auto_simplify_level(s)?)
+    } else {
+        num_param(p, "level").map(|l| if l.is_finite() { l.round().clamp(0.0, 100.0) } else { po::SIMPLIFY_LEVEL })
+    };
+    let tolerance = match level {
+        Some(l) => po::simplify_level_tolerance(l),
+        None => len_param(p, "tolerance").unwrap_or(1.0),
+    };
     let opts = po::SimplifyOptions {
-        tolerance: len_param(p, "tolerance").unwrap_or(1.0).clamp(1e-4, 1e4),
+        tolerance: tolerance.clamp(1e-4, 1e4),
         corner_angle_deg: num_param(p, "cornerAngle").unwrap_or(30.0).clamp(0.0, 180.0),
         straight_lines: bool_or(p, "straightLines", false),
     };
-    let (ids, before, after) = edit_paths(s, "Simplify", |path| po::simplify_with(path, &opts))?;
-    Ok(json!({ "ids": ids.iter().map(|i| i.0).collect::<Vec<_>>(), "before": before, "after": after }))
+    let whole = bool_or(p, "wholePaths", false);
+    // A path with segments direct-selected simplifies only their runs, and keeps those runs (and the
+    // other anchors it had selected) direct-selected.
+    let (ids, before, after) = edit_paths(s, "Simplify", |path, anchors, segments| {
+        let Some(picked) = selected_segments(path, anchors, segments).filter(|_| !whole) else {
+            return (po::simplify_with(path, &opts), None);
+        };
+        let part = po::simplify_part(path, &picked, &opts);
+        let mut kept: BTreeSet<AnchorRef> = anchors.into_iter().flatten().filter_map(|a| part.anchors.get(a).copied()).collect();
+        for &(si, i) in &part.segments {
+            let m = part.path.subpaths.get(si).map_or(1, |sp| sp.anchors.len().max(1));
+            kept.extend([(si, i), (si, (i + 1) % m)]);
+        }
+        let segs = segments.map(|_| part.segments.clone());
+        (part.path, Some((kept, segs)))
+    })?;
+    let mut out = json!({ "ids": ids.iter().map(|i| i.0).collect::<Vec<_>>(), "before": before, "after": after });
+    if let Some(l) = level {
+        out["level"] = json!(l);
+    }
+    Ok(out)
 }
 
 fn add_anchor_points(s: &mut Session, _: &Value) -> Result<Value> {
-    let (ids, before, after) = edit_paths(s, "Add Anchor Points", po::add_anchor_points)?;
+    let (ids, before, after) = edit_paths(s, "Add Anchor Points", |path, _, _| (po::add_anchor_points(path), None))?;
     Ok(json!({ "ids": ids.iter().map(|i| i.0).collect::<Vec<_>>(), "before": before, "after": after }))
 }
 
 // ---------- Split Into Grid ----------
+
+/// One direction of the grid: the (gutter, total size) of `n` rows or columns. A `size` for each
+/// makes the total; otherwise it is `total`, or `extent` (the selection's) when neither is given.
+fn grid_axis(p: &Value, n: f64, [size, gutter, total]: [&str; 3], extent: f64) -> (f64, f64) {
+    let gutter = len_param(p, gutter).or_else(|| len_param(p, "gutter")).unwrap_or(12.0).max(0.0);
+    let total = match len_param(p, size) {
+        Some(size) => n * size + (n - 1.0) * gutter,
+        None => len_param(p, total).unwrap_or(extent),
+    };
+    (gutter, total)
+}
 
 fn split_into_grid(s: &mut Session, p: &Value) -> Result<Value> {
     let rows = num_param(p, "rows").unwrap_or(2.0).round();
@@ -691,34 +988,48 @@ fn split_into_grid(s: &mut Session, p: &Value) -> Result<Value> {
     if !(1.0..=500.0).contains(&rows) || !(1.0..=500.0).contains(&cols) {
         return Err(bad("object.path.splitIntoGrid", "rows and columns must be 1..500"));
     }
-    let gutter = len_param(p, "gutter").unwrap_or(12.0).max(0.0);
+    let too_small = || EngineError::Other("Split Into Grid: select paths large enough for the grid".into());
+    // The selected paths, back to front: one grid over them all replaces them, where the topmost
+    // one was and painted as it is.
+    let d = &s.doc()?.doc;
     let roots = selected_roots(s)?;
+    let paths: Vec<&Node> =
+        roots.iter().filter_map(|id| d.node(*id)).filter(|n| matches!(n.kind, NodeKind::Path { .. } | NodeKind::Compound { .. })).collect();
+    let Some((top, below)) = paths.split_last().map(|(top, below)| (Node::clone(top), below.iter().map(|n| n.id).collect::<Vec<_>>())) else {
+        return Err(too_small());
+    };
+    let Some(b) = paths.iter().filter_map(|n| n.geometric_bounds()).reduce(|a, b| a.union(b)) else { return Err(too_small()) };
+    let (row_gutter, height) = grid_axis(p, rows, ["height", "rowGutter", "totalHeight"], b.height());
+    let (col_gutter, width) = grid_axis(p, cols, ["width", "columnGutter", "totalWidth"], b.width());
+    let (rows, cols) = (rows as usize, cols as usize);
+    let cells = po::split_into_grid(vectorcraft_geom::Rect::new(b.x0, b.y0, b.x0 + width, b.y0 + height), rows, cols, (row_gutter, col_gutter));
+    if cells.is_empty() {
+        return Err(too_small());
+    }
+    let mut edges: Vec<(bool, f64)> = Vec::new();
+    if bool_or(p, "addGuides", false) {
+        // Row-major cells: the first row has the column edges, each row's first cell the row edges.
+        let bounds = cells.iter().filter_map(PathData::bounds);
+        edges.extend(bounds.clone().take(cols).flat_map(|c| [(true, c.x0), (true, c.x1)]));
+        edges.extend(bounds.step_by(cols).flat_map(|c| [(false, c.y0), (false, c.y1)]));
+        // Without a gutter, neighbours share an edge.
+        edges.dedup_by(|a, b| a.0 == b.0 && (a.1 - b.1).abs() < 1e-9);
+    }
     let ids = s.edit("Split Into Grid", |d, sel| {
-        let mut out = vec![];
-        for id in &roots {
-            let Some(n) = d.node(*id).cloned() else { continue };
-            if !matches!(n.kind, NodeKind::Path { .. } | NodeKind::Compound { .. }) {
-                continue;
-            }
-            let Some(b) = n.geometric_bounds() else { continue };
-            let cells = po::split_into_grid(b, rows as usize, cols as usize, gutter);
-            if cells.is_empty() {
-                continue;
-            }
-            let (par, idx, _) = d.position(*id).ok_or(EngineError::NoNode(*id))?;
-            d.remove(*id)?;
-            for (k, c) in cells.into_iter().enumerate() {
-                let node = shape_node(d, c, Some(&n));
-                out.push(d.insert(par, idx + k, node)?);
-            }
+        d.remove_many(&below)?;
+        let (par, idx, _) = d.position(top.id).ok_or(EngineError::NoNode(top.id))?;
+        let layer = d.layer_containing(top.id);
+        d.remove(top.id)?;
+        let mut out = Vec::with_capacity(cells.len());
+        for (k, c) in cells.into_iter().enumerate() {
+            let node = shape_node(d, c, Some(&top));
+            out.push(d.insert(par, idx + k, node)?);
         }
-        if out.is_empty() {
-            return Err(EngineError::Other("Split Into Grid: select paths large enough for the grid".into()));
-        }
+        d.guides.extend(edges.iter().map(|&(vertical, pos)| vectorcraft_doc::Guide { layer, ..vectorcraft_doc::Guide::new(vertical, pos) }));
         sel.set(out.iter().copied());
         Ok(out)
     })?;
-    Ok(ids_json(&ids))
+    Ok(json!({ "ids": ids.iter().map(|i| i.0).collect::<Vec<_>>(), "guides": edges.len() }))
 }
 
 // ---------- Clean Up ----------
@@ -774,19 +1085,21 @@ fn clean_up(s: &mut Session, p: &Value) -> Result<Value> {
         for l in &d.layers {
             visit(l, false, false, false, &mut v, (stray, unpainted, empty_text));
         }
-        v.retain(|id| d.is_editable(*id));
+        let editable = d.editable();
+        v.retain(|id| editable(*id));
         v
     };
     if found.is_empty() {
         return Ok(json!({ "removed": 0 }));
     }
     s.edit("Clean Up", |d, _| {
+        let mut gone = Beside::replacing(d, &found);
         for id in &found {
             if d.node(*id).is_some() {
-                d.remove(*id)?;
+                gone.put(d, *id, vec![])?;
             }
         }
-        Ok(())
+        gone.finish(d)
     })?;
     Ok(json!({ "removed": found.len() }))
 }
@@ -818,14 +1131,17 @@ fn divide_objects_below(s: &mut Session, _: &Value) -> Result<Value> {
         }
         // Compound children are handled via their compound.
         targets.retain(|id| !matches!(d.parent_of(*id).and_then(|p| d.node(p)).map(|p| &p.kind), Some(NodeKind::Compound { .. })));
+        let editable = d.editable();
         targets.retain(|id| {
             *id != cutter_id
-                && d.is_editable(*id)
+                && editable(*id)
                 && d.is_visible(*id)
                 && d.index_path(*id).is_some_and(|ip| ip < cutter_pos)
                 && d.node(*id).and_then(Node::geometric_bounds).is_some_and(|b| b.intersect(cb).area() > 0.0)
         });
+        drop(editable);
         let mut out = vec![];
+        let mut cut = Beside::replacing(d, &[targets.as_slice(), &[cutter_id]].concat());
         for t in targets {
             let Some(n) = d.node(t).cloned() else { continue };
             let Some((tp, tr)) = node_path(&n) else { continue };
@@ -834,14 +1150,12 @@ fn divide_objects_below(s: &mut Session, _: &Value) -> Result<Value> {
             if inside.is_empty() || outside.is_empty() {
                 continue;
             }
-            let (par, idx, _) = d.position(t).ok_or(EngineError::NoNode(t))?;
-            d.remove(t)?;
-            for (k, piece) in [outside, inside].into_iter().enumerate() {
-                let node = shape_node(d, piece, Some(&n));
-                out.push(d.insert(par, idx + k, node)?);
-            }
+            let pieces: Vec<Node> = [outside, inside].into_iter().map(|piece| shape_node(d, piece, Some(&n))).collect();
+            out.extend(pieces.iter().map(|p| p.id));
+            cut.put(d, t, pieces)?;
         }
-        d.remove(cutter_id)?;
+        cut.put(d, cutter_id, vec![])?;
+        cut.finish(d)?;
         sel.set(out.iter().copied());
         Ok(out)
     })?;

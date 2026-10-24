@@ -16,7 +16,7 @@ fn stroke(w: f64) -> StrokeLayer {
 }
 
 fn calli(angle: f64, roundness: f64, size: f64) -> Brush {
-    Brush { name: "c".into(), kind: BrushKind::Calligraphic(Calligraphic { angle, roundness, size, variation: [0.0; 3] }) }
+    Brush { name: "c".into(), kind: BrushKind::Calligraphic(Calligraphic { angle, roundness, size, ..Default::default() }) }
 }
 
 fn bounds(nodes: &[Node]) -> Rect {
@@ -37,7 +37,7 @@ fn all_points(n: &Node, out: &mut Vec<Point>) {
 
 #[test]
 fn calligraphic_vertical_nib_is_full_width_across_horizontal_stroke() {
-    let out = stroke_pieces(&calli(90.0, 20.0, 10.0), &line(0.0, 0.0, 100.0, 0.0), &stroke(1.0));
+    let out = stroke_pieces(&Document::new(1.0, 1.0), &calli(90.0, 20.0, 10.0), &line(0.0, 0.0, 100.0, 0.0), &stroke(1.0));
     assert_eq!(out.len(), 1);
     let b = bounds(&out);
     assert!(near(b.height(), 10.0, 0.05), "{b:?}");
@@ -46,30 +46,30 @@ fn calligraphic_vertical_nib_is_full_width_across_horizontal_stroke() {
 
 #[test]
 fn calligraphic_flat_nib_is_thin_along_its_angle() {
-    let out = stroke_pieces(&calli(0.0, 20.0, 10.0), &line(0.0, 0.0, 100.0, 0.0), &stroke(1.0));
+    let out = stroke_pieces(&Document::new(1.0, 1.0), &calli(0.0, 20.0, 10.0), &line(0.0, 0.0, 100.0, 0.0), &stroke(1.0));
     assert!(near(bounds(&out).height(), 2.0, 0.05), "{:?}", bounds(&out));
 }
 
 #[test]
 fn calligraphic_width_at_45_degrees_matches_ellipse_support() {
     let (a, b) = (5.0_f64, 1.0_f64);
-    let out = stroke_pieces(&calli(45.0, 20.0, 10.0), &line(0.0, 0.0, 100.0, 0.0), &stroke(1.0));
+    let out = stroke_pieces(&Document::new(1.0, 1.0), &calli(45.0, 20.0, 10.0), &line(0.0, 0.0, 100.0, 0.0), &stroke(1.0));
     let expect = 2.0 * ((a * a + b * b) / 2.0).sqrt();
     assert!(near(bounds(&out).height(), expect, 0.05), "{} vs {expect}", bounds(&out).height());
     // A vertical stroke with the same nib has the same width (45° is symmetric).
-    let v = stroke_pieces(&calli(45.0, 20.0, 10.0), &line(0.0, 0.0, 0.0, 100.0), &stroke(1.0));
+    let v = stroke_pieces(&Document::new(1.0, 1.0), &calli(45.0, 20.0, 10.0), &line(0.0, 0.0, 0.0, 100.0), &stroke(1.0));
     assert!(near(bounds(&v).width(), expect, 0.05));
 }
 
 #[test]
 fn calligraphic_scales_with_stroke_weight() {
-    let out = stroke_pieces(&calli(90.0, 100.0, 3.0), &line(0.0, 0.0, 100.0, 0.0), &stroke(2.0));
+    let out = stroke_pieces(&Document::new(1.0, 1.0), &calli(90.0, 100.0, 3.0), &line(0.0, 0.0, 100.0, 0.0), &stroke(2.0));
     assert!(near(bounds(&out).height(), 6.0, 0.05));
 }
 
 #[test]
 fn round_nib_is_direction_independent() {
-    let out = stroke_pieces(&calli(0.0, 100.0, 4.0), &line(0.0, 0.0, 60.0, 80.0), &stroke(1.0));
+    let out = stroke_pieces(&Document::new(1.0, 1.0), &calli(0.0, 100.0, 4.0), &line(0.0, 0.0, 60.0, 80.0), &stroke(1.0));
     let b = bounds(&out);
     // Round caps: the bounds grow by the radius on every side.
     assert!(near(b.x0, -2.0, 0.05) && near(b.y1, 82.0, 0.05), "{b:?}");
@@ -78,7 +78,7 @@ fn round_nib_is_direction_independent() {
 #[test]
 fn closed_calligraphic_makes_a_ring() {
     let bp = shapes::ellipse(Rect::new(0.0, 0.0, 100.0, 100.0)).to_bezpath();
-    let out = stroke_pieces(&calli(0.0, 100.0, 6.0), &bp, &stroke(1.0));
+    let out = stroke_pieces(&Document::new(1.0, 1.0), &calli(0.0, 100.0, 6.0), &bp, &stroke(1.0));
     let pd = out[0].path_data().unwrap();
     assert_eq!(pd.subpaths.len(), 2);
     let poly_area = |sp: &vectorcraft_geom::SubPath| {
@@ -102,12 +102,14 @@ fn rect_art(w: f64, h: f64) -> Node {
 
 #[test]
 fn art_brush_stretches_to_path_length() {
-    let out = stroke_pieces(&art_brush(rect_art(10.0, 4.0), ArtScale::Stretch), &line(20.0, 50.0, 220.0, 50.0), &stroke(1.0));
+    let out =
+        stroke_pieces(&Document::new(1.0, 1.0), &art_brush(rect_art(10.0, 4.0), ArtScale::Stretch), &line(20.0, 50.0, 220.0, 50.0), &stroke(1.0));
     let b = bounds(&out);
     assert!(near(b.x0, 20.0, 1e-6) && near(b.x1, 220.0, 1e-6), "{b:?}");
     assert!(near(b.height(), 4.0, 1e-6));
     // 3 pt stroke → 3× wider.
-    let out = stroke_pieces(&art_brush(rect_art(10.0, 4.0), ArtScale::Stretch), &line(20.0, 50.0, 220.0, 50.0), &stroke(3.0));
+    let out =
+        stroke_pieces(&Document::new(1.0, 1.0), &art_brush(rect_art(10.0, 4.0), ArtScale::Stretch), &line(20.0, 50.0, 220.0, 50.0), &stroke(3.0));
     assert!(near(bounds(&out).height(), 12.0, 1e-6));
 }
 
@@ -118,9 +120,9 @@ fn art_brush_arc_length_mapping_is_linear() {
         Node::path(NodeId(0), shapes::rectangle(Rect::new(5.0, -1.0, 6.0, 1.0)), Appearance::basic(Paint::solid(Color::BLACK), Paint::None, 0.0));
     let frame = rect_art(10.0, 2.0);
     let mut spacer = frame.clone();
-    spacer.appearance = Appearance::default();
+    spacer.appearance = Appearance::default().into();
     let art = Node::group(NodeId(0), vec![std::sync::Arc::new(spacer), std::sync::Arc::new(marker)]);
-    let out = stroke_pieces(&art_brush(art, ArtScale::Stretch), &line(0.0, 0.0, 300.0, 0.0), &stroke(1.0));
+    let out = stroke_pieces(&Document::new(1.0, 1.0), &art_brush(art, ArtScale::Stretch), &line(0.0, 0.0, 300.0, 0.0), &stroke(1.0));
     let g = &out[0];
     let m = g.children().unwrap()[1].geometric_bounds().unwrap();
     assert!(near(m.x0, 150.0, 1e-6) && near(m.x1, 180.0, 1e-6), "{m:?}");
@@ -128,7 +130,8 @@ fn art_brush_arc_length_mapping_is_linear() {
 
 #[test]
 fn art_brush_proportional_keeps_aspect() {
-    let out = stroke_pieces(&art_brush(rect_art(100.0, 4.0), ArtScale::Proportional), &line(0.0, 0.0, 200.0, 0.0), &stroke(1.0));
+    let out =
+        stroke_pieces(&Document::new(1.0, 1.0), &art_brush(rect_art(100.0, 4.0), ArtScale::Proportional), &line(0.0, 0.0, 200.0, 0.0), &stroke(1.0));
     assert!(near(bounds(&out).height(), 8.0, 1e-6));
 }
 
@@ -139,9 +142,36 @@ fn art_brush_between_guides_keeps_ends() {
         Node::path(NodeId(0), shapes::rectangle(Rect::new(80.0, -4.0, 100.0, 4.0)), Appearance::basic(Paint::solid(Color::BLACK), Paint::None, 0.0));
     let shaft = rect_art(80.0, 2.0);
     let art = Node::group(NodeId(0), vec![std::sync::Arc::new(shaft), std::sync::Arc::new(head)]);
-    let out = stroke_pieces(&art_brush(art, ArtScale::BetweenGuides { start: 0.0, end: 0.8 }), &line(0.0, 0.0, 300.0, 0.0), &stroke(1.0));
+    let out = stroke_pieces(
+        &Document::new(1.0, 1.0),
+        &art_brush(art, ArtScale::BetweenGuides { start: 0.0, end: 0.8 }),
+        &line(0.0, 0.0, 300.0, 0.0),
+        &stroke(1.0),
+    );
     let h = out[0].children().unwrap()[1].geometric_bounds().unwrap();
     assert!(near(h.x0, 280.0, 1e-6) && near(h.x1, 300.0, 1e-6), "{h:?}");
+}
+
+#[test]
+fn art_brush_overlap_splits_at_corners() {
+    let mut bp = BezPath::new();
+    bp.move_to((0.0, 0.0));
+    bp.line_to((100.0, 0.0));
+    bp.line_to((100.0, 100.0));
+    let brush = |overlap: bool| Brush {
+        name: "a".into(),
+        kind: BrushKind::Art(ArtBrush {
+            art: rect_art(10.0, 4.0),
+            scale: ArtScale::Stretch,
+            overlap,
+            colorization: Colorization::None,
+            ..Default::default()
+        }),
+    };
+    let one = stroke_pieces(&Document::new(1.0, 1.0), &brush(false), &bp, &stroke(1.0));
+    let two = stroke_pieces(&Document::new(1.0, 1.0), &brush(true), &bp, &stroke(1.0));
+    assert_eq!(one.len(), 1, "one bent copy along the whole path");
+    assert_eq!(two.len(), 2, "one copy per run between corners");
 }
 
 #[test]
@@ -154,7 +184,7 @@ fn art_brush_follows_curves() {
             bp_open.push(*el);
         }
     }
-    let out = stroke_pieces(&art_brush(rect_art(10.0, 4.0), ArtScale::Stretch), &bp_open, &stroke(1.0));
+    let out = stroke_pieces(&Document::new(1.0, 1.0), &art_brush(rect_art(10.0, 4.0), ArtScale::Stretch), &bp_open, &stroke(1.0));
     let mut pts = vec![];
     all_points(&out[0], &mut pts);
     assert!(pts.len() > 40, "long edges are subdivided so they bend: {}", pts.len());
@@ -178,13 +208,13 @@ fn scatter_brush(spacing: f64) -> Brush {
 
 #[test]
 fn scatter_count_and_spacing() {
-    let out = stroke_pieces(&scatter_brush(100.0), &line(0.0, 0.0, 100.0, 0.0), &stroke(1.0));
+    let out = stroke_pieces(&Document::new(1.0, 1.0), &scatter_brush(100.0), &line(0.0, 0.0, 100.0, 0.0), &stroke(1.0));
     assert_eq!(out.len(), 10);
     let centres: Vec<f64> = out.iter().map(|n| n.geometric_bounds().unwrap().center().x).collect();
     for (i, c) in centres.iter().enumerate() {
         assert!(near(*c, 5.0 + 10.0 * i as f64, 1e-6), "{centres:?}");
     }
-    let out = stroke_pieces(&scatter_brush(200.0), &line(0.0, 0.0, 100.0, 0.0), &stroke(1.0));
+    let out = stroke_pieces(&Document::new(1.0, 1.0), &scatter_brush(200.0), &line(0.0, 0.0, 100.0, 0.0), &stroke(1.0));
     assert_eq!(out.len(), 5);
 }
 
@@ -201,8 +231,8 @@ fn scatter_is_deterministic_and_randomised() {
         }),
     };
     let p = line(0.0, 0.0, 300.0, 0.0);
-    let a1 = stroke_pieces(&b, &p, &stroke(1.0));
-    let a2 = stroke_pieces(&b, &p, &stroke(1.0));
+    let a1 = stroke_pieces(&Document::new(1.0, 1.0), &b, &p, &stroke(1.0));
+    let a2 = stroke_pieces(&Document::new(1.0, 1.0), &b, &p, &stroke(1.0));
     assert_eq!(a1, a2);
     let ys: Vec<f64> = a1.iter().map(|n| n.geometric_bounds().unwrap().center().y).collect();
     assert!(ys.iter().any(|y| y.abs() > 0.5), "scatter offsets copies: {ys:?}");
@@ -228,21 +258,21 @@ fn pattern_brush(fit: PatternFit, corners: bool) -> Brush {
 #[test]
 fn pattern_tile_count_by_fit() {
     let p = line(0.0, 0.0, 100.0, 0.0);
-    assert_eq!(stroke_pieces(&pattern_brush(PatternFit::Stretch, false), &p, &stroke(1.0)).len(), 10);
+    assert_eq!(stroke_pieces(&Document::new(1.0, 1.0), &pattern_brush(PatternFit::Stretch, false), &p, &stroke(1.0)).len(), 10);
     let p2 = line(0.0, 0.0, 104.0, 0.0);
-    let st = stroke_pieces(&pattern_brush(PatternFit::Stretch, false), &p2, &stroke(1.0));
+    let st = stroke_pieces(&Document::new(1.0, 1.0), &pattern_brush(PatternFit::Stretch, false), &p2, &stroke(1.0));
     assert_eq!(st.len(), 10);
     assert!(near(bounds(&st).width(), 104.0, 1e-6), "stretch fills the path exactly");
-    let sp = stroke_pieces(&pattern_brush(PatternFit::AddSpace, false), &line(0.0, 0.0, 109.0, 0.0), &stroke(1.0));
+    let sp = stroke_pieces(&Document::new(1.0, 1.0), &pattern_brush(PatternFit::AddSpace, false), &line(0.0, 0.0, 109.0, 0.0), &stroke(1.0));
     assert_eq!(sp.len(), 10);
     assert!(near(sp[0].geometric_bounds().unwrap().width(), 10.0, 1e-6), "add space keeps tile size");
-    assert_eq!(stroke_pieces(&pattern_brush(PatternFit::Stretch, false), &p, &stroke(2.0)).len(), 5);
+    assert_eq!(stroke_pieces(&Document::new(1.0, 1.0), &pattern_brush(PatternFit::Stretch, false), &p, &stroke(2.0)).len(), 5);
 }
 
 #[test]
 fn pattern_places_corner_tiles() {
     let sq = shapes::rectangle(Rect::new(0.0, 0.0, 100.0, 100.0)).to_bezpath();
-    let out = stroke_pieces(&pattern_brush(PatternFit::Stretch, true), &sq, &stroke(1.0));
+    let out = stroke_pieces(&Document::new(1.0, 1.0), &pattern_brush(PatternFit::Stretch, true), &sq, &stroke(1.0));
     let corners = out
         .iter()
         .filter(
@@ -257,7 +287,7 @@ fn pattern_places_corner_tiles() {
 #[test]
 fn bristle_makes_translucent_strands() {
     let b = Brush { name: "b".into(), kind: BrushKind::Bristle(Bristle::default()) };
-    let out = stroke_pieces(&b, &line(0.0, 0.0, 200.0, 0.0), &stroke(1.0));
+    let out = stroke_pieces(&Document::new(1.0, 1.0), &b, &line(0.0, 0.0, 200.0, 0.0), &stroke(1.0));
     assert!(out.len() >= 5, "{}", out.len());
     assert!(out.iter().all(|n| n.opacity < 1.0 && n.opacity > 0.0));
     let bb = bounds(&out);
@@ -270,12 +300,69 @@ fn tints_colorization_uses_stroke_colour() {
     let BrushKind::Art(mut a) = b.kind else { panic!("not an art brush") };
     a.colorization = Colorization::Tints;
     let b = Brush { name: "t".into(), kind: BrushKind::Art(a) };
-    let out = stroke_pieces(&b, &line(0.0, 0.0, 50.0, 0.0), &stroke(1.0));
+    let out = stroke_pieces(&Document::new(1.0, 1.0), &b, &line(0.0, 0.0, 50.0, 0.0), &stroke(1.0));
     assert_eq!(out[0].appearance.fill_paint(), Paint::solid(Color::rgb(1.0, 0.0, 0.0)));
     let mut white = rect_art(1.0, 1.0);
     white.appearance.set_fill(Paint::solid(Color::WHITE));
     colorize(&mut white, Colorization::Tints, &Paint::solid(Color::rgb(1.0, 0.0, 0.0)));
     assert_eq!(white.appearance.fill_paint().color().unwrap().to_rgb(), [1.0, 1.0, 1.0]);
+}
+
+/// Point type at (0, 0) whose characters are painted `fill` and `stroke` (1 pt wide).
+fn type_art(fill: Paint, stroke: Paint) -> Node {
+    use vectorcraft_doc::{CharStyle, TextObject};
+    let style = CharStyle { fill, stroke, stroke_width: 1.0, ..CharStyle::default() };
+    Node::new(NodeId(0), NodeKind::Text(Box::new(TextObject::point(Point::new(0.0, 0.0), "Ag", style))))
+}
+
+/// The characters' fills and strokes of every piece of type in `nodes`.
+fn run_paints(nodes: &[Node]) -> Vec<(Paint, Paint)> {
+    let mut out = vec![];
+    for n in nodes {
+        n.walk(&mut |c| {
+            if let NodeKind::Text(t) = &c.kind {
+                out.extend(t.runs.iter().map(|r| (r.style.fill.clone(), r.style.stroke.clone())));
+            }
+        });
+    }
+    out
+}
+
+/// A scatter brush's colorization recolors the type in its art as it recolors the art's paths.
+#[test]
+fn scatter_colorization_recolors_type() {
+    let red = Paint::solid(Color::rgb(1.0, 0.0, 0.0));
+    let blue = StrokeLayer::new(Paint::solid(Color::rgb(0.0, 0.0, 1.0)), 1.0);
+    let mut path = rect_art(10.0, 4.0);
+    path.appearance.set_fill(red.clone());
+    let art = Node::group(NodeId(0), vec![Arc::new(path), Arc::new(type_art(red.clone(), red.clone()))]);
+    let b = Brush { name: "s".into(), kind: BrushKind::Scatter(Scatter { art, colorization: Colorization::Tints, ..Default::default() }) };
+    let out = stroke_pieces(&Document::new(1.0, 1.0), &b, &line(0.0, 0.0, 100.0, 0.0), &blue);
+    assert!(!out.is_empty());
+    let path_fill = out[0].children().unwrap()[0].appearance.fill_paint();
+    assert_ne!(path_fill, red);
+    let paints = run_paints(&out);
+    assert_eq!(paints.len(), out.len());
+    assert!(paints.iter().all(|p| *p == (path_fill.clone(), path_fill.clone())), "{paints:?}");
+    // Black type takes the stroke color itself.
+    let black = Paint::solid(Color::BLACK);
+    let b = Brush {
+        name: "s".into(),
+        kind: BrushKind::Scatter(Scatter { art: type_art(black.clone(), black), colorization: Colorization::Tints, ..Default::default() }),
+    };
+    let out = stroke_pieces(&Document::new(1.0, 1.0), &b, &line(0.0, 0.0, 100.0, 0.0), &blue);
+    assert!(!out.is_empty());
+    assert!(run_paints(&out).iter().all(|p| *p == (blue.paint.clone(), blue.paint.clone())));
+}
+
+/// The Symbol Stainer mixes the characters' strokes of type toward the stain, as it mixes their fills.
+#[test]
+fn stain_mixes_type_strokes_too() {
+    let red = Paint::solid(Color::rgb(1.0, 0.0, 0.0));
+    let blue = Color::rgb(0.0, 0.0, 1.0);
+    let mut art = type_art(red.clone(), red);
+    tint_node(&mut art, &blue, 1.0);
+    assert_eq!(run_paints(&[art]), [(Paint::solid(blue), Paint::solid(blue))]);
 }
 
 #[test]
@@ -310,7 +397,7 @@ fn brushes_serde_round_trip() {
 fn every_default_brush_draws_something() {
     let bp = preview_path(120.0, 24.0);
     for b in defaults() {
-        let out = stroke_pieces(b, &bp, &stroke(1.0));
+        let out = stroke_pieces(&Document::new(1.0, 1.0), b, &bp, &stroke(1.0));
         assert!(!out.is_empty(), "{}", b.name);
         let bb = bounds(&out);
         assert!(bb.width() > 50.0 && bb.width() < 200.0, "{}: {bb:?}", b.name);
@@ -333,4 +420,348 @@ fn expand_keeps_fill_and_adds_pieces() {
     assert!(near(b.x0, 8.5, 0.05) && near(b.x1, 91.5, 0.05), "{b:?}");
     let plain = Node::path(NodeId(9), shapes::rectangle(Rect::new(0.0, 0.0, 1.0, 1.0)), Appearance::default_art());
     assert!(expand(&d, &plain).is_none());
+}
+
+/// A Calligraphic brush (round nib) whose size follows the pen pressure by `var` either way.
+fn pressure_calli(size: f64, var: f64) -> Brush {
+    let c = Calligraphic {
+        size,
+        variation: [0.0, 0.0, var],
+        modes: Some([Variation::Fixed, Variation::Fixed, Variation::Pressure]),
+        ..Default::default()
+    };
+    Brush { name: "p".into(), kind: BrushKind::Calligraphic(c) }
+}
+
+/// The stroke's half-width (largest |y|) among outline points with x in `x0..x1`.
+fn half_width(nodes: &[Node], x0: f64, x1: f64) -> f64 {
+    let mut pts = vec![];
+    for n in nodes {
+        all_points(n, &mut pts);
+    }
+    pts.iter().filter(|p| p.x >= x0 && p.x <= x1).map(|p| p.y.abs()).fold(0.0, f64::max)
+}
+
+fn pressed(points: Vec<(f64, f64)>) -> StrokeLayer {
+    StrokeLayer { pressure: Some(vectorcraft_doc::PressureProfile { points }), ..stroke(1.0) }
+}
+
+/// #852: with Size on Pressure the nib goes from size − variation at the lightest pressure to
+/// size + variation at the heaviest, along the stroke where the pen pressed.
+#[test]
+fn pressure_maps_to_size_along_the_stroke() {
+    let b = pressure_calli(10.0, 4.0);
+    let light_to_heavy = pressed(vec![(0.0, 0.0), (1.0, 1.0)]);
+    let out = stroke_pieces(&Document::new(1.0, 1.0), &b, &line(0.0, 0.0, 100.0, 0.0), &light_to_heavy);
+    // Lightest: 6 pt (half 3); heaviest: 14 pt (half 7); in between the pressure there.
+    assert!(near(half_width(&out, 0.5, 1.5), 3.0, 0.1), "{}", half_width(&out, 0.5, 1.5));
+    assert!(near(half_width(&out, 98.5, 99.5), 7.0, 0.1), "{}", half_width(&out, 98.5, 99.5));
+    assert!(near(half_width(&out, 49.5, 50.5), 5.0, 0.1), "{}", half_width(&out, 49.5, 50.5));
+    // The stroke weight scales it.
+    let heavy = StrokeLayer { width: 2.0, ..light_to_heavy };
+    let out = stroke_pieces(&Document::new(1.0, 1.0), &b, &line(0.0, 0.0, 100.0, 0.0), &heavy);
+    assert!(near(half_width(&out, 98.5, 99.5), 14.0, 0.2));
+    // No pressure recorded (a mouse, or a path the brush was applied to): the size itself.
+    let out = stroke_pieces(&Document::new(1.0, 1.0), &b, &line(0.0, 0.0, 100.0, 0.0), &stroke(1.0));
+    assert!(near(bounds(&out).height(), 10.0, 0.05), "{:?}", bounds(&out));
+    // Kept within the valid range: 2 ± 4 never goes below nothing.
+    let out = stroke_pieces(&Document::new(1.0, 1.0), &pressure_calli(2.0, 4.0), &line(0.0, 0.0, 100.0, 0.0), &pressed(vec![(0.0, 0.0), (1.0, 0.0)]));
+    assert!(!out.is_empty() && bounds(&out).height() < 0.2, "{:?}", bounds(&out));
+}
+
+/// Angle and roundness follow the pressure the same way, clamped to their ranges.
+#[test]
+fn pressure_varies_angle_and_roundness() {
+    let c = |modes| Calligraphic { angle: 0.0, roundness: 60.0, size: 10.0, variation: [90.0, 60.0, 0.0], modes: Some(modes) };
+    let horizontal = line(0.0, 0.0, 100.0, 0.0);
+    let draw = |c: Calligraphic, p: f64| {
+        let b = Brush { name: "a".into(), kind: BrushKind::Calligraphic(c) };
+        bounds(&stroke_pieces(&Document::new(1.0, 1.0), &b, &horizontal, &pressed(vec![(0.0, p), (1.0, p)]))).height()
+    };
+    use Variation::{Fixed, Pressure};
+    // Angle 0 ± 90: heavy pressure stands the flat nib up across the stroke.
+    assert!(near(draw(c([Pressure, Fixed, Fixed]), 0.5), 6.0, 0.05));
+    assert!(near(draw(c([Pressure, Fixed, Fixed]), 1.0), 10.0, 0.05));
+    // Roundness 60 ± 60, kept within 1..100: light is a hairline, heavy is round.
+    let vertical = Calligraphic { angle: 90.0, ..c([Fixed, Pressure, Fixed]) };
+    let wide = |p| {
+        let b = Brush { name: "r".into(), kind: BrushKind::Calligraphic(vertical.clone()) };
+        bounds(&stroke_pieces(&Document::new(1.0, 1.0), &b, &line(0.0, 0.0, 0.0, 100.0), &pressed(vec![(0.0, p), (1.0, p)]))).width()
+    };
+    assert!(near(wide(0.0), 0.1, 0.05), "{}", wide(0.0));
+    assert!(near(wide(1.0), 10.0, 0.05), "{}", wide(1.0));
+}
+
+/// Brushes saved before the variation modes keep their look: a variation means Random, none
+/// means Fixed, and they are written back without modes.
+#[test]
+fn brushes_without_modes_vary_randomly_as_before() {
+    let old: Brush = serde_json::from_value(serde_json::json!({"name": "x", "type": "calligraphic", "size": 8, "variation": [0, 0, 3]})).unwrap();
+    let BrushKind::Calligraphic(c) = &old.kind else { panic!() };
+    assert_eq!(c.modes, None);
+    assert_eq!(c.modes(), [Variation::Fixed, Variation::Fixed, Variation::Random]);
+    assert!(!c.uses_pressure());
+    assert!(serde_json::to_value(&old).unwrap().get("modes").is_none(), "written back as it was");
+    // The same strokes as the brush with its modes spelled out.
+    let explicit = Brush {
+        kind: BrushKind::Calligraphic(Calligraphic { modes: Some([Variation::Fixed, Variation::Fixed, Variation::Random]), ..c.clone() }),
+        ..old.clone()
+    };
+    let bp = preview_path(120.0, 24.0);
+    assert_eq!(
+        stroke_pieces(&Document::new(1.0, 1.0), &old, &bp, &stroke(1.0)),
+        stroke_pieces(&Document::new(1.0, 1.0), &explicit, &bp, &stroke(1.0))
+    );
+    // Fixed ignores the variation; Random still draws a different size per stroke.
+    let fixed = Brush { kind: BrushKind::Calligraphic(Calligraphic { modes: Some([Variation::Fixed; 3]), ..c.clone() }), ..old.clone() };
+    assert!(near(bounds(&stroke_pieces(&Document::new(1.0, 1.0), &fixed, &line(0.0, 0.0, 100.0, 0.0), &stroke(1.0))).height(), 8.0, 0.05));
+    // Recorded pressure changes nothing for a brush that doesn't use it.
+    assert_eq!(
+        stroke_pieces(&Document::new(1.0, 1.0), &old, &bp, &stroke(1.0)),
+        stroke_pieces(&Document::new(1.0, 1.0), &old, &bp, &pressed(vec![(0.0, 0.0), (1.0, 1.0)]))
+    );
+    // Modes are saved by name.
+    assert_eq!(serde_json::to_value(Variation::ALL).unwrap(), serde_json::json!(["fixed", "random", "pressure"]));
+    assert!(Variation::ALL.iter().all(|v| Variation::parse(v.id()) == Some(*v)));
+}
+
+/// Junk definitions and pressure never panic and never draw non-finite art.
+#[test]
+fn junk_pressure_brushes_draw_finite_art() {
+    let bp = preview_path(120.0, 24.0);
+    for (size, var) in [(1e308, 1e308), (-1e308, 1e308), (0.0, -1e308), (f64::MAX, f64::MAX)] {
+        for profile in [vec![], vec![(0.0, 2.0), (0.0, -1.0), (5.0, 0.5)], vec![(1.0, 1.0), (0.0, 0.0)]] {
+            let out = stroke_pieces(&Document::new(1.0, 1.0), &pressure_calli(size, var), &bp, &pressed(profile));
+            let mut pts = vec![];
+            for n in &out {
+                all_points(n, &mut pts);
+            }
+            assert!(pts.iter().all(|p| p.x.is_finite() && p.y.is_finite()), "{size} {var}");
+        }
+    }
+}
+
+/// A scatter brush of 10 × 4 pt rectangles whose size goes from `lo` % to `hi` % as `mode` says.
+fn sized_scatter(lo: f64, hi: f64, mode: Variation) -> Brush {
+    let s = scatter_brush(100.0);
+    let BrushKind::Scatter(sc) = s.kind else { panic!("not a scatter brush") };
+    let modes = [mode, Variation::Fixed, Variation::Fixed, Variation::Fixed];
+    Brush { kind: BrushKind::Scatter(Scatter { size: (lo, hi), modes: Some(modes), ..sc }), ..s }
+}
+
+/// Scatter Brush Options: Fixed takes the first value, Pressure goes from the first at the
+/// lightest pen pressure to the second at the heaviest; brushes saved before modes keep their look.
+#[test]
+fn scatter_values_follow_their_modes() {
+    let bp = line(0.0, 0.0, 400.0, 0.0);
+    let heights = |b: &Brush, st: &StrokeLayer| -> Vec<f64> {
+        stroke_pieces(&Document::new(1.0, 1.0), b, &bp, st).iter().map(|n| n.geometric_bounds().unwrap().height()).collect()
+    };
+    // Fixed: every copy at 50 %, whatever the second value.
+    assert!(heights(&sized_scatter(50.0, 300.0, Variation::Fixed), &stroke(1.0)).iter().all(|h| near(*h, 2.0, 1e-6)));
+    // Pressure: light at the start (50 %: 2 pt tall), heavy at the end (300 %: 12 pt).
+    let ramp = pressed(vec![(0.0, 0.0), (1.0, 1.0)]);
+    let h = heights(&sized_scatter(50.0, 300.0, Variation::Pressure), &ramp);
+    let (first, last) = (h[0], h[h.len() - 1]);
+    assert!(near(first, 2.0, 0.1) && last > 10.0, "{h:?}");
+    assert!(h.windows(2).all(|w| w[1] >= w[0] - 1e-9), "grows with the pressure: {h:?}");
+    // Without recorded pressure, half way between the two.
+    assert!(heights(&sized_scatter(50.0, 300.0, Variation::Pressure), &stroke(1.0)).iter().all(|h| near(*h, 7.0, 1e-6)));
+    // No modes saved: Random where the values differ, as before; Fixed and Random draw the same.
+    let old = sized_scatter(50.0, 300.0, Variation::Random);
+    let BrushKind::Scatter(sc) = &old.kind else { panic!("not a scatter brush") };
+    assert_eq!(Scatter { modes: None, ..sc.clone() }.modes(), [Variation::Random, Variation::Fixed, Variation::Fixed, Variation::Fixed]);
+    let unsaved = Brush { kind: BrushKind::Scatter(Scatter { modes: None, ..sc.clone() }), ..old.clone() };
+    assert_eq!(
+        stroke_pieces(&Document::new(1.0, 1.0), &old, &bp, &stroke(1.0)),
+        stroke_pieces(&Document::new(1.0, 1.0), &unsaved, &bp, &stroke(1.0))
+    );
+    assert!(serde_json::to_value(&unsaved).unwrap().get("modes").is_none(), "not saved when unset");
+}
+
+/// Definitions from files and commands are kept within their ranges.
+#[test]
+fn sanitize_keeps_values_within_their_ranges() {
+    let mut v = serde_json::to_value(sized_scatter(1e308, -1e308, Variation::Random)).unwrap();
+    v["rotation"] = serde_json::json!([720.0, -1e300]);
+    v["scatter"] = serde_json::json!([5000.0, 0.0]);
+    let lib = parse_library(&serde_json::json!([
+        v,
+        {"name": "a", "type": "art", "art": rect_art(10.0, 4.0), "width": 1e308, "scale": {"mode": "betweenGuides", "start": -3.0, "end": 9.0}},
+        {"name": "p", "type": "pattern", "side": rect_art(10.0, 4.0), "scale": 0.0, "spacing": -5.0},
+        {"name": "c", "type": "calligraphic", "angle": 400.0, "roundness": -1.0, "size": 1e9, "variation": [1e9, -1.0, 2.0]},
+        {"name": "b", "type": "bristle", "size": 0.0, "length": 1000.0, "density": 0.0},
+    ]));
+    let [s, a, p, c, b] = lib.as_slice() else { panic!("{lib:?}") };
+    let BrushKind::Scatter(s) = &s.kind else { panic!() };
+    assert_eq!((s.size, s.rotation, s.scatter), ((10000.0, 1.0), (180.0, -180.0), (1000.0, 0.0)));
+    let BrushKind::Art(a) = &a.kind else { panic!() };
+    assert_eq!((a.width, a.scale), (1000.0, ArtScale::BetweenGuides { start: 0.0, end: 1.0 }));
+    let BrushKind::Pattern(p) = &p.kind else { panic!() };
+    assert_eq!((p.scale, p.spacing), (1.0, 0.0));
+    let BrushKind::Calligraphic(c) = &c.kind else { panic!() };
+    assert_eq!((c.angle, c.roundness, c.size, c.variation), (180.0, 0.0, 1296.0, [180.0, 0.0, 2.0]));
+    let BrushKind::Bristle(b) = &b.kind else { panic!() };
+    assert_eq!((b.size, b.length, b.density), (0.1, 300.0, 1.0));
+}
+
+/// Hue Shift's key colour defaults to the art's most used colour.
+#[test]
+fn art_colors_list_the_most_used_first() {
+    let red = Color::rgb(1.0, 0.0, 0.0);
+    let blue = Color::rgb(0.0, 0.0, 1.0);
+    let path =
+        |c: Color| Node::path(NodeId(0), shapes::rectangle(Rect::new(0.0, 0.0, 1.0, 1.0)), Appearance::basic(Paint::solid(c), Paint::None, 0.0));
+    let g = Node::group(NodeId(0), vec![Arc::new(path(red)), Arc::new(path(blue)), Arc::new(path(blue))]);
+    assert_eq!(art_colors([&g]), vec![blue, red]);
+    // Type counts its characters' fills and drawn strokes.
+    let text = type_art(Paint::solid(red), Paint::solid(red));
+    let g = Node::group(NodeId(0), vec![Arc::new(path(blue)), Arc::new(text.clone())]);
+    assert_eq!(art_colors([&g]), vec![red, blue]);
+    let NodeKind::Text(mut t) = text.kind else { panic!("not type") };
+    t.runs[0].style.stroke_width = 0.0;
+    let text = Node::new(NodeId(0), NodeKind::Text(t));
+    let g = Node::group(NodeId(0), vec![Arc::new(text), Arc::new(path(blue)), Arc::new(path(blue))]);
+    assert_eq!(art_colors([&g]), vec![blue, red], "a stroke 0 wide is not counted");
+    let b = defaults().iter().find(|b| b.name == "Chain").unwrap();
+    assert_eq!(b.art().len(), 3, "the side and both corner tiles");
+    assert!(calli(0.0, 100.0, 3.0).art().is_empty());
+}
+
+/// A Hue Shift definition without a key color takes the art's most used color, or black when the
+/// art has no solid color; a key that is given is kept.
+#[test]
+fn hue_shift_without_a_key_takes_the_most_used_art_color() {
+    let red = Color::rgb(1.0, 0.0, 0.0);
+    let blue = Color::rgb(0.0, 0.0, 1.0);
+    let path = |fill: Paint| Node::path(NodeId(0), shapes::rectangle(Rect::new(0.0, 0.0, 1.0, 1.0)), Appearance::basic(fill, Paint::None, 0.0));
+    let art = Node::group(NodeId(0), vec![Arc::new(path(Paint::solid(red))), Arc::new(path(Paint::solid(blue))), Arc::new(path(Paint::solid(blue)))]);
+    let lib = parse_library(&serde_json::json!([
+        {"name": "s", "type": "scatter", "art": art, "colorization": {"method": "hueShift"}},
+        {"name": "a", "type": "art", "art": art, "colorization": {"method": "hueShift", "key": null}},
+        {"name": "p", "type": "pattern", "side": art, "colorization": {"method": "hueShift", "key": red}},
+        {"name": "n", "type": "art", "art": path(Paint::None), "colorization": {"method": "hueShift"}},
+    ]));
+    let keys: Vec<(&str, Colorization)> = lib.iter().map(|b| (b.name.as_str(), b.kind.colorization())).collect();
+    assert_eq!(
+        keys,
+        vec![
+            ("s", Colorization::HueShift { key: blue }),
+            ("a", Colorization::HueShift { key: blue }),
+            ("p", Colorization::HueShift { key: red }),
+            ("n", Colorization::HueShift { key: Color::BLACK }),
+        ]
+    );
+}
+
+/// Brush pieces draw no brushed stroke, also not by name: a symbol instance whose art is brushed
+/// is left out, a pattern paint whose tile is brushed becomes no paint, and plain ones stay.
+#[test]
+fn pieces_leave_out_what_draws_a_brushed_stroke_by_name() {
+    use vectorcraft_doc::{PatternDef, Symbol};
+    let mut doc = Document::new(100.0, 100.0);
+    let mut brushed = rect_art(10.0, 4.0);
+    brushed.appearance.items.push(vectorcraft_doc::AppearanceItem::Stroke(StrokeLayer { brush: Some("s".into()), ..stroke(1.0) }));
+    for (name, art) in [("plain", rect_art(10.0, 4.0)), ("brushed", brushed)] {
+        doc.symbols.push(Symbol { name: name.into(), art: std::sync::Arc::new(art.clone()) });
+        doc.patterns.push(PatternDef::new(name, vec![std::sync::Arc::new(art)]));
+    }
+    let instance = |symbol: &str| Node::new(NodeId(0), NodeKind::SymbolInstance { symbol: symbol.into(), xf: vectorcraft_geom::Affine::IDENTITY });
+    let painted = |pattern: &str| {
+        let fill = Paint::Pattern { pattern: pattern.into(), xf: vectorcraft_geom::Affine::IDENTITY };
+        Node::path(NodeId(0), shapes::rectangle(Rect::new(0.0, 0.0, 10.0, 4.0)), Appearance::basic(fill, Paint::None, 0.0))
+    };
+    let art = Node::group(NodeId(0), [instance("plain"), instance("brushed"), painted("plain"), painted("brushed")].map(std::sync::Arc::new).into());
+    let b = Brush { name: "s".into(), kind: BrushKind::Scatter(Scatter { art, colorization: Colorization::None, ..Default::default() }) };
+    let out = stroke_pieces(&doc, &b, &line(0.0, 0.0, 100.0, 0.0), &stroke(1.0));
+    assert!(!out.is_empty());
+    for piece in &out {
+        let children = piece.children().unwrap();
+        let symbols: Vec<&str> = children
+            .iter()
+            .filter_map(|c| if let NodeKind::SymbolInstance { symbol, .. } = &c.kind { Some(symbol.as_str()) } else { None })
+            .collect();
+        assert_eq!(symbols, ["plain"]);
+        let fills: Vec<Paint> =
+            children.iter().filter(|c| c.path_data().is_some()).filter_map(|c| c.appearance.fill().map(|f| f.paint.clone())).collect();
+        assert_eq!(fills, [Paint::Pattern { pattern: "plain".into(), xf: vectorcraft_geom::Affine::IDENTITY }, Paint::None]);
+    }
+}
+
+/// Anchors a brushed stroke emitted, which is what the output budget counts.
+fn anchors(nodes: &[Node]) -> usize {
+    nodes
+        .iter()
+        .map(|n| match &n.kind {
+            NodeKind::Path { path, .. } => path.subpaths.iter().map(|s| s.anchors.len()).sum::<usize>(),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// A path of `subpaths` long parallel lines, each long enough to want more tiles than the
+/// per-run cap allows.
+fn many_long_subpaths(subpaths: usize) -> BezPath {
+    let mut bp = BezPath::new();
+    for i in 0..subpaths {
+        let y = i as f64 * 50.0;
+        bp.move_to((0.0, y));
+        bp.line_to((300_000.0, y));
+    }
+    bp
+}
+
+/// #3594: the per-factor caps are per track, and a path has as many tracks as it has subpaths,
+/// so they multiply instead of bounding. Measured before the budget: 20,000 nodes and 320,000
+/// anchors for one subpath, and exactly N times that for N, so sixteen gave 5,120,000.
+#[test]
+fn pattern_output_is_capped_across_subpaths_not_only_per_run() {
+    let brush = pattern_brush(PatternFit::Stretch, false);
+    let one = stroke_pieces(&Document::new(1.0, 1.0), &brush, &many_long_subpaths(1), &stroke(1.0));
+    assert_eq!(one.len(), 20_000, "one track still fills its own per-run cap");
+    let a1 = anchors(&one);
+    assert!(a1 < 2_000_000, "one track stays under the total budget: {a1}");
+
+    // Sixteen tracks would be sixteen times that without a total budget.
+    // Four tracks are 4 x 320,000 anchors, still inside the budget, so nothing is cut: the
+    // budget must not bite before the per-factor caps have actually multiplied past it.
+    let four = stroke_pieces(&Document::new(1.0, 1.0), &brush, &many_long_subpaths(4), &stroke(1.0));
+    assert_eq!(four.len(), 4 * 20_000, "four tracks are under the budget and keep every piece");
+    assert_eq!(anchors(&four), 4 * a1);
+
+    // Sixteen would be 5,120,000 anchors. The budget is what stops it, not the per-run caps.
+    let many = stroke_pieces(&Document::new(1.0, 1.0), &brush, &many_long_subpaths(16), &stroke(1.0));
+    let an = anchors(&many);
+    assert!(an <= 2_000_000, "sixteen subpaths must not exceed the budget: {an}");
+    assert!(an > anchors(&four), "but more is drawn than four tracks' worth: {an}");
+    assert!(many.len() < 16 * 20_000, "and fewer pieces than the per-run caps alone would allow: {}", many.len());
+}
+
+/// The same for scatter, whose per-track guard is also 20,000 copies.
+#[test]
+fn scatter_output_is_capped_across_subpaths() {
+    let b = Brush {
+        name: "s".into(),
+        kind: BrushKind::Scatter(Scatter { art: rect_art(4.0, 4.0), colorization: Colorization::None, ..Default::default() }),
+    };
+    let few = stroke_pieces(&Document::new(1.0, 1.0), &b, &many_long_subpaths(1), &stroke(1.0));
+    let per_track = anchors(&few);
+    assert!(per_track > 0, "one track draws something");
+    // Enough tracks that the per-track guards alone would pass the budget.
+    let tracks = 2_000_000 / per_track + 4;
+    let many = stroke_pieces(&Document::new(1.0, 1.0), &b, &many_long_subpaths(tracks), &stroke(1.0));
+    let an = anchors(&many);
+    assert!(an <= 2_000_000, "{tracks} tracks must not exceed the budget: {an}");
+    assert!(an > per_track, "but more is drawn than one track's worth: {an}");
+    assert!(many.len() < tracks * few.len().max(1), "fewer copies than the per-track guards alone would allow");
+}
+
+/// A short, ordinary stroke is untouched by the budget: it is the absurd ones that are cut.
+#[test]
+fn an_ordinary_stroke_is_unaffected_by_the_budget() {
+    let brush = pattern_brush(PatternFit::Stretch, false);
+    let sq = shapes::rectangle(Rect::new(0.0, 0.0, 100.0, 100.0)).to_bezpath();
+    let out = stroke_pieces(&Document::new(1.0, 1.0), &brush, &sq, &stroke(1.0));
+    assert_eq!(out.len(), 40, "ten tiles on each of the four sides, as before the budget");
+    assert!(anchors(&out) < 2_000_000);
 }

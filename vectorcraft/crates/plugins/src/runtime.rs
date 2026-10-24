@@ -14,6 +14,20 @@ pub const ABI_VERSION: i32 = 1;
 /// Fuel handed out per slice; between slices the host checks the deadline.
 const FUEL_SLICE: u64 = 20_000_000;
 
+/// Instructions a heavy filter's run may use besides [`Limits::fuel_per_byte`] for each byte of
+/// input ([`crate::Budget::Heavy`]): 20 times a light one's. Its output's size can't add to it:
+/// the host learns that only once the run has ended.
+pub const HEAVY_FUEL: u64 = 1_000_000_000;
+
+/// Wall-clock budget of a heavy filter's run, in milliseconds (native builds).
+pub const HEAVY_WALL_TIME_MS: u64 = 300_000;
+
+/// A heavy run's budget as people read it: (minutes it may take, times the instructions a light
+/// run gets).
+pub fn heavy_terms() -> (u64, u64) {
+    (HEAVY_WALL_TIME_MS / 60_000, HEAVY_FUEL / Limits::default().fuel_base.max(1))
+}
+
 /// Resource limits for running plug-ins.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Limits {
@@ -156,6 +170,12 @@ impl Plugin {
             e => e,
         })?;
         p.manifest = Manifest::parse(&text)?;
+        // A heavy filter's runs get the larger budget, which the host lets the user allow or
+        // refuse before installing it.
+        if p.manifest.budget == crate::Budget::Heavy {
+            p.limits.fuel_base = p.limits.fuel_base.max(HEAVY_FUEL);
+            p.limits.wall_time_ms = p.limits.wall_time_ms.max(HEAVY_WALL_TIME_MS);
+        }
         // The other exports must exist with the right types.
         live.func::<i32, i32>("vc_alloc")?;
         live.func::<RunArgs, i64>("vc_run")?;
@@ -206,7 +226,8 @@ impl Plugin {
         Ok(Live { store, instance, memory })
     }
 
-    /// Calls `f` with at most `fuel` instructions, in slices, checking the deadline between them.
+    /// Calls `f` with at most `fuel` instructions, in slices, checking the deadline and the
+    /// caller's cancellation ([`vectorcraft_doc::cancel`]) between them.
     fn call<P: WasmParams, R: WasmResults>(&self, live: &mut Live, f: &TypedFunc<P, R>, params: P, fuel: u64, deadline: &Deadline) -> Result<R> {
         let mut left = fuel;
         let give = left.min(FUEL_SLICE);
@@ -223,6 +244,7 @@ impl Plugin {
                         return Err(Error::Limit("instruction budget".into()));
                     }
                     deadline.check()?;
+                    vectorcraft_doc::cancel::check().map_err(|_| Error::Cancelled)?;
                     let give = left.min(FUEL_SLICE.max(need));
                     left -= give;
                     live.store.set_fuel(give).map_err(wasm_err)?;

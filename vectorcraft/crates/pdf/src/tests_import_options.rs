@@ -2,7 +2,7 @@
 
 use vectorcraft_doc::{Document, NodeKind};
 use vectorcraft_geom::Rect;
-use vectorcraft_testkit::pdf::{PdfPage, pdf};
+use vectorcraft_testkit::pdf::{PdfPage, first_extra, pdf, pdf_with};
 
 use crate::*;
 
@@ -50,6 +50,45 @@ fn each_crop_box_sizes_the_artboard_and_places_the_art_in_it() {
     }
     // The default is the crop box, as before.
     assert_eq!(ImportOptions::default().crop, CropTo::Crop);
+}
+
+/// 10 mm in points.
+const BLEED: f64 = 10.0 * 72.0 / 25.4;
+
+/// A 300 × 200 sheet with a 200 × 100 trim box, the bleed box 10 mm round it, and a red rectangle
+/// reaching 20 pt past the trim box's left and bottom edges into the bleed.
+fn bled_page() -> PdfPage {
+    PdfPage {
+        bleed: Some([50.0 - BLEED, 50.0 - BLEED, 250.0 + BLEED, 150.0 + BLEED]),
+        trim: Some([50.0, 50.0, 250.0, 150.0]),
+        ..PdfPage::new(300.0, 200.0, "1 0 0 rg 30 30 100 60 re f")
+    }
+}
+
+/// The same within the precision of a box read from a file (32-bit floats).
+fn near(a: [f64; 4], b: [f64; 4]) -> bool {
+    a.iter().zip(b).all(|(a, b)| (a - b).abs() < 1e-3)
+}
+
+#[test]
+fn trim_box_artboards_take_the_bleed_box_round_them_as_the_document_bleed() {
+    let bytes = pdf(&[bled_page()], None);
+    let trim = ImportOptions { crop: CropTo::Trim, ..Default::default() };
+    let d = open(&bytes, trim.clone());
+    let ab = d.artboards[0].rect;
+    assert!(close(ab, Rect::new(0.0, 0.0, 200.0, 100.0)), "{ab:?}");
+    assert!(near(d.setup.bleed, [BLEED; 4]), "{:?}", d.setup.bleed);
+    // The rectangle comes in whole, reaching into the bleed (y down: the bottom bleed is below).
+    assert!(close(art(&d), Rect::new(-20.0, 60.0, 80.0, 120.0)), "{:?}", art(&d));
+    assert!(d.setup.bleed_rect(ab).contains_rect(art(&d)));
+    // Each side as the page shows it: PDF space is y up, and a rotated page turns its bleed.
+    let uneven = PdfPage { bleed: Some([49.0, 48.0, 253.0, 154.0]), ..bled_page() };
+    let turned = PdfPage { rotate: 90, ..uneven.clone() };
+    assert!(near(open(&pdf(&[uneven], None), trim.clone()).setup.bleed, [4.0, 2.0, 1.0, 3.0]));
+    assert!(near(open(&pdf(&[turned], None), trim).setup.bleed, [1.0, 3.0, 2.0, 4.0]));
+    // On the crop box (the sheet here) there is no bleed round the artboard.
+    let d = open(&bytes, ImportOptions::default());
+    assert_eq!((d.artboards[0].rect.width(), d.setup.bleed), (300.0, [0.0; 4]));
 }
 
 #[test]
@@ -119,6 +158,27 @@ fn art_of_neighbouring_artboards_off_a_page_is_left_to_its_own_page() {
     assert_eq!(d.layers[0].children().map_or(0, |c| c.len()), 2);
 }
 
+/// A `.ai` keeps its art past the artboard edge (#646): a note mostly left of artboard 2 (as notes
+/// for a design are put beside it) doesn't lie over artboard 1 in the row, where it would be taken
+/// for that page's art: page 2 moves right until its art clears page 1's.
+#[test]
+fn art_of_an_ai_page_reaching_left_does_not_lie_over_the_page_before() {
+    let ai = "/PieceInfo << /Illustrator << /Private << /AIPrivateData1 7 /NumBlock 1 >> >> >>";
+    let page = |content: &str| PdfPage { entries: ai.into(), ..PdfPage::new(100.0, 100.0, content) };
+    // Page 2's note runs from 70 points left of its box to 10 points into it.
+    let pages = [page("0 g 10 10 20 20 re f"), page("1 1 1 rg 1 0 0 RG -70 10 80 60 re B")];
+    let d = open(&pdf(&pages, None), ImportOptions::default());
+    let (a, b) = (d.artboards[0].rect, d.artboards[1].rect);
+    let note = d.layers[1].children().unwrap()[0].visual_bounds().unwrap();
+    assert!(note.x0 >= a.x1 + 36.0, "the note clears artboard 1: {note:?} {a:?}");
+    assert!((b.x0 - note.x0 - 70.0).abs() < 1.0, "and keeps its place by artboard 2: {note:?} {b:?}");
+    assert_eq!((b.width(), b.height()), (100.0, 100.0));
+    // A plain PDF clips its art to the page: its pages stay 36 points apart.
+    let plain = [PdfPage::new(100.0, 100.0, "0 g 10 10 20 20 re f"), PdfPage::new(100.0, 100.0, "1 0 0 RG -70 10 80 60 re S")];
+    let d = open(&pdf(&plain, None), ImportOptions::default());
+    assert_eq!(d.artboards[1].rect.x0, d.artboards[0].rect.x1 + 36.0);
+}
+
 #[test]
 fn an_encrypted_pdf_opens_with_its_password_only() {
     let bytes = pdf(&[PdfPage::new(200.0, 100.0, "1 0 0 rg 10 10 50 50 re f")], Some("secret"));
@@ -148,6 +208,42 @@ fn info_lists_pages_with_their_size_rotation_and_boxes() {
     assert!(p.boxes.iter().all(|(k, _)| *k != CropTo::Bounding));
     assert_eq!((i.pages[1].width, i.pages[1].height, i.pages[1].rotation), (50.0, 100.0, 270));
     assert!(matches!(info(b"not a pdf", None), Err(PdfError::Parse(_))));
+}
+
+/// The edges of `r`, for [`near`].
+fn edges(r: Rect) -> [f64; 4] {
+    [r.x0, r.y0, r.x1, r.y1]
+}
+
+/// `info` gives a page's boxes in points, as its size: a page whose `UserUnit` is 10 has them at
+/// ten times the file's numbers, as the artboard and bleed that Crop To trim makes of them.
+/// Whatever the page's `UserUnit` entry, its media box has the size `info` gives.
+#[test]
+fn info_gives_the_boxes_of_a_user_unit_page_in_points() {
+    // A 5 × 7 inch trim box with an eighth of an inch of bleed round it (0.9 units of 10 points).
+    let page = |entries: &str| PdfPage {
+        trim: Some([0.9, 0.9, 36.9, 51.3]),
+        bleed: Some([0.0, 0.0, 37.8, 52.2]),
+        entries: entries.into(),
+        ..PdfPage::new(37.8, 52.2, "0 g 2 2 10 8 re f")
+    };
+    // The `UserUnit` given directly, and as an indirect object.
+    for bytes in [pdf(&[page("/UserUnit 10")], None), pdf_with(&[page(&format!("/UserUnit {} 0 R", first_extra(1)))], &["10"], None)] {
+        let p = &info(&bytes, None).unwrap().pages[0];
+        assert!((p.width - 378.0).abs() < 1e-3 && (p.height - 522.0).abs() < 1e-3, "{p:?}");
+        let b = |c: CropTo| p.boxes.iter().find(|(k, _)| *k == c).map(|(_, r)| edges(*r)).unwrap();
+        assert!(near(b(CropTo::Media), [0.0, 0.0, 378.0, 522.0]) && near(b(CropTo::Trim), [9.0, 9.0, 369.0, 513.0]), "{p:?}");
+        let d = open(&bytes, ImportOptions { crop: CropTo::Trim, ..Default::default() });
+        assert!(near(edges(d.artboards[0].rect), [0.0, 0.0, 360.0, 504.0]), "{:?}", d.artboards[0].rect);
+        assert!(near(d.setup.bleed, [9.0; 4]), "{:?}", d.setup.bleed);
+    }
+    for unit in
+        ["", "/UserUnit 1", "/UserUnit 2.5", "/UserUnit 0.5", "/UserUnit 0", "/UserUnit -10", "/UserUnit /Ten", "/UserUnit (10)", "/UserUnit 1000000"]
+    {
+        let p = &info(&pdf(&[page(unit)], None), None).unwrap().pages[0];
+        let media = p.boxes.iter().find(|(k, _)| *k == CropTo::Media).map(|(_, r)| *r).unwrap();
+        assert!((media.width() / p.width - 1.0).abs() < 1e-6 && (media.height() / p.height - 1.0).abs() < 1e-6, "{unit}: {p:?}");
+    }
 }
 
 #[test]

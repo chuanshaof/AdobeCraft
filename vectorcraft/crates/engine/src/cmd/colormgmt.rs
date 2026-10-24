@@ -39,9 +39,18 @@ pub fn specs() -> Vec<CommandSpec> {
             "Load Color Profile…",
             [],
             None,
-            "{path: .icc/.icm file} register an ICC profile (native only) → {name, kind}",
+            "{path: .icc/.icm file of at most 32 MB} register an ICC profile (native only). The desktop app and vectorcraft-cli keep a copy of the file in the `Color Profiles` folder next to the preferences and register it again at every start (not with VECTORCRAFT_NO_PREFS, or in a confined `mcp --automation-*-root` server: there it lasts until the process ends) → {name, kind, remembered: whether a copy was kept}",
             always,
             load_profile
+        ),
+        cmd!(
+            "color.removeProfile",
+            "Remove Color Profile…",
+            [],
+            None,
+            "{name} forget a profile color.loadProfile loaded, and the copy kept of it (built-in profiles and the working spaces stay) → {removed: name}",
+            always,
+            remove_profile
         ),
         cmd!(
             "edit.assignProfile",
@@ -57,7 +66,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Convert Document Color Mode",
             [],
             None,
-            "same as file.documentColorMode: {mode: \"cmyk\"|\"rgb\", convert?: true, intent?, grays?} → {changed} (an alias kept for older scripts; the command palette leaves it out)",
+            "{…as file.documentColorMode} same as file.documentColorMode: {mode: \"cmyk\"|\"rgb\", convert?: true, intent?, grays?} → {changed} (an alias kept for older scripts; the command palette leaves it out)",
             has_doc,
             convert_mode
         ),
@@ -75,7 +84,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Gamut Warning",
             [],
             None,
-            "{ids?, colors?: [color]} colours that can't be printed in the working CMYK (selection, or the whole document when nothing is selected) → {checked, outOfGamut: [{hex, deltaE, count}]}",
+            "{ids?|id?, colors?: [color]} colours that can't be printed in the working CMYK (selection, or the whole document when nothing is selected) → {checked, outOfGamut: [{hex, deltaE, count}]}",
             has_doc,
             gamut_check
         ),
@@ -84,7 +93,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Proof Setup",
             ["View", "Proof Setup"],
             None,
-            "{target?: \"workingCmyk\"|\"cmyk:<profile>\"|\"legacyMacRgb\"|\"srgb\"|\"monitorRgb\"|\"protanopia\"|\"deuteranopia\", intent?, simulatePaper?, proof?: bool (also turn Proof Colors on)} → proof state",
+            "{target?: \"workingCmyk\"|\"cmyk:<profile>\"|\"legacyMacRgb\"|\"srgb\"|\"monitorRgb\"|\"protanopia\"|\"deuteranopia\"|\"tritanopia\", intent?, simulatePaper?, proof?: bool (also turn Proof Colors on)} → proof state",
             always,
             proof_setup
         ),
@@ -178,11 +187,35 @@ fn color_settings(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn load_profile(_: &mut Session, p: &Value) -> Result<Value> {
+fn load_profile(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "color.loadProfile";
     let path = str_param(p, "path").ok_or_else(|| bad(C, "missing `path`"))?;
-    let info = cms::load_icc_file(std::path::Path::new(path)).map_err(|e| bad(C, e.to_string()))?;
-    Ok(json!({"name": info.name, "kind": info.kind}))
+    crate::file_access::check_read(path).map_err(EngineError::Other)?;
+    let bytes = crate::store::read_capped(std::path::Path::new(path), crate::store::MAX_PROFILE_FILE).map_err(|e| bad(C, format!("{path}: {e}")))?;
+    let info = cms::register_icc(&bytes, None).map_err(|e| bad(C, e.to_string()))?;
+    // The bytes are kept, not the path: the file may move or go away.
+    let remembered = s.store_profile(&info.name, &bytes);
+    Ok(json!({"name": info.name, "kind": info.kind, "remembered": remembered}))
+}
+
+/// Forget a profile `color.loadProfile` loaded, and the copy that is kept of it.
+fn remove_profile(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "color.removeProfile";
+    let name = str_param(p, "name").ok_or_else(|| bad(C, "missing `name`"))?;
+    let info = cms::profiles().into_iter().find(|i| i.name == name).ok_or_else(|| bad(C, format!("no profile named `{name}`")))?;
+    if info.builtin {
+        return Err(bad(C, format!("`{name}` is a built-in profile and stays")));
+    }
+    let working = cms::active_settings();
+    if working.rgb == name || working.cmyk == name {
+        return Err(bad(C, format!("`{name}` is a working space: choose another with edit.colorSettings first")));
+    }
+    if !cms::unregister_icc(&info.name) {
+        return Err(bad(C, format!("no profile named `{name}`")));
+    }
+    s.unstore_profile(&info.name);
+    touch_all(s);
+    Ok(json!({"removed": info.name}))
 }
 
 #[cfg(target_arch = "wasm32")]

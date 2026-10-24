@@ -5,7 +5,7 @@
 .DESCRIPTION
   Produces, in $env:DIST (default: dist/release):
     vectorcraft-<version>-windows-<arch>.msi            per-machine installer (WiX v5)
-    vectorcraft-<version>-windows-<arch>-portable.zip   vectorcraft.exe + vectorcraft-cli.exe
+    vectorcraft-<version>-windows-<arch>-portable.zip   vectorcraft.exe + vectorcraft-cli.exe + portable.txt
 
   The binaries link the C runtime statically (+crt-static), so neither the MSI nor the portable
   zip needs the Visual C++ redistributable. Signing is delegated to sign.ps1 (skipped with a
@@ -13,6 +13,7 @@
 
   Needs: Rust (MSVC toolchain + the target), the Windows SDK (rc.exe, signtool.exe),
   and WiX v5: dotnet tool install --global wix --version 5.0.2
+             wix extension add -g WixToolset.UI.wixext/5.0.2 WixToolset.Util.wixext/5.0.2
 
 .EXAMPLE
   pwsh packaging/windows/package.ps1 -Arch x64
@@ -90,11 +91,68 @@ Copy-Item (Join-Path $Bin 'vectorcraft.exe'), (Join-Path $Bin 'vectorcraft-cli.e
 
 & (Join-Path $PSScriptRoot 'sign.ps1') (Join-Path $Stage 'vectorcraft.exe') (Join-Path $Stage 'vectorcraft-cli.exe')
 
+# Documentation and dependency licences shared by the MSI and portable ZIP.
+$Docs = Join-Path $Stage 'docs'
+New-Item -ItemType Directory -Force -Path $Docs | Out-Null
+foreach ($f in 'README.md', 'LICENSE', 'LICENSE-MIT', 'LICENSE-APACHE', 'NOTICE', 'ASSETS.md') {
+  $p = Join-Path $Root $f
+  if (Test-Path $p) { Copy-Item $p $Docs }
+}
+# Built with craft-fonts (CRAFT_FONTS_DIR, release builds): the embedded fonts' licences.
+if ($env:CRAFT_FONTS_DIR) {
+  foreach ($ofl in Get-ChildItem -Path (Join-Path $env:CRAFT_FONTS_DIR 'fonts\*\OFL.txt') -ErrorAction SilentlyContinue) {
+    Copy-Item $ofl.FullName (Join-Path $Docs "OFL-$($ofl.Directory.Name).txt")
+  }
+}
+if (Test-Path (Join-Path $Root 'licenses')) {
+  Copy-Item -Recurse (Join-Path $Root 'licenses') $Docs
+}
+
 # ---- MSI ---------------------------------------------------------------------------------------
+# The setup wizard's art, drawn here from the app icon so the MSI shows VectorCraft rather than
+# WiX's stock bitmaps: a 493x58 banner across the top of the inner pages (the page title is drawn
+# over its left side, so that stays white) and a 493x312 backdrop for the Welcome and Finish pages
+# (their text sits on the right; the left 164 px are ours). Both must be 24-bit BMPs.
+function New-InstallerArt([string] $IconPng, [string] $BannerOut, [string] $DialogOut) {
+  Add-Type -AssemblyName System.Drawing
+  $paper = [System.Drawing.ColorTranslator]::FromHtml('#efe9dc')
+  $accent = [System.Drawing.ColorTranslator]::FromHtml('#e8573f')
+  $icon = [System.Drawing.Image]::FromFile($IconPng)
+  try {
+    foreach ($spec in @(@($BannerOut, 493, 58), @($DialogOut, 493, 312))) {
+      $bmp = New-Object System.Drawing.Bitmap $spec[1], $spec[2], ([System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+      $g = [System.Drawing.Graphics]::FromImage($bmp)
+      try {
+        $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $g.Clear([System.Drawing.Color]::White)
+        if ($spec[2] -eq 58) {
+          $g.DrawImage($icon, 493 - 46 - 8, 6, 46, 46)
+        } else {
+          $panel = New-Object System.Drawing.SolidBrush $paper
+          $stripe = New-Object System.Drawing.SolidBrush $accent
+          $g.FillRectangle($panel, 0, 0, 164, 312)
+          $g.FillRectangle($stripe, 160, 0, 4, 312)
+          $g.DrawImage($icon, 18, 64, 124, 124)
+          $panel.Dispose(); $stripe.Dispose()
+        }
+      } finally { $g.Dispose() }
+      $bmp.Save($spec[0], [System.Drawing.Imaging.ImageFormat]::Bmp)
+      $bmp.Dispose()
+    }
+  } finally { $icon.Dispose() }
+}
+$Banner = Join-Path $Stage 'installer-banner.bmp'
+$Dialog = Join-Path $Stage 'installer-dialog.bmp'
+New-InstallerArt (Join-Path $Root 'assets\app-icon\hicolor\256x256\apps\ai.storyteller.vectorcraft.png') $Banner $Dialog
+
 $Msi = Join-Path $Dist "vectorcraft-$Version-windows-$Arch.msi"
 Invoke-Native 'wix build' {
   wix build (Join-Path $PSScriptRoot 'vectorcraft.wxs') -arch $Arch `
-    -d "Version=$MsiVersion" -d "BinDir=$Stage" -d "IconPath=$(Join-Path $Root 'assets\app-icon\vectorcraft.ico')" `
+    -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext `
+    -culture en-US -loc (Join-Path $PSScriptRoot 'vectorcraft.en-us.wxl') `
+    -d "Version=$MsiVersion" -d "DisplayVersion=$Version" -d "BinDir=$Stage" -d "IconPath=$(Join-Path $Root 'assets\app-icon\vectorcraft.ico')" `
+    -d "DocsDir=$Docs" -d "BannerBmp=$Banner" -d "DialogBmp=$Dialog" `
     -o $Msi
 }
 # wix writes its debug symbols (.wixpdb) next to the MSI; keep them out of the release assets.
@@ -106,16 +164,10 @@ $Portable = Join-Path $TargetDir "windows-package\vectorcraft-$Version-windows-$
 Remove-Item -Recurse -Force $Portable -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $Portable | Out-Null
 Copy-Item (Join-Path $Stage '*.exe') $Portable
-foreach ($f in 'README.md', 'LICENSE', 'LICENSE-MIT', 'LICENSE-APACHE') {
-  $p = Join-Path $Root $f
-  if (Test-Path $p) { Copy-Item $p $Portable }
-}
-# Built with craft-fonts (CRAFT_FONTS_DIR, release builds): the embedded fonts' licences.
-if ($env:CRAFT_FONTS_DIR) {
-  foreach ($ofl in Get-ChildItem -Path (Join-Path $env:CRAFT_FONTS_DIR 'fonts\*\OFL.txt') -ErrorAction SilentlyContinue) {
-    Copy-Item $ofl.FullName (Join-Path $Portable "OFL-$($ofl.Directory.Name).txt")
-  }
-}
+Copy-Item -Recurse (Join-Path $Docs '*') $Portable
+# portable.txt beside vectorcraft.exe switches on portable mode: settings, libraries, recovery
+# files and logs go to VectorCraftData\ next to the exe instead of %APPDATA% (#1366; see profile.rs).
+Copy-Item (Join-Path $PSScriptRoot 'portable.txt') $Portable
 $Zip = Join-Path $Dist "vectorcraft-$Version-windows-$Arch-portable.zip"
 Remove-Item -Force $Zip -ErrorAction SilentlyContinue
 Compress-Archive -Path $Portable -DestinationPath $Zip

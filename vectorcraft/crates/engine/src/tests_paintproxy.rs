@@ -118,6 +118,57 @@ fn swap_and_default_work_on_type() {
     assert_eq!(st.stroke, Paint::None);
 }
 
+/// How many steps there are to undo and to redo, and whether the document has unsaved changes.
+fn history(s: &Session) -> (usize, usize, bool) {
+    let st = s.doc().unwrap();
+    (st.history.undo.len(), st.history.redo.len(), st.is_dirty())
+}
+
+/// Select `ids` with a move of them left to redo, and mark the document saved.
+fn select_with_a_step_to_redo(s: &mut Session, ids: &[NodeId]) {
+    s.execute("select.set", &json!({"ids": ids.iter().map(|i| i.0).collect::<Vec<_>>()})).unwrap();
+    s.execute("object.move", &json!({"dx": 5, "dy": 0})).unwrap();
+    s.execute("edit.undo", &json!({})).unwrap();
+    s.doc_mut().unwrap().mark_saved();
+}
+
+/// Default Fill and Stroke on the default fill and stroke, None on a stroke of None, Invert and
+/// Complement on that stroke's Appearance row, Swap Fill and Stroke with the same fill and stroke,
+/// and Apply Last Color and Apply Last Gradient on paint that is the last color or gradient already
+/// record no undo step: the step to redo stays and the document stays unmodified.
+#[test]
+fn proxy_commands_that_change_nothing_record_no_undo_step() {
+    let mut s = session();
+    let id = rect(&mut s);
+    let no_step = |s: &mut Session, calls: &[(&str, serde_json::Value)]| {
+        select_with_a_step_to_redo(s, &[id]);
+        let before = history(s);
+        for (cmd, p) in calls {
+            s.execute(cmd, p).unwrap();
+            assert_eq!(history(s), before, "{cmd} {p}");
+        }
+    };
+    no_step(&mut s, &[("paint.default", json!({}))]);
+    s.execute("paint.setStroke", &json!({"none": true})).unwrap();
+    no_step(&mut s, &[("paint.none", json!({}))]);
+    // The stroke's Appearance row (item 1) has no color to invert or complement.
+    let row = json!({"item": 1, "stroke": true});
+    no_step(&mut s, &[("paint.invert", row.clone()), ("paint.complement", row)]);
+    s.execute("paint.setFill", &json!({"color": "#ff0000"})).unwrap();
+    s.execute("paint.setStroke", &json!({"color": "#ff0000"})).unwrap();
+    no_step(&mut s, &[("paint.swap", json!({})), ("paint.lastColor", json!({})), ("paint.lastColor", json!({"stroke": false}))]);
+    s.execute(
+        "paint.setFill",
+        &json!({"gradient": {"kind": "radial", "stops": [{"offset": 0, "color": "#ff0000"}, {"offset": 1, "color": "#0000ff"}]}}),
+    )
+    .unwrap();
+    no_step(&mut s, &[("paint.lastGradient", json!({"stroke": false}))]);
+    // Swapping a gradient fill and a red stroke is one step.
+    let before = history(&s);
+    s.execute("paint.swap", &json!({})).unwrap();
+    assert_eq!(history(&s), (before.0 + 1, 0, true));
+}
+
 #[test]
 fn recent_colors_are_fed_by_every_paint_command() {
     let mut s = session();
@@ -159,6 +210,11 @@ fn live_previews_remember_only_the_committed_colour() {
     s.preview("paint.setFill", &json!({"color": "#400000"})).unwrap();
     s.cancel_interaction().unwrap();
     assert_eq!(hexes(&s), ["#300000"], "a cancelled preview is forgotten");
+    s.begin_interaction("Color").unwrap();
+    s.preview("paint.setFill", &json!({"color": "#500000"})).unwrap();
+    assert!(s.preview("no.such.command", &json!({})).is_err());
+    s.commit_interaction().unwrap();
+    assert_eq!(hexes(&s), ["#300000"], "a preview undone by a failed one is forgotten");
 }
 
 #[test]
@@ -169,6 +225,78 @@ fn focus_false_keeps_the_active_proxy() {
     s.execute("paint.setStroke", &json!({"color": "#ff0000", "focus": false})).unwrap();
     assert!(s.fill_active);
     assert_eq!(node(&s, id).appearance.stroke_paint().color().unwrap().to_hex(), "#ff0000");
+}
+
+/// Toggle Fill/Stroke Focus, Invert, Complement, Apply Last Color, Apply Last Gradient,
+/// `paint.setFill` and `paint.setStroke` refuse a `fill`, `stroke`, `focus` or `none` given as text or
+/// as another value that is not true or false. The object, the defaults for new art, the proxy in
+/// front and the undo history stay as they were, with the object selected and with nothing selected.
+/// Null is read as the key left out.
+#[test]
+fn proxy_commands_refuse_a_boolean_given_as_text() {
+    let mut s = session();
+    let id = rect(&mut s);
+    s.execute("paint.setFill", &json!({"color": "#ff0000"})).unwrap();
+    let calls = [
+        ("paint.toggleActive", json!({"fill": "false"}), "fill"),
+        ("paint.invert", json!({"stroke": "true"}), "stroke"),
+        ("paint.complement", json!({"stroke": 1}), "stroke"),
+        ("paint.lastColor", json!({"stroke": "true"}), "stroke"),
+        ("paint.lastGradient", json!({"stroke": [true]}), "stroke"),
+        ("paint.setStroke", json!({"color": "#0000ff", "focus": "false"}), "focus"),
+        ("paint.setFill", json!({"none": "true"}), "none"),
+        ("paint.setFill", json!({"color": "#0000ff", "none": "false"}), "none"),
+    ];
+    let state = |s: &Session| (node(s, id), s.paint.clone(), s.fill_active, history(s));
+    for selected in [true, false] {
+        if !selected {
+            s.execute("select.none", &json!({})).unwrap();
+        }
+        let before = state(&s);
+        for (cmd, p, key) in &calls {
+            let r = s.execute(cmd, p);
+            let want = format!("`{key}` must be true or false");
+            assert!(matches!(&r, Err(EngineError::BadParams { msg, .. }) if *msg == want), "{cmd} {p}: {r:?}");
+            assert_eq!(state(&s), before, "{cmd} {p}, selected: {selected}");
+        }
+    }
+    s.execute("select.set", &json!({"ids": [id.0]})).unwrap();
+    let r = s.execute("paint.toggleActive", &json!({"fill": null})).unwrap();
+    assert_eq!(r["fillActive"], json!(false), "a null `fill` swaps the proxy in front");
+    s.execute("paint.setFill", &json!({"color": "#0000ff", "none": null, "focus": null})).unwrap();
+    assert_eq!((node(&s, id).appearance.fill_paint().color().unwrap().to_hex(), s.fill_active), ("#0000ff".to_string(), true));
+}
+
+/// `appearance.setItem`, `livePaint.fill`, `livePaint.strokeEdge`, a `shapeBuilder.merge` `fill`
+/// object, `swatch.new` and `swatch.edit`'s `paint` refuse a `none` given as text or as another value
+/// that is not true or false. The document, the defaults for new art and the undo history stay as
+/// they were. Null is read as `none` left out.
+#[test]
+fn the_commands_that_take_a_paint_refuse_a_none_given_as_text() {
+    let mut s = session();
+    let id = rect(&mut s);
+    let name = s.execute("swatch.new", &json!({"color": "#00ff00"})).unwrap()["name"].clone();
+    let refused = |r: &Result<Value>| matches!(r, Err(EngineError::BadParams { msg, .. }) if msg == "`none` must be true or false");
+    let state = |s: &Session| (s.doc().unwrap().doc.clone(), s.paint.clone(), history(s));
+    let before = state(&s);
+    let calls = [
+        ("appearance.setItem", json!({"index": 0, "ids": [id.0], "none": "true"})),
+        ("livePaint.fill", json!({"ids": [id.0], "point": [20, 30], "none": 1})),
+        ("shapeBuilder.merge", json!({"ids": [id.0], "points": [[20, 30]], "fill": {"none": "true"}})),
+        ("swatch.new", json!({"none": [true]})),
+        ("swatch.edit", json!({"name": name, "paint": {"none": "false"}})),
+    ];
+    for (cmd, p) in &calls {
+        let r = s.execute(cmd, p);
+        assert!(refused(&r), "{cmd} {p}: {r:?}");
+        assert_eq!(state(&s), before, "{cmd} {p}");
+    }
+    let r = s.execute("livePaint.fill", &json!({"ids": [id.0], "point": [20, 30], "color": "#ff0000", "none": null})).unwrap();
+    let g = NodeId(r["group"].as_u64().unwrap());
+    let before = state(&s);
+    let r = s.execute("livePaint.strokeEdge", &json!({"group": g.0, "point": [10, 30], "none": "true"}));
+    assert!(refused(&r), "livePaint.strokeEdge: {r:?}");
+    assert_eq!(state(&s), before, "livePaint.strokeEdge");
 }
 
 #[test]

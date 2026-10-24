@@ -2,20 +2,21 @@
 //! (`Services::system_clipboard`).
 //!
 //! - Windows: text, SVG, PDF, PNG and an opaque bitmap (for apps that don't read PNG) in one go;
-//!   Paste reads each of them, a bitmap as PNG, else as the device-independent bitmap that
+//!   Paste reads each of them and EPS, a bitmap as PNG, else as the device-independent bitmap that
 //!   screenshots and most apps copy (`CF_DIBV5`, `CF_DIB`; the system makes them of a `CF_BITMAP`).
 //! - macOS and Linux: one format at a time, the text (a type-only copy's text or the SVG markup),
-//!   else the PNG as a bitmap; Paste reads text and bitmaps (on macOS the pasteboard's PNG or TIFF
-//!   as they are, as screenshots copy them). On Wayland, arboard's data-control
+//!   else the PNG as a bitmap; Paste reads text and bitmaps, and on macOS the pasteboard's SVG, PDF
+//!   and EPS as vector art (#1499) and its PNG or TIFF as they are, as screenshots copy them (on
+//!   Linux arboard reads no other formats). On Wayland, arboard's data-control
 //!   backend reads the compositor's clipboard (X11 through XWayland only sees what X11 apps
 //!   copied), falling back to X11 where the compositor lacks the protocol.
-//! - Everywhere: files copied in a file manager paste as the first one that is art (SVG, PDF, a
-//!   metafile or a bitmap), before the clipboard's other formats (the files' paths as text).
+//! - Everywhere: files copied in a file manager paste as the first one that is art (SVG, PDF, EPS,
+//!   a metafile or a bitmap), before the clipboard's other formats (the files' paths as text).
 
 use std::io::{Cursor, Read};
 use std::path::PathBuf;
 
-use vectorcraft_engine::cmd::clipboard::{BITMAP, FILE_HEAD, Flavour, PNG, TEXT, file_flavour};
+use vectorcraft_engine::cmd::clipboard::{BITMAP, EPS, FILE_HEAD, Flavour, PDF, PNG, SVG, TEXT, file_flavour};
 use vectorcraft_ui_egui::SystemClipboard;
 
 /// This platform's system clipboard.
@@ -25,6 +26,34 @@ pub fn system_clipboard() -> Box<dyn SystemClipboard> {
     #[cfg(not(windows))]
     let cb = Box::<portable::Clipboard>::default();
     cb
+}
+
+/// The registered Windows clipboard formats a flavour is written under (and read from, first held
+/// first).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_formats(mime: &str) -> &'static [&'static str] {
+    match mime {
+        SVG => &["image/svg+xml"],
+        PDF => &["Portable Document Format", "application/pdf"],
+        EPS => &["Encapsulated PostScript", "application/postscript"],
+        PNG => &["PNG"],
+        _ => &[],
+    }
+}
+
+/// The macOS pasteboard types Paste reads for `mime` (`image/*`: any bitmap), best first, each with
+/// the MIME type of its data. They are the system's uniform type identifiers (the values of
+/// `NSPasteboardTypePDF`, `NSPasteboardTypePNG` and `NSPasteboardTypeTIFF` among them) and the
+/// older name some apps still give PDF. Text is read through arboard.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn pasteboard_types(mime: &str) -> &'static [(&'static str, &'static str)] {
+    match mime {
+        SVG => &[("public.svg-image", SVG)],
+        PDF => &[("com.adobe.pdf", PDF), ("Apple PDF pasteboard type", PDF)], // brand-ok: the system's type identifier
+        EPS => &[("com.adobe.encapsulated-postscript", EPS)],                 // brand-ok: the system's type identifier
+        BITMAP => &[("public.png", PNG), ("public.tiff", "image/tiff")],
+        _ => &[],
+    }
 }
 
 /// The text flavour among `flavours`.
@@ -114,6 +143,13 @@ fn copied_file(paths: Vec<PathBuf>, mimes: &[&'static str]) -> Option<Flavour> {
             Some(p) if p.ends_with('\r') => PathBuf::from(p.trim_end_matches('\r')),
             _ => path,
         };
+        // A paste sent by automation reads only what its roots allow.
+        match path.to_str() {
+            Some(p) => vectorcraft_engine::file_access::check_read(p).ok()?,
+            // A lossy name would check another file than the one opened.
+            None if vectorcraft_engine::file_access::current().is_none() => {}
+            None => return None,
+        }
         let mut head = Vec::with_capacity(FILE_HEAD);
         std::fs::File::open(&path).ok()?.take(FILE_HEAD as u64).read_to_end(&mut head).ok()?;
         let mime = file_flavour(&path.to_string_lossy(), &head, mimes)?;
@@ -127,27 +163,15 @@ mod win {
     use std::num::NonZeroU32;
 
     use clipboard_win::{formats, options::NoClear, raw};
-    use vectorcraft_engine::cmd::clipboard::{PDF, SVG};
 
     use super::*;
-
-    /// The registered clipboard formats a flavour is written under (and read from, first held
-    /// first).
-    fn names(mime: &str) -> &'static [&'static str] {
-        match mime {
-            SVG => &["image/svg+xml"],
-            PDF => &["Portable Document Format", "application/pdf"],
-            PNG => &["PNG"],
-            _ => &[],
-        }
-    }
 
     /// The device-independent bitmaps, the one that carries alpha first. Each is there whenever the
     /// other or a `CF_BITMAP` is: the system converts between them.
     const DIBS: [u32; 2] = [formats::CF_DIBV5, formats::CF_DIB];
 
     fn formats_of(mime: &str) -> impl Iterator<Item = u32> {
-        names(mime).iter().filter_map(|n| raw::register_format(n)).map(NonZeroU32::get)
+        windows_formats(mime).iter().filter_map(|n| raw::register_format(n)).map(NonZeroU32::get)
     }
 
     fn err(e: impl std::fmt::Display) -> String {
@@ -350,27 +374,30 @@ mod portable {
             if let Some(f) = cb.get().file_list().ok().and_then(|paths| copied_file(paths, mimes)) {
                 return Some(f);
             }
-            mimes.iter().find_map(|m| match *m {
-                TEXT => cb.get_text().ok().filter(|t| !t.is_empty()).map(|t| Flavour { mime: TEXT, data: t.into_bytes() }),
-                BITMAP => {
-                    #[cfg(target_os = "macos")]
-                    if let Some(f) = super::mac::bitmap() {
-                        return Some(f);
-                    }
-                    let img = cb.get_image().ok()?;
-                    let rgba = image::RgbaImage::from_raw(u32::try_from(img.width).ok()?, u32::try_from(img.height).ok()?, img.bytes.into_owned())?;
-                    png_flavour(&rgba)
+            mimes.iter().find_map(|m| {
+                #[cfg(target_os = "macos")]
+                if let Some(f) = super::mac::read(m) {
+                    return Some(f);
                 }
-                _ => None,
+                match *m {
+                    TEXT => cb.get_text().ok().filter(|t| !t.is_empty()).map(|t| Flavour { mime: TEXT, data: t.into_bytes() }),
+                    BITMAP => {
+                        let img = cb.get_image().ok()?;
+                        let rgba =
+                            image::RgbaImage::from_raw(u32::try_from(img.width).ok()?, u32::try_from(img.height).ok()?, img.bytes.into_owned())?;
+                        png_flavour(&rgba)
+                    }
+                    _ => None,
+                }
             })
         }
 
-        /// Text, and on macOS a bitmap (by the pasteboard's types). Linux has no cheap way to ask
-        /// for a bitmap (reading one costs as much as pasting it): the paste keys take it, the
-        /// menu item waits for text.
+        /// Text, and on macOS vector art or a bitmap (by the pasteboard's types). Linux has no
+        /// cheap way to ask for a bitmap (reading one costs as much as pasting it): the paste keys
+        /// take it, the menu item waits for text.
         fn has(&mut self, mimes: &[&'static str]) -> bool {
             #[cfg(target_os = "macos")]
-            if mimes.contains(&BITMAP) && super::mac::has_bitmap() {
+            if super::mac::has(mimes) {
                 return true;
             }
             mimes.contains(&TEXT) && self.cb().is_ok_and(|cb| cb.get_text().is_ok_and(|t| !t.is_empty()))
@@ -378,7 +405,8 @@ mod portable {
     }
 }
 
-/// The macOS pasteboard's bitmaps as they are (arboard reads TIFF only, and decodes it).
+/// The macOS pasteboard's vector art and bitmaps as they are (arboard reads text, and of the
+/// pictures TIFF only, decoded).
 #[cfg(target_os = "macos")]
 mod mac {
     use objc2::rc::autoreleasepool;
@@ -387,24 +415,20 @@ mod mac {
 
     use super::*;
 
-    /// The bitmap types Paste reads, best first (the values of `NSPasteboardTypePNG` and
-    /// `NSPasteboardTypeTIFF`), with their MIME types.
-    const TYPES: [(&str, &str); 2] = [("public.png", PNG), ("public.tiff", "image/tiff")];
-
-    /// Does the pasteboard hold a bitmap? Asks for its types only.
-    pub fn has_bitmap() -> bool {
+    /// Does the pasteboard hold one of `mimes` ([`pasteboard_types`])? Asks for its types only.
+    pub fn has(mimes: &[&'static str]) -> bool {
         autoreleasepool(|_| {
-            let types = TYPES.map(|(t, _)| NSString::from_str(t));
+            let types: Vec<_> = mimes.iter().flat_map(|m| pasteboard_types(m)).map(|(t, _)| NSString::from_str(t)).collect();
             let types: Vec<&NSString> = types.iter().map(|t| &**t).collect();
-            NSPasteboard::generalPasteboard().availableTypeFromArray(&NSArray::from_slice(&types)).is_some()
+            !types.is_empty() && NSPasteboard::generalPasteboard().availableTypeFromArray(&NSArray::from_slice(&types)).is_some()
         })
     }
 
-    /// The pasteboard's bitmap, PNG before TIFF.
-    pub fn bitmap() -> Option<Flavour> {
+    /// The pasteboard's data for `mime`, the first of its types held ([`pasteboard_types`]).
+    pub fn read(mime: &str) -> Option<Flavour> {
         autoreleasepool(|_| {
             let pasteboard = NSPasteboard::generalPasteboard();
-            TYPES.into_iter().find_map(|(t, mime)| {
+            pasteboard_types(mime).iter().find_map(|&(t, mime)| {
                 let data = pasteboard.dataForType(&NSString::from_str(t))?.to_vec();
                 (!data.is_empty()).then_some(Flavour { mime, data })
             })
@@ -414,7 +438,7 @@ mod mac {
 
 #[cfg(test)]
 mod tests {
-    use vectorcraft_engine::cmd::clipboard::{PASTE_ORDER, SVG};
+    use vectorcraft_engine::cmd::clipboard::{EMF, PASTE_ORDER};
 
     use super::*;
 
@@ -446,6 +470,36 @@ mod tests {
         assert!(copied_file(vec![red], &[TEXT]).is_none());
         assert!(copied_file(vec![notes], &PASTE_ORDER).is_none());
         assert!(copied_file(vec![], &PASTE_ORDER).is_none());
+    }
+
+    /// What another app copied as vector art is asked for under the names the platforms give it,
+    /// and read as the flavour the paste imports (#1499).
+    #[test]
+    fn vector_art_is_read_under_each_platforms_names() {
+        let mac = |m| pasteboard_types(m).iter().map(|t| t.0).collect::<Vec<_>>();
+        assert_eq!(mac(PDF), ["com.adobe.pdf", "Apple PDF pasteboard type"]);
+        assert_eq!(mac(EPS), ["com.adobe.encapsulated-postscript"]);
+        assert_eq!(mac(SVG), ["public.svg-image"]);
+        assert_eq!(pasteboard_types(BITMAP), [("public.png", PNG), ("public.tiff", "image/tiff")]);
+        assert!(windows_formats(EPS).contains(&"Encapsulated PostScript") && windows_formats(PDF).contains(&"Portable Document Format"));
+        for asked in PASTE_ORDER {
+            // Each type's data is the flavour asked for (a bitmap its own type): what
+            // `clipboard.import*` then reads. Text and metafiles come another way.
+            assert!(pasteboard_types(asked).iter().all(|(_, mime)| *mime == asked || asked == BITMAP), "{asked}");
+            assert_eq!(pasteboard_types(asked).is_empty(), [TEXT, EMF].contains(&asked), "{asked}");
+        }
+        // Vector art before text, text before bitmaps.
+        let at = |m| PASTE_ORDER.iter().position(|x| *x == m).unwrap();
+        assert!(at(PDF) < at(EPS) && at(EPS) < at(TEXT) && at(TEXT) < at(BITMAP));
+    }
+
+    /// An .eps file copied in a file manager pastes as EPS.
+    #[test]
+    fn a_copied_eps_file_pastes() {
+        let eps = dir("eps").join("equation.eps");
+        std::fs::write(&eps, "%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 10 10\n0 0 10 10 rectfill\n").unwrap();
+        assert_eq!(copied_file(vec![eps.clone()], &PASTE_ORDER).map(|f| f.mime), Some(EPS));
+        assert!(copied_file(vec![eps], &[BITMAP, TEXT]).is_none());
     }
 
     #[test]

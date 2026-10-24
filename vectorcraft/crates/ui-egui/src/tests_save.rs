@@ -80,6 +80,80 @@ fn revert_asks_then_reloads_in_the_same_tab_keeping_every_zoom() {
     let _ = std::fs::remove_dir_all(d);
 }
 
+/// With the Artboard tool, Revert keeps the active artboard, and the tool starts on it.
+#[test]
+fn revert_with_the_artboard_tool_keeps_the_active_artboard() {
+    let d = dir("revert-artboard");
+    let path = d.join("a.vectorcraft").to_string_lossy().to_string();
+    let mut app = app();
+    app.run("file.new", json!({"width": 100, "height": 100, "artboards": 3})).unwrap();
+    app.run("file.saveAs", json!({"path": path})).unwrap();
+    app.select_tool("artboard");
+    crate::panels::artboards::select(&mut app, 2);
+    rect(&mut app);
+    app.run("file.revert", json!({"confirmed": true})).unwrap();
+    assert_eq!((app.view().unwrap().artboard, app.session.tool_options()["selected"].clone()), (2, json!([2])));
+    let _ = std::fs::remove_dir_all(d);
+}
+
+/// With the Artboard tool, a `command.batch` with a Revert step keeps the active artboard, and the
+/// tool starts on it, as Revert on its own does. When a later step pastes an artboard, the pasted
+/// one becomes active, as Paste on its own makes it.
+#[test]
+fn a_batch_that_reverts_with_the_artboard_tool_keeps_the_active_artboard() {
+    let d = dir("revert-batch");
+    let path = d.join("a.vectorcraft").to_string_lossy().to_string();
+    let mut app = app();
+    app.run("file.new", json!({"width": 100, "height": 100, "artboards": 3})).unwrap();
+    app.run("file.saveAs", json!({"path": path})).unwrap();
+    let saved = objects(&app);
+    app.select_tool("artboard");
+    crate::panels::artboards::select(&mut app, 2);
+    rect(&mut app);
+    let revert = json!({"command": "file.revert", "params": {"confirmed": true}});
+    app.run("command.batch", json!({"commands": [revert]})).unwrap();
+    assert_eq!(objects(&app), saved, "the batch reverted");
+    let active = |app: &VectorcraftApp| (app.view().unwrap().artboard, app.session.tool_options()["selected"].clone());
+    assert_eq!(active(&app), (2, json!([2])));
+    app.run("edit.copy", json!({})).unwrap();
+    rect(&mut app);
+    app.run("command.batch", json!({"commands": [revert, {"command": "edit.paste", "params": {}}]})).unwrap();
+    assert_eq!(active(&app), (3, json!([3])), "the pasted Artboard 4");
+    let _ = std::fs::remove_dir_all(d);
+}
+
+/// With the Artboard tool, the Actions panel menu's Batch (`action.batch`) keeps the active
+/// artboard, and the tool starts on it: over a folder, whose files it opens and closes, and over
+/// data sets with a Revert step.
+#[test]
+fn batch_with_the_artboard_tool_keeps_the_active_artboard() {
+    let d = dir("batch-artboard");
+    let src = d.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let mut other = app();
+    other.run("file.new", json!({"width": 50, "height": 50})).unwrap();
+    other.run("file.saveAs", json!({"path": src.join("b.vectorcraft").to_string_lossy()})).unwrap();
+    let path = d.join("a.vectorcraft").to_string_lossy().to_string();
+    let mut app = app();
+    app.run("file.new", json!({"width": 100, "height": 100, "artboards": 3})).unwrap();
+    app.run("dataset.new", json!({"name": "a"})).unwrap();
+    app.run("file.saveAs", json!({"path": path})).unwrap();
+    let saved = objects(&app);
+    app.select_tool("artboard");
+    crate::panels::artboards::select(&mut app, 2);
+    let active = |app: &VectorcraftApp| (app.view().unwrap().artboard, app.session.tool_options()["selected"].clone());
+    let unlock = json!([{"command": "object.unlockAll", "params": {}}]);
+    let r = app.run("action.batch", json!({"folder": src.to_string_lossy(), "destination": "saveAndClose", "commands": unlock})).unwrap();
+    assert_eq!((r["count"].clone(), r["failed"].clone(), app.session.documents().len()), (json!(1), json!(0), 1), "{r}");
+    assert_eq!(active(&app), (2, json!([2])), "over a folder");
+    rect(&mut app);
+    let revert = json!([{"command": "file.revert", "params": {"confirmed": true}}]);
+    let r = app.run("action.batch", json!({"source": "datasets", "commands": revert})).unwrap();
+    assert_eq!((r["count"].clone(), r["failed"].clone(), objects(&app)), (json!(1), json!(0), saved), "{r}");
+    assert_eq!(active(&app), (2, json!([2])), "over data sets, reverting");
+    let _ = std::fs::remove_dir_all(d);
+}
+
 #[test]
 fn new_from_template_takes_bytes_from_agents() {
     let mut app = app();
@@ -204,4 +278,28 @@ fn replacing_a_file_that_opening_left_things_out_of_asks_first() {
     assert_ne!(std::fs::read(&path).unwrap(), saved);
     assert!(!app.session.active().unwrap().is_dirty());
     let _ = std::fs::remove_dir_all(d);
+}
+
+#[test]
+fn native_saves_stream_into_the_file() {
+    let d = dir("stream");
+    let streamed = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+    let log = streamed.clone();
+    let mut app = app();
+    app.services.stream_shared = Some(std::sync::Arc::new(move |p: &str, fill: &mut dyn FnMut(&mut dyn std::io::Write) -> std::io::Result<()>| {
+        log.lock().unwrap().push(p.to_string());
+        let mut f = std::fs::File::create(p).map_err(|e| e.to_string())?;
+        fill(&mut f).map_err(|e| e.to_string())
+    }));
+    app.run("file.new", json!({"width": 100, "height": 100})).unwrap();
+    rect(&mut app);
+    let native = d.join("a.vectorcraft").to_string_lossy().to_string();
+    let r = app.run("file.saveAs", json!({"path": native, "compress": true})).unwrap();
+    let bytes = std::fs::read(&native).unwrap();
+    assert_eq!(r["bytes"], bytes.len(), "{r}");
+    assert!(vectorcraft_format::is_compressed(&bytes));
+    assert_eq!(vectorcraft_format::load(&bytes).unwrap().node_count(), objects(&app));
+    assert!(!app.session.doc().unwrap().is_dirty(), "the file is the document's own");
+    assert_eq!(*streamed.lock().unwrap(), [native]);
+    let _ = std::fs::remove_dir_all(&d);
 }

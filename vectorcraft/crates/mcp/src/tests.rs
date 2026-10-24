@@ -66,6 +66,62 @@ fn framing_basics() {
 }
 
 #[test]
+fn framing_rejects_invalid_versions_before_dispatch() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct CountingBackend(Rc<Cell<usize>>);
+    impl Backend for CountingBackend {
+        fn call(&mut self, _: &str, _: Value) -> Result<Value, String> {
+            self.0.set(self.0.get() + 1);
+            Ok(json!({}))
+        }
+        fn has_ui(&self) -> bool {
+            false
+        }
+        fn describe(&self) -> String {
+            "test".into()
+        }
+    }
+
+    let calls = Rc::new(Cell::new(0));
+    let mut s = Server::new(Box::new(CountingBackend(calls.clone())));
+    let mut request = json!({"id": 7, "method": "tools/call", "params": {"name": "run_command", "arguments": {"command": "edit.clear"}}});
+    for version in [None, Some(json!("1.0")), Some(json!("3.0")), Some(json!(2.0)), Some(Value::Null)] {
+        if let Some(version) = version {
+            request["jsonrpc"] = version;
+        }
+        let reply: Value = serde_json::from_str(&s.handle_line(&request.to_string()).unwrap()).unwrap();
+        assert_eq!(calls.get(), 0, "invalid envelope dispatched: {request}");
+        assert_eq!(reply["error"]["code"], -32600, "{reply}");
+        assert_eq!(reply["id"], 7);
+    }
+    request["jsonrpc"] = json!("2.0");
+    let reply = s.handle(request).unwrap();
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    assert_eq!(calls.get(), 1);
+}
+
+#[test]
+fn framing_rejects_invalid_notification_versions_in_batches() {
+    let mut s = server();
+    for version in [None, Some(json!("1.0")), Some(json!(2.0)), Some(Value::Null)] {
+        let mut notification = json!({"method": "notifications/initialized"});
+        if let Some(version) = version {
+            notification["jsonrpc"] = version;
+        }
+        let batch = json!([notification, {"jsonrpc": "2.0", "id": "ping", "method": "ping"}]);
+        let replies: Value = serde_json::from_str(&s.handle_line(&batch.to_string()).unwrap()).unwrap();
+        assert!(!s.is_initialized(), "invalid notification changed state: {batch}");
+        assert_eq!(replies.as_array().unwrap().len(), 1, "{replies}");
+        assert_eq!(replies[0]["id"], "ping");
+        assert_eq!(replies[0]["result"], json!({}));
+    }
+    assert_eq!(s.handle(json!({"jsonrpc": "2.0", "method": "notifications/initialized"})), None);
+    assert!(s.is_initialized());
+}
+
+#[test]
 fn serve_loop_writes_one_line_per_request() {
     let mut s = server();
     let input = [
@@ -183,6 +239,13 @@ fn headless_end_to_end() {
     assert_eq!(skel["layers"][0]["childCount"], layer["children"].as_array().unwrap().len());
     assert_eq!(skel["artboards"], doc["artboards"]);
     assert_eq!(call(&mut s, 42, "inspect_document", json!({"depth": -1}))["isError"], true);
+
+    // Scoping reaches the command: one node by id equals its part of the full tree;
+    // an unknown id is a tool error.
+    let r = call(&mut s, 43, "doc_inspect", json!({"ids": [id]}));
+    let one: Value = serde_json::from_str(&text_of(&r)).unwrap();
+    assert_eq!(one["nodes"], json!([rect]), "{one}");
+    assert_eq!(call(&mut s, 44, "doc_inspect", json!({"ids": [999_999]}))["isError"], true);
 
     // Screenshot returns image content (base64 PNG) and text.
     let shot_path = tmp("shot.png");
@@ -312,6 +375,81 @@ fn inspect_document_reports_the_paint_of_type() {
     assert_eq!((t["fill"].as_str(), t["stroke"].as_str(), t["strokeWidth"].as_f64()), (Some("#0000ff"), Some("#00ff00"), Some(3.0)), "{t}");
 }
 
+/// #1003: type made on or in a path takes add_text's `color` too, over the current fill.
+#[test]
+fn add_text_on_or_in_a_path_takes_its_color() {
+    for mode in ["onPath", "area"] {
+        let mut s = server();
+        let r = call(&mut s, 2, "draw_shape", json!({"shape": "rectangle", "x": 40, "y": 40, "width": 180, "height": 60, "fill": "#0000ff"}));
+        let path = serde_json::from_str::<Value>(&text_of(&r)).unwrap()["id"].clone();
+        let r = call(&mut s, 3, "add_text", json!({"text": "Hello", "path": path, "mode": mode, "color": "#ff0000"}));
+        assert_eq!(r["isError"], false, "{r}");
+        let id = serde_json::from_str::<Value>(&text_of(&r)).unwrap()["id"].clone();
+        let v: Value = serde_json::from_str(&text_of(&call(&mut s, 4, "inspect_document", json!({})))).unwrap();
+        let t = v["layers"][0]["children"].as_array().unwrap().iter().find(|c| c["id"] == id).cloned().unwrap();
+        assert_eq!(t["fill"].as_str(), Some("#ff0000"), "{mode}: {t}");
+    }
+}
+
+/// #1748: add_text's `justify` centres point type on (x, y) or ends it there.
+#[test]
+fn add_text_justify_anchors_point_type_on_x() {
+    let mut s = server();
+    let mut ids = Vec::new();
+    for (n, justify) in [(2, "left"), (3, "center"), (4, "right")] {
+        let r = call(&mut s, n, "add_text", json!({"text": "Title", "x": 300, "y": 100, "size": 24, "justify": justify}));
+        assert_eq!(r["isError"], false, "{r}");
+        ids.push(serde_json::from_str::<Value>(&text_of(&r)).unwrap()["id"].clone());
+    }
+    let doc: Value = serde_json::from_str(&text_of(&call(&mut s, 5, "inspect_document", json!({})))).unwrap();
+    let b = |id: &Value| {
+        let t = doc["layers"][0]["children"].as_array().unwrap().iter().find(|c| &c["id"] == id).unwrap();
+        (t["bounds"]["x"].as_f64().unwrap(), t["bounds"]["width"].as_f64().unwrap())
+    };
+    let ((l, lw), (c, cw), (r, rw)) = (b(&ids[0]), b(&ids[1]), b(&ids[2]));
+    assert!(lw > 10.0 && (l - 300.0).abs() < 1.0, "{l} {lw}");
+    assert!((c + cw / 2.0 - 300.0).abs() < 0.5, "{c} {cw}");
+    assert!((r + rw - 300.0).abs() < 1.0, "{r} {rw}");
+}
+
+/// add_text forwards writing direction to both text-creation commands, keeping horizontal as the default.
+#[test]
+fn add_text_sets_writing_direction_for_every_kind() {
+    let tools = tool_definitions();
+    let definition = tools.iter().find(|t| t["name"] == "add_text").unwrap();
+    assert_eq!(definition["inputSchema"]["properties"]["vertical"]["type"], "boolean");
+    for mode in ["point", "area", "pathArea", "onPath"] {
+        for vertical in [None, Some(false), Some(true)] {
+            let mut s = server();
+            let mut args = json!({"text": "AB", "size": 24});
+            if mode == "point" || mode == "area" {
+                args["x"] = json!(100);
+                args["y"] = json!(100);
+                if mode == "area" {
+                    args["width"] = json!(180);
+                    args["height"] = json!(160);
+                }
+            } else {
+                let path = call(&mut s, 1, "draw_shape", json!({"shape": "rectangle", "x": 40, "y": 40, "width": 180, "height": 160}));
+                assert_eq!(path["isError"], false, "{path}");
+                args["path"] = serde_json::from_str::<Value>(&text_of(&path)).unwrap()["id"].clone();
+                args["mode"] = json!(if mode == "pathArea" { "area" } else { "onPath" });
+            }
+            if let Some(value) = vertical {
+                args["vertical"] = json!(value);
+            }
+            let made = call(&mut s, 2, "add_text", args);
+            assert_eq!(made["isError"], false, "{mode} {vertical:?}: {made}");
+            let id = serde_json::from_str::<Value>(&text_of(&made)).unwrap()["id"].clone();
+            let node = call(&mut s, 3, "run_command", json!({"command": "document.node", "params": {"id": id}}));
+            assert_eq!(node["isError"], false, "{node}");
+            let node: Value = serde_json::from_str(&text_of(&node)).unwrap();
+            assert_eq!(node["kind"]["type"], "text", "{node}");
+            assert_eq!(node["kind"]["vertical"].as_bool().unwrap_or(false), vertical.unwrap_or(false), "{mode}: {node}");
+        }
+    }
+}
+
 /// save_file says it saves in the document's own format or the one the path's extension picks.
 #[test]
 fn save_file_describes_the_formats_it_writes() {
@@ -415,6 +553,186 @@ fn remote_forwards_methods() {
 }
 
 #[test]
+fn remote_does_not_replay_when_edit_reply_is_lost() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let h = std::thread::spawn(move || {
+        let timeout = std::time::Duration::from_secs(5);
+        let mut backend = Headless::with_document();
+        let base = backend.call("document.inspect", json!({})).unwrap()["objects"].as_u64().unwrap();
+        for connection in 0..2 {
+            let deadline = std::time::Instant::now() + timeout;
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && std::time::Instant::now() < deadline => std::thread::yield_now(),
+                    Err(e) => panic!("accept failed: {e}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream.set_read_timeout(Some(timeout)).unwrap();
+            stream.set_write_timeout(Some(timeout)).unwrap();
+            let mut out = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            for _ in 0..2 {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let msg: Value = serde_json::from_str(&line).unwrap();
+                let method = msg["method"].as_str().unwrap();
+                let result = backend.call(method, msg["params"].clone()).unwrap();
+                if connection == 0 {
+                    assert_eq!(method, "engine.execute");
+                    break;
+                }
+                let reply = json!({"id": msg["id"], "ok": true, "result": result});
+                writeln!(out, "{reply}").unwrap();
+                if method == "document.inspect" {
+                    return result["objects"].as_u64().unwrap() - base;
+                }
+                assert_eq!(method, "engine.execute");
+            }
+        }
+        panic!("document.inspect was not received");
+    });
+
+    let mut remote = Remote::connect(&addr).unwrap();
+    let first = remote.call("engine.execute", json!({"command": "shape.rectangle", "params": {"x": 10, "y": 10, "width": 20, "height": 20}}));
+    let next = remote.call("document.inspect", json!({}));
+    let edits = h.join().unwrap();
+
+    assert_eq!(edits, 1, "a lost reply must not duplicate the edit");
+    let error = first.expect_err("the lost reply must report uncertainty");
+    assert!(error.contains("operation may have completed"), "{error}");
+    assert!(next.is_ok(), "the next call must reconnect: {next:?}");
+}
+
+#[test]
+fn remote_rejects_uncorrelated_replies_without_replaying() {
+    for reply in [
+        json!({"ok": true, "result": {}}).to_string(),
+        json!({"id": null, "ok": true, "result": {}}).to_string(),
+        json!({"id": "1", "ok": true, "result": {}}).to_string(),
+        json!({"id": 2, "ok": true, "result": {}}).to_string(),
+        json!({"id": 2, "ok": false, "error": "unrelated error"}).to_string(),
+        "not json".into(),
+    ] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let h = std::thread::spawn(move || {
+            let timeout = std::time::Duration::from_secs(5);
+            let mut seen = vec![];
+            for connection in 0..2 {
+                let deadline = std::time::Instant::now() + timeout;
+                let stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && std::time::Instant::now() < deadline => std::thread::yield_now(),
+                        Err(e) => panic!("accept failed: {e}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream.set_read_timeout(Some(timeout)).unwrap();
+                stream.set_write_timeout(Some(timeout)).unwrap();
+                let mut out = stream.try_clone().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let msg: Value = serde_json::from_str(&line).unwrap();
+                seen.push(msg.clone());
+                if connection == 0 {
+                    writeln!(out, "{reply}").unwrap();
+                    line.clear();
+                    assert_eq!(reader.read_line(&mut line).unwrap(), 0, "invalid reply must close the connection without another request");
+                } else {
+                    writeln!(out, "{}", json!({"id": msg["id"], "ok": true, "result": {"objects": 1}})).unwrap();
+                }
+            }
+            seen
+        });
+        let mut remote = Remote::connect(&addr).unwrap();
+        let first = remote.call("engine.execute", json!({"command": "shape.rectangle", "params": {"width": 20, "height": 20}}));
+        let next = remote.call("document.inspect", json!({}));
+        drop(remote);
+        let seen = h.join().unwrap();
+        let error = first.expect_err("an uncorrelated reply cannot confirm the edit");
+        assert!(error.contains("operation may have completed"), "{error}");
+        assert_eq!(next.unwrap(), json!({"objects": 1}));
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0]["method"], "engine.execute");
+        assert_eq!(seen[1]["method"], "document.inspect", "the edit must not be replayed");
+        assert_eq!(seen[0]["id"], 1);
+        assert_eq!(seen[1]["id"], 2);
+    }
+}
+
+#[test]
+fn remote_rejects_a_reply_with_a_mismatched_id_and_reconnects() {
+    // A fake control server that answers the first request with another call's id, then serves
+    // correctly: the client must reject the stray reply, drop the connection, and reconnect.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let h = std::thread::spawn(move || {
+        let mut seen = vec![];
+        for stream in listener.incoming().flatten().take(2) {
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut out = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                continue;
+            }
+            let msg: Value = serde_json::from_str(&line).unwrap();
+            // First connection: somebody else's answer. Later ones: the right echo.
+            let id = if seen.is_empty() { json!(msg["id"].as_u64().unwrap_or(0) + 1000) } else { msg["id"].clone() };
+            let reply = json!({"ok": true, "result": {"echo": msg["params"]}, "id": id});
+            writeln!(out, "{reply}").unwrap();
+            seen.push(msg);
+        }
+        seen
+    });
+    let mut remote = Remote::connect(&addr).unwrap();
+    let err = remote.call("engine.execute", json!({"command": "shape.rectangle", "params": {}})).expect_err("a stray reply must not be trusted");
+    assert!(err.contains("mismatch"), "{err}");
+    let good = remote.call("engine.execute", json!({"command": "shape.rectangle", "params": {}}));
+    assert!(good.is_ok(), "the next call reconnects: {good:?}");
+    drop(remote);
+    let seen = h.join().unwrap();
+    assert_eq!(seen.len(), 2, "one request per connection: {seen:?}");
+    assert_ne!(seen[0]["id"], seen[1]["id"]);
+}
+
+/// The app's refusals carry no id (a 17th connection gets one and is closed). The call reports the
+/// app's reason, not a mismatch, says nothing ran, and the next call starts a fresh connection.
+#[test]
+fn remote_reports_the_reason_of_a_refusal_without_an_id() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let h = std::thread::spawn(move || {
+        let (mut refused, _) = listener.accept().unwrap();
+        // The request is read first, so the refusal answers it and the close is orderly.
+        refused.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let _ = BufReader::new(refused.try_clone().unwrap()).read_line(&mut String::new());
+        writeln!(refused, "{}", json!({"ok": false, "error": "too many control connections"})).unwrap();
+        drop(refused);
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let mut out = stream.try_clone().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        let msg: Value = serde_json::from_str(&line).unwrap();
+        writeln!(out, "{}", json!({"ok": true, "result": 7, "id": msg["id"]})).unwrap();
+    });
+    let mut remote = Remote::connect(&addr).unwrap();
+    let err = remote.call("document.inspect", json!({})).expect_err("a refusal is an error");
+    assert!(err.contains("too many control connections") && err.contains("nothing was run"), "{err}");
+    assert!(!err.contains("mismatch") && !err.contains("may have completed"), "{err}");
+    assert_eq!(remote.call("document.inspect", json!({})), Ok(json!(7)), "the next call reconnects");
+    h.join().unwrap();
+}
+
+#[test]
 fn remote_connect_fails_fast() {
     // A port this test holds, bound but not listening, so connecting to it is refused. (A port
     // bound and dropped could be taken by another process or test before the connect.)
@@ -427,6 +745,140 @@ fn remote_connect_fails_fast() {
     // Nothing else could listen there meanwhile.
     assert!(std::net::TcpListener::bind(format!("127.0.0.1:{port}")).is_err());
     drop(held);
+}
+
+fn reusable_listener(addr: std::net::SocketAddr) -> std::net::TcpListener {
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    socket.set_reuse_address(true).unwrap();
+    socket.bind(&addr.into()).unwrap();
+    socket.listen(1).unwrap();
+    socket.into()
+}
+
+fn wait_for_remote_eof(remote: &Remote) {
+    let probe = remote.connection_probe();
+    probe.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+    assert_eq!(probe.peek(&mut [0]).unwrap(), 0);
+}
+
+#[test]
+fn remote_edit_succeeds_once_when_app_restarts() {
+    let listener = reusable_listener(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+    let addr = listener.local_addr().unwrap();
+    let mut remote = Remote::connect(&addr.to_string()).unwrap();
+    let (old_connection, _) = listener.accept().unwrap();
+    let old_handle = std::thread::spawn(move || {
+        let timeout = std::time::Duration::from_secs(2);
+        old_connection.set_read_timeout(Some(timeout)).unwrap();
+        old_connection.set_write_timeout(Some(timeout)).unwrap();
+        let mut reader = BufReader::new(old_connection.try_clone().unwrap());
+        let mut writer = old_connection;
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let message: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(message["method"], "document.inspect");
+        let result = Headless::with_document().call("document.inspect", message["params"].clone()).unwrap();
+        writeln!(writer, "{}", json!({"id": message["id"], "ok": true, "result": result})).unwrap();
+        writer
+    });
+    let inspected = remote.call("document.inspect", json!({})).unwrap();
+    assert!(inspected["objects"].as_u64().unwrap() > 0);
+    drop(old_handle.join().unwrap());
+    drop(listener);
+    wait_for_remote_eof(&remote);
+
+    let listener = reusable_listener(addr);
+    listener.set_nonblocking(true).unwrap();
+    let handle = std::thread::spawn(move || {
+        let timeout = std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + timeout;
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return (0, 0);
+                    }
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("accept failed: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream.set_read_timeout(Some(timeout)).unwrap();
+        stream.set_write_timeout(Some(timeout)).unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut backend = Headless::with_document();
+        let base = backend.call("document.inspect", json!({})).unwrap()["objects"].as_u64().unwrap();
+        let mut requests = 0;
+        for line in BufReader::new(stream).lines() {
+            let message: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            let result = backend.call(message["method"].as_str().unwrap(), message["params"].clone()).unwrap();
+            requests += 1;
+            writeln!(writer, "{}", json!({"id": message["id"], "ok": true, "result": result})).unwrap();
+        }
+        let objects = backend.call("document.inspect", json!({})).unwrap()["objects"].as_u64().unwrap();
+        (requests, objects - base)
+    });
+
+    let edit = remote.call("engine.execute", json!({"command": "shape.rectangle", "params": {"x": 10, "y": 10, "width": 20, "height": 20}}));
+    drop(remote);
+    let (requests, edits) = handle.join().unwrap();
+
+    assert!(edit.is_ok(), "the first edit after restart must succeed: {edit:?}");
+    assert_eq!((requests, edits), (1, 1), "the edit must be sent and applied exactly once");
+}
+
+/// A connection holding a line nobody asked for (an app that says why it closes an idle
+/// connection) is not used: the call goes out once, on a fresh connection, and succeeds.
+#[test]
+fn remote_does_not_send_on_a_connection_with_a_stray_line() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let mut remote = Remote::connect(&addr).unwrap();
+    let (mut stale, _) = listener.accept().unwrap();
+    stale.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+    writeln!(stale, "{}", json!({"ok": false, "error": "idle"})).unwrap();
+    let probe = remote.connection_probe();
+    probe.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+    assert_eq!(probe.peek(&mut [0]).unwrap(), 1, "the stray line arrived");
+    drop(probe);
+    let h = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        let mut out = stream.try_clone().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        let msg: Value = serde_json::from_str(&line).unwrap();
+        writeln!(out, "{}", json!({"ok": true, "result": 7, "id": msg["id"]})).unwrap();
+    });
+    assert_eq!(remote.call("document.inspect", json!({})), Ok(json!(7)));
+    h.join().unwrap();
+    // Nothing was written to the stale connection: it ends (or is reset, its line unread) without a byte.
+    let mut rest = String::new();
+    assert_eq!(BufReader::new(stale).read_line(&mut rest).unwrap_or(0), 0, "{rest}");
+}
+
+#[test]
+fn remote_call_reports_nothing_sent_when_reconnect_is_refused() {
+    let listener = reusable_listener(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+    let addr = listener.local_addr().unwrap();
+    let mut remote = Remote::connect(&addr.to_string()).unwrap();
+    let (old_connection, _) = listener.accept().unwrap();
+    drop(old_connection);
+    drop(listener);
+    wait_for_remote_eof(&remote);
+    let held = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    held.set_reuse_address(true).unwrap();
+    held.bind(&addr.into()).unwrap();
+
+    let start = std::time::Instant::now();
+    let error = remote.call("engine.execute", json!({"command": "shape.rectangle", "params": {"width": 20, "height": 20}})).unwrap_err();
+
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    assert!(error.contains("not reachable"), "{error}");
+    assert!(error.contains("nothing was sent"), "{error}");
+    assert!(!error.contains("operation may have completed"), "{error}");
 }
 
 #[test]
@@ -563,6 +1015,85 @@ fn shift_marquee_gesture_toggles_the_selection() {
     }
 }
 
+/// `press_key {key: "e"}` while a Selection marquee is being dragged makes the marquee select only
+/// the objects entirely inside it. With nothing dragged, E still chooses its tool.
+#[test]
+fn e_during_a_marquee_gesture_selects_only_the_objects_inside() {
+    let mut s = server();
+    let square = |s: &mut Server, id: u64, x: u64| {
+        let r = call(s, id, "draw_shape", json!({"shape": "rectangle", "x": x, "y": 100, "width": 50, "height": 50}));
+        serde_json::from_str::<Value>(&text_of(&r)).unwrap()["id"].as_u64().unwrap()
+    };
+    let (a, _b) = (square(&mut s, 1, 100), square(&mut s, 2, 200));
+    let begin = json!([{"kind": "down", "x": 80, "y": 80}, {"kind": "drag", "x": 220, "y": 170}]);
+    let r = call(&mut s, 3, "pointer_gesture", json!({"tool": "selection", "events": begin}));
+    assert_eq!(r["isError"], false, "{r}");
+    let r = call(&mut s, 4, "press_key", json!({"key": "e"}));
+    assert_eq!(serde_json::from_str::<Value>(&text_of(&r)).unwrap()["handledBy"], "tool", "{r}");
+    let end = json!([{"kind": "drag", "x": 230, "y": 170}, {"kind": "up", "x": 230, "y": 170}]);
+    let r = call(&mut s, 5, "pointer_gesture", json!({"tool": "selection", "events": end}));
+    assert_eq!(serde_json::from_str::<Value>(&text_of(&r)).unwrap()["selection"], json!([a]), "{r}");
+    let r = call(&mut s, 6, "press_key", json!({"key": "e"}));
+    assert_eq!(serde_json::from_str::<Value>(&text_of(&r)).unwrap()["handledBy"], "tool.select", "{r}");
+}
+
+/// A click on one of two selected objects makes it the key object: `pointer_gesture` replies
+/// with it as `key` and `inspect_document` lists it, and a click on the key again lets it go.
+#[test]
+fn pointer_gestures_report_the_key_object() {
+    let mut s = server();
+    let square = |s: &mut Server, id: u64, x: u64| {
+        let r = call(s, id, "draw_shape", json!({"shape": "rectangle", "x": x, "y": 100, "width": 50, "height": 50, "fill": "#ff0000"}));
+        serde_json::from_str::<Value>(&text_of(&r)).unwrap()["id"].as_u64().unwrap()
+    };
+    let (a, b) = (square(&mut s, 1, 100), square(&mut s, 2, 200));
+    let r = call(&mut s, 3, "run_command", json!({"command": "select.set", "params": {"ids": [a, b]}}));
+    assert_eq!(r["isError"], false, "{r}");
+    let click = |s: &mut Server, id: u64| {
+        let events = json!([{"kind": "down", "x": 225, "y": 125}, {"kind": "up", "x": 225, "y": 125}]);
+        let r = call(s, id, "pointer_gesture", json!({"tool": "selection", "events": events}));
+        assert_eq!(r["isError"], false, "{r}");
+        serde_json::from_str::<Value>(&text_of(&r)).unwrap().get("key").cloned()
+    };
+    assert_eq!(click(&mut s, 4), Some(json!(b)), "a click on a selected object makes it the key");
+    let doc: Value = serde_json::from_str(&text_of(&call(&mut s, 5, "inspect_document", json!({})))).unwrap();
+    assert_eq!(doc.get("key"), Some(&json!(b)));
+    assert_eq!(click(&mut s, 6), Some(Value::Null), "a click on the key again lets it go");
+}
+
+/// Preferences › Type › Show Font Names in English (#394): agents set it with `prefs.set`;
+/// `text.fontList` stays the English (canonical) family names used by `text.setStyle`, not the
+/// native UI labels.
+#[test]
+fn show_font_names_in_english_does_not_change_font_list_for_agents() {
+    let mut s = server();
+    let r = call(&mut s, 1, "run_command", json!({"command": "prefs.set", "params": {"key": "fontNamesInEnglish", "value": false}}));
+    assert_eq!(r["isError"], false, "{r}");
+    let r = call(&mut s, 2, "run_command", json!({"command": "prefs.get", "params": {"key": "fontNamesInEnglish"}}));
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(serde_json::from_str::<Value>(&text_of(&r)).unwrap(), json!(false));
+    let r = call(&mut s, 3, "run_command", json!({"command": "text.fontList", "params": {}}));
+    assert_eq!(r["isError"], false, "{r}");
+    let families = serde_json::from_str::<Value>(&text_of(&r)).unwrap()["families"].as_array().unwrap().clone();
+    // Canonical English name for commands, whatever the UI labels show with the preference off.
+    assert!(families.iter().any(|f| f.as_str() == Some("Source Sans 3")), "{families:?}");
+}
+
+/// Preferences › Type › Highlight Alternate Glyphs (#394): off by default so the canvas stays
+/// clear until an agent (or the Preferences dialog) turns it on. Headless MCP has no canvas.
+#[test]
+fn highlight_alternate_glyphs_pref_round_trips_for_agents() {
+    let mut s = server();
+    let r = call(&mut s, 1, "run_command", json!({"command": "prefs.get", "params": {"key": "highlightAlternateGlyphs"}}));
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(serde_json::from_str::<Value>(&text_of(&r)).unwrap(), json!(false));
+    let r = call(&mut s, 2, "run_command", json!({"command": "prefs.set", "params": {"key": "highlightAlternateGlyphs", "value": true}}));
+    assert_eq!(r["isError"], false, "{r}");
+    let r = call(&mut s, 3, "run_command", json!({"command": "prefs.get", "params": {"key": "highlightAlternateGlyphs"}}));
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(serde_json::from_str::<Value>(&text_of(&r)).unwrap(), json!(true));
+}
+
 /// Type preferences reach agents (#394): type the Type tool places starts with placeholder text,
 /// selected; Alt+→ tracks it by Tracking and Cmd+Shift+. steps its size by Size/Leading.
 #[test]
@@ -587,6 +1118,95 @@ fn type_preferences_apply_to_agents() {
     let r = call(&mut s, 5, "press_key", json!({"key": ".", "mods": {"cmd": true, "shift": true}}));
     assert_eq!(r["isError"], false, "{r}");
     assert_eq!(style(&mut s, 6), (size + 4.0, tracking + 50.0));
+}
+
+/// Cmd+Alt+Shift+. and , reach agents: the placeholder text the Type tool selects steps by five
+/// times the Size/Leading increment (2 pt by default) and back.
+#[test]
+fn cmd_alt_shift_period_steps_the_font_size_by_five_for_agents() {
+    let mut s = server();
+    let events = json!([{"kind": "down", "x": 100, "y": 100}, {"kind": "up", "x": 100, "y": 100}]);
+    let r = call(&mut s, 1, "pointer_gesture", json!({"tool": "type", "events": events}));
+    assert_eq!(r["isError"], false, "{r}");
+    let id = serde_json::from_str::<Value>(&text_of(&r)).unwrap()["selection"][0].as_u64().unwrap();
+    let r = call(&mut s, 2, "run_command", json!({"command": "text.setRangeStyle", "params": {"id": id, "size": 12}}));
+    assert_eq!(r["isError"], false, "{r}");
+    let size = |s: &mut Server, n| {
+        let r = call(s, n, "run_command", json!({"command": "text.getRange", "params": {"id": id, "effective": true}}));
+        serde_json::from_str::<Value>(&text_of(&r)).unwrap()["runs"][0]["style"]["size"].clone()
+    };
+    let r = call(&mut s, 3, "press_key", json!({"key": ".", "mods": {"cmd": true, "alt": true, "shift": true}}));
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(serde_json::from_str::<Value>(&text_of(&r)).unwrap()["command"], "type.size.increaseByFive", "{r}");
+    assert_eq!(size(&mut s, 4), json!(22.0));
+    let r = call(&mut s, 5, "press_key", json!({"key": ",", "mods": {"cmd": true, "alt": true, "shift": true}}));
+    assert_eq!(serde_json::from_str::<Value>(&text_of(&r)).unwrap()["command"], "type.size.decreaseByFive", "{r}");
+    assert_eq!(size(&mut s, 6), json!(12.0));
+}
+
+/// Cmd+Alt+Q reaches agents: the placeholder text the Type tool selects goes back to tracking 0
+/// and Auto kerning.
+#[test]
+fn cmd_alt_q_resets_tracking_and_kerning_for_agents() {
+    let mut s = server();
+    let events = json!([{"kind": "down", "x": 100, "y": 100}, {"kind": "up", "x": 100, "y": 100}]);
+    let r = call(&mut s, 1, "pointer_gesture", json!({"tool": "type", "events": events}));
+    assert_eq!(r["isError"], false, "{r}");
+    let id = serde_json::from_str::<Value>(&text_of(&r)).unwrap()["selection"][0].as_u64().unwrap();
+    let r = call(&mut s, 2, "run_command", json!({"command": "text.setRangeStyle", "params": {"id": id, "tracking": 200, "kerning": -40}}));
+    assert_eq!(r["isError"], false, "{r}");
+    let r = call(&mut s, 3, "press_key", json!({"key": "Q", "mods": {"cmd": true, "alt": true}}));
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(serde_json::from_str::<Value>(&text_of(&r)).unwrap()["command"], "type.resetTracking", "{r}");
+    let r = call(&mut s, 4, "run_command", json!({"command": "text.getRange", "params": {"id": id}}));
+    let runs = serde_json::from_str::<Value>(&text_of(&r)).unwrap()["runs"].clone();
+    assert_eq!(runs.as_array().unwrap().len(), 1, "{runs}");
+    assert_eq!((&runs[0]["style"]["tracking"], &runs[0]["style"]["kerning"]), (&json!(0.0), &Value::Null), "{runs}");
+}
+
+/// Cmd+Shift+X reaches agents: the placeholder text the Type tool selects goes back to a
+/// horizontal scale of 100%.
+#[test]
+fn cmd_shift_x_resets_horizontal_scale_for_agents() {
+    let mut s = server();
+    let events = json!([{"kind": "down", "x": 100, "y": 100}, {"kind": "up", "x": 100, "y": 100}]);
+    let r = call(&mut s, 1, "pointer_gesture", json!({"tool": "type", "events": events}));
+    assert_eq!(r["isError"], false, "{r}");
+    let id = serde_json::from_str::<Value>(&text_of(&r)).unwrap()["selection"][0].as_u64().unwrap();
+    let r = call(&mut s, 2, "run_command", json!({"command": "text.setRangeStyle", "params": {"id": id, "hScale": 150}}));
+    assert_eq!(r["isError"], false, "{r}");
+    let r = call(&mut s, 3, "press_key", json!({"key": "X", "mods": {"cmd": true, "shift": true}}));
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(serde_json::from_str::<Value>(&text_of(&r)).unwrap()["command"], "type.resetHorizontalScale", "{r}");
+    let r = call(&mut s, 4, "run_command", json!({"command": "text.getRange", "params": {"id": id}}));
+    let runs = serde_json::from_str::<Value>(&text_of(&r)).unwrap()["runs"].clone();
+    assert_eq!(runs.as_array().unwrap().len(), 1, "{runs}");
+    assert_eq!(runs[0]["style"]["h_scale"], json!(100.0), "{runs}");
+}
+
+/// `press_key` runs Cmd+/ and Cmd+Alt+/ for agents: a new fill and then a new stroke go on top of
+/// the selected rectangle's appearance stack.
+#[test]
+fn cmd_slash_and_cmd_alt_slash_add_a_fill_and_a_stroke_for_agents() {
+    let mut s = server();
+    let r = call(&mut s, 1, "run_command", json!({"command": "shape.rectangle", "params": {"x": 10, "y": 10, "width": 100, "height": 100}}));
+    let id = serde_json::from_str::<Value>(&text_of(&r)).unwrap()["id"].as_u64().unwrap();
+    let r = call(&mut s, 2, "run_command", json!({"command": "select.set", "params": {"ids": [id]}}));
+    assert_eq!(r["isError"], false, "{r}");
+    let kinds = |s: &mut Server, n: u64| {
+        let r = call(s, n, "run_command", json!({"command": "effect.list", "params": {}}));
+        let items = serde_json::from_str::<Value>(&text_of(&r)).unwrap()["applied"][0]["items"].clone();
+        items.as_array().unwrap().iter().map(|it| it["kind"].as_str().unwrap().to_string()).collect::<Vec<_>>()
+    };
+    assert_eq!(kinds(&mut s, 3), ["fill", "stroke"]);
+    let r = call(&mut s, 4, "press_key", json!({"key": "/", "mods": {"cmd": true}}));
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(serde_json::from_str::<Value>(&text_of(&r)).unwrap()["command"], "appearance.addFill", "{r}");
+    assert_eq!(kinds(&mut s, 5), ["fill", "stroke", "fill"]);
+    let r = call(&mut s, 6, "press_key", json!({"key": "/", "mods": {"cmd": true, "alt": true}}));
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(serde_json::from_str::<Value>(&text_of(&r)).unwrap()["command"], "appearance.addStroke", "{r}");
+    assert_eq!(kinds(&mut s, 7), ["fill", "stroke", "fill", "stroke"]);
 }
 
 /// The drawing tools snap to Smart Guides over MCP as with the mouse (#506): a Rectangle drawn
@@ -614,4 +1234,20 @@ fn drawing_gestures_snap_to_smart_guides() {
     assert_eq!(r["isError"], false, "{r}");
     let events = json!([{"kind": "down", "x": 300, "y": 420}, {"kind": "up", "x": 300, "y": 420}, {"kind": "move", "x": 151.5, "y": 431}, {"kind": "down", "x": 151.5, "y": 431}, {"kind": "up", "x": 151.5, "y": 431}]);
     assert_eq!(bounds(&mut s, 6, events, "pen"), [150.0, 420.0, 150.0, 11.0]);
+}
+
+/// #1471: add_text says when the text doesn't fit its frame, and takes area type's `fit`.
+#[test]
+fn add_text_reports_overflow_and_takes_a_fit() {
+    let mut s = server();
+    let made = |r: &Value| serde_json::from_str::<Value>(&text_of(r)).unwrap();
+    let headline = json!({"text": "NEON DRIVE", "x": 0, "y": 20, "width": 400, "height": 60, "size": 60});
+    let low = made(&call(&mut s, 1, "add_text", headline.clone()));
+    assert_eq!(low["overflow"], true, "{low}");
+    let mut auto = headline;
+    auto["fit"] = json!("autoHeight");
+    let auto = made(&call(&mut s, 2, "add_text", auto));
+    assert!(auto["id"].is_u64() && auto.get("overflow").is_none(), "{auto}");
+    let point = made(&call(&mut s, 3, "add_text", json!({"text": "NEON DRIVE", "x": 0, "y": 300, "size": 60})));
+    assert!(point.get("overflow").is_none(), "{point}");
 }

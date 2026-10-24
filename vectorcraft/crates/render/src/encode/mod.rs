@@ -15,7 +15,9 @@ pub mod tga;
 pub mod tiff;
 pub mod web;
 
-use vectorcraft_doc::{Document, Node, NodeKind};
+use std::sync::Arc;
+
+use vectorcraft_doc::{Document, Node, NodeKind, SymbolBoxes};
 use vectorcraft_geom::Rect;
 
 use crate::{AntiAlias, RenderOptions, Rendered, Renderer, fx};
@@ -60,6 +62,9 @@ pub struct RasterExportOptions {
     pub tga: tga::TgaOptions,
     /// PSD colour model, layers and profile.
     pub psd: psd::PsdOptions,
+    /// Appearance of Black › Printing / Exporting › Output All Blacks as Rich Black: pure CMYK
+    /// black (K alone at 100%) becomes RGB black in RGB raster exports (document values unchanged).
+    pub rich_black: bool,
 }
 
 impl Default for RasterExportOptions {
@@ -76,6 +81,7 @@ impl Default for RasterExportOptions {
             bmp: bmp::BmpOptions::default(),
             tga: tga::TgaOptions::default(),
             psd: psd::PsdOptions::default(),
+            rich_black: false,
         }
     }
 }
@@ -86,8 +92,8 @@ impl RasterExportOptions {
         self.ppi / 72.0
     }
 
-    /// What the renderer draws for `format`: template layers left out, over the background
-    /// (white for a JPEG or a flat PSD without one).
+    /// What the renderer draws for `format`: template layers and guides left out, over the background
+    /// (white for a JPEG or a flat PSD without one), composited in floating point.
     pub fn render_options(&self, format: RasterFormat) -> RenderOptions {
         let flat = format == RasterFormat::Jpeg || (format == RasterFormat::Psd && !self.psd.layers);
         let background = self.background.or(flat.then_some([255; 3]));
@@ -95,6 +101,11 @@ impl RasterExportOptions {
             background: background.map(|[r, g, b]| [r, g, b, 255]),
             skip_templates: true,
             anti_alias: self.anti_alias,
+            // Opaque art stays exactly opaque where translucent edges cross it (#787).
+            precise: true,
+            // Shapes meeting edge to edge leave no seam (#983).
+            supersample: true,
+            rich_black: self.rich_black,
             ..Default::default()
         }
     }
@@ -182,23 +193,88 @@ pub(crate) fn webp(img: &Rendered) -> Result<Vec<u8>, String> {
 }
 
 /// Bounds of the art an export draws: visible objects off template layers (guides left out),
-/// with their strokes and live effects. `None` when nothing would be drawn.
+/// each measured by [`crate::effect_bounds`]: with its strokes and its effects (the effects of
+/// groups, layers, type and images included), symbol instances by their art, and a Shaper group
+/// without effects of its own by the art it shows. `None` when nothing would be drawn.
 pub fn art_bounds(doc: &Document) -> Option<Rect> {
-    doc.layers.iter().fold(None, |acc, l| vectorcraft_geom::union_opt(acc, drawn_bounds(l)))
+    let symbols = doc.symbol_boxes();
+    doc.layers.iter().fold(None, |acc, l| vectorcraft_geom::union_opt(acc, drawn_bounds(&symbols, l)))
 }
 
-fn drawn_bounds(n: &Node) -> Option<Rect> {
+/// Bounds of the art an export draws ([`art_bounds`]) that is on artboard rectangle `rect`: each
+/// object of a layer or sublayer whose drawn bounds overlap `rect`, with all of its bounds; a group
+/// or a clipping layer counts as one object. `None` when no object overlaps `rect`.
+pub fn art_bounds_on(doc: &Document, rect: Rect) -> Option<Rect> {
+    // Art flush with an edge from outside can overlap it by a rounding error (#1295).
+    let rect = rect.inflate(-1e-6, -1e-6);
+    fn on(symbols: &SymbolBoxes, n: &Node, rect: Rect) -> Option<Rect> {
+        match &n.kind {
+            NodeKind::Layer { template: false, clip: false, children, .. } if n.visible => {
+                children.iter().fold(None, |acc, c| vectorcraft_geom::union_opt(acc, on(symbols, c, rect)))
+            }
+            _ => drawn_bounds(symbols, n).filter(|b| b.x0 < rect.x1 && b.x1 > rect.x0 && b.y0 < rect.y1 && b.y1 > rect.y0),
+        }
+    }
+    let symbols = doc.symbol_boxes();
+    doc.layers.iter().fold(None, |acc, l| vectorcraft_geom::union_opt(acc, on(&symbols, l, rect)))
+}
+
+/// Bounds of what an export draws of object `n` ([`art_bounds`]): `None` when `n` is hidden, a
+/// guide or a template layer. The hidden objects, guides and template layers in it are left out,
+/// except in a group or layer with effects of its own that keep all its members (`without_undrawn`
+/// lists them). Symbol instances are measured by their art in `symbols`.
+pub fn drawn_bounds(symbols: &SymbolBoxes, n: &Node) -> Option<Rect> {
     if !n.visible {
         return None;
     }
     match &n.kind {
         NodeKind::Layer { template: true, .. } | NodeKind::Path { guide: true, .. } => None,
-        NodeKind::Layer { children, .. } | NodeKind::Group { children, clip: false } => {
-            children.iter().fold(None, |acc, c| vectorcraft_geom::union_opt(acc, drawn_bounds(c)))
-        }
-        _ if fx::has_fx(n) => fx::visual_bounds(n),
-        _ => n.visual_bounds(),
+        NodeKind::Layer { children, clip: false, .. } | NodeKind::Group { children, clip: false } if !fx::has_object_fx(n) => children
+            .iter()
+            .skip(usize::from(n.extras().shaper.is_some()))
+            .fold(None, |acc, c| vectorcraft_geom::union_opt(acc, drawn_bounds(symbols, c))),
+        _ => crate::effect_bounds(symbols, without_undrawn(n).as_ref().unwrap_or(n)),
     }
+}
+
+/// `n`, a group or layer that doesn't clip, without the hidden objects, guides and template layers
+/// in it and in the groups and layers in it that don't clip, or `None` when it holds none of them
+/// or is anything else. A Shaper group keeps all its members, and so does a group or layer with a
+/// visible geometry, Pathfinder, Crop Marks or 3D effect, or with a visible effect on one of its
+/// own visible fills or strokes.
+fn without_undrawn(n: &Node) -> Option<Node> {
+    use crate::effects;
+    let keeps_all = n.extras().shaper.is_some()
+        || effects::has_geometry(&n.appearance.effects)
+        || effects::has_pathfinder(n)
+        || effects::has_crop_marks(n)
+        || effects::has_revolve(n)
+        || effects::has_solid(n)
+        || n.appearance.items.iter().any(|i| i.visible() && i.effects().iter().any(|e| e.visible));
+    if keeps_all || !matches!(n.kind, NodeKind::Layer { clip: false, .. } | NodeKind::Group { clip: false, .. }) {
+        return None;
+    }
+    let undrawn = |c: &Node| !c.visible || matches!(c.kind, NodeKind::Layer { template: true, .. } | NodeKind::Path { guide: true, .. });
+    let mut changed = false;
+    let kept: Vec<Arc<Node>> = n
+        .children()?
+        .iter()
+        .filter_map(|c| {
+            if undrawn(c) {
+                changed = true;
+                return None;
+            }
+            let part = without_undrawn(c);
+            changed |= part.is_some();
+            Some(part.map_or_else(|| c.clone(), Arc::new))
+        })
+        .collect();
+    if !changed {
+        return None;
+    }
+    let mut out = n.clone();
+    *out.children_mut()? = kept;
+    Some(out)
 }
 
 #[cfg(test)]

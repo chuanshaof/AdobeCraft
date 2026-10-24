@@ -75,12 +75,37 @@ proptest! {
         d.images.insert(key.clone(), ImageBlob::new("image/png", data.clone()));
         let layer = d.layers[0].id;
         let id = d.alloc_id();
-        let im = ImageObject { key: key.clone(), width: 1, height: 1, xf: Affine::IDENTITY, link: None, placement: Default::default() };
-        d.insert(Some(layer), 0, Node::new(id, NodeKind::Image(im))).unwrap();
+        let im = ImageObject { key: key.clone(), width: 1, height: 1, xf: Affine::IDENTITY, link: None, placement: Default::default(), pixels: None };
+        d.insert(Some(layer), 0, Node::new(id, NodeKind::Image(Box::new(im)))).unwrap();
         for pretty in [false, true] {
             let back = load(&save(&d, pretty)).unwrap();
             prop_assert_eq!(back.images.get(&key).map(|b| b.bytes.as_ref().clone()), Some(data.clone()));
         }
+    }
+
+    /// Area type's rows and columns from a file: a count up to `u64::MAX` reads clamped to 1..=100,
+    /// and what loads saves and loads again unchanged.
+    #[test]
+    fn area_type_rows_and_columns_read_as_1_to_100(rows in prop_oneof![0u64..=200, any::<u64>()], columns in prop_oneof![0u64..=200, any::<u64>()]) {
+        use vectorcraft_doc::{AreaOptions, TextKind, TextObject};
+        use vectorcraft_geom::{Point, Rect, shapes};
+        let count = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
+        let mut t = TextObject::point(Point::ZERO, "Rows and columns", Default::default());
+        t.kind = TextKind::Area { frame: shapes::rectangle(Rect::new(0.0, 0.0, 300.0, 120.0)) };
+        t.area.rows = count(rows);
+        t.area.columns = count(columns);
+        let mut d = Document::new(400.0, 300.0);
+        let layer = d.layers[0].id;
+        let id = d.alloc_id();
+        d.insert(Some(layer), 0, Node::new(id, NodeKind::Text(Box::new(t)))).unwrap();
+        let read = |d: &Document| match d.node(id).map(|n| &n.kind) {
+            Some(NodeKind::Text(t)) => Some((t.area.rows, t.area.columns)),
+            _ => None,
+        };
+        let back = load(&save(&d, false)).unwrap();
+        let max = AreaOptions::MAX_ROWS_COLUMNS;
+        prop_assert_eq!(read(&back), Some((count(rows).clamp(1, max), count(columns).clamp(1, max))));
+        prop_assert_eq!(read(&load(&save(&back, false)).unwrap()), read(&back));
     }
 
     /// Compressed and older-version saves of random documents load to the same document.
@@ -200,7 +225,7 @@ fn approx_equal_documents_compare_equal() {
 fn bug_f64_bit_exact_roundtrip() {
     check_native_roundtrip_exact(&rich_doc()).unwrap();
     let mut d = Document::new(126.86291501015239, 214.69463130731182);
-    d.raster_effects_ppi = 0.1 + 0.2;
+    d.raster_effects_ppi = (0.1 + 0.2) * 1000.0;
     check_native_roundtrip_exact(&d).unwrap();
 }
 

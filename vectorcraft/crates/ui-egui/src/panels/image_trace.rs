@@ -19,6 +19,16 @@ const MODES: [(&str, &str); 4] = [("blackAndWhite", "Black and White"), ("graysc
 const PALETTES: [&str; 4] = ["limited", "fullTone", "automatic", "documentLibrary"];
 
 /// Palette `id`, in the UI language.
+/// The colour Ignore Color leaves out in `params` (`ignoreColor`, `#rrggbb`): white when there is none.
+fn ignore_color(params: &Value) -> [u8; 3] {
+    let hex = params["ignoreColor"].as_str().unwrap_or("").trim_start_matches('#');
+    let channel = |i: usize| hex.get(i * 2..i * 2 + 2).and_then(|h| u8::from_str_radix(h, 16).ok());
+    match (hex.len(), channel(0), channel(1), channel(2)) {
+        (6, Some(r), Some(g), Some(b)) => [r, g, b],
+        _ => [255; 3],
+    }
+}
+
 fn palette_label(id: &str) -> &'static str {
     match id {
         "fullTone" => tl!("Full Tone"),
@@ -43,7 +53,7 @@ fn library_label(app: &VectorcraftApp, key: &str) -> String {
 fn library_list(app: &VectorcraftApp, ui: &mut Ui, current: &str) -> Option<String> {
     let document = menu_item(ui, swatches::DOCUMENT_SWATCHES, true, current == DOCUMENT_SWATCHES).then(|| DOCUMENT_SWATCHES.to_string());
     ui.separator();
-    library_panel::library_items(ui, &swatches::colour_libraries(app), Some(current)).or(document)
+    library_panel::library_items(ui, &swatches::colour_libraries(app), &|id| id == current).or(document)
 }
 
 /// Panel state: the preset name, the current parameters, the view and the last result's counts.
@@ -58,11 +68,12 @@ struct TraceUi {
     synced: Value,
 }
 
-fn presets(app: &mut VectorcraftApp) -> Vec<(String, Value)> {
+/// Each preset: its name, its parameters, and those of its enhanced version (null if it has none).
+fn presets(app: &mut VectorcraftApp) -> Vec<(String, Value, Value)> {
     let v = app.session.execute("imageTrace.presets", &json!({})).unwrap_or_default();
     v["presets"]
         .as_array()
-        .map(|a| a.iter().map(|p| (p["name"].as_str().unwrap_or("").to_string(), p["params"].clone())).collect())
+        .map(|a| a.iter().map(|p| (p["name"].as_str().unwrap_or("").to_string(), p["params"].clone(), p["enhanced"].clone())).collect())
         .unwrap_or_default()
 }
 
@@ -76,7 +87,7 @@ pub(crate) fn is_trace(n: &Node) -> bool {
 /// What the selection is: an Image Trace object (with its stored settings), a plain image, or neither.
 fn target(app: &VectorcraftApp) -> (bool, bool, Option<Value>) {
     let Some(n) = first_selected(app) else { return (false, false, None) };
-    (is_trace(&n), matches!(n.kind, NodeKind::Image(_)), n.trace.map(|t| *t))
+    (is_trace(&n), matches!(n.kind, NodeKind::Image(_)), n.extras().trace.as_deref().cloned())
 }
 
 /// The one selected Image Trace object's preset ("Custom" once its settings were changed) and view.
@@ -84,7 +95,7 @@ pub(crate) fn selected_trace(app: &VectorcraftApp) -> Option<(String, TraceView)
     let st = app.session.active()?;
     let [id] = st.selection.objects[..] else { return None };
     let n = st.doc.node(id).filter(|n| is_trace(n))?;
-    Some((n.trace.as_ref().and_then(|t| t["preset"].as_str()).unwrap_or("Custom").to_string(), n.trace_view()))
+    Some((n.extras().trace.as_ref().and_then(|t| t["preset"].as_str()).unwrap_or("Custom").to_string(), n.trace_view()))
 }
 
 /// Image Trace › View, in the UI language.
@@ -114,23 +125,43 @@ fn set_view(app: &mut VectorcraftApp, view: TraceView) {
 /// The selected Image Trace object's View row (Control bar, Properties).
 pub(crate) fn view_row(app: &mut VectorcraftApp, ui: &mut Ui, current: TraceView, width: f32) {
     widgets::dim_label(ui, tl!("View:"));
-    if let Some(v) = view_dropdown(ui, current, width) {
+    // No wider than what the label leaves of the row (#1358).
+    if let Some(v) = view_dropdown(ui, current, width.min(ui.available_width())) {
         set_view(app, v);
     }
 }
 
 /// Trace the selected image, or trace the selected Image Trace object again, with built-in `preset`.
 fn trace_with(app: &mut VectorcraftApp, preset: &str) {
-    // A failure is reported in the status bar.
+    // A failure is reported in the status bar. The panel stays as it was: the Image Trace
+    // button (Properties, Control bar) opens it.
     let _ = app.run("imageTrace.make", json!({ "preset": preset }));
+}
+
+/// Reveal the editable tracing controls, including fidelity, in the panel's current location.
+pub(crate) fn open_settings(app: &mut VectorcraftApp) {
+    // Icon panels toggle when activated, so an already open flyout must stay open.
+    if app.ui.open_panel.as_deref() != Some("imageTrace")
+        && let Err(e) = app.run("window.panel.activate", json!({ "panel": "imageTrace" }))
+    {
+        app.ui.status = e;
+        return;
+    }
+    app.ui.image_trace_advanced = true;
 }
 
 /// The built-in presets to choose from (`current` highlighted) → the one chosen. Listed only
 /// while the menu is open.
+/// A preset's name as shown: translated as a preset's name where the catalog has it so (the
+/// Outline preset is not the Outline view), as any other string else.
+fn preset_label(name: &str) -> &str {
+    crate::i18n::tr_ctx(crate::i18n::current(), "imageTrace", name)
+}
+
 fn preset_list(app: &mut VectorcraftApp, ui: &mut Ui, current: &str) -> Option<String> {
     let mut chosen = None;
-    for (name, _) in presets(app) {
-        if ui.add(egui::Button::selectable(name == current, tl!(&name))).clicked() {
+    for (name, ..) in presets(app) {
+        if ui.add(egui::Button::selectable(name == current, preset_label(&name))).clicked() {
             chosen = Some(name);
         }
     }
@@ -143,11 +174,10 @@ pub(crate) const TRACE_BUTTON_W: f32 = 104.0;
 /// The Image Trace button for a selected image (Control bar, Properties): a click traces it with
 /// the Default preset, its arrow lists the presets to trace it with.
 pub(crate) fn trace_button(app: &mut VectorcraftApp, ui: &mut Ui, width: f32) {
-    let (main, arrow) = widgets::split_button(ui, tl!("Image Trace"), width);
+    let (main, arrow) = widgets::split_button_named(ui, tl!("Image Trace"), tl!("Tracing Presets"), width);
     if main.on_hover_text(tl!("Trace the image with the Default preset")).clicked() {
         trace_with(app, "Default");
     }
-    let arrow = arrow.on_hover_text(tl!("Tracing Presets"));
     if let Some(p) = egui::Popup::menu(&arrow).show(|ui| preset_list(app, ui, "")).and_then(|r| r.inner) {
         trace_with(app, &p);
     }
@@ -169,7 +199,7 @@ pub fn control_bar(app: &mut VectorcraftApp, ui: &mut Ui) -> bool {
     preset_dropdown(app, ui, &preset, 150.0);
     view_row(app, ui, view, 190.0);
     if widgets::icon_button(ui, "image", tl!("Image Trace"), false, 24.0).clicked() {
-        app.ui.open_panel = Some("imageTrace".into());
+        open_settings(app);
     }
     if widgets::flat_button(ui, tl!("Expand"), 64.0).clicked() {
         app.run("imageTrace.expand", json!({})).ok();
@@ -181,7 +211,14 @@ pub fn control_bar(app: &mut VectorcraftApp, ui: &mut Ui) -> bool {
 fn trace(app: &mut VectorcraftApp, st: &mut TraceUi) {
     let preset = if st.preset == "Custom" { "Default" } else { st.preset.as_str() };
     match app.run("imageTrace.make", json!({ "preset": preset, "params": st.params, "view": st.view.id() })) {
-        Ok(r) => st.info = Some((r["paths"].as_u64().unwrap_or(0), r["anchors"].as_u64().unwrap_or(0), r["colors"].as_u64().unwrap_or(0))),
+        Ok(r) => {
+            st.info = Some((r["paths"].as_u64().unwrap_or(0), r["anchors"].as_u64().unwrap_or(0), r["colors"].as_u64().unwrap_or(0)));
+            // Adopt the committed state immediately: Undo before the next panel frame must
+            // still be recognized as a change, even when it returns to the previous settings.
+            if let Some(stored) = target(app).2 {
+                st.synced = stored;
+            }
+        }
         Err(e) => app.ui.status = e,
     }
 }
@@ -195,6 +232,9 @@ fn slider(ui: &mut Ui, label: &str, v: &mut f64, range: std::ops::RangeInclusive
         ui.visuals_mut().widgets.inactive.bg_fill = t.input_border;
         ui.visuals_mut().selection.bg_fill = t.accent;
         let r = ui.add(egui::Slider::new(v, range).suffix(suffix).integer().trailing_fill(true));
+        if cfg!(test) {
+            ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new(("trace-slider", label)), r.rect));
+        }
         out = (r.changed(), r.drag_stopped() || (r.changed() && !r.dragged()));
     });
     out
@@ -225,6 +265,14 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
             retrace = true;
         }
     });
+    // The preset's enhanced version (with Shapes and Auto Grouping) or its legacy one.
+    if let Some((_, legacy, better)) = all.iter().find(|p| p.0 == st.preset && !p.2.is_null()) {
+        let on = *better == st.params;
+        if widgets::check(ui, tl!("Enhanced"), on, true) {
+            st.params = if on { legacy.clone() } else { better.clone() };
+            retrace = true;
+        }
+    }
     ui.horizontal(|ui| {
         widgets::dim_label(ui, tl!("View:"));
         if let Some(v) = view_dropdown(ui, st.view, 170.0) {
@@ -282,6 +330,10 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     let (changed, release) = slider(ui, label, &mut v, range, suffix);
     if changed {
         st.params[key] = if key == "colorDetail" { json!(v.round()) } else { json!(v.round() as u64) };
+    }
+    // Keep the preset's Enhanced row (and widget identities) until the drag finishes.
+    // Switching to Custom mid-drag removes that row and loses the slider's release event.
+    if release {
         st.preset = "Custom".into();
     }
     retrace |= release;
@@ -299,6 +351,8 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
             let (changed, release) = slider(ui, label, &mut v, range, suffix);
             if changed {
                 st.params[key] = if key == "noise" { json!(v.round() as u64) } else { json!(v.round()) };
+            }
+            if release {
                 st.preset = "Custom".into();
             }
             retrace |= release;
@@ -333,18 +387,54 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
             let (changed, release) = ui.add_enabled_ui(strokes, |ui| slider(ui, tl!("Stroke"), &mut v, 1.0..=100.0, " px")).inner;
             if changed {
                 st.params["strokeWidth"] = json!(v.round());
+            }
+            if release {
                 st.preset = "Custom".into();
             }
             retrace |= release;
         }
-        for (key, label) in [("snapCurvesToLines", tl!("Snap Curves To Lines")), ("ignoreWhite", tl!("Ignore White"))] {
-            let on = st.params[key].as_bool().unwrap_or(false);
-            if widgets::check(ui, label, on, true) {
-                st.params[key] = json!(!on);
+        let snap = st.params["snapCurvesToLines"].as_bool().unwrap_or(false);
+        if widgets::check(ui, tl!("Snap Curves To Lines"), snap, true) {
+            st.params["snapCurvesToLines"] = json!(!snap);
+            st.preset = "Custom".into();
+            retrace = true;
+        }
+        let shapes = st.params["shapes"].as_bool().unwrap_or(false);
+        if widgets::check(ui, tl!("Shapes"), shapes, true) {
+            st.params["shapes"] = json!(!shapes);
+            st.preset = "Custom".into();
+            retrace = true;
+        }
+        let grouping = st.params["autoGrouping"].as_bool().unwrap_or(false);
+        if widgets::check(ui, tl!("Auto Grouping"), grouping, true) {
+            st.params["autoGrouping"] = json!(!grouping);
+            st.preset = "Custom".into();
+            retrace = true;
+        }
+        // (Black and White has one colour and Flat Logo flat ones: no gradients to find.)
+        let gradients = st.params["gradients"].as_bool().unwrap_or(false);
+        if widgets::check(ui, tl!("Gradients"), gradients, mode == "grayscale" || mode == "color") {
+            st.params["gradients"] = json!(!gradients);
+            st.preset = "Custom".into();
+            retrace = true;
+        }
+        // Ignore Color: white, unless another colour is picked.
+        ui.horizontal(|ui| {
+            let on = st.params["ignoreWhite"].as_bool().unwrap_or(false);
+            if widgets::check(ui, tl!("Ignore Color"), on, true) {
+                st.params["ignoreWhite"] = json!(!on);
                 st.preset = "Custom".into();
                 retrace = true;
             }
-        }
+            if on {
+                let mut rgb = ignore_color(&st.params);
+                if ui.color_edit_button_srgb(&mut rgb).changed() {
+                    st.params["ignoreColor"] = json!(format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2]));
+                    st.preset = "Custom".into();
+                    retrace = true;
+                }
+            }
+        });
     }
     widgets::divider(ui);
     if let Some((p, a, c)) = st.info {
@@ -408,15 +498,220 @@ mod tests {
     }
 
     fn traced_app() -> VectorcraftApp {
+        traced_app_with_ink(0)
+    }
+
+    /// A quick trace, then the Image Trace button.
+    fn trace_and_open(app: &mut VectorcraftApp, preset: &str) {
+        trace_with(app, preset);
+        open_settings(app);
+    }
+
+    fn traced_app_with_ink(ink: u8) -> VectorcraftApp {
         let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
         app.session.execute("file.new", &json!({"width": 100, "height": 100})).unwrap();
-        let img = image::RgbaImage::from_fn(20, 20, |x, _| image::Rgba(if x < 10 { [0, 0, 0, 255] } else { [255, 255, 255, 255] }));
+        let img = image::RgbaImage::from_fn(20, 20, |x, _| image::Rgba(if x < 10 { [ink, ink, ink, 255] } else { [255, 255, 255, 255] }));
         let mut png = vec![];
         img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
         let data = vectorcraft_format::base64_encode(&png);
         app.run("file.place", json!({"name": "half.png", "dataBase64": data, "link": false})).unwrap();
         app.run("imageTrace.make", json!({"preset": "Default"})).unwrap();
         app
+    }
+
+    #[test]
+    fn a_large_image_traces_and_the_status_bar_says_it_is_slower() {
+        let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+        app.session.execute("file.new", &json!({"width": 100, "height": 100})).unwrap();
+        let img = image::RgbaImage::from_fn(1601, 12, |x, _| image::Rgba(if x < 800 { [0, 0, 0, 255] } else { [255, 255, 255, 255] }));
+        let mut png = vec![];
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let data = vectorcraft_format::base64_encode(&png);
+        app.run("file.place", json!({"name": "wide.png", "dataBase64": data, "link": false})).unwrap();
+        trace_with(&mut app, "Default");
+        assert!(target(&app).2.is_some(), "the image is traced");
+        assert!(app.ui.status.contains("1601 × 12") && app.ui.status.contains("more slowly"), "{}", app.ui.status);
+    }
+
+    #[test]
+    fn sketch_quick_trace_reveals_all_adjustments_and_keeps_the_source() {
+        let mut app = traced_app();
+        app.run("imageTrace.release", json!({})).unwrap();
+        app.ui.image_trace_advanced = false;
+        trace_and_open(&mut app, "Sketched Art");
+        assert_eq!(app.ui.open_panel.as_deref(), Some("imageTrace"));
+        assert!(app.ui.image_trace_advanced);
+        assert_eq!(selected_trace(&app).unwrap().0, "Sketched Art");
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let texts = frame(&mut app, &ctx, vec![]);
+        for label in ["Threshold", "Paths", "Corners", "Noise", "Method:", "Fills", "Strokes", "Ignore Color"] {
+            assert!(texts.iter().any(|(t, _)| t == label), "missing {label}: {texts:?}");
+        }
+        let n = first_selected(&app).unwrap();
+        assert!(is_trace(&n));
+        assert!(matches!(n.children().unwrap()[0].kind, NodeKind::Image(_)));
+        // Opening controls again neither closes the flyout nor adds a document undo step.
+        let steps = app.session.active().unwrap().history.undo.len();
+        open_settings(&mut app);
+        assert_eq!(app.ui.open_panel.as_deref(), Some("imageTrace"));
+        assert_eq!(app.session.active().unwrap().history.undo.len(), steps);
+        // Optional local visual QA; no reference images or generated captures are committed.
+        if let Some(path) = std::env::var_os("VECTORCRAFT_TRACE_CAPTURE") {
+            let mut ready = false;
+            let mut harness = egui_kittest::Harness::builder().with_size(vec2(340.0, 820.0)).wgpu().build_ui_state(
+                move |ui, app: &mut VectorcraftApp| {
+                    if !ready {
+                        egui_extras::install_image_loaders(ui.ctx());
+                        crate::theme::install_fonts(ui.ctx());
+                        crate::theme::apply(ui.ctx(), crate::theme::Brightness::MediumDark);
+                        ready = true;
+                        return;
+                    }
+                    show(app, ui);
+                },
+                app,
+            );
+            harness.run_steps(4);
+            harness.render().unwrap().save(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_quick_trace_leaves_the_panel_as_it_was() {
+        let mut app = traced_app();
+        app.run("imageTrace.release", json!({})).unwrap();
+        app.ui.open_panel = None;
+        app.ui.image_trace_advanced = false;
+        trace_with(&mut app, "Sketched Art");
+        assert!(is_trace(&first_selected(&app).unwrap()));
+        assert!(app.ui.open_panel.is_none());
+        assert!(!app.ui.image_trace_advanced);
+    }
+
+    #[test]
+    fn quick_trace_activates_the_existing_floating_panel() {
+        let mut app = traced_app();
+        app.run("window.panel.float", json!({"panel": "imageTrace"})).unwrap();
+        let before = app.ui.docking.clone().unwrap();
+        trace_and_open(&mut app, "Sketched Art");
+        let after = app.ui.docking.as_ref().unwrap();
+        assert_eq!(after.floating.len(), before.floating.len());
+        assert!(after.floating.iter().any(|g| g.panels == ["imageTrace"]));
+        assert!(app.ui.open_panel.is_none(), "the existing floating group owns the panel");
+    }
+
+    #[test]
+    fn adjusting_sketch_threshold_changes_the_vector_result_and_can_be_undone() {
+        let mut app = traced_app_with_ink(100);
+        trace_and_open(&mut app, "Sketched Art");
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        frame(&mut app, &ctx, vec![]);
+        let rail = ctx.data(|d| d.get_temp::<Rect>(egui::Id::new(("trace-slider", "Threshold")))).unwrap();
+        let at = rail.left_center() + vec2(20.0, 0.0);
+        assert_eq!(first_selected(&app).unwrap().children().unwrap().len(), 2, "source and ink path");
+        for pressed in [true, false] {
+            frame(
+                &mut app,
+                &ctx,
+                vec![
+                    Event::PointerMoved(at),
+                    Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Default::default() },
+                ],
+            );
+        }
+        assert_eq!(first_selected(&app).unwrap().children().unwrap().len(), 1, "only the source remains below the ink's luminance");
+        app.run("edit.undo", json!({})).unwrap();
+        assert_eq!(first_selected(&app).unwrap().children().unwrap().len(), 2);
+        frame(&mut app, &ctx, vec![]);
+        let state: TraceUi = pstate(&ctx, "image-trace");
+        assert_eq!(state.params["threshold"], 150);
+    }
+
+    #[test]
+    fn sketch_adjustment_sliders_retrace_on_release() {
+        let mut app = traced_app();
+        trace_and_open(&mut app, "Sketched Art");
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        for (label, key) in [("Threshold", "threshold"), ("Paths", "paths"), ("Corners", "corners"), ("Noise", "noise")] {
+            frame(&mut app, &ctx, vec![]);
+            let rail = ctx.data(|d| d.get_temp::<Rect>(egui::Id::new(("trace-slider", label)))).unwrap();
+            let at = rail.left_center() + vec2(20.0, 0.0);
+            let press = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+            let before = target(&app).2.unwrap()["params"][key].clone();
+            let preset_before = pstate::<TraceUi>(&ctx, "image-trace").preset;
+            let steps = app.session.active().unwrap().history.undo.len();
+            frame(&mut app, &ctx, vec![Event::PointerMoved(at), press(true)]);
+            assert_eq!(app.session.active().unwrap().history.undo.len(), steps, "{label} waits for release");
+            let draft: TraceUi = pstate(&ctx, "image-trace");
+            assert_ne!(draft.params[key], before, "{label} updates while held");
+            assert_eq!(draft.preset, preset_before, "the preset row stays in place during {label}");
+            frame(&mut app, &ctx, vec![press(false)]);
+            let stored = target(&app).2.unwrap();
+            assert_ne!(
+                stored["params"][key],
+                before,
+                "{label} reaches the tracer; rail {rail:?}, draft {:?}",
+                pstate::<TraceUi>(&ctx, "image-trace").params
+            );
+            assert_eq!(stored["preset"], "Custom");
+            assert_eq!(app.session.active().unwrap().history.undo.len(), steps + 1, "one undo step for {label}");
+            frame(&mut app, &ctx, vec![]);
+            let state: TraceUi = pstate(&ctx, "image-trace");
+            assert_eq!(state.params, stored["params"], "{label} survives the next frame");
+        }
+    }
+
+    #[test]
+    fn properties_can_reopen_the_trace_controls() {
+        let mut app = traced_app();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let mut at = None;
+        for _ in 0..2 {
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| super::super::properties::show(&mut app, ui));
+            let texts = crate::tests_removeanchors::shapes_text(&out.shapes.iter().map(|c| c.shape.clone()).collect::<Vec<_>>());
+            // The first Image Trace text is the section heading, the last is the button.
+            at = texts.iter().rev().find(|(t, _)| t == "Image Trace").map(|(_, r)| r.center());
+            out.textures_delta.clear();
+        }
+        let at = at.unwrap();
+        for pressed in [true, false] {
+            let events = vec![
+                Event::PointerMoved(at),
+                Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Default::default() },
+            ];
+            let mut out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| super::super::properties::show(&mut app, ui));
+            out.textures_delta.clear();
+        }
+        assert_eq!(app.ui.open_panel.as_deref(), Some("imageTrace"));
+    }
+
+    /// #1358: in Properties the View row fits the panel, so the panel doesn't widen and clip its
+    /// labels (the row took the panel's whole width for its menu, beside its label).
+    #[test]
+    fn the_view_row_fits_the_properties_panel() {
+        let mut app = traced_app();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        // Where the panel's content ends after a few frames.
+        let right = |app: &mut VectorcraftApp| {
+            let mut right = 0.0;
+            for _ in 0..3 {
+                let screen = Rect::from_min_size(Pos2::ZERO, vec2(280.0, 700.0));
+                let mut out = ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+                    crate::panels::properties::show(app, ui);
+                    right = ui.min_rect().right();
+                });
+                out.textures_delta.clear();
+            }
+            right
+        };
+        let traced = right(&mut app);
+        app.run("select.none", json!({})).unwrap();
+        assert_eq!(traced, right(&mut app));
     }
 
     #[test]

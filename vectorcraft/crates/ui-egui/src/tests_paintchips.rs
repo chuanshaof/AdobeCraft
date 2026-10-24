@@ -319,6 +319,6 @@ fn the_popover_swatch_libraries_button_opens_the_libraries_menu() {
     let earth = menu_item_rect(&shapes, "Earth Tones").expect("the menu lists the built-in libraries");
     assert!(earth.top() > defaults.top());
     click(&mut app, &ctx, earth.center(), Modifiers::NONE, control_bar);
-    let open = app.ui.library_panel.as_ref().map(|o| (o.kind.clone(), o.id.clone()));
+    let open = crate::panels::library_panel::last_open(&app.ui).map(|o| (o.kind.clone(), o.id.clone()));
     assert_eq!(open, Some(("swatches".into(), "earth-tones".into())));
 }

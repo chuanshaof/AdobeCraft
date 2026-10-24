@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use vectorcraft_color::freeform::{painted_box, spread_scale};
 use vectorcraft_color::{BlendMode, GradientKind, GradientPaint, Paint};
-use vectorcraft_doc::{AppearanceItem, Dash, Document, ImageObject, LineCap, LineJoin, Node, NodeKind, StrokeLayer};
+use vectorcraft_doc::{AppearanceItem, Dash, Document, ImageObject, LineCap, LineJoin, Node, NodeKind, StrokeLayer, SymbolBoxes};
 use vectorcraft_effects::stroke;
 use vectorcraft_geom::{Affine, BezPath, FillRule, PathData, Point, Rect, Shape};
 
@@ -17,6 +17,9 @@ use crate::dib::Rgba;
 
 /// How deep symbols, brush art and pattern tiles may nest in one another (deeper art is left out).
 const MAX_NEST: u32 = 8;
+/// Most pattern tiles written in all. One fill tiles at most 250,000 (`PatternDef::offsets_covering`),
+/// but a tile whose art is filled with a pattern again multiplies that at every level of nesting.
+const MAX_TILES: usize = 250_000;
 /// Most pixels along a side of a gradient's image (its colours are smooth).
 const MAX_GRADIENT_PX: f64 = 512.0;
 /// Opacity at or above this is written as opaque.
@@ -29,6 +32,12 @@ const RASTER_FX: &str = "raster effects (shadows, glows, blurs, feathering) are 
 const CLIPPING: &str = "clipping masks are not applied: the art they clip is written whole";
 const FLAT_GRADIENTS: &str = "gradients are written as one colour, the average of their stops";
 const FLAT_PATTERNS: &str = "pattern fills are written as one colour";
+const TOO_MANY_TILES: &str = "pattern fills past 250,000 tiles in all are written as one colour";
+const TEXT_OUTLINES: &str = "type is written as outlines: it can't be searched, selected or read aloud as text";
+const PATTERN_TILES: &str = "pattern fills are written as their tiles, one shape each";
+/// The warning for an image left out because it can't be decoded: the note raster exports give
+/// (`vectorcraft-engine`'s `rasterfx::undecoded_warning`).
+const UNDECODED: &str = "an image couldn't be decoded and is missing from the picture";
 
 /// A stroke as a pen draws it.
 #[derive(Clone, Debug, PartialEq)]
@@ -100,6 +109,9 @@ fn q(v: f32) -> u8 {
 
 pub(crate) struct Scene<'a> {
     doc: &'a Document,
+    /// The art boxes of `doc`'s symbols, which the walk measures symbol instances by when it
+    /// leaves out objects outside the region ([`SymbolBoxes::quick`]).
+    symbols: SymbolBoxes<'a>,
     region: Rect,
     /// The format clips (EMF).
     clips: bool,
@@ -112,11 +124,25 @@ pub(crate) struct Scene<'a> {
     opacity: f32,
     /// Symbols, brush art and pattern tiles being written inside one another.
     nest: u32,
+    /// Pattern tiles left to write ([`MAX_TILES`]).
+    tiles_left: usize,
 }
 
 impl<'a> Scene<'a> {
     pub fn new(doc: &'a Document, region: Rect, clips: bool) -> Self {
-        Self { doc, region, clips, ops: vec![], warnings: vec![], images: HashMap::new(), brushes: None, opacity: 1.0, nest: 0 }
+        Self {
+            doc,
+            symbols: doc.symbol_boxes().quick(),
+            region,
+            clips,
+            ops: vec![],
+            warnings: vec![],
+            images: HashMap::new(),
+            brushes: None,
+            opacity: 1.0,
+            nest: 0,
+            tiles_left: MAX_TILES,
+        }
     }
 
     /// The operations (clipped to the region when the format clips) and the warnings.
@@ -148,7 +174,7 @@ impl<'a> Scene<'a> {
             return;
         }
         if !n.is_layer() {
-            match n.visual_bounds() {
+            match n.visual_bounds_with(&self.symbols) {
                 Some(b) if !overlaps(b, self.region) => return,
                 None if !n.is_container() => return,
                 _ => {}
@@ -173,6 +199,7 @@ impl<'a> Scene<'a> {
             }
             NodeKind::Text(_) => {
                 if let Some(o) = vectorcraft_effects::outline_text(n) {
+                    self.warn(TEXT_OUTLINES);
                     self.node(&o, true);
                 }
             }
@@ -189,7 +216,12 @@ impl<'a> Scene<'a> {
                 }
             }
             // Live blends, envelopes, meshes and repeats are written as their evaluated art.
-            NodeKind::Blend { .. } | NodeKind::Envelope { .. } | NodeKind::Mesh(_) | NodeKind::Repeat(_) | NodeKind::PlacedDocument(_) => {
+            NodeKind::Blend { .. }
+            | NodeKind::Envelope { .. }
+            | NodeKind::Mesh(_)
+            | NodeKind::Repeat(_)
+            | NodeKind::PlacedDocument(_)
+            | NodeKind::Intertwine { .. } => {
                 let g = vectorcraft_effects::expand_live_deep(Some(self.doc), n);
                 for c in g.children().into_iter().flatten() {
                     self.node(c, false);
@@ -236,7 +268,7 @@ impl<'a> Scene<'a> {
         if n.blend != BlendMode::Normal {
             self.warn(BLENDING);
         }
-        if n.mask.as_ref().is_some_and(|m| !m.disabled) {
+        if n.extras().mask.as_ref().is_some_and(|m| !m.disabled) {
             self.warn(MASKS);
         }
         let raster = |fx: &[vectorcraft_doc::Effect]| fx.iter().any(|e| e.visible && vectorcraft_effects::is_raster(&e.id));
@@ -277,9 +309,19 @@ impl<'a> Scene<'a> {
         match paint {
             Paint::None => {}
             Paint::Gradient(g) if self.clips => self.gradient(bp, rule, g, opacity, bounds),
-            Paint::Pattern { pattern, xf } if self.clips && self.nest < MAX_NEST && self.doc.pattern(pattern).is_some() => {
+            Paint::Pattern { pattern, xf } if self.clips && self.nest < MAX_NEST && self.tiles_left > 0 && self.doc.pattern(pattern).is_some() => {
                 let area = bp.bounding_box().intersect(self.region);
                 let tiles = self.doc.pattern(pattern).map(|def| def.instances_in(*xf, area)).unwrap_or_default();
+                if tiles.len() > self.tiles_left {
+                    self.tiles_left = 0;
+                    self.warn(TOO_MANY_TILES);
+                    self.flat_fill(bp, rule, paint, opacity);
+                    return;
+                }
+                self.tiles_left -= tiles.len();
+                if !tiles.is_empty() {
+                    self.warn(PATTERN_TILES);
+                }
                 let outer = self.opacity;
                 self.opacity *= opacity.clamp(0.0, 1.0);
                 self.ops.push(Op::Clip { path: bp.clone(), rule });
@@ -289,12 +331,15 @@ impl<'a> Scene<'a> {
                 self.ops.push(Op::Unclip);
                 self.opacity = outer;
             }
-            p => {
-                let Some(rgb) = self.flat(p) else { return };
-                self.check_opacity(opacity);
-                self.ops.push(Op::Fill { path: bp.clone(), rule, rgb });
-            }
+            p => self.flat_fill(bp, rule, p, opacity),
         }
+    }
+
+    /// Fill `bp` with one colour for `paint` at `opacity`.
+    fn flat_fill(&mut self, bp: &BezPath, rule: FillRule, paint: &Paint, opacity: f32) {
+        let Some(rgb) = self.flat(paint) else { return };
+        self.check_opacity(opacity);
+        self.ops.push(Op::Fill { path: bp.clone(), rule, rgb });
     }
 
     /// One colour for a paint: a solid colour, the average of a gradient's stops, or a pattern's
@@ -389,31 +434,32 @@ impl<'a> Scene<'a> {
         let doc = self.doc;
         let brushes = self.brushes.get_or_insert_with(|| vectorcraft_brush::library(doc));
         let b = st.brush.as_deref().and_then(|name| brushes.iter().find(|b| b.name == name))?;
-        Some(vectorcraft_brush::stroke_pieces(b, bp, st))
+        Some(vectorcraft_brush::stroke_pieces(doc, b, bp, st))
     }
 
     /// A placed image, decoded once per image.
     fn image(&mut self, im: &ImageObject) {
-        let Some(img) = self.decoded(&im.key) else { return };
+        let Some(img) = self.decoded(im) else { return };
         let (dw, dh) = (f64::from(img.width), f64::from(img.height));
         let xf = im.xf * Affine::scale_non_uniform(f64::from(im.width.max(1)) / dw, f64::from(im.height.max(1)) / dh);
         self.ops.push(Op::Image { image: img, xf, opacity: self.opacity.clamp(0.0, 1.0) });
     }
 
-    /// Image `key`'s pixels (scaled down to what a metafile stores), `None` with a warning when it
+    /// Image `im`'s pixels (scaled down to what a metafile stores), `None` with a warning when it
     /// has none or can't be decoded.
-    fn decoded(&mut self, key: &str) -> Option<Arc<Rgba>> {
+    fn decoded(&mut self, im: &ImageObject) -> Option<Arc<Rgba>> {
+        let key = im.key.as_str();
         if let Some(i) = self.images.get(key) {
             return i.clone();
         }
-        let blob = self.doc.images.get(key).filter(|b| !b.bytes.is_empty());
+        let blob = self.doc.image_blob(im).filter(|b| !b.bytes.is_empty());
         let img = blob
             .and_then(|b| image::load_from_memory(&b.bytes).ok())
             .map(|i| Rgba::fitted(i.to_rgba8()))
             .filter(|i| i.width > 0 && i.height > 0)
             .map(Arc::new);
         if img.is_none() {
-            self.warn(&format!("image '{key}' could not be decoded and was left out"));
+            self.warn(UNDECODED);
         }
         self.images.insert(key.to_string(), img.clone());
         img

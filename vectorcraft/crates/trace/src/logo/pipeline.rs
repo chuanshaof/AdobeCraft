@@ -4,7 +4,7 @@ use super::field::{blur_plane, upsample};
 use super::geom::{Cubic, finite};
 use super::march::{area2, contours};
 use super::outline::{Stats, Style, fit_outline};
-use super::palette::{WHITE_MIN, auto_palette, flat_fraction, parse_hex, unexplained_colours};
+use super::palette::{WHITE_MIN, auto_palette, flat_fraction, fold_tones, parse_hex, unexplained_colours};
 use super::restore::RestoreParams;
 use super::unmix::{Px, count_ambiguous, unmix};
 use crate::{Raster, TraceError, TraceParams, TraceResult, TracedPath};
@@ -317,11 +317,15 @@ fn distance(a: [u8; 3], b: [u8; 3]) -> f64 {
     (0..3).map(|k| (f64::from(a[k]) - f64::from(b[k])).powi(2)).sum::<f64>().sqrt()
 }
 
+type Colours = Vec<[u8; 3]>;
+
 /// The colours to trace: those the caller named (white is always its own class so it is skipped;
-/// colours closer than [`SAME_COLOUR`] count as one; at most [`MAX_COLOURS`]) or the ones found.
-fn choose_palette(params: &TraceParams, pix: &[Px], w: usize, h: usize) -> Result<Vec<[u8; 3]>, TraceError> {
+/// colours closer than [`SAME_COLOUR`] count as one; at most [`MAX_COLOURS`]) or the ones found,
+/// the tones of one colour folded into it ([`fold_tones`]); and with them the colours before folding.
+fn choose_palette(params: &TraceParams, pix: &[Px], w: usize, h: usize) -> Result<(Colours, Colours), TraceError> {
     if params.logo_colors.is_empty() {
-        return Ok(auto_palette(pix, w, h, (params.colors as usize).clamp(2, MAX_COLOURS)));
+        let found = auto_palette(pix, w, h, (params.colors as usize).clamp(2, MAX_COLOURS));
+        return Ok((fold_tones(pix, found.clone()), found));
     }
     let mut palette: Vec<[u8; 3]> = Vec::new();
     for s in &params.logo_colors {
@@ -332,21 +336,23 @@ fn choose_palette(params: &TraceParams, pix: &[Px], w: usize, h: usize) -> Resul
             palette.push(c);
         }
     }
-    Ok(palette)
+    Ok((palette.clone(), palette))
 }
 
 /// Trace a flat-colour logo.
 pub(crate) fn trace_logo(img: &Raster, params: &TraceParams, max_anchors: usize) -> Result<TraceResult, TraceError> {
     let (w0, h0) = (img.width as usize, img.height as usize);
-    if w0 == 0 || h0 == 0 || img.rgba.len() != w0 * h0 * 4 {
+    if w0 == 0 || h0 == 0 || w0.checked_mul(h0).and_then(|n| n.checked_mul(4)) != Some(img.rgba.len()) {
         return Ok(TraceResult::default());
     }
     let (mut pix, mut w, mut h, mut factor) = working_copy(img, 1);
-    let mut palette = choose_palette(params, &pix, w, h)?;
+    // (`tones`: the colours as found, each tone of an unevenly lit colour on its own. Whether the
+    // image is flat art is asked of them: a paper's tones are flat colour too.)
+    let (mut palette, tones) = choose_palette(params, &pix, w, h)?;
     if palette.is_empty() {
         return Ok(TraceResult::default());
     }
-    let fraction = flat_fraction(&pix, w, h, &palette);
+    let fraction = flat_fraction(&pix, w, h, &tones);
     if fraction < MIN_FLAT {
         return Err(TraceError::NotFlat { fraction });
     }
@@ -366,6 +372,8 @@ pub(crate) fn trace_logo(img: &Raster, params: &TraceParams, max_anchors: usize)
             planes
         } else {
             palette.extend(extra.into_iter().take(MAX_COLOURS - palette.len()));
+            // (A colour nothing explained may be one more tone of a colour that is there.)
+            palette = fold_tones(&pix, palette);
             classes = classes_for(&palette);
             unmix(&pix, w, h, &classes).0
         }
@@ -478,7 +486,15 @@ pub(crate) fn trace_logo(img: &Raster, params: &TraceParams, max_anchors: usize)
         if !out.palette.contains(&color) {
             out.palette.push(color);
         }
-        out.paths.push(TracedPath { path: PathData::new(subs), color, pixels: (s.area * (factor * factor) as f64) as usize, stroke: None });
+        out.paths.push(TracedPath {
+            path: PathData::new(subs),
+            color,
+            pixels: (s.area * (factor * factor) as f64) as usize,
+            stroke: None,
+            shape: None,
+            gradient: None,
+            square_caps: false,
+        });
     }
     Ok(out)
 }

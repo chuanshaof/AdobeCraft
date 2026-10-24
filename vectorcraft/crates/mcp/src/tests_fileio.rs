@@ -43,8 +43,9 @@ fn headless_opens_pdf_ai_and_templates() {
     std::fs::write(&ait, &pdf).unwrap();
     let r = text(&call_tool(&mut h, "open_file", &json!({"path": ait})));
     assert!(r["title"].as_str().unwrap().starts_with("Untitled-"), "{r}");
-    let tpl = tmp("t.vectorcraft");
-    h.call("engine.execute", json!({"command": "file.saveAsTemplate", "params": {"path": tpl}})).unwrap();
+    let saved = h.call("engine.execute", json!({"command": "file.saveAsTemplate", "params": {"path": tmp("t.vectorcraft")}})).unwrap();
+    let tpl = tmp("t.vctemplate");
+    assert_eq!(saved["path"], tpl.as_str(), "saved with the template's extension: {saved}");
     let r = text(&call_tool(&mut h, "open_file", &json!({"path": tpl})));
     assert!(r["title"].as_str().unwrap().starts_with("Untitled-"), "{r}");
     assert_eq!(h.session.doc().unwrap().path, None, "Save asks for a new name");
@@ -83,8 +84,15 @@ fn export_tool_lists_engine_formats_and_options() {
     for k in ["artboard", "range", "options"] {
         assert!(props.get(k).is_some(), "export takes {k}");
     }
+    // The description names every format of the enum.
+    let words: Vec<&str> = export["description"].as_str().unwrap().split(|c: char| !c.is_ascii_alphanumeric()).collect();
+    for f in props["format"]["enum"].as_array().unwrap() {
+        assert!(words.contains(&f.as_str().unwrap()), "{f}");
+    }
     let open = tools.iter().find(|t| t["name"] == "open_file").unwrap();
     assert!(open["description"].as_str().unwrap().contains(".ait"));
+    assert!(open["description"].as_str().unwrap().contains(".eps, .epsf, .ps, "), "{open}");
+    assert!(open["description"].as_str().unwrap().contains(".bmp, .tga, .vda, .icb, .vst, "), "{open}");
 }
 
 /// A fake app that records `engine.execute` calls and answers each with an empty object.
@@ -126,6 +134,17 @@ fn export_is_the_same_call_in_the_app_and_headless() {
 }
 
 #[test]
+fn the_raster_scale_leaves_other_formats_alone() {
+    // DXF's own `scale` (drawing units per mm) comes through `options`; the raster one would resize
+    // the drawing and leave its units unset.
+    let mut h = two_boards();
+    let dxf = |h: &mut Headless, args: Value| text(&call_tool(h, "export", &args))["dataBase64"].clone();
+    let plain = dxf(&mut h, json!({"format": "dxf"}));
+    assert!(dxf(&mut h, json!({"format": "dxf", "scale": 2})) == plain, "the raster scale changed the DXF");
+    assert!(dxf(&mut h, json!({"format": "dxf", "options": {"scale": 2}})) != plain, "the DXF scale was dropped");
+}
+
+#[test]
 fn exporting_native_keeps_the_document_path() {
     let mut h = two_boards();
     let doc = tmp("keep.vectorcraft");
@@ -138,6 +157,13 @@ fn exporting_native_keeps_the_document_path() {
     let pdf = text(&call_tool(&mut h, "export", &json!({"format": "pdf", "range": "2"})));
     let pdf = vectorcraft_format::base64_decode(pdf["dataBase64"].as_str().unwrap()).unwrap();
     assert_eq!(pdf_pages(&pdf), 1);
+    // An .ai export holds every artboard by default and one artboard with a range, and the document keeps its path.
+    for (args, pages) in [(json!({"format": "ai"}), 2), (json!({"format": "ai", "range": "2"}), 1)] {
+        let ai = text(&call_tool(&mut h, "export", &args));
+        assert_eq!(ai["format"], "ai");
+        assert_eq!(pdf_pages(&vectorcraft_format::base64_decode(ai["dataBase64"].as_str().unwrap()).unwrap()), pages, "{args}");
+    }
+    assert_eq!(h.session.doc().unwrap().path.as_deref(), Some(doc.as_str()));
 }
 
 fn pdf_pages(pdf: &[u8]) -> usize {

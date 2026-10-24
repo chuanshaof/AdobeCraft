@@ -1,13 +1,17 @@
 //! Transform panel: reference point, X/Y/W/H with the constrain link, rotate and shear, flips,
 //! live-shape properties and the Scale Corners / Scale Strokes & Effects options. While the
-//! Artboard tool is in use it shows and edits the active artboard's X/Y/W/H instead.
+//! Artboard tool is in use it shows and edits the active artboard's X/Y/W/H instead (a new W or H
+//! resizes every selected artboard), and with only ruler guides selected their X (vertical guides)
+//! and Y (horizontal ones).
 
 use egui::Ui;
 use serde_json::json;
-use vectorcraft_doc::NodeKind;
+use vectorcraft_doc::{LiveShape, Node, NodeKind};
 use vectorcraft_geom::Rect;
+use vectorcraft_geom::shapes::CornerKind;
 
 use super::{corner_radius_row, first_selected, pstate, set_pstate};
+use crate::dialogs::corners::kind_label as corner_kind;
 use crate::theme::Tokens;
 use crate::widgets::{self, menu_item};
 use crate::{VectorcraftApp, icons};
@@ -47,45 +51,103 @@ pub fn artboard_rect(r: Rect, refi: usize, x: Option<f64>, y: Option<f64>, w: Op
     Rect::new(x0, y0, x0 + nw, y0 + nh)
 }
 
-/// The Artboard tool's view of the panel: the active artboard's position and size.
+/// The reference point the Transform panel and the Control bar share (0 to 8, the center by default).
+pub fn reference_index(ui: &Ui) -> usize {
+    ui.data(|d| d.get_temp(egui::Id::new("refpt"))).unwrap_or(4)
+}
+
+/// The shared reference point's locator; a click on it chooses another point.
+pub fn reference_locator(ui: &mut Ui, refi: usize) {
+    if let Some(i) = widgets::reference_point(ui, refi) {
+        ui.data_mut(|d| d.insert_temp(egui::Id::new("refpt"), i));
+    }
+}
+
+/// Set artboard `index` to a new X, Y, W or H from reference point `refi` ([`artboard_rect`]) with
+/// `artboard.setProps`, passing the Artboard tool's Move and Scale Artwork with Artboard options as
+/// `moveArt` and `scaleArt`; an error is shown in the status bar. A new X or Y moves artboard
+/// `index` alone; a new W or H resizes every selected artboard about its own reference point
+/// ([`crate::panels::artboards::resized_with`]), in one undo step.
+pub fn set_artboard(app: &mut VectorcraftApp, index: usize, refi: usize, xywh: [Option<f64>; 4], link: bool) {
+    let [x, y, w, h] = xywh;
+    let scale_art = crate::panels::artboards::scale_art(app);
+    let move_art = crate::panels::artboards::move_art(app);
+    let indices = if x.is_none() && y.is_none() { crate::panels::artboards::resized_with(app, index) } else { vec![index] };
+    let common = json!({"scaleArt": scale_art, "moveArt": move_art});
+    let r = crate::panels::artboards::set_props(app, &indices, common, |i, r| {
+        let n = artboard_rect(r, refi, x, y, w, h, link);
+        Some(json!({"index": i, "x": n.x0, "y": n.y0, "width": n.width(), "height": n.height()}))
+    });
+    if let Err(e) = r {
+        app.status(e);
+    }
+}
+
+/// The Artboard tool's view of the panel: the active artboard's position and size ([`set_artboard`]).
 fn artboard_fields(app: &mut VectorcraftApp, ui: &mut Ui, index: usize, r: Rect) {
     let units = app.session.general_unit();
-    let refi: usize = ui.data(|d| d.get_temp(egui::Id::new("refpt"))).unwrap_or(4);
-    let link = app.session.prefs.constrain_proportions;
+    let origin = app.ruler_origin();
+    let refi = reference_index(ui);
+    let link = proportional(app, ui);
     let rp = vectorcraft_geom::reference_point(r, refi);
-    let set = |app: &mut VectorcraftApp, x, y, w, h| {
-        let n = artboard_rect(r, refi, x, y, w, h, link);
-        let p = json!({"index": index, "x": n.x0, "y": n.y0, "width": n.width(), "height": n.height()});
-        if let Err(e) = app.run("artboard.setProps", p) {
-            app.status(e);
-        }
-    };
+    let set = |app: &mut VectorcraftApp, x, y, w, h| set_artboard(app, index, refi, [x, y, w, h], link);
     ui.horizontal(|ui| {
-        if let Some(i) = widgets::reference_point(ui, refi) {
-            ui.data_mut(|d| d.insert_temp(egui::Id::new("refpt"), i));
-        }
+        reference_locator(ui, refi);
         ui.add_space(4.0);
         egui::Grid::new("xfp-ab-grid").num_columns(4).spacing([4.0, 6.0]).min_col_width(0.0).show(ui, |ui| {
             widgets::dim_label(ui, "X:");
-            if let Some(v) = widgets::num_field(ui, "xfp-ab-x", Some(rp.x), units, 80.0) {
-                set(app, Some(v), None, None, None);
+            if let Some(v) = widgets::num_field(ui, "xfp-ab-x", Some(rp.x - origin.x), units, 80.0) {
+                set(app, Some(v + origin.x), None, None, None);
             }
             widgets::dim_label(ui, "W:");
-            if let Some(v) = widgets::num_field(ui, "xfp-ab-w", Some(r.width()), units, 80.0) {
+            if let Some(v) = widgets::size_field(ui, "xfp-ab-w", Some(r.width()), units, 80.0) {
                 set(app, None, None, Some(v), None);
             }
             ui.end_row();
             widgets::dim_label(ui, "Y:");
-            if let Some(v) = widgets::num_field(ui, "xfp-ab-y", Some(rp.y), units, 80.0) {
-                set(app, None, Some(v), None, None);
+            if let Some(v) = widgets::num_field(ui, "xfp-ab-y", Some(rp.y - origin.y), units, 80.0) {
+                set(app, None, Some(v + origin.y), None, None);
             }
             widgets::dim_label(ui, "H:");
-            if let Some(v) = widgets::num_field(ui, "xfp-ab-h", Some(r.height()), units, 80.0) {
+            if let Some(v) = widgets::size_field(ui, "xfp-ab-h", Some(r.height()), units, 80.0) {
                 set(app, None, None, None, Some(v));
             }
             ui.end_row();
         });
         constrain_link(app, ui);
+    });
+}
+
+/// With ruler guides selected and no art: the X of the vertical ones and the Y of the horizontal
+/// ones (the least of each; none where no such guide is selected).
+fn selected_guides(app: &VectorcraftApp) -> Option<(Option<f64>, Option<f64>)> {
+    let st = app.session.active()?;
+    if !st.selection.objects.is_empty() || st.selection.guides.is_empty() {
+        return None;
+    }
+    let least = |vertical: bool| {
+        st.selection.guides.iter().filter_map(|i| st.doc.guides.get(*i)).filter(|g| g.vertical == vertical).map(|g| g.pos).min_by(f64::total_cmp)
+    };
+    Some((least(true), least(false)))
+}
+
+/// The selected ruler guides' view of the panel (#1597): X moves the vertical ones and Y the
+/// horizontal ones, together.
+fn guide_fields(app: &mut VectorcraftApp, ui: &mut Ui, (x, y): (Option<f64>, Option<f64>)) {
+    let units = app.session.general_unit();
+    let origin = app.ruler_origin();
+    egui::Grid::new("xfp-guide-grid").num_columns(2).spacing([4.0, 6.0]).min_col_width(0.0).show(ui, |ui| {
+        for (label, id, pos, origin, by) in [("X:", "xfp-guide-x", x, origin.x, "dx"), ("Y:", "xfp-guide-y", y, origin.y, "dy")] {
+            widgets::dim_label(ui, label);
+            ui.add_enabled_ui(pos.is_some(), |ui| {
+                if let (Some(v), Some(pos)) = (widgets::num_field(ui, id, pos.map(|p| p - origin), units, 80.0), pos)
+                    && let Err(e) = app.run("guide.move", json!({ by: v + origin - pos }))
+                {
+                    app.status(e);
+                }
+            });
+            ui.end_row();
+        }
     });
 }
 
@@ -99,13 +161,19 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
         artboard_fields(app, ui, i, r);
         return;
     }
+    if let Some(guides) = selected_guides(app) {
+        guide_fields(app, ui, guides);
+        return;
+    }
     let units = app.session.general_unit();
+    let origin = app.ruler_origin();
     // The bounding box, rotated with rotated objects: W/H are its own sides, X/Y its reference
     // point on the page.
     let bx = app.selection_box();
     let bounds = bx.map(|b| b.rect);
     let refi: usize = ui.data(|d| d.get_temp(egui::Id::new("refpt"))).unwrap_or(4);
-    let link = app.session.prefs.constrain_proportions;
+    let link = proportional(app, ui);
+    let copy = alt_enter_copies(app, ui);
     let has = bounds.is_some();
     let rp = bx.map(|b| b.reference_point(refi));
     ui.horizontal(|ui| {
@@ -116,21 +184,21 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
         ui.add_enabled_ui(has, |ui| {
             egui::Grid::new("xfp-grid").num_columns(4).spacing([4.0, 6.0]).min_col_width(0.0).show(ui, |ui| {
                 widgets::dim_label(ui, "X:");
-                if let Some(v) = widgets::num_field(ui, "xfp-x", rp.map(|p| p.x), units, 80.0) {
-                    app.run("object.setBounds", json!({"x": v, "reference": refi})).ok();
+                if let Some(v) = widgets::num_field(ui, "xfp-x", rp.map(|p| p.x - origin.x), units, 80.0) {
+                    app.run("object.setBounds", json!({"x": v + origin.x, "reference": refi, "copy": copy})).ok();
                 }
                 widgets::dim_label(ui, "W:");
-                if let Some(v) = widgets::num_field(ui, "xfp-w", bounds.map(|b| b.width()), units, 80.0) {
-                    app.run("object.setBounds", json!({"width": v, "reference": refi, "proportional": link})).ok();
+                if let Some(v) = widgets::size_field(ui, "xfp-w", bounds.map(|b| b.width()), units, 80.0) {
+                    app.run("object.setBounds", json!({"width": v, "reference": refi, "proportional": link, "copy": copy})).ok();
                 }
                 ui.end_row();
                 widgets::dim_label(ui, "Y:");
-                if let Some(v) = widgets::num_field(ui, "xfp-y", rp.map(|p| p.y), units, 80.0) {
-                    app.run("object.setBounds", json!({"y": v, "reference": refi})).ok();
+                if let Some(v) = widgets::num_field(ui, "xfp-y", rp.map(|p| p.y - origin.y), units, 80.0) {
+                    app.run("object.setBounds", json!({"y": v + origin.y, "reference": refi, "copy": copy})).ok();
                 }
                 widgets::dim_label(ui, "H:");
-                if let Some(v) = widgets::num_field(ui, "xfp-h", bounds.map(|b| b.height()), units, 80.0) {
-                    app.run("object.setBounds", json!({"height": v, "reference": refi, "proportional": link})).ok();
+                if let Some(v) = widgets::size_field(ui, "xfp-h", bounds.map(|b| b.height()), units, 80.0) {
+                    app.run("object.setBounds", json!({"height": v, "reference": refi, "proportional": link, "copy": copy})).ok();
                 }
                 ui.end_row();
             });
@@ -148,7 +216,7 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
             if let Some(a) = widgets::spin_plain(ui, "xfp-rot", angle, "°", 2, 96.0, 15.0, -360.0, &ANGLE_PRESETS)
                 && a != angle
             {
-                app.run("object.rotate", json!({"angle": a, "absolute": true, "origin": origin})).ok();
+                app.run("object.rotate", json!({"angle": a, "absolute": true, "origin": origin, "copy": copy})).ok();
             }
             ui.add_space(4.0);
             let icon = icons::icon(ui, "dc-shear", 16.0, t.icon).on_hover_text(tl!("Shear"));
@@ -158,38 +226,38 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
                 && a != 0.0
                 && a.abs() < 90.0
             {
-                app.run("object.shear", json!({"angle": a, "axis": "horizontal", "origin": origin})).ok();
+                app.run("object.shear", json!({"angle": a, "axis": "horizontal", "origin": origin, "copy": copy})).ok();
             }
         });
     });
     ui.horizontal(|ui| {
-        if widgets::icon_button_enabled(ui, "flip-horizontal-2", tl!("Flip Horizontal"), false, has, 24.0).clicked() {
+        // Lucide's flip icons are named for their mirror line: flip-vertical-2 draws a vertical
+        // line (the left-right flip), flip-horizontal-2 a horizontal one (top-bottom).
+        if widgets::icon_button_enabled(ui, "flip-vertical-2", tl!("Flip Horizontal"), false, has, 24.0).clicked() {
             app.run("object.reflect", json!({"axis": "vertical", "origin": origin})).ok();
         }
-        if widgets::icon_button_enabled(ui, "flip-vertical-2", tl!("Flip Vertical"), false, has, 24.0).clicked() {
+        if widgets::icon_button_enabled(ui, "flip-horizontal-2", tl!("Flip Vertical"), false, has, 24.0).clicked() {
             app.run("object.reflect", json!({"axis": "horizontal", "origin": origin})).ok();
         }
     });
     // Live shape properties (a path with live corners is no shape).
     if let Some(n) = first_selected(app)
         && let NodeKind::Path { live: Some(live), .. } = &n.kind
-        && !matches!(live, vectorcraft_doc::LiveShape::Path { .. })
+        && !matches!(**live, vectorcraft_doc::LiveShape::Path { .. })
     {
         widgets::divider(ui);
-        match live {
+        match &**live {
             vectorcraft_doc::LiveShape::Rectangle { .. } => {
                 widgets::subheader(ui, tl!("Rectangle Properties:"));
                 corner_radius_row(app, ui, &n, "xfp-radius");
             }
-            vectorcraft_doc::LiveShape::Polygon { sides, .. } => {
+            vectorcraft_doc::LiveShape::Polygon { .. } => {
                 widgets::subheader(ui, tl!("Polygon Properties:"));
-                ui.horizontal(|ui| {
-                    widgets::dim_label(ui, tl!("Sides:"));
-                    if let Some(s) = widgets::plain_field(ui, "xfp-sides", *sides as f64, "", 0, 60.0) {
-                        app.run("object.setLiveShape", json!({"sides": s.clamp(3.0, 20.0) as u32})).ok();
-                    }
-                });
-                corner_radius_row(app, ui, &n, "xfp-radius");
+                polygon_rows(app, ui, &n, live, "xfp-polygon");
+            }
+            vectorcraft_doc::LiveShape::Ellipse { pie, .. } => {
+                widgets::subheader(ui, tl!("Ellipse Properties:"));
+                pie_rows(app, ui, *pie, "xfp-pie");
             }
             _ => {
                 widgets::subheader(ui, tl!("Shape Properties:"));
@@ -207,6 +275,72 @@ pub fn show(app: &mut VectorcraftApp, ui: &mut Ui) {
     }
     if widgets::check(ui, tl!("Scale Strokes & Effects"), ss, true) {
         set_pref(app, "scaleStrokes", !ss);
+    }
+}
+
+/// An ellipse's Pie Start and End Angle (degrees, counterclockwise from 3 o'clock; 0 to 360 is the
+/// whole ellipse) and Invert Pie, which shows the other part of it (Transform and Properties panels).
+pub(crate) fn pie_rows(app: &mut VectorcraftApp, ui: &mut Ui, pie: (f64, f64), id: &str) {
+    for (label, key, v) in [(tl!("Pie Start Angle:"), "pieStart", pie.0), (tl!("Pie End Angle:"), "pieEnd", pie.1)] {
+        ui.horizontal(|ui| {
+            widgets::dim_label(ui, label);
+            if let Some(a) = widgets::plain_field(ui, (id, key), v, "°", 1, 60.0) {
+                app.run("object.setLiveShape", json!({ key: a })).ok();
+            }
+        });
+    }
+    if widgets::flat_button(ui, tl!("Invert Pie"), 90.0).clicked() {
+        app.run("object.setLiveShape", json!({"invertPie": true})).ok();
+    }
+}
+
+/// A live polygon's Polygon Properties (Transform and Properties panels): its side count, angle
+/// (counterclockwise), corner type and radius, radius (centre to vertex) and side length, and Make
+/// Sides Equal, which an uneven scale enables.
+pub(crate) fn polygon_rows(app: &mut VectorcraftApp, ui: &mut Ui, n: &Node, live: &LiveShape, id: &str) {
+    let LiveShape::Polygon { sides, .. } = live else { return };
+    let (units, fw) = (app.session.general_unit(), super::field_width(ui));
+    let radius = live.polygon_radius();
+    let side = radius.map(|r| 2.0 * r * (std::f64::consts::PI / f64::from((*sides).max(3))).sin());
+    let kind = super::corner_style(app, n).1;
+    let kinds: Vec<&str> = CornerKind::ALL.iter().map(|k| corner_kind(*k)).collect();
+    // The `object.setLiveShape` param an edited field sets.
+    let mut set = None;
+    egui::Grid::new((id, "grid")).num_columns(2).spacing([6.0, 6.0]).show(ui, |ui| {
+        widgets::dim_label(ui, tl!("Sides:"));
+        if let Some(s) = widgets::range_field(ui, (id, "sides"), f64::from(*sides), 3.0..=f64::INFINITY, "", 0, fw) {
+            set = Some(("sides", json!(s as u64)));
+        }
+        ui.end_row();
+        widgets::dim_label(ui, tl!("Angle:"));
+        if let Some(a) = widgets::plain_field(ui, (id, "angle"), live.polygon_angle().unwrap_or(0.0), "°", 1, fw) {
+            set = Some(("polygonAngle", json!(a)));
+        }
+        ui.end_row();
+        widgets::dim_label(ui, tl!("Corner:"));
+        if let Some(k) = widgets::dropdown_names(ui, (id, "kind"), kind.map_or("", corner_kind), &kinds, fw).and_then(|i| CornerKind::ALL.get(i)) {
+            set = Some(("kind", json!(k)));
+        }
+        ui.end_row();
+        widgets::dim_label(ui, tl!("Corner Radius:"));
+        super::corner_radius_field(app, ui, n, (id, "cornerRadius"), fw);
+        ui.end_row();
+        widgets::dim_label(ui, tl!("Radius:"));
+        if let Some(r) = widgets::num_field(ui, (id, "radius"), radius, units, fw) {
+            set = Some(("polygonRadius", json!(r)));
+        }
+        ui.end_row();
+        widgets::dim_label(ui, tl!("Side Length:"));
+        if let Some(l) = widgets::num_field(ui, (id, "side"), side, units, fw) {
+            set = Some(("sideLength", json!(l)));
+        }
+        ui.end_row();
+    });
+    if ui.add_enabled_ui(!live.polygon_sides_equal(), |ui| widgets::flat_button(ui, tl!("Make Sides Equal"), 130.0)).inner.clicked() {
+        set = Some(("makeSidesEqual", json!(true)));
+    }
+    if let Some((key, v)) = set {
+        app.run("object.setLiveShape", json!({ key: v })).ok();
     }
 }
 
@@ -230,6 +364,20 @@ pub fn constrain_link(app: &mut VectorcraftApp, ui: &mut Ui) {
     }
 }
 
+/// The `copy` param of a command that a field of the Transform panel, the Properties panel's
+/// Transform section or the Control bar runs: true when Alt+Enter (Option+Return) applied the value
+/// and no anchors are selected with Direct Selection.
+pub fn alt_enter_copies(app: &VectorcraftApp, ui: &Ui) -> bool {
+    widgets::enter_modifiers(ui).is_some_and(|m| m.alt) && app.session.active().is_some_and(|st| st.selection.anchors.is_empty())
+}
+
+/// The `proportional` param of the W and H fields of the Transform panel (the artboard's too), the
+/// Properties panel's Transform section and the Control bar: the Constrain Width and Height
+/// Proportions link, or true when Ctrl/Cmd+Enter applied the value.
+pub fn proportional(app: &VectorcraftApp, ui: &Ui) -> bool {
+    app.session.prefs.constrain_proportions || widgets::enter_modifiers(ui).is_some_and(|m| m.command)
+}
+
 /// Toggle a boolean preference (through `prefs.set`, as agents do).
 pub fn set_pref(app: &mut VectorcraftApp, key: &str, on: bool) {
     if let Err(e) = app.run("prefs.set", json!({ "key": key, "value": on })) {
@@ -240,15 +388,18 @@ pub fn set_pref(app: &mut VectorcraftApp, key: &str, on: bool) {
 pub fn menu(app: &mut VectorcraftApp, ui: &mut Ui) {
     let hidden: bool = pstate(ui.ctx(), "xf-hide-options");
     let has = super::selection_len(app) > 0;
+    // The flips mirror across the panel's reference point, as its flip buttons do.
+    let refi: usize = ui.data(|d| d.get_temp(egui::Id::new("refpt"))).unwrap_or(4);
+    let origin = app.selection_box().map(|b| b.reference_point(refi)).map(|p| json!([p.x, p.y]));
     if menu_item(ui, if hidden { tl!("Show Options") } else { tl!("Hide Options") }, true, false) {
         set_pstate(ui.ctx(), "xf-hide-options", !hidden);
     }
     ui.separator();
     if menu_item(ui, tl!("Flip Horizontal"), has, false) {
-        app.run("object.reflect", json!({"axis": "vertical"})).ok();
+        app.run("object.reflect", json!({"axis": "vertical", "origin": origin})).ok();
     }
     if menu_item(ui, tl!("Flip Vertical"), has, false) {
-        app.run("object.reflect", json!({"axis": "horizontal"})).ok();
+        app.run("object.reflect", json!({"axis": "horizontal", "origin": origin})).ok();
     }
     ui.separator();
     let ss = app.session.prefs.scale_strokes;
@@ -300,6 +451,21 @@ mod tests {
     }
 
     #[test]
+    fn use_preview_bounds_shows_the_size_after_geometry_effects() {
+        // A 100 × 50 rectangle without a stroke, with Offset Path 10: 120 × 70 as drawn.
+        let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+        app.run("file.new", json!({"width": 300, "height": 300})).unwrap();
+        app.run("shape.rectangle", json!({"x": 50, "y": 50, "width": 100, "height": 50})).unwrap();
+        app.run("paint.setStroke", json!({"none": true})).unwrap();
+        app.run("effect.apply", json!({"effect": "path.offsetPath", "params": {"offset": 10}, "item": null})).unwrap();
+        let shown = texts(&mut app, show);
+        assert!(shown.iter().any(|t| t == "100 pt") && shown.iter().any(|t| t == "50 pt"), "{shown:?}");
+        set_pref(&mut app, "usePreviewBounds", true);
+        let shown = texts(&mut app, show);
+        assert!(shown.iter().any(|t| t == "120 pt") && shown.iter().any(|t| t == "70 pt"), "{shown:?}");
+    }
+
+    #[test]
     fn rotation_field_shows_the_angle_the_box_keeps() {
         let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
         app.run("file.new", json!({"width": 300, "height": 300})).unwrap();
@@ -312,6 +478,49 @@ mod tests {
         app.run("object.resetBoundingBox", json!({})).unwrap();
         let shown = texts(&mut app, show);
         assert!(shown.iter().any(|t| t == "0°") && !shown.iter().any(|t| t == "100 pt"), "{shown:?}");
+    }
+
+    /// #812: a selected live polygon shows its Polygon Properties in the Transform panel and the
+    /// Properties panel's Transform section, and Make Sides Equal evens it out after a stretch.
+    #[test]
+    fn a_polygon_shows_its_polygon_properties() {
+        let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+        app.run("file.new", json!({"width": 300, "height": 300})).unwrap();
+        app.run("shape.polygon", json!({"cx": 150, "cy": 150, "radius": 50, "sides": 6})).unwrap();
+        for draw in [show as fn(&mut VectorcraftApp, &mut Ui), crate::panels::properties::transform_section] {
+            let shown = texts(&mut app, draw);
+            // A hexagon's side is as long as its radius.
+            for t in ["Sides:", "6", "Angle:", "0°", "Corner:", "Round", "Corner Radius:", "Radius:", "Side Length:", "50 pt", "Make Sides Equal"] {
+                assert!(shown.iter().any(|s| s == t), "{t} in {shown:?}");
+            }
+        }
+        assert!(texts(&mut app, show).iter().any(|s| s == "Polygon Properties:"));
+        app.run("object.scale", json!({"sx": 200, "sy": 100})).unwrap();
+        let live = |app: &VectorcraftApp| match &first_selected(app).unwrap().kind {
+            NodeKind::Path { live: Some(l), .. } => l.clone(),
+            k => panic!("{k:?}"),
+        };
+        assert!(!live(&app).polygon_sides_equal());
+        app.run("object.setLiveShape", json!({"makeSidesEqual": true})).unwrap();
+        assert!(live(&app).polygon_sides_equal());
+    }
+
+    /// #3451: a live ellipse shows pie start/end angles and Invert Pie in the Transform panel and
+    /// the Properties panel's Transform section; typed angles update the shape.
+    #[test]
+    fn an_ellipse_shows_its_pie_properties() {
+        let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+        app.run("file.new", json!({"width": 300, "height": 300})).unwrap();
+        app.run("shape.ellipse", json!({"x": 50, "y": 50, "width": 120, "height": 80})).unwrap();
+        for draw in [show as fn(&mut VectorcraftApp, &mut Ui), crate::panels::properties::transform_section] {
+            let shown = texts(&mut app, draw);
+            for t in ["Ellipse Properties:", "Pie Start Angle:", "0°", "Pie End Angle:", "360°", "Invert Pie"] {
+                assert!(shown.iter().any(|s| s == t), "{t} in {shown:?}");
+            }
+        }
+        app.run("object.setLiveShape", json!({"pieStart": 30, "pieEnd": 120})).unwrap();
+        let shown = texts(&mut app, show);
+        assert!(shown.iter().any(|s| s == "30°") && shown.iter().any(|s| s == "120°"), "{shown:?}");
     }
 
     #[test]
@@ -327,6 +536,73 @@ mod tests {
             assert!(shown.iter().any(|t| t == v), "{v} in {shown:?}");
         }
         assert!(!shown.iter().any(|t| t == "40 pt" || t == "0°"), "{shown:?}");
+    }
+
+    /// #1597: with only ruler guides selected the panel shows their X or Y, and nothing of the art.
+    #[test]
+    fn selected_guides_show_their_position() {
+        let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+        app.run("file.new", json!({"width": 300, "height": 200})).unwrap();
+        app.run("guide.add", json!({"vertical": true, "pos": 120})).unwrap();
+        app.run("guide.add", json!({"vertical": false, "pos": 45})).unwrap();
+        app.run("guide.select", json!({"indexes": [0]})).unwrap();
+        assert_eq!(selected_guides(&app), Some((Some(120.0), None)));
+        let shown = texts(&mut app, show);
+        assert!(shown.iter().any(|t| t == "120 pt") && !shown.iter().any(|t| t == "W:" || t == "45 pt"), "{shown:?}");
+        app.run("guide.select", json!({"indexes": [0, 1]})).unwrap();
+        let shown = texts(&mut app, show);
+        assert!(shown.iter().any(|t| t == "120 pt") && shown.iter().any(|t| t == "45 pt"), "{shown:?}");
+        // The field's edit: the vertical guide moves, the horizontal one stays.
+        app.run("guide.move", json!({"dx": 30})).unwrap();
+        assert_eq!(selected_guides(&app), Some((Some(150.0), Some(45.0))));
+        // Art selected with them: the art's box, as before.
+        app.run("shape.rectangle", json!({"x": 0, "y": 0, "width": 40, "height": 30})).unwrap();
+        assert_eq!(selected_guides(&app), None);
+    }
+
+    /// #1824: with an anchor selected with Direct Selection the panel shows that anchor's position,
+    /// and a new X moves it alone.
+    #[test]
+    fn an_anchor_selection_shows_and_moves_its_own_box() {
+        let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+        app.run("file.new", json!({"width": 300, "height": 300})).unwrap();
+        let square = json!({"anchors": [{"x": 20, "y": 30}, {"x": 120, "y": 30}, {"x": 120, "y": 130}, {"x": 20, "y": 130}], "closed": true});
+        let id = app.run("path.create", square).unwrap()["id"].as_u64().unwrap();
+        let shown = texts(&mut app, show);
+        assert!(shown.iter().any(|t| t == "70 pt") && shown.iter().any(|t| t == "100 pt"), "the whole path: {shown:?}");
+        app.run("select.anchors", json!({"id": id, "anchors": [[0, 1]]})).unwrap();
+        let shown = texts(&mut app, show);
+        for v in ["120 pt", "30 pt", "0 pt"] {
+            assert!(shown.iter().any(|t| t == v), "{v} in {shown:?}");
+        }
+        assert!(!shown.iter().any(|t| t == "70 pt" || t == "100 pt"), "{shown:?}");
+        app.run("object.setBounds", json!({"x": 150, "reference": 4})).unwrap();
+        let n = first_selected(&app).unwrap();
+        let Some(path) = n.path_data() else { panic!("a path") };
+        let xs: Vec<f64> = path.subpaths[0].anchors.iter().map(|a| a.p.x).collect();
+        assert_eq!(xs, [20.0, 150.0, 120.0, 20.0]);
+    }
+
+    /// #2398: the panel menu's Flip Horizontal and Flip Vertical mirror the selection across the
+    /// reference point, as the panel's flip buttons do, not across its centre.
+    #[test]
+    fn menu_flips_keep_the_reference_point() {
+        use crate::panels::tests_appearance::{click, frame_events};
+        let mut app = VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+        app.run("file.new", json!({"width": 300, "height": 300})).unwrap();
+        app.run("shape.rectangle", json!({"x": 20, "y": 30, "width": 100, "height": 50})).unwrap();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        // Top-right reference point: (120, 30).
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new("refpt"), 2usize));
+        let flip = |app: &mut VectorcraftApp, item: &str| {
+            let texts = frame_events(&ctx, app, vec![], menu);
+            let r = texts.iter().find(|(t, _)| t.trim_start() == item).unwrap_or_else(|| panic!("{item} in {texts:?}")).1;
+            click(&ctx, app, r.center(), menu);
+            app.selection_box().unwrap().rect
+        };
+        assert_eq!(flip(&mut app, "Flip Horizontal"), Rect::new(120.0, 30.0, 220.0, 80.0));
+        assert_eq!(flip(&mut app, "Flip Vertical"), Rect::new(120.0, -20.0, 220.0, 30.0));
     }
 
     #[test]

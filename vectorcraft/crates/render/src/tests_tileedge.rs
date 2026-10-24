@@ -67,3 +67,44 @@ fn swatch_bounds_outline_the_period_dashed() {
     let off = render(&editing(tt, false, false), Some([0, 200, 0]));
     assert!((51..70).all(|x| is_white(off.pixel(x, 90))));
 }
+
+/// #3261: exports (which leave templates and guides out) don't draw the tile edge or the swatch
+/// bounds, but do draw the tile's art.
+#[test]
+fn exports_leave_the_tile_edge_and_swatch_bounds_out() {
+    let d = editing(TileType::BrickByRow { offset: 0.5 }, true, true);
+    let opts = RenderOptions { background: Some([255; 4]), tile_edge: [0, 200, 0], skip_templates: true, ..Default::default() };
+    let out = Renderer::new().render(&d, 120, 120, Affine::translate((50.5, 50.5)), &opts);
+    assert!(is_white(out.pixel(50, 65)), "tile edge: {:?}", out.pixel(50, 65));
+    assert!((51..70).all(|x| is_white(out.pixel(x, 90))), "swatch bounds");
+    let p = out.pixel(55, 55);
+    assert!(p[0] > 200 && p[1] < 60 && p[2] < 60, "the red square is still drawn: {p:?}");
+}
+
+/// #1534: a path made into a guide is drawn in the guide colour and style (Preferences › Guides &
+/// Grid), as ruler guides are: a line, or dots with gaps between them.
+#[test]
+fn guide_paths_take_the_guide_color_and_style() {
+    let mut d = Document::new(200.0, 200.0);
+    let (layer, id) = (d.layers[0].id, d.alloc_id());
+    let mut n = Node::path(id, shapes::rectangle(Rect::new(0.0, 0.0, 60.0, 60.0)), Appearance::basic(Paint::None, Paint::None, 0.0));
+    if let NodeKind::Path { guide, .. } = &mut n.kind {
+        *guide = true;
+    }
+    d.insert(Some(layer), 0, n).unwrap();
+    let draw = |guide| {
+        let opts = RenderOptions { background: Some([255; 4]), guide, ..Default::default() };
+        Renderer::new().render(&d, 120, 120, Affine::translate((50.5, 50.5)), &opts)
+    };
+    // Along the top edge of the square (y = 50), between its corners: the pixels the red covers.
+    let inked = |r: &Rendered| (55..105).filter(|x| r.pixel(*x, 50)[1] < 64).count();
+    let line = draw(([200, 0, 0], false));
+    let p = line.pixel(80, 50);
+    assert!(p[0] > 150 && p[1] < 100 && p[2] < 100, "{p:?}");
+    assert_eq!(inked(&line), 50);
+    let dotted = draw(([200, 0, 0], true));
+    let dots = inked(&dotted);
+    assert!((10..40).contains(&dots), "{dots}: {:?}", (45..70).map(|x| dotted.pixel(x, 50)[1]).collect::<Vec<_>>());
+    let default = draw(RenderOptions::default().guide);
+    assert!((55..105).all(|x| !is_white(default.pixel(x, 50))), "a line by default");
+}

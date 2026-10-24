@@ -2,7 +2,7 @@
 //! visibility, print state and lock) and Advanced › Overprint (a graphics state that overprints
 //! for the overprinting fills and strokes).
 
-use hayro_syntax::object::{Array, Dict, Name, ObjectIdentifier};
+use craft_pdf::syntax::object::{Array, Dict, Name, ObjectIdentifier};
 use serde_json::{Value, json};
 use vectorcraft_color::{Color, Paint};
 use vectorcraft_doc::{Appearance, CharStyle, Document, LayerColor, Node, NodeKind, TextObject};
@@ -43,18 +43,18 @@ fn export(d: &Document, v: Value) -> ExportReport {
 }
 
 /// The groups of `refs` (an array of the catalog's optional content properties) by name.
-fn names(xref: &hayro_syntax::xref::XRef, refs: Option<Array<'_>>) -> Vec<String> {
+fn names(xref: &craft_pdf::syntax::xref::XRef, refs: Option<Array<'_>>) -> Vec<String> {
     let ids = refs.map(|a| a.raw_iter().filter_map(|i| i.as_obj_ref()).map(ObjectIdentifier::from).collect::<Vec<_>>()).unwrap_or_default();
     ids.into_iter()
         .map(|id| {
             let g = xref.get::<Dict<'_>>(id).unwrap();
-            String::from_utf8(g.get::<hayro_syntax::object::String<'_>>(b"Name").unwrap().as_bytes().to_vec()).unwrap()
+            String::from_utf8(g.get::<craft_pdf::syntax::object::String<'_>>(b"Name").unwrap().as_bytes().to_vec()).unwrap()
         })
         .collect()
 }
 
 /// The catalog's `/OCProperties` of `bytes` (opened with `password`), if any.
-fn oc_properties(bytes: &[u8], password: Option<&str>, f: impl FnOnce(Option<Dict<'_>>, &hayro_syntax::xref::XRef)) {
+fn oc_properties(bytes: &[u8], password: Option<&str>, f: impl FnOnce(Option<Dict<'_>>, &craft_pdf::syntax::xref::XRef)) {
     let file = crate::pages::open(bytes, password).unwrap();
     let xref = file.xref();
     let catalog = xref.get::<Dict<'_>>(xref.root_id()).unwrap();
@@ -86,7 +86,7 @@ fn create_layers_writes_a_group_per_layer_with_its_states() {
         assert_eq!(names(xref, config.get(b"Order")), ["Notes", "Hidden", "Back"]);
         assert_eq!(names(xref, config.get(b"OFF")), ["Hidden"], "hidden layers are off");
         assert_eq!(names(xref, config.get(b"Locked")), ["Hidden"]);
-        assert!(config.get::<hayro_syntax::object::String<'_>>(b"Name").is_some());
+        assert!(config.get::<craft_pdf::syntax::object::String<'_>>(b"Name").is_some());
         let auto = config.get::<Array<'_>>(b"AS").unwrap().iter::<Dict<'_>>().next().unwrap();
         assert_eq!(auto.get::<Name<'_>>(b"Event").unwrap().as_ref(), b"Print");
         let print_state = |name: &str| {
@@ -95,7 +95,7 @@ fn create_layers_writes_a_group_per_layer_with_its_states() {
             let g = ids
                 .into_iter()
                 .map(|id| xref.get::<Dict<'_>>(id).unwrap())
-                .find(|g| g.get::<hayro_syntax::object::String<'_>>(b"Name").unwrap().as_bytes() == name.as_bytes());
+                .find(|g| g.get::<craft_pdf::syntax::object::String<'_>>(b"Name").unwrap().as_bytes() == name.as_bytes());
             let usage = g.unwrap().get::<Dict<'_>>(b"Usage").unwrap();
             usage.get::<Dict<'_>>(b"Print").unwrap().get::<Name<'_>>(b"PrintState").unwrap().as_ref().to_vec()
         };
@@ -228,7 +228,7 @@ fn pdf_a_layers_have_no_automatic_states() {
     let r = export(&layered(), json!({"standard": "pdfA2b", "createLayers": true}));
     oc_properties(&r.bytes, None, |props, _| {
         let config = props.unwrap().get::<Dict<'_>>(b"D").unwrap();
-        assert!(config.get::<Array<'_>>(b"AS").is_none() && config.get::<hayro_syntax::object::String<'_>>(b"Name").is_some());
+        assert!(config.get::<Array<'_>>(b"AS").is_none() && config.get::<craft_pdf::syntax::object::String<'_>>(b"Name").is_some());
     });
 }
 
@@ -331,9 +331,11 @@ fn pdf_a_overprint_mode_is_0() {
 #[test]
 fn overprinting_art_imports_as_it_was_drawn() {
     let d = overprinting(RED);
-    let plain = leaves(&import(&export(&d, json!({"advanced": {"overprint": "discard"}})).bytes).unwrap());
+    // What is drawn (a form's bounds may come back as an unpainted clipping path).
+    let painted = |bytes: &[u8]| leaves(&import(bytes).unwrap()).into_iter().filter(|l| l.2.is_some()).collect::<Vec<_>>();
+    let plain = painted(&export(&d, json!({"advanced": {"overprint": "discard"}})).bytes);
     for v in [json!({}), json!({"createLayers": true})] {
-        assert_eq!(leaves(&import(&export(&d, v.clone()).bytes).unwrap()), plain, "{v}: the marks draw nothing");
+        assert_eq!(painted(&export(&d, v.clone()).bytes), plain, "{v}: the marks draw nothing");
     }
 }
 

@@ -1,5 +1,6 @@
 //! Headless frames of the Stroke panel's reach: Units > Stroke in the panel, the Control bar and
-//! the Properties panel, mixed values shown blank, Align Stroke for open paths and type, and the
+//! the Properties panel, mixed values shown blank, Align Stroke for open paths and type (also
+//! while the Type tool edits it), and the
 //! weight presets.
 
 use serde_json::json;
@@ -82,7 +83,7 @@ fn mixed_weights_show_blank() {
 }
 
 #[test]
-fn inside_and_outside_are_off_for_open_paths_and_type() {
+fn inside_and_outside_are_off_for_open_paths_and_on_for_type() {
     let ctx = egui::Context::default();
     let mut app = app_with_rect();
     let align = |app: &VectorcraftApp| current_stroke(app).unwrap().align;
@@ -95,9 +96,29 @@ fn inside_and_outside_are_off_for_open_paths_and_type() {
     let id = run(&mut app, "text.create", json!({"x": 10, "y": 190, "text": "Hi"}))["id"].as_u64().unwrap();
     run(&mut app, "select.set", json!({ "ids": [id] }));
     run(&mut app, "paint.setStroke", json!({"color": "#000000"}));
-    let undo = app.session.active().unwrap().history.undo.len();
     click(&ctx, &mut app, at, stroke::show);
-    assert_eq!(app.session.active().unwrap().history.undo.len(), undo, "type doesn't");
+    assert_eq!(align(&app), vectorcraft_doc::StrokeAlign::Inside, "type's characters do, around their glyphs");
+}
+
+/// While the Type tool edits text, Align Stroke styles the selected characters' stroke.
+#[test]
+fn align_stroke_styles_the_characters_the_type_tool_selects() {
+    let ctx = egui::Context::default();
+    let mut app = app_with_rect();
+    let at = row_button(&ctx, &texts(&ctx, &mut app, stroke::show), "Align Stroke:", 2);
+    app.session.select_tool("type", Default::default()).unwrap();
+    let id = run(&mut app, "text.create", json!({"x": 10, "y": 190, "text": "Hello"}))["id"].as_u64().unwrap();
+    run(&mut app, "paint.setStroke", json!({"color": "#000000"}));
+    app.session.apply_actions(vec![vectorcraft_tools::Action::Notify("text.editNew".into())]).unwrap();
+    app.session.set_tool_option("select", &json!({"start": 0, "end": 2}));
+    assert!(character::text_editing(&app).is_some());
+    assert!(stroke_mixed(&app, &ctx).can_align, "the buttons are on");
+    click(&ctx, &mut app, at, stroke::show);
+    let vectorcraft_doc::NodeKind::Text(t) = &app.session.active().unwrap().doc.node(vectorcraft_doc::NodeId(id)).unwrap().kind else {
+        panic!("not type")
+    };
+    let aligns: Vec<_> = t.runs.iter().map(|r| r.style.stroke_align).collect();
+    assert_eq!(aligns, [vectorcraft_doc::StrokeAlign::Outside, vectorcraft_doc::StrokeAlign::Center], "only the selected characters");
 }
 
 #[test]
@@ -138,4 +159,38 @@ fn weight_presets_display_cleanly_in_their_native_unit() {
     assert!([1.0, 12.0, 60.0].iter().all(|w| pc.contains(w)), "{pc:?}");
     // Units no stroke is measured in keep the pt ladder, in points.
     assert_eq!(stroke::weight_presets(Unit::Meters), stroke::weight_presets(Unit::Points));
+}
+
+/// #991: the spinner left of the Stroke Weight field steps ten with Shift on both arrows and a
+/// tenth with Ctrl/Cmd, as ↑/↓ do in the focused field, while a plain click steps one point.
+#[test]
+fn stroke_weight_stepper_uses_ten_point_shift_steps() {
+    use super::tests_appearance::frame_raw;
+
+    let ctx = egui::Context::default();
+    crate::theme::install_fonts(&ctx);
+    let mut app = app_with_rect();
+    run(&mut app, "stroke.set", json!({"weight": 14}));
+    let t = texts(&ctx, &mut app, stroke::show);
+    // The 16 px spinner sits just left of the field's text.
+    let r = text_rect(&t, "14 pt");
+    let x = r.left() - 14.0;
+    let click_step = |app: &mut VectorcraftApp, y: f32, modifiers: egui::Modifiers| {
+        let pos = egui::pos2(x, y);
+        let button = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers };
+        for event in [egui::Event::PointerMoved(pos), button(true), button(false)] {
+            let events = vec![egui::Event::ModifiersChanged(modifiers), event];
+            frame_raw(&ctx, app, egui::RawInput { events, ..Default::default() }, stroke::show);
+        }
+    };
+
+    click_step(&mut app, r.center().y - 5.0, egui::Modifiers::SHIFT);
+    assert_eq!(app.session.shown_stroke().unwrap().width, 24.0);
+    click_step(&mut app, r.center().y + 5.0, egui::Modifiers::NONE);
+    assert_eq!(app.session.shown_stroke().unwrap().width, 23.0);
+    click_step(&mut app, r.center().y + 5.0, egui::Modifiers::SHIFT);
+    assert_eq!(app.session.shown_stroke().unwrap().width, 13.0);
+    // Ctrl/Cmd steps a tenth, as ↑/↓ and the wheel do in the field.
+    click_step(&mut app, r.center().y + 5.0, egui::Modifiers::COMMAND);
+    assert!((app.session.shown_stroke().unwrap().width - 12.9).abs() < 1e-6);
 }

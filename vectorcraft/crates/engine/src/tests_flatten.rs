@@ -7,6 +7,8 @@ use vectorcraft_doc::{AppearanceItem, Node, NodeKind};
 use vectorcraft_geom::{BezPath, Point, Rect, Shape};
 use vectorcraft_render::{Rendered, Renderer};
 
+use super::tests_expand::{RANDOM_CASES, random_transforms};
+use super::tests_menucmds::{place_undecodable_png, warns_undecoded};
 use super::*;
 
 /// Colours here go through the process-wide colour settings, which the colour management tests
@@ -293,6 +295,18 @@ fn gradients_rasterize_and_flat_areas_stay_vector() {
 }
 
 #[test]
+fn flatten_says_when_an_image_could_not_be_decoded() {
+    let _settings = settings_lock();
+    let mut s = session();
+    let cut = place_undecodable_png(&mut s).0;
+    let t = rect(&mut s, 60.0, 60.0, 100.0, 100.0, "#20c040");
+    run(&mut s, "transparency.set", json!({"ids": [t], "opacity": 50}));
+    let r = run(&mut s, "object.flattenTransparency", json!({"ids": [cut, t]}));
+    assert!(warns_undecoded(&r), "{r}");
+    assert_eq!(r["rasterized"], 1, "the image area is still flattened: {r}");
+}
+
+#[test]
 fn flatten_is_one_undo_step() {
     let _settings = settings_lock();
     let mut s = session();
@@ -308,6 +322,23 @@ fn flatten_is_one_undo_step() {
     assert_eq!(s.doc().unwrap().doc.layers, doc.layers);
     run(&mut s, "edit.redo", json!({}));
     assert!(!exists(&s, a));
+}
+
+/// Flattening a document for export in which two objects have the same id (a damaged file)
+/// removes both objects and puts one group in their place.
+#[test]
+fn flattening_objects_that_share_an_id_removes_both() {
+    let _settings = settings_lock();
+    let mut s = session();
+    let a = rect(&mut s, 10.0, 10.0, 100.0, 100.0, "#ff0000");
+    let b = rect(&mut s, 60.0, 60.0, 100.0, 100.0, "#0000ff");
+    run(&mut s, "transparency.set", json!({"ids": [a, b], "opacity": 50}));
+    let mut doc = (*s.doc().unwrap().doc).clone();
+    doc.node_mut(NodeId(b)).unwrap().id = NodeId(a);
+    let flat = crate::cmd::flatten::flatten_document(&doc, &crate::cmd::FlattenOptions::default()).unwrap().unwrap();
+    let art = flat.layers[0].children().unwrap();
+    assert_eq!(art.len(), 1, "one group where the two objects were");
+    assert!(matches!(art[0].kind, NodeKind::Group { .. }) && art[0].id != NodeId(a));
 }
 
 #[test]
@@ -336,6 +367,69 @@ fn objects_without_transparency_stay_unless_outlined() {
             assert!(c.appearance.stroke().is_none_or(|st| st.paint.is_none()), "strokes are outlined");
         });
     }
+}
+
+#[test]
+fn outlined_type_keeps_its_underline() {
+    let _settings = settings_lock();
+    let mut s = session();
+    let text = run(&mut s, "text.create", json!({"x": 10, "y": 150, "text": "Hi", "size": 24}))["id"].as_u64().unwrap();
+    run(&mut s, "text.setFormat", json!({"ids": [text], "underline": true}));
+    let (ids, ..) = flatten(&mut s, json!({"ids": [text], "textToOutlines": true}));
+    // "Hi" has no ink below its baseline (y 150): the outlines reach the bar under it.
+    let b = node(&s, ids[0]).geometric_bounds().unwrap();
+    assert!(b.y1 > 151.0, "{b:?}");
+}
+
+#[test]
+fn outlined_type_keeps_its_gradient_on_the_outlines_its_transform_effect_moves() {
+    let _settings = settings_lock();
+    // "IIII" at 80 pt with its baseline at (x, y), its characters filled with a red-to-blue gradient
+    // that runs left to right, with a Transform effect of `params` if any.
+    let typed = |x: f64, y: f64, params: Option<Value>| {
+        let mut s = session();
+        let t = run(&mut s, "text.create", json!({"x": x, "y": y, "text": "IIII", "size": 80}))["id"].as_u64().unwrap();
+        let stops = json!([{"offset": 0, "color": "#ff0000"}, {"offset": 1, "color": "#0000ff"}]);
+        run(&mut s, "paint.setFill", json!({"ids": [t], "gradient": {"kind": "linear", "stops": stops}}));
+        if let Some(params) = params {
+            run(&mut s, "effect.apply", json!({"effect": "distort.transform", "params": params, "ids": [t], "item": null}));
+        }
+        (s, t)
+    };
+    let mut diffs = vec![];
+    // The effect moves the type 30 pt right (along the gradient) or 20 pt down (across it). Type
+    // laid out at the moved baseline is the reference.
+    for (dx, dy) in [(30.0, 0.0), (0.0, 20.0)] {
+        let reference = picture(&typed(10.0 + dx, 150.0 + dy, None).0);
+        let (mut s, t) = typed(10.0, 150.0, Some(json!({"moveH": dx, "moveV": dy})));
+        flatten(&mut s, json!({"ids": [t], "textToOutlines": true}));
+        diffs.push(changed(&picture(&s), &reference));
+        // The outlines draw the same after the document is saved and opened again.
+        let back = vectorcraft_format::load(&vectorcraft_format::save(&s.doc().unwrap().doc, false)).unwrap();
+        diffs.push(changed(&Renderer::new().render_region(&back, Rect::new(0.0, 0.0, 200.0, 200.0), 1.0, true), &reference));
+    }
+    assert!(diffs.iter().all(|&d| d < 0.0002), "shares of the pixels that changed: {diffs:?}");
+}
+
+/// Random in a Transform effect takes its seed from the object's id. Each of [`random_transforms`]'
+/// objects at 50% opacity draws as the canvas drew it with its geometry effects baked, as Flatten
+/// Transparency bakes them first, and after Flatten Transparency, within the seams between its
+/// regions (the same objects without Random change 1.4% to 2.3% of the pixels).
+#[test]
+fn flattened_art_keeps_the_random_transforms_the_canvas_drew() {
+    let _settings = settings_lock();
+    let mut diffs = vec![];
+    for case in RANDOM_CASES {
+        let mut s = session();
+        let id = random_transforms(&mut s, case);
+        run(&mut s, "transparency.set", json!({"ids": [id.0], "opacity": 50}));
+        let before = picture(&s);
+        let baked = vectorcraft_render::effects::bake_document(&s.doc().unwrap().doc).unwrap();
+        let baked = Renderer::new().render_region(&baked, Rect::new(0.0, 0.0, 200.0, 200.0), 1.0, true);
+        flatten(&mut s, json!({"ids": [id.0]}));
+        diffs.push((case, changed(&before, &baked), changed(&before, &picture(&s))));
+    }
+    assert!(diffs.iter().all(|&(_, baked, flat)| baked == 0.0 && flat < 0.03), "shares of the pixels that changed: {diffs:?}");
 }
 
 #[test]
@@ -451,13 +545,13 @@ fn opacity_masks_are_rasterized_with_their_look() {
         json!({"ids": [m], "gradient": {"kind": "linear", "stops": [{"offset": 0, "color": "#ffffff"}, {"offset": 1, "color": "#000000"}]}}),
     );
     run(&mut s, "transparency.makeOpacityMask", json!({"ids": [a, m]}));
-    assert!(node(&s, a).mask.is_some());
+    assert!(node(&s, a).extras().mask.is_some());
     let before = picture(&s);
     run(&mut s, "select.all", json!({}));
     let (ids, _, rasterized) = flatten(&mut s, json!({"lineArtPpi": 144}));
     assert_eq!((ids.len(), rasterized), (1, 1));
     let mut masks = 0;
-    node(&s, ids[0]).walk(&mut |c| masks += c.mask.is_some() as usize);
+    node(&s, ids[0]).walk(&mut |c| masks += c.extras().mask.is_some() as usize);
     assert_eq!(masks, 0, "no transparency is left");
     assert!(changed(&before, &picture(&s)) < 0.02);
 }

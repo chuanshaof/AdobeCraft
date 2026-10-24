@@ -26,7 +26,7 @@ fn node(s: &Session, id: NodeId) -> vectorcraft_doc::Node {
 /// The art the renderer and exporters draw for `id` (its outlines, projected).
 fn drawn_bounds(s: &Session, id: NodeId) -> Rect {
     let n = node(s, id);
-    vectorcraft_render::effects::reshape(&n, None).unwrap().geometric_bounds().unwrap()
+    vectorcraft_render::effects::reshape(None, &n, None).unwrap().geometric_bounds().unwrap()
 }
 
 #[test]
@@ -39,7 +39,7 @@ fn type_in_perspective_is_projected_and_stays_type() {
     let h = n.projection().expect("drawn through a projection");
     // Really foreshortened: the right plane recedes to the right, so the letters' far end is
     // shorter than their near end.
-    let out = vectorcraft_render::effects::reshape(&n, None).unwrap();
+    let out = vectorcraft_render::effects::reshape(None, &n, None).unwrap();
     let mut pts = vec![];
     out.walk(&mut |c| {
         if let Some(p) = c.path_data() {
@@ -71,6 +71,21 @@ fn type_in_perspective_exports_projected_outlines() {
     let baked = pdf.node(id).unwrap();
     assert!(!matches!(baked.kind, NodeKind::Text(_)));
     let bb = baked.geometric_bounds().unwrap();
+    assert!((bb.x0 - b.x0).abs() < 1e-6 && (bb.y1 - b.y1).abs() < 1e-6, "{bb:?} {b:?}");
+}
+
+#[test]
+fn type_in_perspective_in_a_group_with_a_geometry_effect_exports_projected() {
+    let (mut s, rect) = persp_session();
+    let id = persp_text(&mut s);
+    let b = drawn_bounds(&s, id);
+    s.execute("select.set", &json!({"ids": [rect.0, id.0]})).unwrap();
+    s.execute("object.group", &json!({})).unwrap();
+    // Offset Path 0 on the group leaves every path as it is.
+    s.execute("effect.apply", &json!({"effect": "path.offsetPath", "params": {"offset": 0}})).unwrap();
+    let doc = s.doc().unwrap().doc.clone();
+    let baked = vectorcraft_render::effects::bake_document(&doc).unwrap();
+    let bb = baked.node(id).unwrap().geometric_bounds().unwrap();
     assert!((bb.x0 - b.x0).abs() < 1e-6 && (bb.y1 - b.y1).abs() < 1e-6, "{bb:?} {b:?}");
 }
 
@@ -117,13 +132,44 @@ fn edit_text_shows_it_flat_in_isolation_then_projects_it_again() {
     assert!(n.projection().is_some(), "projected again");
     // Nothing left flat anywhere in the history.
     for e in &s.doc().unwrap().history.undo {
-        if let Some(p) = e.doc.node(id).and_then(|n| n.perspective.as_deref()) {
+        if let Some(p) = e.doc.node(id).and_then(|n| n.extras().perspective.as_deref()) {
             assert!(!p.editing);
         }
     }
     // Not type in perspective: refused.
     let (mut s2, rect) = persp_session();
     assert!(s2.execute("perspective.editText", &json!({"id": rect.0})).is_err());
+}
+
+/// Edit Text ending while a background save writes the file leaves the document saved once the
+/// file is written: the flat view is never saved. Saved while editing and edited after: undoing
+/// the edit once Edit Text has ended is back at what the file holds.
+#[test]
+fn ending_edit_text_during_a_save_leaves_the_document_saved() {
+    use crate::cmd::fileio::{SaveMode, save_job, save_plan, save_with};
+    let (mut s, _) = persp_session();
+    let id = persp_text(&mut s);
+    s.execute("select.set", &json!({"ids": [id.0]})).unwrap();
+    s.execute("perspective.editText", &json!({})).unwrap();
+    let uid = s.doc().unwrap().uid;
+    let plan = save_plan(&s, SaveMode::SaveAs, &json!({"path": "/x/type.vectorcraft", "modified": 777})).unwrap();
+    let job = save_job(&mut s, plan).unwrap();
+    s.execute("object.exitIsolation", &json!({})).unwrap();
+    job.write(|_, _| Ok(())).unwrap();
+    job.complete(&mut s, uid);
+    assert!(node(&s, id).projection().is_some(), "projected again");
+    let st = s.doc().unwrap();
+    assert_eq!(st.doc.metadata.modified, Some(777));
+    assert!(!st.is_dirty());
+    s.execute("perspective.editText", &json!({})).unwrap();
+    let plan = save_plan(&s, SaveMode::Save, &json!({"modified": 778})).unwrap();
+    save_with(&mut s, plan, |_, _| Ok(())).unwrap();
+    assert!(!s.doc().unwrap().is_dirty());
+    s.execute("text.setText", &json!({"id": id.0, "text": "HELLO WORLD"})).unwrap();
+    s.execute("object.exitIsolation", &json!({})).unwrap();
+    assert!(s.doc().unwrap().is_dirty());
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert!(!s.doc().unwrap().is_dirty());
 }
 
 #[test]

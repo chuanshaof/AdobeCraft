@@ -1,7 +1,8 @@
 //! Swatch library files: the native `.vcswatches` JSON (colour models, global, spot, gradients
 //! and colour groups exactly), `.gpl` palettes (8-bit RGB; colour groups as `# Group:` comment
-//! headers) and CSS custom properties (written only). Swatch exchange files (`.ase`) are read
-//! only ([`read_bytes`]).
+//! headers), swatch exchange `.ase` files (binary: solid colors in their own model, global, spot
+//! and process colors, color groups), color books `.acb` (read only: the books a user owns, such
+//! as a Pantone book) and CSS custom properties (written only).
 
 use std::collections::{HashMap, HashSet};
 
@@ -16,18 +17,22 @@ pub enum PaletteFormat {
     Native,
     /// `.gpl`: a plain-text RGB palette many paint and design tools read.
     Gpl,
+    /// `.ase`: a swatch exchange file (binary): solid colors in their own model, global, spot or
+    /// process, and color groups.
+    Ase,
     /// `.css`: custom properties on `:root` (colours and gradients; written only).
     Css,
 }
 
 impl PaletteFormat {
-    pub const ALL: [PaletteFormat; 3] = [PaletteFormat::Native, PaletteFormat::Gpl, PaletteFormat::Css];
+    pub const ALL: [PaletteFormat; 4] = [PaletteFormat::Native, PaletteFormat::Gpl, PaletteFormat::Ase, PaletteFormat::Css];
 
     /// The format's id, which is also its extension.
     pub fn id(self) -> &'static str {
         match self {
             PaletteFormat::Native => "vcswatches",
             PaletteFormat::Gpl => "gpl",
+            PaletteFormat::Ase => "ase",
             PaletteFormat::Css => "css",
         }
     }
@@ -35,6 +40,7 @@ impl PaletteFormat {
         match self {
             PaletteFormat::Native => "VectorCraft Swatches (.vcswatches)",
             PaletteFormat::Gpl => "GPL Palette (.gpl)",
+            PaletteFormat::Ase => "Swatch Exchange (.ase)",
             PaletteFormat::Css => "CSS Custom Properties (.css)",
         }
     }
@@ -46,6 +52,23 @@ impl PaletteFormat {
     /// Can libraries be read back from this format?
     pub fn readable(self) -> bool {
         self != PaletteFormat::Css
+    }
+    /// Are files of this format binary rather than text?
+    pub fn binary(self) -> bool {
+        self == PaletteFormat::Ase
+    }
+    /// Does [`write`] keep a swatch with `paint` in a file of this format? None and patterns are
+    /// never written; `.gpl` and `.ase` hold solid colors only, and CSS holds no freeform gradients.
+    pub fn holds(self, paint: &Paint) -> bool {
+        match paint {
+            Paint::Solid { .. } => true,
+            Paint::Gradient(g) => match self {
+                PaletteFormat::Native => true,
+                PaletteFormat::Css => g.gradient.kind != GradientKind::Freeform,
+                PaletteFormat::Gpl | PaletteFormat::Ase => false,
+            },
+            Paint::None | Paint::Pattern { .. } => false,
+        }
     }
 }
 
@@ -70,12 +93,16 @@ const ASE_MAX_ENTRIES: usize = 100_000;
 /// The most UTF-16 code units of a name that are kept.
 const ASE_MAX_NAME: usize = 1024;
 const ASE_CUT_SHORT: &str = "the swatch exchange file is cut short";
+const ACB_SIGNATURE: &[u8] = b"8BCB";
+const ACB_CUT_SHORT: &str = "the color book is cut short";
 
-/// Write `lib` in `format`. Pattern swatches (their tiles live in a document) and None are left
-/// out; `.gpl` keeps solid colours only, as 8-bit RGB.
-pub fn write(lib: &SwatchLibrary, format: PaletteFormat) -> String {
-    let keep = |w: &&Swatch| matches!(w.paint, Paint::Solid { .. } | Paint::Gradient(_));
-    match format {
+/// Write `lib` in `format` → the file's bytes. Pattern swatches (their tiles live in a document)
+/// and None are left out; `.gpl` keeps solid colours only, as 8-bit RGB, and `.ase` keeps solid
+/// colors in their own model. Writing `.ase` fails for a library with more colors and groups than
+/// [`read_bytes`] reads from one file.
+pub fn write(lib: &SwatchLibrary, format: PaletteFormat) -> Result<Vec<u8>, String> {
+    let keep = |w: &&Swatch| format.holds(&w.paint);
+    let text = match format {
         PaletteFormat::Native => {
             let strip = |list: &[Swatch]| list.iter().filter(keep).cloned().collect::<Vec<_>>();
             let library = SwatchLibrary {
@@ -87,8 +114,10 @@ pub fn write(lib: &SwatchLibrary, format: PaletteFormat) -> String {
             serde_json::to_string_pretty(&file).unwrap_or_default()
         }
         PaletteFormat::Gpl => write_gpl(lib),
+        PaletteFormat::Ase => return write_ase(lib),
         PaletteFormat::Css => write_css(lib, keep),
-    }
+    };
+    Ok(text.into_bytes())
 }
 
 /// One line of text: no line breaks or tabs.
@@ -152,14 +181,16 @@ fn css_comment(s: &str) -> String {
 
 fn write_css(lib: &SwatchLibrary, keep: impl Fn(&&Swatch) -> bool) -> String {
     let mut out = format!("/* {} */\n:root {{\n", css_comment(&lib.name));
-    let mut taken: Vec<String> = vec![];
+    let mut taken: HashSet<String> = HashSet::new();
+    // The next number to try for each base, so repeated names don't search the ones used before.
+    let mut next: HashMap<String, usize> = HashMap::new();
     let mut props = |out: &mut String, list: &[Swatch]| {
         for w in list.iter().filter(&keep) {
             let value = match &w.paint {
                 Paint::Solid { color, .. } => css_color(color, 1.0),
                 Paint::Gradient(g) if g.gradient.kind != GradientKind::Freeform => {
                     let stops: Vec<String> =
-                        g.gradient.stops.iter().map(|s| format!("{} {}%", css_color(&s.color, s.opacity), (s.offset * 100.0).round())).collect();
+                        g.gradient.stops.iter().map(|s| format!("{} {}%", css_color(&s.color, s.opacity), s.offset * 100.0)).collect();
                     match g.gradient.kind {
                         GradientKind::Radial => format!("radial-gradient(circle, {})", stops.join(", ")),
                         _ => format!("linear-gradient({}deg, {})", (90.0 - g.angle).rem_euclid(360.0).round(), stops.join(", ")),
@@ -169,8 +200,18 @@ fn write_css(lib: &SwatchLibrary, keep: impl Fn(&&Swatch) -> bool) -> String {
             };
             // Names differing only in case or punctuation map to one property: number the others.
             let base = css_property(&w.name);
-            let name = (1..).map(|i| if i == 1 { base.clone() } else { format!("{base}-{i}") }).find(|n| !taken.contains(n)).unwrap_or(base);
-            taken.push(name.clone());
+            let name = if taken.insert(base.clone()) {
+                base
+            } else {
+                let n = next.entry(base.clone()).or_insert(1);
+                loop {
+                    *n += 1;
+                    let name = format!("{base}-{n}");
+                    if taken.insert(name.clone()) {
+                        break name;
+                    }
+                }
+            };
             let note = if w.spot { " /* spot */" } else { "" };
             out.push_str(&format!("  {name}: {value};{note}\n"));
         }
@@ -182,6 +223,102 @@ fn write_css(lib: &SwatchLibrary, keep: impl Fn(&&Swatch) -> bool) -> String {
     }
     out.push_str("}\n");
     out
+}
+
+/// `.ase`, as [`read_ase`] reads it: version 1.0, the ungrouped colors, then each color group as a
+/// group start (its name), its colors and a group end, also for a group without colors. A color is
+/// written in its own model: RGB, CMYK and gray components from 0 to 1 (gray as a level, 1 is
+/// white), Lab lightness as a fraction of 100 and a and b from −128 to 127. Components are clamped
+/// to those ranges, and a component that isn't a finite number is written as 0. The color type is
+/// 1 for a spot color, 0 for another global color and 2 for a process color.
+///
+/// A swatch exchange file holds solid colors only: gradients, patterns and None are left out, and
+/// a tint swatch is written as the color it shows, a process color without its link to its base.
+/// The file has no library name ([`read_ase`] names a library after its file). More than
+/// [`ASE_MAX_ENTRIES`] colors and groups is an error.
+fn write_ase(lib: &SwatchLibrary) -> Result<Vec<u8>, String> {
+    let solid = |list: &[Swatch]| list.iter().filter(|w| w.paint.color().is_some()).count();
+    let entries = solid(&lib.swatches) + lib.groups.iter().map(|g| 1 + solid(&g.swatches)).sum::<usize>();
+    if entries > ASE_MAX_ENTRIES {
+        return Err(format!(
+            "VectorCraft reads at most {ASE_MAX_ENTRIES} colors and groups from a swatch exchange file, and this library has {entries}"
+        ));
+    }
+    let mut body = vec![];
+    let mut blocks = put_ase_colors(&mut body, &lib.swatches)?;
+    for g in &lib.groups {
+        let mut name = vec![];
+        put_ase_name(&mut name, &g.name)?;
+        put_ase_block(&mut body, ASE_GROUP_START, &name)?;
+        blocks += 2 + put_ase_colors(&mut body, &g.swatches)?;
+        put_ase_block(&mut body, ASE_GROUP_END, &[])?;
+    }
+    let blocks = u32::try_from(blocks).map_err(|_| "too many swatch exchange blocks".to_string())?;
+    let mut out = ASE_SIGNATURE.to_vec();
+    out.extend(1u16.to_be_bytes());
+    out.extend(0u16.to_be_bytes());
+    out.extend(blocks.to_be_bytes());
+    out.extend(body);
+    Ok(out)
+}
+
+/// The color blocks of the solid colors in `list` → how many were written.
+fn put_ase_colors(out: &mut Vec<u8>, list: &[Swatch]) -> Result<usize, String> {
+    let unit = |v: f32| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 };
+    let ab = |v: f32| if v.is_finite() { v.clamp(-128.0, 127.0) } else { 0.0 };
+    let mut n = 0;
+    for (w, color) in list.iter().filter_map(|w| Some((w, w.paint.color()?))) {
+        let mut body = vec![];
+        put_ase_name(&mut body, &w.name)?;
+        let (model, values): (&[u8; 4], Vec<f32>) = match color {
+            Color::Rgb { r, g, b } => (b"RGB ", vec![unit(r), unit(g), unit(b)]),
+            Color::Cmyk { c, m, y, k } => (b"CMYK", vec![unit(c), unit(m), unit(y), unit(k)]),
+            Color::Lab { l, a, b } => (b"LAB ", vec![unit(l / 100.0), ab(a), ab(b)]),
+            Color::Gray { k } => (b"Gray", vec![1.0 - unit(k)]),
+        };
+        body.extend(model);
+        body.extend(values.iter().flat_map(|v| v.to_be_bytes()));
+        let kind: u16 = if w.spot {
+            1
+        } else if w.global {
+            0
+        } else {
+            2
+        };
+        body.extend(kind.to_be_bytes());
+        put_ase_block(out, ASE_COLOR, &body)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// A block: its type, the length of its body and the body.
+fn put_ase_block(out: &mut Vec<u8>, kind: u16, body: &[u8]) -> Result<(), String> {
+    let len = u32::try_from(body.len()).map_err(|_| "a swatch exchange block is too long".to_string())?;
+    out.extend(kind.to_be_bytes());
+    out.extend(len.to_be_bytes());
+    out.extend_from_slice(body);
+    Ok(())
+}
+
+/// A name as `.ase` stores it: a `u16` count of UTF-16 code units, the terminating zero included,
+/// then the units. NUL characters are left out, and a name longer than [`ASE_MAX_NAME`] code units
+/// is cut before the character that would pass that limit.
+fn put_ase_name(out: &mut Vec<u8>, name: &str) -> Result<(), String> {
+    let mut units: Vec<u16> = vec![];
+    for c in name.chars().filter(|&c| c != '\0') {
+        let mut buf = [0; 2];
+        let encoded = c.encode_utf16(&mut buf);
+        if units.len() + encoded.len() > ASE_MAX_NAME {
+            break;
+        }
+        units.extend_from_slice(encoded);
+    }
+    units.push(0);
+    let count = u16::try_from(units.len()).map_err(|_| "a swatch exchange name is too long".to_string())?;
+    out.extend(count.to_be_bytes());
+    out.extend(units.iter().flat_map(|u| u.to_be_bytes()));
+    Ok(())
 }
 
 /// Read a `.vcswatches` or `.gpl` library (detected from its content). `name` names it when the
@@ -217,6 +354,9 @@ pub fn read_bytes(bytes: &[u8], name: &str) -> Result<SwatchLibrary, String> {
     if bytes.starts_with(ASE_SIGNATURE) {
         return read_ase(bytes, name);
     }
+    if bytes.starts_with(ACB_SIGNATURE) {
+        return read_acb(bytes, name).map_err(|e| if e == ASE_CUT_SHORT { ACB_CUT_SHORT.into() } else { e });
+    }
     read(&String::from_utf8_lossy(bytes), name)
 }
 
@@ -224,6 +364,7 @@ pub fn read_bytes(bytes: &[u8], name: &str) -> Result<SwatchLibrary, String> {
 /// [`read_bytes`] reads it, with the invalid bytes replaced (its first KiB is enough).
 pub fn sniff_bytes(bytes: &[u8]) -> bool {
     bytes.starts_with(ASE_SIGNATURE)
+        || bytes.starts_with(ACB_SIGNATURE)
         || std::str::from_utf8(bytes).is_ok_and(sniff)
         || sniff(&String::from_utf8_lossy(bytes.get(..1024).unwrap_or(bytes)))
 }
@@ -242,7 +383,9 @@ fn read_gpl(text: &str, fallback: &str) -> SwatchLibrary {
             continue;
         }
         if let Some(n) = line.strip_prefix("Name:") {
-            lib.name = n.trim().to_string();
+            if !n.trim().is_empty() {
+                lib.name = n.trim().to_string();
+            }
             continue;
         }
         // Comments, headers (`Columns: 4`) and anything else that isn't a colour are skipped.
@@ -314,6 +457,67 @@ fn read_ase(bytes: &[u8], fallback: &str) -> Result<SwatchLibrary, String> {
             // Other blocks are skipped.
             _ => {}
         }
+    }
+    Ok(lib)
+}
+
+/// `.acb` (a color book, read only), from public descriptions of the format: after the signature
+/// come, big-endian, a `u16` version (1) and book id, the title, prefix, suffix and description
+/// as strings, a `u16` color count, page size and page selector offset, a `u16` color space (0
+/// RGB, 2 CMYK, 7 Lab) and the colors: each a name, a six-character catalog code and its
+/// components as bytes. RGB runs from 0 to 255, CMYK ink is stored inverted (255 is no ink), Lab
+/// lightness is 0 to 255 for 0 to 100 and a and b are offset by 128. A string is a `u32` count of
+/// UTF-16 code units, then the units; a `$$$/key=Text` string means `Text`, and `^R`, `^C` stand
+/// for ® and ©. An optional `spflspot` or `spflproc` at the end says whether the colors are spot
+/// or process colors (a book without it is a spot color book).
+///
+/// The book's colors are named with its prefix and suffix ("PANTONE 185 C"); colors without a
+/// name (the padding of a book's pages) are left out. A version other than 1, a color space other
+/// than those three or more than [`ASE_MAX_ENTRIES`] colors is an error.
+fn read_acb(bytes: &[u8], fallback: &str) -> Result<SwatchLibrary, String> {
+    let mut data = AseData(bytes);
+    data.bytes(ACB_SIGNATURE.len())?;
+    let version = data.u16()?;
+    if version != 1 {
+        return Err(format!("color book version {version} isn't supported (only 1)"));
+    }
+    let _book_id = data.u16()?;
+    let [title, prefix, suffix, _description] = [data.acb_string()?, data.acb_string()?, data.acb_string()?, data.acb_string()?];
+    let count = usize::from(data.u16()?);
+    if count > ASE_MAX_ENTRIES {
+        return Err(format!("the color book holds more than {ASE_MAX_ENTRIES} colors"));
+    }
+    let (_page_size, _page_offset) = (data.u16()?, data.u16()?);
+    let space = data.u16()?;
+    let mut colors = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name = data.acb_string()?;
+        let _code = data.bytes(6)?;
+        let color = match space {
+            0 => {
+                let [r, g, b] = data.array::<3>()?;
+                Color::rgb8(r, g, b)
+            }
+            2 => {
+                let ink = |v: u8| f32::from(255 - v) / 255.0;
+                let [c, m, y, k] = data.array::<4>()?;
+                Color::cmyk(ink(c), ink(m), ink(y), ink(k))
+            }
+            7 => {
+                let [l, a, b] = data.array::<3>()?;
+                Color::lab(f32::from(l) * 100.0 / 255.0, f32::from(a) - 128.0, f32::from(b) - 128.0)
+            }
+            other => return Err(format!("color books in color space {other} aren't supported (only RGB, CMYK and Lab)")),
+        };
+        colors.push((name, color));
+    }
+    // Spot colors unless the book says process ones.
+    let spot = data.0.windows(8).last() != Some(b"spflproc".as_slice());
+    let mut lib = SwatchLibrary { name: if title.is_empty() { fallback.into() } else { title }, ..Default::default() };
+    let mut names = UniqueNames::default();
+    for (name, color) in colors.into_iter().filter(|(n, _)| !n.trim().is_empty()) {
+        let name = names.unique(format!("{prefix}{name}{suffix}").trim().to_string());
+        lib.swatches.push(Swatch { name, paint: Paint::solid(color), global: spot, spot });
     }
     Ok(lib)
 }
@@ -394,6 +598,20 @@ impl<'a> AseData<'a> {
         let v = f32::from_be_bytes(self.array()?);
         Ok(if v.is_finite() { v } else { 0.0 })
     }
+    /// A color book string ([`read_acb`]): a `u32` count of UTF-16 code units, then the units,
+    /// with `$$$/key=Text` read as `Text` and `^R`, `^C` as ®, ©; at most [`ASE_MAX_NAME`] units
+    /// are kept.
+    fn acb_string(&mut self) -> Result<String, String> {
+        let n = usize::try_from(self.u32()?).unwrap_or(usize::MAX);
+        let (units, _) = self.bytes(n.checked_mul(2).ok_or(ASE_CUT_SHORT)?)?.as_chunks::<2>();
+        let units: Vec<u16> = units.iter().take(ASE_MAX_NAME).map(|u| u16::from_be_bytes(*u)).take_while(|&u| u != 0).collect();
+        let s = String::from_utf16_lossy(&units);
+        let s = match s.strip_prefix("$$$/") {
+            Some(key) => key.split_once('=').map_or("", |(_, text)| text).to_string(),
+            None => s,
+        };
+        Ok(s.replace("^R", "®").replace("^C", "©"))
+    }
     /// A name up to its terminating zero, trimmed. A block that ends before it has no name.
     fn name(&mut self) -> Result<String, String> {
         if self.0.is_empty() {
@@ -442,15 +660,86 @@ impl UniqueNames {
 mod tests {
     use super::*;
     use crate::{Gradient, GradientPaint, GradientStop};
+    use proptest::prelude::*;
+
+    #[test]
+    fn gpl_blank_name_keeps_fallback() {
+        let blank = "GIMP Palette\nName: \nColumns: 0\n#\n  1   2   3\tx\n";
+        assert_eq!(read(blank, "fallback").unwrap().name, "fallback");
+        let named = "GIMP Palette\nName: Warm\n  1   2   3\tx\n";
+        assert_eq!(read(named, "fallback").unwrap().name, "Warm");
+    }
+
+    /// A color book's string: a `u32` count of UTF-16 code units, then the units.
+    fn acb_str(out: &mut Vec<u8>, s: &str) {
+        let units: Vec<u16> = s.encode_utf16().collect();
+        out.extend((units.len() as u32).to_be_bytes());
+        units.iter().for_each(|u| out.extend(u.to_be_bytes()));
+    }
+
+    /// A color book in `space` (0 RGB, 2 CMYK, 7 Lab) with `colors` (name, components) and an
+    /// optional spot/process marker.
+    fn acb(space: u16, colors: &[(&str, &[u8])], marker: &[u8]) -> Vec<u8> {
+        let mut b = b"8BCB".to_vec();
+        b.extend(1u16.to_be_bytes());
+        b.extend(3000u16.to_be_bytes());
+        for s in ["$$$/colorbook/Test/title=Test Book^R", "TEST ", " C", "a book"] {
+            acb_str(&mut b, s);
+        }
+        b.extend((colors.len() as u16).to_be_bytes());
+        b.extend(7u16.to_be_bytes());
+        b.extend(0u16.to_be_bytes());
+        b.extend(space.to_be_bytes());
+        for (name, comps) in colors {
+            acb_str(&mut b, name);
+            b.extend(b"TST001");
+            b.extend(*comps);
+        }
+        b.extend(marker);
+        b
+    }
+
+    /// #831: color books (`.acb`) are read: their colors in RGB, CMYK or Lab, named with the book's
+    /// prefix and suffix, spot unless the book says process; page padding is left out.
+    #[test]
+    fn color_books_are_read() {
+        let lib = read_bytes(&acb(0, &[("185", &[228, 0, 43]), ("", &[0, 0, 0]), ("Red 032", &[239, 51, 64])], b"spflspot"), "fallback").unwrap();
+        assert_eq!(lib.name, "Test Book®");
+        let names: Vec<&str> = lib.swatches.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["TEST 185 C", "TEST Red 032 C"]);
+        assert!(lib.swatches.iter().all(|s| s.spot && s.global));
+        assert_eq!(lib.swatches[0].paint.color(), Some(Color::rgb8(228, 0, 43)));
+        // CMYK ink is stored inverted; a book marked process gives process colors.
+        let lib = read_bytes(&acb(2, &[("Cyan", &[0, 255, 255, 255])], b"spflproc"), "x").unwrap();
+        assert_eq!(lib.swatches[0].paint.color(), Some(Color::cmyk(1.0, 0.0, 0.0, 0.0)));
+        assert!(!lib.swatches[0].spot && !lib.swatches[0].global);
+        // Lab: lightness 0..255 for 0..100, a and b offset by 128; no marker: spot.
+        let lib = read_bytes(&acb(7, &[("Grey", &[255, 128, 128])], b""), "x").unwrap();
+        assert_eq!(lib.swatches[0].paint.color(), Some(Color::lab(100.0, 0.0, 0.0)));
+        assert!(lib.swatches[0].spot);
+        assert!(sniff_bytes(&acb(0, &[], b"")));
+        // Unsupported versions and color spaces, and short files, are errors.
+        let mut v2 = acb(0, &[], b"");
+        v2[5] = 2;
+        assert!(read_bytes(&v2, "x").is_err());
+        assert!(read_bytes(&acb(1, &[("x", &[1, 2, 3])], b""), "x").is_err());
+        let full = acb(0, &[("185", &[228, 0, 43])], b"");
+        for cut in 4..full.len() {
+            assert!(read_bytes(&full[..cut], "x").is_err(), "{cut} bytes");
+        }
+        let mut huge = b"8BCB\0\x01\0\x01".to_vec();
+        huge.extend(u32::MAX.to_be_bytes());
+        assert!(read_bytes(&huge, "x").is_err(), "a string longer than the file");
+    }
 
     fn sample() -> SwatchLibrary {
-        let grad = Paint::Gradient(Box::new(GradientPaint::new(Gradient {
-            kind: GradientKind::Linear,
-            stops: vec![
+        let grad = Paint::Gradient(Box::new(GradientPaint::new(Gradient::new(
+            GradientKind::Linear,
+            vec![
                 GradientStop { midpoint: 0.4, ..GradientStop::new(0.0, Color::cmyk(0.1, 0.2, 0.3, 0.0)) },
                 GradientStop { opacity: 0.5, ..GradientStop::new(1.0, Color::rgb8(255, 0, 0)) },
             ],
-        })));
+        ))));
         SwatchLibrary {
             name: "Brand */ Colours".into(),
             swatches: vec![
@@ -468,10 +757,15 @@ mod tests {
         }
     }
 
+    /// `lib` written as text format `f`.
+    fn written(lib: &SwatchLibrary, f: PaletteFormat) -> String {
+        String::from_utf8(write(lib, f).unwrap()).unwrap()
+    }
+
     #[test]
     fn native_round_trip_keeps_cmyk_spot_and_groups() {
         let lib = sample();
-        let text = write(&lib, PaletteFormat::Native);
+        let text = written(&lib, PaletteFormat::Native);
         assert!(sniff(&text));
         let back = read(&text, "fallback").unwrap();
         let mut expected = lib.clone();
@@ -484,7 +778,7 @@ mod tests {
 
     #[test]
     fn gpl_writes_rgb_with_group_headers_and_reads_comments_and_headers() {
-        let text = write(&sample(), PaletteFormat::Gpl);
+        let text = written(&sample(), PaletteFormat::Gpl);
         assert!(text.starts_with("GIMP Palette\nName: Brand */ Colours\n"));
         assert!(text.contains("# Group: Neutrals\n255   0   0\tR=255 G=0 B=0\n"), "{text}");
         assert!(!text.contains("Fade") && !text.contains("Tiles"), "only solid colours");
@@ -514,7 +808,7 @@ mod tests {
         assert_eq!(css_property("#FF00CC"), "--\\#ff00cc");
         assert_eq!(css_property("Café 50%"), "--café-50\\%");
         assert_eq!(css_property("  "), "--swatch");
-        let text = write(&sample(), PaletteFormat::Css);
+        let text = written(&sample(), PaletteFormat::Css);
         assert!(text.starts_with("/* Brand * / Colours */\n:root {\n"), "{text}");
         assert!(text.contains("  --ink: #"), "{text}");
         assert!(text.contains("; /* spot */"));
@@ -528,9 +822,52 @@ mod tests {
             swatches: ["Red", "red"].map(|n| Swatch { name: n.into(), paint: Paint::solid(Color::BLACK), global: false, spot: false }).to_vec(),
             groups: vec![],
         };
-        let text = write(&lib, PaletteFormat::Css);
+        let text = written(&lib, PaletteFormat::Css);
         assert!(text.contains("--red: #000000;") && text.contains("--red-2: #000000;"));
         assert!(read(&text, "x").is_err(), "CSS is written only");
+    }
+
+    #[test]
+    fn css_preserves_fractional_gradient_stop_positions() {
+        for kind in [GradientKind::Linear, GradientKind::Radial] {
+            let lib = SwatchLibrary {
+                name: "Positions".into(),
+                swatches: vec![Swatch {
+                    name: "Ramp".into(),
+                    paint: Paint::Gradient(Box::new(GradientPaint::new(Gradient::new(
+                        kind,
+                        vec![
+                            GradientStop::new(0.0, Color::BLACK),
+                            GradientStop::new(0.125, Color::rgb8(255, 0, 0)),
+                            GradientStop::new(0.12890625, Color::WHITE),
+                            GradientStop::new(1.0, Color::rgb8(0, 0, 255)),
+                        ],
+                    )))),
+                    global: false,
+                    spot: false,
+                }],
+                groups: vec![],
+            };
+            let text = written(&lib, PaletteFormat::Css);
+            assert!(text.contains("#000000 0%, #ff0000 12.5%, #ffffff 12.890625%, #0000ff 100%"), "{kind:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn holds_counts_the_swatches_each_format_writes() {
+        // `sample()` holds the spot color Ink, the linear gradient Fade, the pattern Tiles and two solid colors in a group.
+        let mut lib = sample();
+        let Paint::Gradient(mut mesh) = lib.swatches[1].paint.clone() else { panic!("Fade is a gradient") };
+        mesh.gradient.kind = GradientKind::Freeform;
+        lib.swatches.push(Swatch { name: "Mesh".into(), paint: Paint::Gradient(mesh), global: false, spot: false });
+        lib.swatches.push(Swatch { name: "[None]".into(), paint: Paint::None, global: false, spot: false });
+        let held = |f: PaletteFormat| lib.iter().filter(|w| f.holds(&w.paint)).count();
+        assert_eq!(PaletteFormat::ALL.map(held), [5, 3, 3, 4], "vcswatches, gpl, ase, css");
+        for f in [PaletteFormat::Native, PaletteFormat::Gpl, PaletteFormat::Ase] {
+            assert_eq!(read_bytes(&write(&lib, f).unwrap(), "x").unwrap().len(), held(f), "{f:?}");
+        }
+        let css = written(&lib, PaletteFormat::Css);
+        assert_eq!(css.lines().filter(|l| l.starts_with("  --")).count(), held(PaletteFormat::Css), "one property each: {css}");
     }
 
     /// A swatch exchange file of `blocks` (type, body).
@@ -644,5 +981,200 @@ mod tests {
         let groups: Vec<(u16, Vec<u8>)> = (0..=ASE_MAX_ENTRIES).map(|_| (ASE_GROUP_START, vec![])).collect();
         assert!(read_bytes(&ase(&groups), "x").unwrap_err().contains("more than"));
         assert_eq!(read_bytes(&ase(&groups[1..]), "x").unwrap().groups.len(), ASE_MAX_ENTRIES, "up to the limit");
+    }
+
+    #[test]
+    fn ase_writes_each_model_kind_and_group() {
+        let sw = |name: &str, color, global, spot| Swatch { name: name.into(), paint: Paint::solid(color), global, spot };
+        let tint = Swatch {
+            name: "Ink 40%".into(),
+            paint: Paint::Solid { color: Color::cmyk(0.4, 0.2, 0.0, 0.08), swatch: Some("Ink".into()), tint: 0.4 },
+            global: false,
+            spot: false,
+        };
+        // `sample()` holds the spot color Ink, the gradient Fade, the pattern Tiles and the group Neutrals.
+        let mut lib = sample();
+        lib.swatches.insert(0, sw("Sky", Color::rgb(0.0, 0.5, 1.0), true, false));
+        lib.swatches.push(tint);
+        lib.groups[0].swatches = vec![sw("Mist", Color::gray(0.25), false, false), sw("Clay", Color::lab(50.0, 20.0, -30.0), false, false)];
+        lib.groups.push(SwatchGroup { name: "Empty".into(), swatches: vec![] });
+        let bytes = write(&lib, PaletteFormat::Ase).unwrap();
+        let expected = ase(&[
+            ase_color("Sky", b"RGB ", &[0.0, 0.5, 1.0], 0),
+            ase_color("Ink", b"CMYK", &[1.0, 0.5, 0.0, 0.2], 1),
+            ase_color("Ink 40%", b"CMYK", &[0.4, 0.2, 0.0, 0.08], 2),
+            (ASE_GROUP_START, ase_name("Neutrals")),
+            ase_color("Mist", b"Gray", &[0.75], 2),
+            ase_color("Clay", b"LAB ", &[0.5, 20.0, -30.0], 2),
+            (ASE_GROUP_END, vec![]),
+            (ASE_GROUP_START, ase_name("Empty")),
+            (ASE_GROUP_END, vec![]),
+        ]);
+        assert_eq!(bytes, expected, "no gradient or pattern; the tint as the process color it shows");
+        let back = read_bytes(&bytes, "Brand").unwrap();
+        assert_eq!((back.len(), back.groups.len()), (5, 2), "the empty group stays");
+        assert_eq!(PaletteFormat::parse(".ASE"), Some(PaletteFormat::Ase));
+        assert!(PaletteFormat::Ase.readable() && PaletteFormat::Ase.binary() && !PaletteFormat::Gpl.binary());
+    }
+
+    #[test]
+    fn ase_names_lose_nul_and_stop_at_the_reader_limit() {
+        let names = ["Re\0d".to_string(), "é".repeat(1030), format!("a{}", "🎨".repeat(600))];
+        let swatches = names.iter().map(|n| Swatch { name: n.clone(), paint: Paint::solid(Color::BLACK), global: false, spot: false }).collect();
+        let lib = SwatchLibrary { name: "x".into(), swatches, groups: vec![] };
+        let back = read_bytes(&write(&lib, PaletteFormat::Ase).unwrap(), "x").unwrap();
+        let got: Vec<&str> = back.swatches.iter().map(|w| w.name.as_str()).collect();
+        // At most 1024 UTF-16 code units, cut between characters: "a" and 511 two-unit emoji.
+        assert_eq!(got, ["Red".to_string(), "é".repeat(1024), format!("a{}", "🎨".repeat(511))]);
+    }
+
+    #[test]
+    fn ase_clamps_components_and_writes_non_finite_ones_as_zero() {
+        let sw = |name: &str, color| Swatch { name: name.into(), paint: Paint::solid(color), global: false, spot: false };
+        let swatches = vec![
+            sw("Lab", Color::lab(100.5, 300.0, -300.0)),
+            sw("Rgb", Color::rgb(2.0, -1.0, f32::NAN)),
+            sw("Cmyk", Color::cmyk(1.5, 0.0, 0.0, f32::INFINITY)),
+            sw("Gray", Color::gray(1.5)),
+        ];
+        let bytes = write(&SwatchLibrary { name: "x".into(), swatches, groups: vec![] }, PaletteFormat::Ase).unwrap();
+        let expected = ase(&[
+            ase_color("Lab", b"LAB ", &[1.0, 127.0, -128.0], 2),
+            ase_color("Rgb", b"RGB ", &[1.0, 0.0, 0.0], 2),
+            ase_color("Cmyk", b"CMYK", &[1.0, 0.0, 0.0, 0.0], 2),
+            ase_color("Gray", b"Gray", &[0.0], 2),
+        ]);
+        assert_eq!(bytes, expected, "clamped to the ranges .ase holds, a component that isn't finite as 0");
+        // Lightness 100.5 is written as 1, which reads back as L* 100.
+        let back = read_bytes(&bytes, "x").unwrap();
+        assert_eq!(back.swatches[0].paint.color(), Some(Color::lab(100.0, 127.0, -128.0)));
+    }
+
+    #[test]
+    fn ase_write_refuses_more_entries_than_the_reader_takes() {
+        let gray = |i: usize| Swatch { name: format!("G{i}"), paint: Paint::solid(Color::gray(0.5)), global: false, spot: false };
+        // The limit counts colors and groups: a group and `ASE_MAX_ENTRIES - 1` colors reach it.
+        let mut lib = SwatchLibrary {
+            name: "x".into(),
+            swatches: (1..ASE_MAX_ENTRIES).map(gray).collect(),
+            groups: vec![SwatchGroup { name: "Group".into(), swatches: vec![] }],
+        };
+        let back = read_bytes(&write(&lib, PaletteFormat::Ase).unwrap(), "x").unwrap();
+        assert_eq!((back.len(), back.groups.len()), (ASE_MAX_ENTRIES - 1, 1));
+        lib.swatches.push(gray(0));
+        let e = write(&lib, PaletteFormat::Ase).unwrap_err();
+        assert!(e.contains("reads at most 100000 colors and groups from a swatch exchange file, and this library has 100001"), "{e}");
+        // A gradient is left out and is not counted.
+        lib.swatches.last_mut().unwrap().paint = sample().swatches[1].paint.clone();
+        assert!(write(&lib, PaletteFormat::Ase).is_ok());
+    }
+
+    /// A color in one of the four models, in the ranges `.ase` holds.
+    fn arb_color() -> impl Strategy<Value = Color> {
+        let unit = || 0.0f32..=1.0;
+        prop_oneof![
+            (unit(), unit(), unit()).prop_map(|(r, g, b)| Color::rgb(r, g, b)),
+            (unit(), unit(), unit(), unit()).prop_map(|(c, m, y, k)| Color::cmyk(c, m, y, k)),
+            unit().prop_map(Color::gray),
+            (0.0f32..=100.0, -128.0f32..=127.0, -128.0f32..=127.0).prop_map(|(l, a, b)| Color::lab(l, a, b)),
+        ]
+    }
+
+    /// A swatch's paint with its global and spot flags: a solid color with any flags, a tint swatch
+    /// (both flags off) or a gradient.
+    fn arb_paint() -> impl Strategy<Value = (Paint, bool, bool)> {
+        prop_oneof![
+            4 => (arb_color(), any::<bool>(), any::<bool>()).prop_map(|(c, global, spot)| (Paint::solid(c), global, spot)),
+            1 => arb_color().prop_map(|c| (Paint::Solid { color: c, swatch: Some("Base".into()), tint: 0.4 }, false, false)),
+            1 => Just((sample().swatches[1].paint.clone(), false, false)),
+        ]
+    }
+
+    /// Ungrouped swatches and color groups. A name is a number and up to 12 characters of any script
+    /// but NUL, trimmed, so swatches and groups have unique names, as in a document.
+    fn arb_library() -> impl Strategy<Value = SwatchLibrary> {
+        let swatches = || prop::collection::vec((arb_paint(), "[^\\x00]{0,12}"), 0..12);
+        (swatches(), prop::collection::vec(("[^\\x00]{0,12}", swatches()), 0..4)).prop_map(|(loose, groups)| {
+            let mut n = 0;
+            let mut name = |prefix: &str, base: &str| {
+                n += 1;
+                format!("{prefix}{n} {base}").trim().to_string()
+            };
+            let mut lib = SwatchLibrary { name: "Fuzz".into(), ..Default::default() };
+            for ((paint, global, spot), base) in loose {
+                lib.swatches.push(Swatch { name: name("", &base), paint, global, spot });
+            }
+            for (base, list) in groups {
+                let mut g = SwatchGroup { name: name("G", &base), swatches: vec![] };
+                for ((paint, global, spot), base) in list {
+                    g.swatches.push(Swatch { name: name("", &base), paint, global, spot });
+                }
+                lib.groups.push(g);
+            }
+            lib
+        })
+    }
+
+    /// Are `got` and `want` in the same model, with every component within 1e-4? Lab lightness and
+    /// gray read back within `f32` rounding.
+    fn close(got: Color, want: Color) -> bool {
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-4;
+        match (got, want) {
+            (Color::Rgb { r, g, b }, Color::Rgb { r: r2, g: g2, b: b2 }) => near(r, r2) && near(g, g2) && near(b, b2),
+            (Color::Cmyk { c, m, y, k }, Color::Cmyk { c: c2, m: m2, y: y2, k: k2 }) => near(c, c2) && near(m, m2) && near(y, y2) && near(k, k2),
+            (Color::Gray { k }, Color::Gray { k: k2 }) => near(k, k2),
+            (Color::Lab { l, a, b }, Color::Lab { l: l2, a: a2, b: b2 }) => near(l, l2) && near(a, a2) && near(b, b2),
+            _ => false,
+        }
+    }
+
+    /// The swatches of `list` as an `.ase` file reads them back: solid colors only, unlinked, spot
+    /// colors global.
+    fn ase_expected(list: &[Swatch]) -> Vec<Swatch> {
+        list.iter()
+            .filter_map(|w| Some(Swatch { name: w.name.clone(), paint: Paint::solid(w.paint.color()?), global: w.global || w.spot, spot: w.spot }))
+            .collect()
+    }
+
+    /// Do swatches `got` have the names, flags and unlinked colors (within 1e-4) of `want`?
+    fn same_swatches(got: &[Swatch], want: &[Swatch]) -> bool {
+        got.len() == want.len()
+            && got.iter().zip(want).all(|(g, w)| {
+                let color = match (&g.paint, w.paint.color()) {
+                    (Paint::Solid { color, swatch: None, .. }, Some(c)) => close(*color, c),
+                    _ => false,
+                };
+                g.name == w.name && g.global == w.global && g.spot == w.spot && color
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { failure_persistence: None, ..ProptestConfig::default() })]
+
+        /// A written `.ase` file reads back as the library's solid colors in their own model, with
+        /// their names, kinds and color groups.
+        #[test]
+        fn ase_round_trip_keeps_models_kinds_and_groups(lib in arb_library()) {
+            let bytes = write(&lib, PaletteFormat::Ase).unwrap();
+            prop_assert!(sniff_bytes(&bytes));
+            let back = read_bytes(&bytes, &lib.name).unwrap();
+            prop_assert_eq!(&back.name, &lib.name);
+            prop_assert!(same_swatches(&back.swatches, &ase_expected(&lib.swatches)), "{:?}", back.swatches);
+            prop_assert_eq!(back.groups.len(), lib.groups.len());
+            for (g, want) in back.groups.iter().zip(&lib.groups) {
+                prop_assert_eq!(&g.name, &want.name);
+                prop_assert!(same_swatches(&g.swatches, &ase_expected(&want.swatches)), "{}: {:?}", g.name, g.swatches);
+            }
+        }
+
+        /// A written `.vcswatches`, `.gpl` or `.ase` file reads back with as many swatches as
+        /// [`PaletteFormat::holds`] counts.
+        #[test]
+        fn written_files_read_back_with_the_swatches_holds_counts(lib in arb_library()) {
+            for f in [PaletteFormat::Native, PaletteFormat::Gpl, PaletteFormat::Ase] {
+                let back = read_bytes(&write(&lib, f).unwrap(), &lib.name).unwrap();
+                prop_assert_eq!(back.len(), lib.iter().filter(|w| f.holds(&w.paint)).count(), "{:?}", f);
+            }
+        }
     }
 }

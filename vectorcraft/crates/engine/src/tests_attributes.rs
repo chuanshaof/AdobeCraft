@@ -1,5 +1,6 @@
-//! Window → Attributes (`attributes.set`, `attributes.info`, `path.setFillRule`, `path.reverse`)
-//! and the links SVG export writes for objects with a URL.
+//! Window → Attributes (`attributes.set`, `attributes.info`, `path.setFillRule`, `path.reverse`),
+//! the links SVG export writes for objects with a URL, and what objects keep for other software
+//! (their `data-*` attributes and their attributes in other applications' namespaces).
 
 use serde_json::{Value, json};
 use vectorcraft_doc::{ImageMap, NodeKind};
@@ -52,13 +53,13 @@ fn each_attribute_sets_reads_back_and_undoes_in_one_step() {
         assert_eq!(i[k], v, "{k}");
     }
     let n = s.doc().unwrap().doc.node(a).unwrap().clone();
-    let at = n.attrs.as_deref().unwrap();
+    let at = n.extras().attrs.as_deref().unwrap();
     assert_eq!((at.show_center, at.image_map, n.url()), (Some(false), ImageMap::Rectangle, Some("https://example.com")));
     assert!(!n.shows_center());
     // One undo step takes everything back, and the attributes go away entirely.
     run(&mut s, "edit.undo", json!({}));
     let n = s.doc().unwrap().doc.node(a).unwrap().clone();
-    assert!(n.attrs.is_none() && !n.has_overprint());
+    assert!(n.extras().attrs.is_none() && !n.has_overprint());
     // Nothing to change: no undo step; bad values are refused.
     let before = s.doc().unwrap().revision;
     assert_eq!(run(&mut s, "attributes.set", json!({"showCenter": true}))["changed"], 0);
@@ -68,7 +69,7 @@ fn each_attribute_sets_reads_back_and_undoes_in_one_step() {
     // Clearing the URL and note drops the attributes.
     run(&mut s, "attributes.set", json!({"url": "u", "note": "n"}));
     run(&mut s, "attributes.set", json!({"url": "", "note": ""}));
-    assert!(s.doc().unwrap().doc.node(a).unwrap().attrs.is_none());
+    assert!(s.doc().unwrap().doc.node(a).unwrap().extras().attrs.is_none());
 }
 
 #[test]
@@ -168,8 +169,8 @@ fn attributes_survive_a_native_round_trip() {
     run(&mut s, "attributes.set", json!({"showCenter": false, "imageMap": "polygon", "url": "https://example.com/x", "note": "keep"}));
     let doc = s.doc().unwrap().doc.clone();
     let back = vectorcraft_format::load(&vectorcraft_format::save(&doc, false)).unwrap();
-    assert_eq!(back.node(a).unwrap().attrs, doc.node(a).unwrap().attrs);
-    assert!(back.node(a).unwrap().attrs.is_some());
+    assert_eq!(back.node(a).unwrap().extras().attrs, doc.node(a).unwrap().extras().attrs);
+    assert!(back.node(a).unwrap().extras().attrs.is_some());
 }
 
 #[test]
@@ -197,7 +198,7 @@ fn svg_export_links_objects_and_import_reads_the_links_back() {
 fn object_data_is_set_saved_and_written_to_svg() {
     let mut s = session();
     let a = rect(&mut s, 10.0);
-    let data = |s: &Session| s.doc().unwrap().doc.node(a).unwrap().attrs.as_deref().map(|x| x.data.clone()).unwrap_or_default();
+    let data = |s: &Session| s.doc().unwrap().doc.node(a).unwrap().extras().attrs.as_deref().map(|x| x.data.clone()).unwrap_or_default();
     let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
     run(&mut s, "object.setProps", json!({"data": {"pivot": "60,100", "z": 3}}));
     assert_eq!(data(&s), [pair("pivot", "60,100"), pair("z", "3")], "values are text");
@@ -212,5 +213,35 @@ fn object_data_is_set_saved_and_written_to_svg() {
     assert!(svg.contains("data-pivot=\"60,100\" data-z=\"3\""), "{svg}");
     let native = vectorcraft_format::save(&s.doc().unwrap().doc, false);
     let back = vectorcraft_format::load(&native).unwrap();
-    assert_eq!(back.node(a).unwrap().attrs, s.doc().unwrap().doc.node(a).unwrap().attrs);
+    assert_eq!(back.node(a).unwrap().extras().attrs, s.doc().unwrap().doc.node(a).unwrap().extras().attrs);
+}
+
+/// An object's attributes in other applications' XML namespaces are its own, as its `data-*`
+/// attributes are: a pasted copy and a duplicate keep them, deleting the object takes them with
+/// it, and the native file and SVG export keep them.
+#[test]
+fn other_applications_attributes_go_with_their_object() {
+    let mut s = Session::new();
+    let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:plotter="https://example.org/plotter" width="100" height="100">
+        <rect width="20" height="20" plotter:pen="2"/></svg>"#;
+    run(&mut s, "document.open", json!({"name": "pens.svg", "dataBase64": vectorcraft_format::base64_encode(svg.as_bytes())}));
+    // The `plotter:pen` values on the document's objects.
+    let pens = |d: &vectorcraft_doc::Document| {
+        let mut out = vec![];
+        d.walk(|n| out.extend(n.extras().attrs.iter().flat_map(|a| a.foreign.iter().map(|f| f.value.clone()))));
+        out
+    };
+    assert_eq!(pens(&s.doc().unwrap().doc), ["2"]);
+    run(&mut s, "select.all", json!({}));
+    run(&mut s, "edit.copy", json!({}));
+    run(&mut s, "edit.paste", json!({}));
+    assert_eq!(pens(&s.doc().unwrap().doc), ["2", "2"], "a pasted copy keeps them");
+    run(&mut s, "edit.duplicate", json!({}));
+    assert_eq!(pens(&s.doc().unwrap().doc), ["2", "2", "2"], "so does a duplicate");
+    run(&mut s, "edit.clear", json!({}));
+    assert_eq!(pens(&s.doc().unwrap().doc), ["2", "2"], "a deleted object leaves none behind");
+    let back = vectorcraft_format::load(&vectorcraft_format::save(&s.doc().unwrap().doc, false)).unwrap();
+    assert_eq!(pens(&back), ["2", "2"], "the native file keeps them");
+    let out = run(&mut s, "document.serialize", json!({"format": "svg"}))["text"].as_str().unwrap().to_string();
+    assert_eq!((out.matches("xmlns:plotter=\"https://example.org/plotter\"").count(), out.matches("plotter:pen=\"2\"").count()), (1, 2), "{out}");
 }

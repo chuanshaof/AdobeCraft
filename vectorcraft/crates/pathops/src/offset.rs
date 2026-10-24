@@ -8,11 +8,30 @@ pub use kurbo::{Cap, Join};
 use linesweeper::topology::{ContourIdx, Contours};
 
 use crate::boolean::{Arrangement, DEFAULT_PRECISION, Tidy, all_contours_to_path, contours_to_path, fill_bezpath, normalize_bez};
+use crate::edit::remove_redundant_points;
 
 /// Flattening/fit tolerance handed to kurbo's stroker.
 const STROKE_TOL: f64 = 1e-3;
 
+/// Drop collinear and coincident spine vertices before stroking (#3446). Uses `tol` only for
+/// redundancy; does not simplify or refit the spine.
+fn compact_stroke_spine(bp: &BezPath, tol: f64) -> BezPath {
+    if bp.elements().is_empty() {
+        return BezPath::new();
+    }
+    let tol = if tol.is_finite() && tol > 0.0 { tol } else { STROKE_TOL };
+    remove_redundant_points(&PathData::from_bezpath(bp), tol).to_bezpath()
+}
+
 fn stroke_bez(bp: &BezPath, width: f64, cap: Cap, join: Join, miter_limit: f64) -> BezPath {
+    let spine = compact_stroke_spine(bp, STROKE_TOL);
+    let style = Stroke::new(width).with_join(join).with_caps(cap).with_miter_limit(miter_limit.max(1.0));
+    close_all(&kurbo::stroke(spine.iter(), &style, &StrokeOpts::default(), STROKE_TOL))
+}
+
+/// Like [`stroke_bez`] but without [`compact_stroke_spine`] (regression baseline in unit tests).
+#[cfg(test)]
+fn stroke_bez_without_spine_compact(bp: &BezPath, width: f64, cap: Cap, join: Join, miter_limit: f64) -> BezPath {
     let style = Stroke::new(width).with_join(join).with_caps(cap).with_miter_limit(miter_limit.max(1.0));
     close_all(&kurbo::stroke(bp.iter(), &style, &StrokeOpts::default(), STROKE_TOL))
 }
@@ -191,5 +210,82 @@ mod tests {
         let area = crate::area(&region, FillRule::NonZero);
         // Ring 16·20 − 8·12 = 224, plus the bar outside it (10·4) and inside its hole (6·4).
         assert!((area - (224.0 + 40.0 + 24.0)).abs() < 1e-6, "{area}");
+    }
+
+    #[test]
+    fn miter_offset_finishes_where_the_sweep_used_to_loop() {
+        // Issue #1028: with linesweeper 0.4 the sweep over this miter offset never finished and
+        // its memory grew without bound, freezing the app. A synthetic outline (found by search)
+        // with the same failure as the reported glyph; the exact coordinates matter.
+        const OUTLINE: &str = "M74.359137297823,82.83738194552835 L88.097432485874,103.04979803227248 \
+            L67.06936731196308,105.95779886823588 L53.29382873396223,98.53943925153727 \
+            L29.684713319694094,94.17996020306241 L41.65480824807079,75.639672165115 \
+            Q47.491034578751446,52.12555333014565 46.157302824282816,55.67193079127421 \
+            Q69.08365151786553,53.9608681393331 68.37499772324333,51.17242466680129 \
+            Q74.4136309339628,75.13284223919301 71.3309887459222,73.69128869058812 Z";
+        let path = PathData::from_bezpath(&BezPath::from_svg(OUTLINE).unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let input = path.clone();
+        std::thread::spawn(move || tx.send(offset_path(&input, 1.8350459854022054, Join::Miter, 4.0)));
+        let Ok(out) = rx.recv_timeout(std::time::Duration::from_secs(30)) else {
+            // the stuck sweep keeps allocating on its thread: end the test binary now
+            eprintln!("Offset Path didn't finish in 30 s (issue #1028)");
+            std::process::exit(101);
+        };
+        let (before, after) = (crate::area(&path, FillRule::NonZero), crate::area(&out, FillRule::NonZero));
+        assert_eq!(out.subpaths.len(), 1);
+        assert!(after > before, "{before} → {after}");
+    }
+
+    fn outline_max_deviation(a: &BezPath, b: &BezPath) -> f64 {
+        use kurbo::ParamCurve;
+        use vectorcraft_geom::Point;
+        let pa = PathData::from_bezpath(a);
+        let pb = PathData::from_bezpath(b);
+        let mut worst: f64 = 0.0;
+        for (src, dst) in [(a, &pb), (b, &pa)] {
+            for seg in src.segments() {
+                for i in 0..=12 {
+                    let p = seg.eval(i as f64 / 12.0);
+                    let pt = Point::new(p.x, p.y);
+                    worst = worst.max(dst.nearest(pt).unwrap().4);
+                }
+            }
+        }
+        worst
+    }
+
+    #[test]
+    fn compact_stroke_spine_drops_colinear_points_without_moving_curved_outlines() {
+        let width = 10.0;
+        let cap = Cap::Round;
+        let join = Join::Round;
+        let miter = 4.0;
+        // Dense colinear spine: compact outline should match the uncompacted one closely.
+        let dense: Vec<vectorcraft_geom::Point> = (0..=40).map(|i| vectorcraft_geom::Point::new(i as f64 * 2.5, 50.0)).collect();
+        let dense_path = PathData::single(SubPath::polyline(&dense, false));
+        let dense_bez = dense_path.to_bezpath();
+        let compact = stroke_bez(&dense_bez, width, cap, join, miter);
+        let raw = stroke_bez_without_spine_compact(&dense_bez, width, cap, join, miter);
+        assert!(outline_max_deviation(&compact, &raw) <= 1e-3, "colinear compaction must not refit the stroke outline");
+        let sparse =
+            PathData::single(SubPath::polyline(&[vectorcraft_geom::Point::new(0.0, 50.0), vectorcraft_geom::Point::new(100.0, 50.0)], false));
+        let sparse_outline = outline_stroke(&sparse, width, cap, join, miter);
+        let compact_region = stroke_region(&[compact]);
+        assert!(
+            outline_max_deviation(&compact_region.to_bezpath(), &sparse_outline.to_bezpath()) <= 1e-3,
+            "compacted colinear spine should outline like the endpoints alone"
+        );
+        // Sampled arc: only redundant vertices are removed; outline must track the raw stroke.
+        let arc: Vec<vectorcraft_geom::Point> = (0..=32)
+            .map(|i| {
+                let t = i as f64 / 32.0 * std::f64::consts::PI;
+                vectorcraft_geom::Point::new(50.0 + 50.0 * t.cos(), 50.0 + 8.0 * t.sin())
+            })
+            .collect();
+        let arc_bez = PathData::single(SubPath::polyline(&arc, false)).to_bezpath();
+        let arc_compact = stroke_bez(&arc_bez, width, cap, join, miter);
+        let arc_raw = stroke_bez_without_spine_compact(&arc_bez, width, cap, join, miter);
+        assert!(outline_max_deviation(&arc_compact, &arc_raw) <= 1e-3, "curved spine compaction must not refit the stroke outline");
     }
 }

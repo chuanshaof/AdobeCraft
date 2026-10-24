@@ -17,7 +17,7 @@ pub fn specs() -> Vec<CommandSpec> {
         "Document Setup",
         [],
         None,
-        "{units?: \"Points\"|\"Inches\"|\"Millimeters\"|…, bleed?: pt (all sides)|[top, bottom, left, right]|{top?, bottom?, left?, right?} (0–72 pt), outlineImages?: bool (show images in Outline mode), highlightSubstitutedFonts?: bool, highlightSubstitutedGlyphs?: bool, gridSize?: \"small\"|\"medium\"|\"large\", gridColors?: \"Light\"|\"Medium\"|\"Dark\"|\"Red\"|\"Orange\"|\"Green\"|\"Blue\"|\"Purple\"|[colour, colour] (transparency grid; the first is also the paper colour), simulatePaper?: bool, flattenerPreset?: \"High Resolution\"|\"Medium Resolution\"|\"Low Resolution\"|a saved preset (flattener.presets.list), discardWhiteOverprint?: bool, language?: \"English: USA\"|\"German\"|\"French\"|… (also picks its quotes), quotes?: {double?: \"“”\", single?: \"‘’\"} (beside a language: only if they differ from the current ones), typographersQuotes?: bool (typed straight quotes become the document's quotes), superscript?: {size?: %, position?: %}, subscript?: {size?: %, position?: %}, smallCapsSize?: %, exportText?: \"editable\"|\"appearance\" (SVG text as text or as outlines), backgroundContents?: \"transparent\"|\"white\" (white: raster exports are white behind the art)} change the document setup in one undo step; no params → the current setup",
+        "{units?: \"Points\"|\"Inches\"|\"Millimeters\"|…, bleed?: pt (all sides)|[top, bottom, left, right]|{top?, bottom?, left?, right?} (0–72 pt), outlineImages?: bool (show images in Outline mode), highlightSubstitutedFonts?: bool, highlightSubstitutedGlyphs?: bool, gridSize?: \"small\"|\"medium\"|\"large\", gridColors?: \"Light\"|\"Medium\"|\"Dark\"|\"Red\"|\"Orange\"|\"Green\"|\"Blue\"|\"Purple\"|[colour, colour] (transparency grid; the first is also the paper colour), simulatePaper?: bool, flattenerPreset?: \"High Resolution\"|\"Medium Resolution\"|\"Low Resolution\"|a saved preset (flattener.presets.list), discardWhiteOverprint?: bool, language?: \"English: USA\"|\"German\"|\"French\"|… (also picks its quotes), quotes?: {double?: \"“”\", single?: \"‘’\"} (beside a language: only if they differ from the current ones), typographersQuotes?: bool (typed straight quotes become the document's quotes), superscript?: {size?: %, position?: %}, subscript?: {size?: %, position?: %}, smallCapsSize?: %, exportText?: \"editable\"|\"appearance\" (SVG text as text or as outlines), backgroundContents?: \"transparent\"|\"white\" (white: raster exports are white behind the art), …the keys of its own reply (it can be passed back; the values it only reports are ignored)} change the document setup in one undo step; no params → the current setup",
         has_doc,
         setup
     )]
@@ -121,7 +121,7 @@ fn apply(s: &mut DocSetup, units: &mut vectorcraft_doc::Unit, k: &str, v: &Value
         "typographersQuotes" => s.typographers_quotes = flag(k, v)?,
         "superscript" => s.superscript = script_param(k, v, s.superscript)?,
         "subscript" => s.subscript = script_param(k, v, s.subscript)?,
-        "smallCapsSize" => s.small_caps_size = percent(k, v, 1.0, 200.0)?,
+        "smallCapsSize" => s.small_caps_size = percent(k, v, 1.0, vectorcraft_doc::setup::MAX_SMALL_CAPS)?,
         "exportText" => s.export_text = v.as_str().and_then(ExportText::parse).ok_or_else(|| bad(C, "exportText must be editable or appearance"))?,
         "backgroundContents" => s.background = background_param(v, C)?,
         // Read-only values `document.setup` reports.
@@ -223,8 +223,8 @@ fn script_param(k: &str, v: &Value, mut m: ScriptMetrics) -> Result<ScriptMetric
     let o = v.as_object().ok_or_else(|| bad(C, format!("{k} must be {{size?, position?}}")))?;
     for (key, x) in o {
         match key.as_str() {
-            "size" => m.size = percent(&format!("{k}.size"), x, 1.0, 500.0)?,
-            "position" => m.position = percent(&format!("{k}.position"), x, -500.0, 500.0)?,
+            "size" => m.size = percent(&format!("{k}.size"), x, 1.0, vectorcraft_doc::setup::MAX_SCRIPT)?,
+            "position" => m.position = percent(&format!("{k}.position"), x, -vectorcraft_doc::setup::MAX_SCRIPT, vectorcraft_doc::setup::MAX_SCRIPT)?,
             _ => return Err(bad(C, format!("unknown {k} key `{key}` (size, position)"))),
         }
     }
@@ -251,7 +251,7 @@ pub(crate) fn script_params(p: &Value, setup: &DocSetup, cmd: &str) -> Result<(O
 }
 
 /// A superscript or subscript in `setup`'s proportions.
-fn position_in(setup: &DocSetup, p: CharPosition) -> CharPosition {
+pub(crate) fn position_in(setup: &DocSetup, p: CharPosition) -> CharPosition {
     match p {
         CharPosition::Normal => CharPosition::Normal,
         CharPosition::Superscript(_) => CharPosition::Superscript(setup.superscript),

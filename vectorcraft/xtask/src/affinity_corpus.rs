@@ -3,8 +3,9 @@
 //! They land in `corpus/affinity/` (gitignored, never committed). `vectorcraft-affinity`'s
 //! `real_files` test and the engine's `affinity_corpus` test use them when present.
 //!
-//! Only permissively licensed files (CC0, MIT, Apache-2.0) whose metadata holds no personal paths
-//! are listed. Moving a pin: change the commit, re-run, review the manifest diff.
+//! Only permissively licensed files (CC0, MIT, Apache-2.0) are listed. Fixture provenance and
+//! exclusions are documented in docs/affinity-validation.md. Moving a pin: change the commit,
+//! re-run, review the manifest diff. Metadata is never imported or published by the app.
 
 use std::path::Path;
 use std::process::Command;
@@ -15,6 +16,44 @@ use crate::{root, run, sha256};
 type Source = (&'static str, &'static str, &'static str, &'static [(&'static str, &'static str)]);
 
 const SOURCES: &[Source] = &[
+    (
+        "SethRobinson/Patchy",
+        "de84eab550758b30fa062e479f5778cce7693b73",
+        "MIT",
+        &[
+            ("LICENSE", "patchy-LICENSE.txt"),
+            ("NOTICE-THIRD-PARTY.md", "patchy-NOTICE.txt"),
+            ("test-fixtures/af/tiny-adjust-curves.af", "patchy-adjust-curves.af"),
+            ("test-fixtures/af/tiny-adjust-hsl.af", "patchy-adjust-hsl.af"),
+            ("test-fixtures/af/tiny-artboards.af", "patchy-artboards.af"),
+            ("test-fixtures/af/tiny-blend-affinity.af", "patchy-blend-affinity.af"),
+            ("test-fixtures/af/tiny-cmyk.af", "patchy-cmyk.af"),
+            ("test-fixtures/af/tiny-dpi300.af", "patchy-dpi300.af"),
+            ("test-fixtures/af/tiny-embedded-jpeg.af", "patchy-embedded-jpeg.af"),
+            ("test-fixtures/af/tiny-fx-blur.af", "patchy-fx-blur.af"),
+            ("test-fixtures/af/tiny-fx-gradient.af", "patchy-fx-gradient.af"),
+            ("test-fixtures/af/tiny-fx.af", "patchy-fx.af"),
+            ("test-fixtures/af/tiny-group.af", "patchy-group.af"),
+            ("test-fixtures/af/tiny-incremental-chain.af", "patchy-incremental-chain.af"),
+            ("test-fixtures/af/tiny-lab.af", "patchy-lab.af"),
+            ("test-fixtures/af/tiny-lazy-placed.af", "patchy-lazy-placed.af"),
+            ("test-fixtures/af/tiny-live-filter.af", "patchy-live-filter.af"),
+            ("test-fixtures/af/tiny-rgba16.af", "patchy-rgba16.af"),
+            ("test-fixtures/af/tiny-rgba8.af", "patchy-rgba8.af"),
+            ("test-fixtures/af/tiny-shapes-2.af", "patchy-shapes-2.af"),
+            ("test-fixtures/af/tiny-shapes.af", "patchy-shapes.af"),
+            ("test-fixtures/af/tiny-text-artistic.af", "patchy-text-artistic.af"),
+            ("test-fixtures/af/tiny-text-caps.af", "patchy-text-caps.af"),
+            ("test-fixtures/af/tiny-text-frame.af", "patchy-text-frame.af"),
+            ("test-fixtures/af/tiny-text-indent.af", "patchy-text-indent.af"),
+            ("test-fixtures/af/tiny-text-para-spacing.af", "patchy-text-para-spacing.af"),
+            ("test-fixtures/af/tiny-text-rotated.af", "patchy-text-rotated.af"),
+            ("test-fixtures/af/tiny-text-runs.af", "patchy-text-runs.af"),
+            ("test-fixtures/af/tiny-transform.af", "patchy-transform.af"),
+            ("test-fixtures/af/tiny-vector-mask.af", "patchy-vector-mask.af"),
+            ("test-fixtures/af/tiny-vector.af", "patchy-vector.af"),
+        ],
+    ),
     (
         "samuel-etver/vector-art",
         "255f8add3c8f0740196e22bd59502b811b532f0b",
@@ -97,7 +136,9 @@ pub fn fetch() -> Result<(), String> {
                 }
             }
             sources.push_str(&format!("| {name} | https://github.com/{repo}/blob/{commit}/{path} | {licence} |\n"));
-            count += 1;
+            if out.extension().is_some_and(|e| e != "txt") {
+                count += 1;
+            }
         }
     }
     std::fs::write(dest.join("SOURCES.md"), sources).map_err(|e| format!("SOURCES.md: {e}"))?;

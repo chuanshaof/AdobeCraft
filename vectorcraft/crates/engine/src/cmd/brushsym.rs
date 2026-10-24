@@ -6,20 +6,23 @@
 //! `Node::geometric_bounds` assumes for instances, and each instance's `xf` scales it back. The
 //! natural size is kept in `Document::unknown["symbolSizes"]` so new instances come out right.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
-use vectorcraft_brush::{self as brush, Brush};
+use vectorcraft_brush::{self as brush, Bristle, Brush, BrushKind};
 use vectorcraft_color::{Color, Paint};
-use vectorcraft_doc::{AppearanceItem, Document, FillLayer, Node, NodeId, NodeKind, Symbol};
+use vectorcraft_doc::{AppearanceItem, Document, FillLayer, Node, NodeId, NodeKind, Symbol, SymbolExportType, SymbolNineSlice, SymbolRegistration};
 use vectorcraft_geom::{Affine, Point, Vec2};
 
-use super::edit::selected_roots;
+use super::edit::{outermost, selected_roots};
+use super::pathops::{remove_each, separate};
+use super::swatch::{anchor, names_param};
 use super::*;
 use crate::EngineError;
 
 const SIZES_KEY: &str = vectorcraft_doc::SYMBOL_SIZES;
-const CURRENT_SYMBOL: &str = "currentSymbol";
+pub(crate) const CURRENT_SYMBOL: &str = "currentSymbol";
 /// Half the instance box `Node::geometric_bounds` uses for symbol instances.
 const HALF: f64 = vectorcraft_doc::SYMBOL_HALF;
 
@@ -29,15 +32,32 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!(query "brush.list", "Brushes", [], None, "{} → {brushes: [{name, type}], current}", has_doc, brush_list),
         cmd!(query "brush.get", "Brush Definition", [], None, "{name} → the brush definition (JSON)", has_doc, brush_get),
         cmd!(
+            query "brush.selectionArt",
+            "Brush Art",
+            [],
+            None,
+            "{ids?|id?} → {art: the object brush.new takes as a new scatter or art brush's art and as a new pattern brush's side tile (several objects become one group), or null when nothing is selected or ids name no object}",
+            has_doc,
+            brush_selection_art
+        ),
+        cmd!(
             "brush.apply",
             "Apply Brush",
             [],
             None,
-            "{name, ids?} apply a brush to the strokes of the selected paths (adds a stroke if missing) and make it current → {ids}",
+            "{name, ids?|id?} apply a brush to the strokes of the selected paths (adds a stroke if missing) and make it current → {ids}",
             has_doc,
             brush_apply
         ),
-        cmd!("brush.remove", "Remove Brush Stroke", [], None, "{ids?} remove brushes from the selected strokes → {ids}", has_selection, brush_remove),
+        cmd!(
+            "brush.remove",
+            "Remove Brush Stroke",
+            [],
+            None,
+            "{ids?|id?} remove brushes from the selected strokes → {ids}",
+            has_selection,
+            brush_remove
+        ),
         cmd!(
             "brush.setCurrent",
             "Current Brush",
@@ -52,18 +72,52 @@ pub fn specs() -> Vec<CommandSpec> {
             "New Brush…",
             [],
             None,
-            "{type: calligraphic|scatter|art|pattern|bristle, name?, params?: {…definition fields}, ids?} new brush; art/scatter/pattern brushes take the selected art (pattern: side tile) unless params give it → {name}",
+            "{type: calligraphic|scatter|art|pattern|bristle, name? (trimmed; blank: New <Type> Brush; a bristle brush name, with the number a taken name gets, has at most 31 characters), params?: {…definition fields}, ids?|id?} new brush; art/scatter/pattern brushes take the selected art (pattern: side tile) unless params give it → {name}",
             has_doc,
             brush_new
         ),
-        cmd!("brush.delete", "Delete Brush", [], None, "{name} delete a brush; strokes using it become plain strokes", has_doc, brush_delete),
-        cmd!("brush.duplicate", "Duplicate Brush", [], None, "{name, newName?} → {name}", has_doc, brush_duplicate),
+        cmd!(
+            "brush.delete",
+            "Delete Brush",
+            [],
+            None,
+            "{name} | {names: [name…]} delete brushes; strokes using them become plain strokes",
+            has_doc,
+            brush_delete
+        ),
+        cmd!(
+            "brush.move",
+            "Move Brush",
+            [],
+            None,
+            "{name? | names?: [brush names of one type, in order], to?: index among the brushes of that type in brush.list order (they go before the brush of that type now there that isn't moving; default: after the last one), type?: calligraphic|scatter|art|pattern|bristle (the type they go into; default: theirs)} reorder brushes within their type, as one undo step (none when the order stays as it was); brushes of different types, or a type that isn't theirs, are refused (brushes move only within their type) → {moved}",
+            has_doc,
+            brush_move
+        ),
+        cmd!(
+            "brush.duplicate",
+            "Duplicate Brush",
+            [],
+            None,
+            "{name, newName? (trimmed; blank: <name> copy)} | {names: [name…]} → {name} | {names}",
+            has_doc,
+            brush_duplicate
+        ),
+        cmd!(
+            query "brush.unused",
+            "Select All Unused",
+            [],
+            None,
+            "{} → {names: [the brushes no stroke paints with, in library order]} (the Brushes panel selects them): strokes in the art (opacity masks included), symbols, graph designs, pattern tiles and graphic styles count, and so do strokes in the art of a brush that is used",
+            has_doc,
+            brush_unused
+        ),
         cmd!(
             "brush.options",
             "Brush Options…",
             [],
             None,
-            "{name, params?: {…fields to change}, newName?} edit a brush definition (strokes using it update) → {name}",
+            "{name, params?: {…fields to change (brush.get shows them; values outside their ranges are clamped). calligraphic: angle −180..180°, roundness 0..100%, size 0..1296 pt, variation: [angle°, roundness%, size pt], modes: [fixed|random|pressure for angle, roundness, size] (pressure goes from value − variation at the lightest pen pressure to value + variation at the heaviest). scatter: size [a, b] 1..10000%, spacing [a, b] 1..10000%, scatter [a, b] −1000..1000%, rotation [a, b] −180..180°, modes: [fixed|random|pressure for size, spacing, scatter, rotation] (fixed: a; random: between a and b; pressure: a at the lightest pen pressure to b at the heaviest), rotation_relative_to_path. art: width 1..1000%, scale: {mode: proportional|stretch|betweenGuides, start, end: 0..1 of the art length}, direction: leftToRight|rightToLeft|topToBottom|bottomToTop, flip_along, flip_across, overlap. pattern: scale 1..10000%, spacing 0..10000%, fit: stretch|addSpace|approximate, flip_along, flip_across. scatter, art and pattern: colorization: {method: none|tints|tintsAndShades|hueShift, key: colour (hueShift: the art colour that becomes the stroke colour; without a key: the solid color the art's fills and strokes use most, black when they use none)}; colorization and the art brush's scale change only the fields given}, newName? (trimmed; blank: the name is kept; a new bristle brush name has at most 31 characters, and a longer name the brush has is kept)} edit a brush definition (strokes using it update) → {name}",
             has_doc,
             brush_options
         ),
@@ -72,7 +126,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Expand Brush Strokes",
             [],
             None,
-            "{ids?} replace brushed paths (in the selection) with groups of the brush art → {ids}",
+            "{ids?|id?} replace brushed paths (in the selection) with groups of the brush art → {ids}",
             has_selection,
             expand_brush
         ),
@@ -81,27 +135,36 @@ pub fn specs() -> Vec<CommandSpec> {
             "Paintbrush",
             [],
             None,
-            "{…path.freehand params, brush} paint a freehand stroke with a brush → {id}",
+            "{…params as path.freehand, brush} paint a freehand stroke with a brush → {id}",
             has_doc,
             brush_freehand
         ),
         // ----- symbols -----
-        cmd!(query "symbol.list", "Symbols", [], None, "{} → {symbols: [{name, instances, size: [w,h]}], current}", has_doc, symbol_list),
+        cmd!(query "symbol.list", "Symbols", [], None, "{} → {symbols: [{name, instances, size: [w,h], registration: 0..8, exportType: movieClip|graphic}], current}", has_doc, symbol_list),
         cmd!(
             "symbol.new",
             "New Symbol…",
             [],
             None,
-            "{name?, ids?} make a symbol from the selection and replace it with an instance → {name, id}",
+            "{name?, ids?|id?, registration?: 0..8 (9-point grid, 4 = centre; Symbol Options › Registration), exportType?: movieClip (default)|graphic, nineSlice?: bool, nineSliceGuides?: array} make a symbol from the selection and replace it with an instance; nineSlice is Symbol Options › Enable Guides for 9-Slice Scaling, nineSliceGuides [left, top, right, bottom] as fractions 0..1 of the natural size (default a third each) → {name, id, registration, exportType, nineSlice}",
             has_selection,
             symbol_new
+        ),
+        cmd!(
+            "symbol.options",
+            "Symbol Options…",
+            [],
+            None,
+            "{name?, newName?, registration?: 0..8, exportType?: movieClip|graphic, nineSlice?: bool, nineSliceGuides?: array} rename a symbol and/or set Symbol Options › Registration and Export Type and 9-slice guides (nineSliceGuides [left, top, right, bottom] fractions 0..1; default name: current) → {name, registration, exportType, nineSlice}",
+            has_doc,
+            symbol_options
         ),
         cmd!(
             "symbol.place",
             "Place Symbol Instance",
             [],
             None,
-            "{name?, x?, y?} place an instance centred at (x, y) (default: artboard centre; name default: current) → {id}",
+            "{name?, x?, y?} place an instance so its registration point is at (x, y) (default: artboard centre; name default: current) → {id}",
             has_doc,
             symbol_place
         ),
@@ -110,7 +173,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Break Link to Symbol",
             [],
             None,
-            "{ids?} expand selected instances into plain art → {ids}",
+            "{ids?|id?} expand selected instances into plain art → {ids}",
             has_selection,
             symbol_break_link
         ),
@@ -119,7 +182,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit Symbol",
             [],
             None,
-            "{id?} break the link of the selected instance so its art can be edited; finish with symbol.update → {name, ids}",
+            "{id?, ids?: [id…] (instead of id)} break the link of the selected instance so its art can be edited; finish with symbol.update → {name, ids}",
             has_selection,
             symbol_edit
         ),
@@ -128,7 +191,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Redefine Symbol",
             [],
             None,
-            "{name, ids?} replace the symbol's art with the selection (instances update; the selection becomes an instance) → {name, id}",
+            "{name, ids?|id?} replace the symbol's art with the selection (instances update; the selection becomes an instance) → {name, id}",
             has_selection,
             symbol_update
         ),
@@ -147,7 +210,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Replace Symbol",
             [],
             None,
-            "{name, ids?} swap the symbol of the selected instances → {ids}",
+            "{name, ids?|id?} swap the symbol of the selected instances → {ids}",
             has_selection,
             symbol_replace
         ),
@@ -175,7 +238,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Symbolism Tool",
             [],
             None,
-            "{tool: shift|scrunch|size|spin|stain|screen|style, points: [[x,y]…], radius?: 40, intensity?: 1..10 (5), alt?: bool, color?, style?: name} adjust instances near the points (selection, else all) → {count}",
+            "{tool: shift|scrunch|size|spin|stain|screen|style, points: [[x,y]…], radius?: 40, intensity?: 1..10 (5), alt?: bool, color?, keepModel?: bool (as paint.setFill), style?: name} adjust instances near the points (selection, else all) → {count}",
             has_doc,
             symbol_adjust
         ),
@@ -189,11 +252,11 @@ fn ids_json(ids: &[NodeId]) -> Value {
 fn roots(s: &Session, p: &Value) -> Result<Vec<NodeId>> {
     match ids_param(p, "ids").or_else(|| id_param(p, "id").map(|i| vec![i])) {
         Some(mut v) => {
-            // Explicit ids: only existing, non-layer objects.
+            // Explicit ids: only existing, non-layer objects, none inside another of them.
             let d = &s.doc()?.doc;
             v.retain(|id| d.node(*id).is_some_and(|n| !n.is_layer()));
             v.dedup();
-            Ok(v)
+            Ok(outermost(d, v))
         }
         None => selected_roots(s),
     }
@@ -231,6 +294,12 @@ fn brush_get(s: &mut Session, p: &Value) -> Result<Value> {
     let name = name_param(p, "brush.get")?;
     let b = brush::find(&s.doc()?.doc, name).ok_or_else(|| EngineError::Other(format!("no brush named `{name}`")))?;
     Ok(serde_json::to_value(b).unwrap_or_default())
+}
+
+/// The art `brush.new` takes from `ids` or `id`, else from the selection ([`selection_art`]).
+fn brush_selection_art(s: &mut Session, p: &Value) -> Result<Value> {
+    let art = selection_art(s, p)?;
+    Ok(json!({ "art": art.map(|n| serde_json::to_value(&n).unwrap_or_default()) }))
 }
 
 fn brush_apply(s: &mut Session, p: &Value) -> Result<Value> {
@@ -302,7 +371,7 @@ fn brush_set_current(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// The selection as one art node (a group for several objects), ids kept.
-fn selection_art(s: &Session, p: &Value) -> Result<Option<Node>> {
+pub(crate) fn selection_art(s: &Session, p: &Value) -> Result<Option<Node>> {
     let d = &s.doc()?.doc;
     let ids = roots(s, p)?;
     let nodes: Vec<Node> = ids.iter().filter_map(|id| d.node(*id).cloned()).collect();
@@ -313,38 +382,100 @@ fn selection_art(s: &Session, p: &Value) -> Result<Option<Node>> {
     })
 }
 
+/// The definition fields that `params` change field by field when the brush has them as objects:
+/// `{colorization: {method: "hueShift"}}` keeps the key color, and an art brush's `scale` with only
+/// `start` keeps `end`.
+const MERGED_FIELDS: [&str; 2] = ["colorization", "scale"];
+
 fn merge(base: &mut Value, patch: &Value) {
     if let (Some(b), Some(pt)) = (base.as_object_mut(), patch.as_object()) {
         for (k, v) in pt {
-            b.insert(k.clone(), v.clone());
+            match (b.get_mut(k).and_then(Value::as_object_mut), v.as_object()) {
+                (Some(inner), Some(fields)) if MERGED_FIELDS.contains(&k.as_str()) => {
+                    for (f, fv) in fields {
+                        inner.insert(f.clone(), fv.clone());
+                    }
+                }
+                _ => {
+                    b.insert(k.clone(), v.clone());
+                }
+            }
         }
     }
 }
 
-fn save_library(s: &mut Session, label: &str, lib: Vec<Brush>, rename: Option<(String, Option<String>)>) -> Result<()> {
+/// Sets brush `to` on the strokes in `items` that paint with brush `from`.
+fn set_stroke_brush(items: &mut [AppearanceItem], from: &str, to: Option<&str>) {
+    for it in items {
+        if let AppearanceItem::Stroke(st) = it
+            && st.brush.as_deref() == Some(from)
+        {
+            st.brush = to.map(str::to_string);
+        }
+    }
+}
+
+/// Whether a stroke in `n` (its opacity masks included) paints with brush `name`.
+fn paints_with(n: &Node, name: &str) -> bool {
+    let mut hit = false;
+    vectorcraft_doc::swatches::walk_with_masks(n, &mut |m| {
+        hit |= m.appearance.items.iter().any(|i| matches!(i, AppearanceItem::Stroke(st) if st.brush.as_deref() == Some(name)));
+    });
+    hit
+}
+
+/// Applies [`set_stroke_brush`] to every stroke in `n` and its opacity masks. Only the objects that
+/// hold such a stroke, and those that hold them, are copied.
+fn set_brush_in(n: &mut Node, from: &str, to: Option<&str>) {
+    set_stroke_brush(&mut n.appearance.items, from, to);
+    if let Some(mask) = n.extras_if_any().and_then(|e| e.mask.as_mut())
+        && paints_with(&mask.art, from)
+    {
+        set_brush_in(Arc::make_mut(&mut mask.art), from, to);
+    }
+    for c in n.children_mut().into_iter().flatten() {
+        if paints_with(c, from) {
+            set_brush_in(Arc::make_mut(c), from, to);
+        }
+    }
+}
+
+/// Returns the art a brush is made of ([`Brush::art`]) for editing.
+fn brush_art_mut(b: &mut Brush) -> Vec<&mut Node> {
+    use vectorcraft_brush::BrushKind;
+    match &mut b.kind {
+        BrushKind::Scatter(s) => vec![&mut s.art],
+        BrushKind::Art(a) => vec![&mut a.art],
+        BrushKind::Pattern(p) => {
+            std::iter::once(&mut p.side).chain([&mut p.outer_corner, &mut p.inner_corner, &mut p.start, &mut p.end].into_iter().flatten()).collect()
+        }
+        BrushKind::Calligraphic(_) | BrushKind::Bristle(_) => vec![],
+    }
+}
+
+/// Sets brush `to` (`None`: no brush) on every stroke that paints with brush `from`: in the art
+/// (opacity masks included), symbols, graph designs, pattern tiles and the tiles that pattern
+/// editing's Cancel puts back, graphic styles and the art of the brushes in `lib`.
+fn rename_brush_strokes(d: &mut Document, lib: &mut [Brush], from: &str, to: Option<&str>) {
+    let trees = d.layers.iter_mut().chain(d.symbols.iter_mut().map(|s| &mut s.art)).chain(d.graph_designs.iter_mut().map(|g| &mut g.art));
+    let patterns = d.patterns.iter_mut().chain(d.pattern_edit.iter_mut().filter_map(|pe| pe.original.as_mut()));
+    for n in trees.chain(patterns.flat_map(|p| &mut p.art)) {
+        if paints_with(n, from) {
+            set_brush_in(Arc::make_mut(n), from, to);
+        }
+    }
+    for g in &mut d.graphic_styles {
+        set_stroke_brush(&mut g.appearance.items, from, to);
+    }
+    for n in lib.iter_mut().flat_map(brush_art_mut) {
+        set_brush_in(n, from, to);
+    }
+}
+
+fn save_library(s: &mut Session, label: &str, mut lib: Vec<Brush>, renames: &[(String, Option<String>)]) -> Result<()> {
     s.edit(label, |d, _| {
-        brush::store(d, &lib);
-        if let Some((from, to)) = rename {
-            let ids: Vec<NodeId> = {
-                let mut v = vec![];
-                d.walk(|n| {
-                    if n.appearance.items.iter().any(|i| matches!(i, AppearanceItem::Stroke(st) if st.brush.as_deref() == Some(from.as_str()))) {
-                        v.push(n.id);
-                    }
-                });
-                v
-            };
-            for id in ids {
-                if let Some(n) = d.node_mut(id) {
-                    for it in &mut n.appearance.items {
-                        if let AppearanceItem::Stroke(st) = it
-                            && st.brush.as_deref() == Some(from.as_str())
-                        {
-                            st.brush = to.clone();
-                        }
-                    }
-                }
-            }
+        for (from, to) in renames {
+            rename_brush_strokes(d, &mut lib, from, to.as_deref());
             if brush::current(d).as_deref() == Some(from.as_str()) {
                 match to {
                     Some(t) => d.unknown.insert(brush::CURRENT_KEY.into(), json!(t)),
@@ -352,6 +483,7 @@ fn save_library(s: &mut Session, label: &str, lib: Vec<Brush>, rename: Option<(S
                 };
             }
         }
+        brush::store(d, &lib);
         Ok(())
     })
 }
@@ -366,8 +498,12 @@ fn brush_new(s: &mut Session, p: &Value) -> Result<Value> {
         o => return Err(bad(C, format!("unknown brush type `{o}`"))),
     };
     let mut lib = brush::library(&s.doc()?.doc);
-    let base_name = str_param(p, "name").map(str::to_string).unwrap_or_else(|| format!("New {} Brush", ty[..1].to_uppercase() + &ty[1..]));
+    let given = str_param(p, "name").map(str::trim).filter(|n| !n.is_empty());
+    let base_name = given.map_or_else(|| format!("New {} Brush", ty[..1].to_uppercase() + &ty[1..]), str::to_string);
     let name = brush::unique_name(&lib, &base_name);
+    if ty == "bristle" {
+        bristle_name_fits(C, &name)?;
+    }
     let mut v = json!({"name": name, "type": ty});
     if let Some(params) = p.get("params") {
         merge(&mut v, params);
@@ -383,33 +519,142 @@ fn brush_new(s: &mut Session, p: &Value) -> Result<Value> {
         }
         v[k] = serde_json::to_value(&art).unwrap_or_default();
     }
-    let b: Brush = serde_json::from_value(v).map_err(|e| bad(C, format!("invalid brush: {e}")))?;
-    lib.push(b);
-    save_library(s, "New Brush", lib, None)?;
+    lib.push(parse_brush(C, v)?);
+    save_library(s, "New Brush", lib, &[])?;
     Ok(json!({ "name": name }))
 }
 
-fn brush_delete(s: &mut Session, p: &Value) -> Result<Value> {
-    let name = name_param(p, "brush.delete")?.to_string();
-    let mut lib = brush::library(&s.doc()?.doc);
-    let n = lib.len();
-    lib.retain(|b| b.name != name);
-    if lib.len() == n {
-        return Err(bad("brush.delete", format!("no brush named `{name}`")));
+/// Refuses `name` for a bristle brush when it has more than [`Bristle::MAX_NAME_CHARS`] characters.
+fn bristle_name_fits(cmd: &str, name: &str) -> Result<()> {
+    let (count, max) = (name.chars().count(), Bristle::MAX_NAME_CHARS);
+    if count > max {
+        return Err(bad(cmd, format!("a bristle brush name can have at most {max} characters: `{name}` has {count}")));
     }
-    save_library(s, "Delete Brush", lib, Some((name, None)))?;
+    Ok(())
+}
+
+/// A brush definition from command params, its values kept within their ranges ([`Brush::from_json`]).
+fn parse_brush(cmd: &str, v: Value) -> Result<Brush> {
+    Brush::from_json(v).map_err(|e| bad(cmd, format!("invalid brush: {e}")))
+}
+
+fn brush_delete(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "brush.delete";
+    let names = names_param(p, C)?;
+    let mut lib = brush::library(&s.doc()?.doc);
+    if let Some(name) = names.iter().find(|n| !lib.iter().any(|b| &b.name == *n)) {
+        return Err(bad(C, format!("no brush named `{name}`")));
+    }
+    lib.retain(|b| !names.contains(&b.name));
+    let renames: Vec<(String, Option<String>)> = names.into_iter().map(|n| (n, None)).collect();
+    save_library(s, "Delete Brush", lib, &renames)?;
     ok()
 }
 
+/// Moves the brushes in `name` or `names`, in that order, to index `to` among the brushes of their
+/// type in library order: before the first brush of that type at or after `to` that isn't moving,
+/// else after the last brush of that type that isn't moving. Brushes of different types, or a `type`
+/// that isn't theirs, are an error. A move that leaves the order as it was records no undo step.
+fn brush_move(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "brush.move";
+    const WITHIN: &str = "brushes move only within their type";
+    let names = names_param(p, C)?;
+    check_numbers(p, &["to"], C)?;
+    let to = match p.get("to").filter(|v| !v.is_null()) {
+        Some(v) => Some(v.as_u64().map(|i| usize::try_from(i).unwrap_or(usize::MAX)).ok_or_else(|| bad(C, "`to` must be a whole number"))?),
+        None => None,
+    };
+    let old = brush::library(&s.doc()?.doc);
+    let mut lib = old.clone();
+    // `names_param` refuses an empty list, so the loop sets `kind`.
+    let mut kind = "";
+    for name in &names {
+        let b = lib.iter().find(|b| &b.name == name).ok_or_else(|| bad(C, format!("no brush named `{name}`")))?;
+        if !kind.is_empty() && kind != b.kind.type_id() {
+            return Err(bad(C, WITHIN));
+        }
+        kind = b.kind.type_id();
+    }
+    if p.get("type").filter(|v| !v.is_null()).is_some_and(|t| t.as_str() != Some(kind)) {
+        return Err(bad(C, WITHIN));
+    }
+    let same: Vec<&Brush> = lib.iter().filter(|b| b.kind.type_id() == kind).collect();
+    let before = anchor(&same, to, &names, |b| &b.name);
+    let first = lib.iter().position(|b| names.contains(&b.name)).unwrap_or(lib.len());
+    let mut items = vec![];
+    for name in &names {
+        if let Some(i) = lib.iter().position(|b| &b.name == name) {
+            items.push(lib.remove(i));
+        }
+    }
+    let at = match before {
+        Some(a) => lib.iter().position(|b| b.name == a),
+        None => lib.iter().rposition(|b| b.kind.type_id() == kind).map(|i| i + 1),
+    };
+    let at = at.unwrap_or(first).min(lib.len());
+    lib.splice(at..at, items);
+    if lib != old {
+        save_library(s, "Move Brush", lib, &[])?;
+    }
+    Ok(json!({ "moved": names.len() }))
+}
+
+/// Adds a copy of each brush in `name` or `names` at the end of the library. `newName`, given
+/// without `names`, names the copy.
 fn brush_duplicate(s: &mut Session, p: &Value) -> Result<Value> {
-    let name = name_param(p, "brush.duplicate")?;
-    let mut lib = brush::library(&s.doc()?.doc);
-    let mut b = lib.iter().find(|b| b.name == name).cloned().ok_or_else(|| bad("brush.duplicate", format!("no brush named `{name}`")))?;
-    b.name = brush::unique_name(&lib, str_param(p, "newName").unwrap_or(&format!("{name} copy")));
-    let out = b.name.clone();
-    lib.push(b);
-    save_library(s, "Duplicate Brush", lib, None)?;
-    Ok(json!({ "name": out }))
+    const C: &str = "brush.duplicate";
+    let names = names_param(p, C)?;
+    let before = brush::library(&s.doc()?.doc);
+    let mut lib = before.clone();
+    let mut out = vec![];
+    for name in &names {
+        let mut b = before.iter().find(|b| &b.name == name).cloned().ok_or_else(|| bad(C, format!("no brush named `{name}`")))?;
+        let given = str_param(p, "newName").map(str::trim).filter(|n| !n.is_empty() && p.get("names").is_none());
+        let new_name = given.map_or_else(|| format!("{} copy", name.trim()), str::to_string);
+        b.name = brush::unique_name(&lib, &new_name);
+        out.push(b.name.clone());
+        lib.push(b);
+    }
+    save_library(s, "Duplicate Brush", lib, &[])?;
+    Ok(if p.get("names").is_some() { json!({ "names": out }) } else { json!({ "name": out.first() }) })
+}
+
+/// Adds the names of the brushes the strokes of `items` paint with to `out`.
+fn stroke_brushes(items: &[AppearanceItem], out: &mut Vec<String>) {
+    for it in items {
+        if let AppearanceItem::Stroke(st) = it
+            && let Some(b) = &st.brush
+        {
+            out.push(b.clone());
+        }
+    }
+}
+
+/// Adds the names of the brushes the strokes in `n` (its opacity masks included) paint with to
+/// `out`.
+fn art_brushes(n: &Node, out: &mut Vec<String>) {
+    vectorcraft_doc::swatches::walk_with_masks(n, &mut |m| stroke_brushes(&m.appearance.items, out));
+}
+
+/// The brushes no stroke paints with. Strokes in the art (opacity masks included), symbols, graph
+/// designs, pattern tiles and graphic styles count, and so do the strokes in the art of every brush
+/// that a counted stroke paints with.
+fn brush_unused(s: &mut Session, _: &Value) -> Result<Value> {
+    let d = &s.doc()?.doc;
+    let lib = brush::library(d);
+    let mut todo = vec![];
+    let trees = d.layers.iter().chain(d.symbols.iter().map(|s| &s.art)).chain(d.graph_designs.iter().map(|g| &g.art));
+    trees.chain(d.patterns.iter().flat_map(|p| &p.art)).for_each(|n| art_brushes(n, &mut todo));
+    d.graphic_styles.iter().for_each(|g| stroke_brushes(&g.appearance.items, &mut todo));
+    let mut used = BTreeSet::new();
+    while let Some(name) = todo.pop() {
+        if !used.contains(&name) {
+            lib.iter().filter(|b| b.name == name).flat_map(Brush::art).for_each(|n| art_brushes(n, &mut todo));
+            used.insert(name);
+        }
+    }
+    let names: Vec<&str> = lib.iter().map(|b| b.name.as_str()).filter(|n| !used.contains(*n)).collect();
+    Ok(json!({ "names": names }))
 }
 
 fn brush_options(s: &mut Session, p: &Value) -> Result<Value> {
@@ -421,20 +666,24 @@ fn brush_options(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(params) = p.get("params") {
         merge(&mut v, params);
     }
-    let new_name = str_param(p, "newName").filter(|n| !n.trim().is_empty() && *n != name).map(str::to_string);
+    let new_name = str_param(p, "newName").map(str::trim).filter(|n| !n.is_empty() && *n != name).map(str::to_string);
     if let Some(nn) = &new_name {
         if lib.iter().any(|b| &b.name == nn) {
             return Err(bad(C, format!("a brush named `{nn}` exists")));
+        }
+        // A `newName` that only trims the white space around the saved name is taken at any length.
+        if matches!(lib[i].kind, BrushKind::Bristle(_)) && nn != name.trim() {
+            bristle_name_fits(C, nn)?;
         }
         v["name"] = json!(nn);
     } else {
         v["name"] = json!(name);
     }
     v["type"] = json!(lib[i].kind.type_id());
-    lib[i] = serde_json::from_value(v).map_err(|e| bad(C, format!("invalid brush: {e}")))?;
+    lib[i] = parse_brush(C, v)?;
     let out = lib[i].name.clone();
     let rename = new_name.map(|nn| (name, Some(nn)));
-    save_library(s, "Brush Options", lib, rename)?;
+    save_library(s, "Brush Options", lib, rename.as_slice())?;
     Ok(json!({ "name": out }))
 }
 
@@ -478,7 +727,7 @@ fn brush_freehand(s: &mut Session, p: &Value) -> Result<Value> {
 
 // ---------- symbols ----------
 
-fn natural_size(d: &Document, name: &str) -> (f64, f64) {
+pub(crate) fn natural_size(d: &Document, name: &str) -> (f64, f64) {
     d.unknown
         .get(SIZES_KEY)
         .and_then(|m| m.get(name))
@@ -486,7 +735,7 @@ fn natural_size(d: &Document, name: &str) -> (f64, f64) {
         .unwrap_or((2.0 * HALF, 2.0 * HALF))
 }
 
-fn set_natural_size(d: &mut Document, name: &str, size: Option<(f64, f64)>) {
+pub(crate) fn set_natural_size(d: &mut Document, name: &str, size: Option<(f64, f64)>) {
     let m = d.unknown.entry(SIZES_KEY.to_string()).or_insert_with(|| json!({}));
     if let Some(o) = m.as_object_mut() {
         match size {
@@ -496,27 +745,74 @@ fn set_natural_size(d: &mut Document, name: &str, size: Option<(f64, f64)>) {
     }
 }
 
-/// Instance transform for a symbol of natural size `(w, h)` centred at `c`.
-fn place_xf(c: Point, (w, h): (f64, f64)) -> Affine {
+/// Instance transform for a symbol of natural size `(w, h)` whose registration point is at `at`.
+pub(crate) fn place_xf(at: Point, (w, h): (f64, f64), reg: SymbolRegistration) -> Affine {
+    let c = at - reg.offset_from_center(w, h);
     Affine::translate(c.to_vec2()) * Affine::scale_non_uniform(w / (2.0 * HALF), h / (2.0 * HALF))
 }
 
+fn registration_param(p: &Value, cmd: &str) -> Result<Option<SymbolRegistration>> {
+    match p.get("registration") {
+        None => Ok(None),
+        Some(v) => v.as_u64().and_then(SymbolRegistration::from_u64).map(Some).ok_or_else(|| bad(cmd, "registration must be 0..8")),
+    }
+}
+
+fn export_type_param(p: &Value, cmd: &str) -> Result<Option<SymbolExportType>> {
+    match str_param(p, "exportType") {
+        None => Ok(None),
+        Some(s) => SymbolExportType::from_id(s).map(Some).ok_or_else(|| bad(cmd, format!("exportType must be movieClip or graphic, not `{s}`"))),
+    }
+}
+
+/// `nineSlice` (bool) and `nineSliceGuides` ([left, top, right, bottom] fractions of the natural
+/// size): `None` leaves the symbol alone, `Some(None)` turns 9-slice off, `Some(Some(g))` turns it
+/// on with guides `g` (the symbol's current ones, else the centre third, when none are given).
+fn nine_slice_param(p: &Value, cmd: &str, current: Option<SymbolNineSlice>) -> Result<Option<Option<SymbolNineSlice>>> {
+    let on = match p.get("nineSlice") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.as_bool().ok_or_else(|| bad(cmd, "nineSlice must be true or false"))?),
+    };
+    let guides =
+        match p.get("nineSliceGuides") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(SymbolNineSlice::from_value(v).ok_or_else(|| {
+                bad(cmd, "nineSliceGuides must be [left, top, right, bottom], each 0..1, with left + right < 1 and top + bottom < 1")
+            })?),
+        };
+    Ok(match (on, guides) {
+        (Some(false), _) => Some(None),
+        (None, None) => None,
+        (_, Some(g)) => Some(Some(g)),
+        (Some(true), None) => Some(Some(current.unwrap_or_default())),
+    })
+}
+
+fn nine_slice_json(d: &Document, name: &str) -> Value {
+    d.symbol_nine_slice(name).map_or(Value::Null, SymbolNineSlice::to_value)
+}
+
+fn rename_natural_size(d: &mut Document, from: &str, to: &str) {
+    if from == to {
+        return;
+    }
+    let size = d.unknown.get(SIZES_KEY).and_then(|m| m.get(from)).cloned();
+    set_natural_size(d, from, None);
+    if let Some(v) = size
+        && let (Some(w), Some(h)) = (v.get(0).and_then(Value::as_f64), v.get(1).and_then(Value::as_f64))
+    {
+        set_natural_size(d, to, Some((w, h)));
+    }
+}
+
 /// Normalise art for a symbol definition: returns (art, natural size, centre in the document).
-fn normalize(mut art: Node) -> Result<(Node, (f64, f64), Point)> {
+pub(crate) fn normalize(mut art: Node) -> Result<(Node, (f64, f64), Point)> {
     let b = art.geometric_bounds().ok_or_else(|| EngineError::Other("the art has no bounds".into()))?;
     let (w, h) = (b.width().max(1.0), b.height().max(1.0));
     let c = b.center();
     let n = Affine::scale_non_uniform(2.0 * HALF / w, 2.0 * HALF / h) * Affine::translate(-c.to_vec2());
     art.transform(n, false);
     Ok((art, (w, h), c))
-}
-
-fn unique_symbol_name(d: &Document, base: &str) -> String {
-    let taken = |n: &str| d.symbols.iter().any(|s| s.name == n);
-    if !taken(base) {
-        return base.to_string();
-    }
-    (2..).map(|i| format!("{base} {i}")).find(|n| !taken(n)).unwrap_or_else(|| base.to_string())
 }
 
 fn instances_of(d: &Document, name: Option<&str>) -> Vec<NodeId> {
@@ -546,7 +842,14 @@ fn symbol_list(s: &mut Session, _: &Value) -> Result<Value> {
         .iter()
         .map(|sym| {
             let (w, h) = natural_size(d, &sym.name);
-            json!({"name": sym.name, "instances": instances_of(d, Some(&sym.name)).len(), "size": [w, h]})
+            json!({
+                "name": sym.name,
+                "instances": instances_of(d, Some(&sym.name)).len(),
+                "size": [w, h],
+                "registration": d.symbol_registration(&sym.name).0,
+                "exportType": d.symbol_export_type(&sym.name).id(),
+                "nineSlice": nine_slice_json(d, &sym.name),
+            })
         })
         .collect();
     Ok(json!({ "symbols": list, "current": current_symbol(d).or_else(|| symbol_names(d).into_iter().next()) }))
@@ -555,6 +858,10 @@ fn symbol_list(s: &mut Session, _: &Value) -> Result<Value> {
 /// Replace the root nodes `ids` with one instance of `name` (art already stored). Returns the id.
 fn replace_with_instance(d: &mut Document, ids: &[NodeId], name: &str, xf: Affine) -> Result<NodeId> {
     let top = *ids.last().ok_or_else(|| EngineError::Other("nothing selected".into()))?;
+    if separate(d, ids) {
+        let id = d.alloc_id();
+        return Ok(d.wrap(ids, |_| Node::new(id, NodeKind::SymbolInstance { symbol: name.into(), xf }))?);
+    }
     let (par, idx, _) = d.position(top).ok_or(EngineError::NoNode(top))?;
     let id = d.alloc_id();
     d.insert(par, idx + 1, Node::new(id, NodeKind::SymbolInstance { symbol: name.into(), xf }))?;
@@ -565,20 +872,88 @@ fn replace_with_instance(d: &mut Document, ids: &[NodeId], name: &str, xf: Affin
 }
 
 fn symbol_new(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "symbol.new";
     let ids = roots(s, p)?;
     let art = selection_art(s, p)?.ok_or_else(|| EngineError::Other("nothing selected".into()))?;
     let (art, size, c) = normalize(art)?;
-    let name = unique_symbol_name(&s.doc()?.doc, str_param(p, "name").filter(|n| !n.trim().is_empty()).unwrap_or("New Symbol"));
+    let name = s.doc()?.doc.unique_symbol_name(str_param(p, "name").map(str::trim).filter(|n| !n.is_empty()).unwrap_or("New Symbol"));
+    let reg = registration_param(p, C)?.unwrap_or(SymbolRegistration::CENTER);
+    let export = export_type_param(p, C)?.unwrap_or_default();
+    let nine = nine_slice_param(p, C, None)?.flatten();
+    // Keep the art where it was: the geometric centre stays at `c`, whatever the registration is.
+    let place = place_xf(c + reg.offset_from_center(size.0, size.1), size, reg);
     let id = s.edit("New Symbol", |d, sel| {
         let art = d.reid(&art);
         d.symbols.push(Symbol { name: name.clone(), art: Arc::new(art) });
         set_natural_size(d, &name, Some(size));
+        d.set_symbol_registration(&name, reg);
+        d.set_symbol_export_type(&name, export);
+        d.set_symbol_nine_slice(&name, nine);
         d.unknown.insert(CURRENT_SYMBOL.into(), json!(name));
-        let id = replace_with_instance(d, &ids, &name, place_xf(c, size))?;
+        let id = replace_with_instance(d, &ids, &name, place)?;
         sel.set([id]);
         Ok(id)
     })?;
-    Ok(json!({ "name": name, "id": id.0 }))
+    Ok(
+        json!({ "name": name, "id": id.0, "registration": reg.0, "exportType": export.id(), "nineSlice": nine.map_or(Value::Null, SymbolNineSlice::to_value) }),
+    )
+}
+
+fn symbol_options(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "symbol.options";
+    let name = resolve_symbol(&s.doc()?.doc, p, C)?;
+    let export = export_type_param(p, C)?;
+    let reg = registration_param(p, C)?;
+    let nine = nine_slice_param(p, C, s.doc()?.doc.symbol_nine_slice(&name))?;
+    let new_name = str_param(p, "newName").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
+    if new_name.is_none() && export.is_none() && reg.is_none() && nine.is_none() {
+        return Err(bad(C, "pass newName, registration, exportType and/or nineSlice"));
+    }
+    if let Some(ref n) = new_name
+        && n != &name
+        && s.doc()?.doc.symbols.iter().any(|x| x.name == *n)
+    {
+        return Err(bad(C, format!("a symbol named `{n}` already exists")));
+    }
+    let final_name = new_name.clone().unwrap_or_else(|| name.clone());
+    s.edit("Symbol Options", |d, _| {
+        if let Some(ref n) = new_name
+            && n != &name
+        {
+            if let Some(sym) = d.symbols.iter_mut().find(|x| x.name == name) {
+                sym.name = n.clone();
+            }
+            for id in instances_of(d, Some(&name)) {
+                if let Some(NodeKind::SymbolInstance { symbol, .. }) = d.node_mut(id).map(|node| &mut node.kind) {
+                    *symbol = n.clone();
+                }
+            }
+            rename_natural_size(d, &name, n);
+            d.rename_symbol_registration(&name, n);
+            d.rename_symbol_export_type(&name, n);
+            d.rename_symbol_nine_slice(&name, n);
+            if d.unknown.get(CURRENT_SYMBOL).and_then(Value::as_str) == Some(name.as_str()) {
+                d.unknown.insert(CURRENT_SYMBOL.into(), json!(n));
+            }
+        }
+        if let Some(r) = reg {
+            d.set_symbol_registration(&final_name, r);
+        }
+        if let Some(kind) = export {
+            d.set_symbol_export_type(&final_name, kind);
+        }
+        if let Some(g) = nine {
+            d.set_symbol_nine_slice(&final_name, g);
+        }
+        Ok(())
+    })?;
+    let d = &s.doc()?.doc;
+    Ok(json!({
+        "name": final_name,
+        "registration": d.symbol_registration(&final_name).0,
+        "exportType": d.symbol_export_type(&final_name).id(),
+        "nineSlice": nine_slice_json(d, &final_name),
+    }))
 }
 
 fn resolve_symbol(d: &Document, p: &Value, cmd: &str) -> Result<String> {
@@ -595,12 +970,13 @@ fn symbol_place(s: &mut Session, p: &Value) -> Result<Value> {
     let d = &s.doc()?.doc;
     let name = resolve_symbol(d, p, "symbol.place")?;
     let centre = d.artboards.first().map(|a| a.rect.center()).unwrap_or(Point::ZERO);
-    let c = Point::new(f64_or(p, "x", centre.x), f64_or(p, "y", centre.y));
+    let at = Point::new(number_or(p, "x", centre.x, "symbol.place")?, number_or(p, "y", centre.y, "symbol.place")?);
     let size = natural_size(d, &name);
-    let parent = s.doc()?.insertion_parent();
+    let reg = d.symbol_registration(&name);
+    let parent = s.doc()?.target_parent()?;
     let id = s.edit("Place Symbol Instance", |d, sel| {
         let id = d.alloc_id();
-        d.insert(parent, usize::MAX, Node::new(id, NodeKind::SymbolInstance { symbol: name.clone(), xf: place_xf(c, size) }))?;
+        d.insert(parent, usize::MAX, Node::new(id, NodeKind::SymbolInstance { symbol: name.clone(), xf: place_xf(at, size, reg) }))?;
         sel.set([id]);
         Ok(id)
     })?;
@@ -709,7 +1085,8 @@ fn symbol_update(s: &mut Session, p: &Value) -> Result<Value> {
                 *xf *= fix;
             }
         }
-        let id = replace_with_instance(d, &ids, &name, place_xf(c, size))?;
+        let reg = d.symbol_registration(&name);
+        let id = replace_with_instance(d, &ids, &name, place_xf(c + reg.offset_from_center(size.0, size.1), size, reg))?;
         sel.set([id]);
         Ok(id)
     })?;
@@ -722,18 +1099,19 @@ fn symbol_delete(s: &mut Session, p: &Value) -> Result<Value> {
     if !s.doc()?.doc.symbols.iter().any(|x| x.name == name) {
         return Err(bad(C, format!("no symbol named `{name}`")));
     }
-    let expand = bool_or(p, "expandInstances", true);
+    let expand = switch_or(p, "expandInstances", true, C)?;
     s.edit("Delete Symbol", |d, _| {
         let inst = instances_of(d, Some(&name));
         if expand {
             break_links(d, &inst)?;
         } else {
-            for i in inst {
-                d.remove(i)?;
-            }
+            remove_each(d, &inst)?;
         }
         d.symbols.retain(|x| x.name != name);
         set_natural_size(d, &name, None);
+        d.set_symbol_registration(&name, SymbolRegistration::CENTER);
+        d.clear_symbol_export_type(&name);
+        d.set_symbol_nine_slice(&name, None);
         if d.unknown.get(CURRENT_SYMBOL).and_then(Value::as_str) == Some(name.as_str()) {
             d.unknown.remove(CURRENT_SYMBOL);
         }
@@ -747,15 +1125,22 @@ fn symbol_duplicate(s: &mut Session, p: &Value) -> Result<Value> {
     let name = name_param(p, C)?.to_string();
     let d = &s.doc()?.doc;
     let sym = d.symbols.iter().find(|x| x.name == name).cloned().ok_or_else(|| bad(C, format!("no symbol named `{name}`")))?;
-    let new = unique_symbol_name(d, str_param(p, "newName").unwrap_or(&format!("{name} copy")));
+    let given = str_param(p, "newName").map(str::trim).filter(|n| !n.is_empty());
+    let new = d.unique_symbol_name(&given.map_or_else(|| format!("{} copy", name.trim()), str::to_string));
     let size = natural_size(d, &name);
+    let reg = d.symbol_registration(&name);
+    let export = d.symbol_export_type(&name);
+    let nine = d.symbol_nine_slice(&name);
     s.edit("Duplicate Symbol", |d, _| {
         let art = d.reid(&sym.art);
         d.symbols.push(Symbol { name: new.clone(), art: Arc::new(art) });
         set_natural_size(d, &new, Some(size));
+        d.set_symbol_registration(&new, reg);
+        d.set_symbol_export_type(&new, export);
+        d.set_symbol_nine_slice(&new, nine);
         Ok(())
     })?;
-    Ok(json!({ "name": new }))
+    Ok(json!({ "name": new, "registration": reg.0, "exportType": export.id(), "nineSlice": nine.map_or(Value::Null, SymbolNineSlice::to_value) }))
 }
 
 fn symbol_replace(s: &mut Session, p: &Value) -> Result<Value> {
@@ -831,13 +1216,14 @@ fn symbol_spray(s: &mut Session, p: &Value) -> Result<Value> {
     let pts = points(p, C)?;
     let st = s.doc()?;
     let name = resolve_symbol(&st.doc, p, C)?;
-    let radius = f64_or(p, "radius", 40.0).clamp(1.0, 2000.0);
-    let density = f64_or(p, "density", 5.0).clamp(1.0, 10.0);
-    let scale = f64_or(p, "scale", 1.0).clamp(0.01, 100.0);
-    let alt = bool_or(p, "alt", false);
+    let radius = number_or(p, "radius", 40.0, C)?.clamp(1.0, 2000.0);
+    let density = number_or(p, "density", 5.0, C)?.clamp(1.0, 10.0);
+    let scale = number_or(p, "scale", 1.0, C)?.clamp(0.01, 100.0);
+    let alt = switch_or(p, "alt", false, C)?;
     let size = natural_size(&st.doc, &name);
     let set = st.selection.objects.first().copied().filter(|id| st.selection.len() == 1 && st.doc.node(*id).is_some_and(is_symbol_set));
-    let parent = st.insertion_parent();
+    // Only a new Symbol Set needs a layer that takes new art.
+    let parent = if alt || set.is_some() { st.insertion_parent() } else { st.target_parent()? };
     if alt {
         // Remove instances of this symbol under the brush (within the set, or anywhere).
         let d = &st.doc;
@@ -856,12 +1242,7 @@ fn symbol_spray(s: &mut Session, p: &Value) -> Result<Value> {
             .collect();
         let n = doomed.len();
         if n > 0 {
-            s.edit("Symbol Sprayer", |d, _| {
-                for id in &doomed {
-                    d.remove(*id)?;
-                }
-                Ok(())
-            })?;
+            s.edit("Symbol Sprayer", |d, _| remove_each(d, &doomed))?;
         }
         return Ok(json!({ "count": n }));
     }
@@ -877,13 +1258,14 @@ fn symbol_spray(s: &mut Session, p: &Value) -> Result<Value> {
         placed.push(c);
     }
     let count = placed.len();
+    let reg = s.doc()?.doc.symbol_registration(&name);
     let id = s.edit("Symbol Sprayer", |d, sel| {
         let mut nodes = vec![];
         for (i, c) in placed.iter().enumerate() {
             let (_, _, js) = jitter(i + 7, *c);
             let k = scale * (1.0 + js * 0.1);
             let id = d.alloc_id();
-            nodes.push(Node::new(id, NodeKind::SymbolInstance { symbol: name.clone(), xf: place_xf(*c, size) * Affine::scale(k) }));
+            nodes.push(Node::new(id, NodeKind::SymbolInstance { symbol: name.clone(), xf: place_xf(*c, size, reg) * Affine::scale(k) }));
         }
         let gid = match set {
             Some(g) => {
@@ -919,13 +1301,14 @@ fn symbol_adjust(s: &mut Session, p: &Value) -> Result<Value> {
     if !["shift", "scrunch", "size", "spin", "stain", "screen", "style"].contains(&tool.as_str()) {
         return Err(bad(C, format!("unknown tool `{tool}`")));
     }
+    super::paint::check_keep_model(p, C)?;
     let pts = points(p, C)?;
-    let radius = f64_or(p, "radius", 40.0).clamp(1.0, 2000.0);
-    let intensity = f64_or(p, "intensity", 5.0).clamp(1.0, 10.0) / 10.0;
-    let alt = bool_or(p, "alt", false);
+    let radius = number_or(p, "radius", 40.0, C)?.clamp(1.0, 2000.0);
+    let intensity = number_or(p, "intensity", 5.0, C)?.clamp(1.0, 10.0) / 10.0;
+    let alt = switch_or(p, "alt", false, C)?;
     let st = s.doc()?;
     let color = match p.get("color").and_then(color_value) {
-        Some(c) => c,
+        Some(c) => super::paint::new_color(s, p, c),
         None => s.paint.fill.color().unwrap_or(Color::BLACK),
     };
     let style_paint = match str_param(p, "style") {
@@ -948,7 +1331,8 @@ fn symbol_adjust(s: &mut Session, p: &Value) -> Result<Value> {
                 }
             }
         }
-        v.retain(|id| d.is_editable(*id));
+        let editable = d.editable();
+        v.retain(|id| editable(*id));
         v
     };
     let label = match tool.as_str() {

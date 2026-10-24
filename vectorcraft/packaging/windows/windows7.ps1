@@ -37,7 +37,7 @@ try {
   $CargoArgs = @('--locked') + $Patch + @('--target', $Target, '--no-default-features', '--features', 'vectorcraft/windows7')
   $Tree = cargo "+$Toolchain" tree @CargoArgs -p vectorcraft -e normal --prefix none
   if ($LASTEXITCODE -ne 0) { throw 'dependency inspection failed' }
-  if ($Tree -match '^(wgpu|wgpu-core|wgpu-hal|accesskit_windows) v') { throw 'unsupported Windows backend in compatibility build' }
+  if ($Tree -match '^(wgpu|wgpu-core|wgpu-hal|accesskit_windows|craft-print) v') { throw 'unsupported Windows backend in compatibility build' }
   if (-not ($Tree -match '^windows-link v[^ ]+ \(.*vendor[\\/]windows-link\)')) { throw 'the patched windows-link is not in use' }
   # The ordinary pc-windows-msvc standard library requires Windows 10. Rebuild std for win7.
   [Environment]::SetEnvironmentVariable($FlagName, '-C target-feature=+crt-static')
@@ -65,10 +65,13 @@ try {
   $Stage = Join-Path $TargetDir ('windows7-portable-' + [Guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Force $Stage | Out-Null
   Copy-Item (Join-Path $Bin 'vectorcraft.exe'), (Join-Path $Bin 'vectorcraft-cli.exe') $Stage
-  Copy-Item LICENSE-MIT, LICENSE-APACHE, NOTICE $Stage
+  Copy-Item LICENSE-MIT, LICENSE-APACHE, NOTICE, ASSETS.md $Stage
+  Copy-Item -Recurse licenses $Stage
   Copy-Item vendor/windows-link/license-mit (Join-Path $Stage 'LICENSE-windows-link-MIT')
   Copy-Item vendor/windows-link/license-apache-2.0 (Join-Path $Stage 'LICENSE-windows-link-Apache-2.0')
   Copy-Item docs/windows7.md (Join-Path $Stage 'WINDOWS7.md')
+  # portable.txt switches on portable mode, as in the regular portable zip (#1366).
+  Copy-Item (Join-Path $PSScriptRoot 'portable.txt') $Stage
   if ($env:CRAFT_FONTS_DIR) {
     foreach ($ofl in Get-ChildItem (Join-Path $env:CRAFT_FONTS_DIR 'fonts\*\OFL.txt')) {
       Copy-Item $ofl.FullName (Join-Path $Stage "OFL-$($ofl.Directory.Name).txt")

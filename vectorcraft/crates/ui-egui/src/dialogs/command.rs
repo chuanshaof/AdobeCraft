@@ -1,5 +1,7 @@
 //! The generic parameter dialog (`ui.paramDialog`): edits a command's parameters (`__command`,
-//! headed `__label`) and runs it on OK.
+//! headed `__label`) and runs it on OK, with the fixed ones in `__params` (not shown) added.
+
+use std::sync::LazyLock;
 
 use serde_json::Value;
 
@@ -11,8 +13,9 @@ pub(super) const SPEC: DialogSpec = DialogSpec {
     heading: |d| tl!(&d.str("__label")).to_string(),
     body: |app, ui, d| {
         let command = d.str("__command");
-        let lengths = lengths(&command);
-        form::param_fields(ui, d, &|k| lengths.contains(&k), &|k| choices(&command, k), &|_| 0, app.session.general_unit());
+        let (lengths, order) = (lengths(&command), order(&command));
+        let rank = |k: &str| order.iter().position(|o| *o == k).unwrap_or(order.len());
+        form::param_fields(ui, d, &|k| lengths.contains(&k), &|k| choices(&command, k), &rank, app.session.general_unit());
         false
     },
     confirm,
@@ -28,6 +31,17 @@ fn lengths(command: &str) -> &'static [&'static str] {
         "object.repeat.options" => &["radius", "hSpacing", "vSpacing"],
         "text.areaOptions" => &["width", "height", "gutter", "inset", "firstBaselineMin"],
         "type.pathOptions" => &["spacing"],
+        "object.pathfinder.trap" => &["thickness"],
+        _ => &[],
+    }
+}
+
+/// The order the fields of the commands this dialog edits come in, where the order of their
+/// names isn't it (the rest follow, by name).
+fn order(command: &str) -> &'static [&'static str] {
+    match command {
+        // The public Trap options' order.
+        "object.pathfinder.trap" => &["thickness", "heightWidth", "tintReduction", "trapsWithProcessColor", "reverseTraps"],
         _ => &[],
     }
 }
@@ -40,6 +54,12 @@ fn choices(command: &str, key: &str) -> Option<form::Choices> {
         ("text.areaOptions", "fit") => Some(AREA_FIT),
         ("text.areaOptions", "firstBaseline") => Some(FIRST_BASELINE),
         ("text.areaOptions", "verticalAlign") => Some(VERTICAL_ALIGN),
+        ("graph.setType", "type") => Some(GRAPH_KINDS.as_slice()),
+        ("graph.setType", "valueAxis") => Some(GRAPH_VALUE_AXIS),
+        ("graph.setType", "tickLength" | "rightTickLength" | "categoryTickLength") => Some(GRAPH_TICK_LENGTH),
+        ("graph.setType", "pieLegend") => Some(PIE_LEGEND),
+        ("graph.setType", "piePosition") => Some(PIE_POSITION),
+        ("graph.setType", "pieSort") => Some(PIE_SORT),
         _ => None,
     }
 }
@@ -57,10 +77,28 @@ const FIRST_BASELINE: form::Choices =
 /// Area Type Options › Align (vertical alignment of the lines in each row/column).
 const VERTICAL_ALIGN: form::Choices = &[("Top", "top"), ("Center", "center"), ("Bottom", "bottom"), ("Justify", "justify")];
 
+/// Graph Type › Type: the nine graph kinds, in the Graph tool group's order.
+static GRAPH_KINDS: LazyLock<Vec<(&'static str, &'static str)>> =
+    LazyLock::new(|| vectorcraft_doc::GraphKind::ALL.iter().map(|k| (k.label(), k.id())).collect());
+
+/// Graph Type › Value Axis (series picked on both axes show none, and OK leaves each where it is).
+const GRAPH_VALUE_AXIS: form::Choices = &[("On Left Side", "left"), ("On Right Side", "right"), ("On Both Sides", "both")];
+
+/// Graph Type › Legend, Position and Sort for pie graphs.
+const PIE_LEGEND: form::Choices = &[("No Legend", "none"), ("Standard Legend", "standard"), ("Legends in Wedges", "wedges")];
+const PIE_POSITION: form::Choices = &[("Ratio", "ratio"), ("Even", "even"), ("Stacked", "stacked")];
+const PIE_SORT: form::Choices = &[("All", "all"), ("First", "first"), ("None", "none")];
+
+/// Graph Type › Tick Marks › Length.
+const GRAPH_TICK_LENGTH: form::Choices = &[("None", "none"), ("Short", "short"), ("Full Width", "full")];
+
 /// Closes before running, so a dialog the command opens stays open.
 fn confirm(app: &mut VectorcraftApp, d: &Dialog) -> Result<Value, String> {
     let cmd = d.str("__command");
-    let params = form::params(d);
+    let mut params = form::params(d);
+    if let (Some(o), Some(Value::Object(fixed))) = (params.as_object_mut(), d.fields.get("__params")) {
+        o.extend(fixed.clone());
+    }
     app.ui.dialog = None;
     // A tool's click-to-size shape (Flare) goes on the active perspective plane while the grid shows.
     let at = |x: &str, y: &str| Some(vectorcraft_geom::Point::new(params.get(x)?.as_f64()?, params.get(y)?.as_f64()?));
@@ -109,5 +147,41 @@ mod tests {
         crate::dialogs::confirm(&mut app).unwrap();
         let NodeKind::Text(t) = &app.session.doc().unwrap().doc.node(vectorcraft_doc::NodeId(id)).unwrap().kind else { panic!("text") };
         assert_eq!(t.area.vertical_align, VerticalAlign::Center);
+    }
+
+    /// Graph Type › Value Axis is a dropdown of the values `graph.setType` takes, and OK puts the
+    /// value axis on the side picked.
+    #[test]
+    fn graph_type_value_axis_is_a_dropdown_of_its_sides() {
+        let doc = vectorcraft_engine::find_command("graph.setType").unwrap().params;
+        let values: Vec<&str> = choices("graph.setType", "valueAxis").unwrap().iter().map(|(_, v)| *v).collect();
+        assert!(doc.contains(&format!("valueAxis?: {}", values.join("|"))), "{values:?}");
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 400, "height": 400})).unwrap();
+        app.run("graph.create", json!({"type": "column", "x": 0, "y": 0, "width": 200, "height": 150})).unwrap();
+        crate::menus::graph_dialog(&mut app, "graph.setType").unwrap();
+        assert_eq!(app.ui.dialog.as_ref().unwrap().str("valueAxis"), "left");
+        app.ui.dialog.as_mut().unwrap().fields.insert("valueAxis".into(), json!("both"));
+        crate::dialogs::confirm(&mut app).unwrap();
+        assert_eq!(app.session.execute("graph.setType", &json!({})).unwrap()["valueAxis"], "both");
+    }
+
+    /// Graph Type › Type is a dropdown of the nine graph kinds (#2175), and OK changes the graph's
+    /// type and keeps its data.
+    #[test]
+    fn graph_type_is_a_dropdown_of_the_graph_kinds() {
+        let kinds: Vec<(&str, &str)> = vectorcraft_doc::GraphKind::ALL.iter().map(|k| (k.label(), k.id())).collect();
+        assert_eq!(choices("graph.setType", "type").unwrap().to_vec(), kinds);
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 400, "height": 400})).unwrap();
+        app.run("graph.create", json!({"type": "column", "x": 0, "y": 0, "width": 200, "height": 150, "csv": ",a,b\nQ1,1,2\nQ2,3,4"})).unwrap();
+        let data = app.session.execute("graph.setData", &json!({})).unwrap();
+        assert_eq!(data["rows"], json!([[1.0, 2.0], [3.0, 4.0]]));
+        crate::menus::graph_dialog(&mut app, "graph.setType").unwrap();
+        assert_eq!(app.ui.dialog.as_ref().unwrap().str("type"), "column");
+        app.ui.dialog.as_mut().unwrap().fields.insert("type".into(), json!("stackedBar"));
+        crate::dialogs::confirm(&mut app).unwrap();
+        assert_eq!(app.session.execute("graph.setType", &json!({})).unwrap()["type"], "stackedBar");
+        assert_eq!(app.session.execute("graph.setData", &json!({})).unwrap(), data);
     }
 }

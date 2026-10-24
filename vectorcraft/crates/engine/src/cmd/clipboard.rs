@@ -10,7 +10,7 @@
 //! text besides it (see `flavours`).
 
 mod flavours;
-mod resources;
+pub(crate) mod resources;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -21,7 +21,7 @@ use vectorcraft_color::Swatch;
 use vectorcraft_doc::{Document, GraphicStyle, ImageBlob, Node, NodeId, PatternDef, Symbol, TextStyleDef};
 use vectorcraft_geom::Rect;
 
-pub use flavours::{BITMAP, EMF, FILE_HEAD, Flavour, PASTE_ORDER, PDF, PNG, SVG, TEXT, file_flavour, is_address};
+pub use flavours::{AI, BITMAP, EMF, EPS, FILE_HEAD, Flavour, PASTE_ORDER, PDF, PNG, SVG, TEXT, file_flavour, is_address, names_a_picture};
 pub(crate) use resources::SwatchChoices;
 
 use super::*;
@@ -80,21 +80,22 @@ pub struct Clipboard {
     pub para_styles: Vec<TextStyleDef>,
     /// Brushes the objects' strokes use.
     pub brushes: Vec<Brush>,
-    /// The artboard the objects were copied from: Paste on All Artboards keeps their offset to it.
+    /// The artboard the objects were copied from (none when they lie on no artboard; the first of
+    /// [`Self::artboards`] when there are any): Paste on All Artboards keeps their offset to it.
     pub source_artboard: Option<Rect>,
     /// Per object: the name of the layer it was copied from (Paste Remembers Layers).
     pub source_layers: Vec<Option<String>>,
     /// The open document the objects came from ([`DocState::uid`]): pasting back into it uses its
     /// own resources as they are now.
     pub source_doc: Option<u64>,
-    /// An artboard copied with the Artboard tool (`artboard.copy`); `nodes` are then its art. Pasting
-    /// adds a copy of it with the art.
-    pub artboard: Option<vectorcraft_doc::Artboard>,
+    /// The artboards copied with the Artboard tool (`artboard.copy`); `nodes` are then their art.
+    /// Pasting adds a copy of each with the art.
+    pub artboards: Vec<vectorcraft_doc::Artboard>,
 }
 
 impl Clipboard {
     pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty() && self.artboard.is_none()
+        self.nodes.is_empty() && self.artboards.is_empty()
     }
 
     /// Objects `roots` of `st`'s document with their resources, source artboard and layers.
@@ -108,9 +109,17 @@ impl Clipboard {
             // The nearest enclosing layer (or sublayer).
             source_layers.push(anc.iter().rev().skip(1).find_map(|a| d.node(*a).filter(|l| l.is_layer())).and_then(|l| l.name.clone()));
         }
-        let bounds = nodes.iter().filter_map(Node::visual_bounds).reduce(|a, b| a.union(b));
-        let board = bounds.and_then(|b| d.artboard_at(b.center())).unwrap_or(0);
-        Self { source_artboard: d.artboards.get(board).map(|a| a.rect), source_layers, source_doc: Some(st.uid), ..Self::gather(d, nodes) }
+        // Symbol instances are measured by their art.
+        let symbols = d.symbol_boxes();
+        let bounds = nodes.iter().filter_map(|n| n.visual_bounds_with(&symbols)).reduce(|a, b| a.union(b));
+        // Art on no artboard has no source artboard: in-place pastes put it back where it was (#1924).
+        let board = bounds.and_then(|b| d.artboard_at(b.center()));
+        Self {
+            source_artboard: board.and_then(|i| d.artboards.get(i)).map(|a| a.rect),
+            source_layers,
+            source_doc: Some(st.uid),
+            ..Self::gather(d, nodes)
+        }
     }
 
     /// Every object of `src` (each top-level layer's contents) with its resources, for Place and
@@ -120,9 +129,13 @@ impl Clipboard {
         Self::gather(src, nodes)
     }
 
-    /// Union of the objects' visual bounds.
+    /// Union of the objects' visual bounds, with symbol instances measured by the art of the
+    /// symbols the clipboard holds.
     pub fn bounds(&self) -> Option<Rect> {
-        self.nodes.iter().filter_map(Node::visual_bounds).reduce(|a, b| a.union(b))
+        let mut d = Document::new(100.0, 100.0);
+        d.symbols = self.symbols.clone();
+        let symbols = d.symbol_boxes();
+        self.nodes.iter().filter_map(|n| n.visual_bounds_with(&symbols)).reduce(|a, b| a.union(b))
     }
 
     /// The swatch name conflicts pasting into `st` raises, as (pasted, document) swatches: none
@@ -142,8 +155,8 @@ impl Clipboard {
         d.patterns = self.patterns.clone();
         d.swatches.extend(self.swatches.iter().cloned());
         d.graphic_styles.extend(self.graphic_styles.iter().cloned());
-        d.char_styles = self.char_styles.clone();
-        d.para_styles = self.para_styles.clone();
+        d.char_styles = self.char_styles.clone().into();
+        d.para_styles = self.para_styles.clone().into();
         if !self.brushes.is_empty() {
             let mut lib = vectorcraft_brush::library(&d);
             for b in &self.brushes {
@@ -154,28 +167,40 @@ impl Clipboard {
             }
             vectorcraft_brush::store(&mut d, &lib);
         }
-        let mut layer = Node::layer(NodeId(u64::MAX), "Clipboard", vectorcraft_doc::LayerColor::Preset(0));
+        // The layer's id is above every copied object's, so the document saves and reopens as
+        // a native file.
+        let mut top = 0;
+        for n in &self.nodes {
+            n.walk(&mut |c| top = top.max(c.id.0));
+        }
+        let mut layer = Node::layer(NodeId(top.saturating_add(1)), "Clipboard", vectorcraft_doc::LayerColor::Preset(0));
         if let Some(ch) = layer.children_mut() {
             *ch = self.nodes.iter().cloned().map(Arc::new).collect();
         }
         d.layers = vec![Arc::new(layer)];
+        d.fix_next_id();
         d
     }
-}
 
-impl Session {
-    /// The internal clipboard as standalone SVG (`None` when it is empty).
-    pub fn clipboard_svg(&self) -> Option<String> {
-        if self.clipboard.is_empty() {
+    /// The objects as standalone SVG (`None` when there are none).
+    pub fn svg(&self) -> Option<String> {
+        if self.is_empty() {
             return None;
         }
-        let d = self.clipboard.to_document();
+        let d = self.to_document();
         // SVG has no filters for the Photoshop-style effects: their objects go in as images.
         let flat = super::rasterfx::flatten_pixel_effects(&d);
         Some(vectorcraft_svg::export(
             flat.as_ref().unwrap_or(&d),
             &vectorcraft_svg::ExportOptions { artboard: None, object_ids: vectorcraft_svg::ObjectIds::Minimal, ..Default::default() },
         ))
+    }
+}
+
+impl Session {
+    /// The internal clipboard as standalone SVG (`None` when it is empty).
+    pub fn clipboard_svg(&self) -> Option<String> {
+        self.clipboard.svg()
     }
 }
 
@@ -238,6 +263,24 @@ mod tests {
         }
         for t in ["Pasted words", "see https://example.com", "https://a.org https://b.org", "https://", "example.com/cat.png", ""] {
             assert!(!is_address(t), "{t}");
+        }
+    }
+
+    /// The image markup some browsers put as text next to a copied picture names it too (#1089);
+    /// markup with words in it is text.
+    #[test]
+    fn markup_of_only_images_names_a_picture() {
+        for m in [
+            r#"<img src="https://static.example.com/eagle.png" jsaction="" class="sFlh5c" style="max-width: 351px" alt="">"#,
+            r#"<meta http-equiv="content-type" content="text/html; charset=utf-8"><img src="a.png">"#,
+            "<html><body><!--StartFragment--><IMG SRC=\"a.png\"/><!--EndFragment--></body></html>",
+            r#"<a href="https://x.org"><img src="a.png"></a>"#,
+            "https://example.com/cat.png",
+        ] {
+            assert!(names_a_picture(m), "{m}");
+        }
+        for t in ["<p>Hello</p>", r#"<img src="a.png"> and a caption"#, "<b>bold</b>", "<imgx>", "<img", "plain words", "<br>", ""] {
+            assert!(!names_a_picture(t), "{t}");
         }
     }
 

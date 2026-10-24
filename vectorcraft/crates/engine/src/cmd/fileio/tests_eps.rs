@@ -156,6 +156,23 @@ fn placed_images_are_written_and_previews_are_black_and_white_on_request() {
     assert!(l3.contains("/FlateDecode filter >> image"));
 }
 
+/// Two placed images whose pixel data can't be decoded are left out of the EPS, and `warnings`
+/// holds the note raster exports give, once, without naming either image's key.
+#[test]
+fn images_that_cant_be_decoded_give_the_raster_note_once() {
+    const NOTE: &str = "an image couldn't be decoded and is missing from the picture";
+    let mut s = session(200.0, 100.0, 1);
+    crate::tests_menucmds::place_undecodable_png(&mut s);
+    crate::tests_menucmds::place_undecodable_png_sized(&mut s, 32, 16);
+    let keys: Vec<String> = s.doc().unwrap().doc.images.keys().cloned().collect();
+    assert_eq!(keys.len(), 2);
+    let r = s.execute("document.exportEps", &json!({"previewFormat": "none"})).unwrap();
+    let w = warnings(&r);
+    assert_eq!(w.iter().filter(|w| *w == NOTE).count(), 1, "{w:?}");
+    assert!(!w.iter().any(|w| keys.iter().any(|k| w.contains(k.as_str()))), "{w:?}");
+    assert!(!postscript(&b64(&r)).contains("filter >> image"), "no image is written");
+}
+
 #[test]
 fn bad_eps_options_are_refused_and_formats_list_eps() {
     let mut s = session(100.0, 100.0, 1);
@@ -171,7 +188,9 @@ fn bad_eps_options_are_refused_and_formats_list_eps() {
         let e = s.execute("document.exportEps", &p).unwrap_err().to_string();
         assert!(e.contains("EPS"), "{p}: {e}");
     }
-    assert!(s.execute("document.exportForScreens", &json!({"formats": [{"format": "eps"}]})).is_err());
+    // Export for Screens writes an EPS per artboard (a document of that artboard alone).
+    let r = s.execute("document.exportForScreens", &json!({"formats": [{"format": "eps"}]})).unwrap();
+    assert!(r["files"][0]["name"].as_str().unwrap().ends_with(".eps"), "{r}");
     let r = s.execute("document.formats", &json!({})).unwrap();
     let eps = r["formats"].as_array().unwrap().iter().find(|f| f["id"] == "eps").unwrap().clone();
     // Readable too since EPS import (tests_epsimport.rs).

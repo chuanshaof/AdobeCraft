@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 use super::*;
 use crate::Prefs;
 use crate::units::Measure;
-use vectorcraft_doc::Unit;
+use vectorcraft_doc::{GridPrefs, Unit};
 
 /// What kind of value a preference holds.
 #[derive(Clone, Copy, Debug)]
@@ -49,7 +49,7 @@ pub struct PrefSpec {
     pub kind: PrefKind,
 }
 
-/// Categories in Illustrator's order (Plug-ins & Scratch Disks is "Performance & Storage" here).
+/// Categories in Illustrator's order.
 pub const PREF_CATEGORIES: &[&str] = &[
     "General",
     "Selection & Anchor Display",
@@ -59,7 +59,7 @@ pub const PREF_CATEGORIES: &[&str] = &[
     "Smart Guides",
     "Slices",
     "Hyphenation",
-    "Performance & Storage",
+    "Plug-ins & Scratch Disks",
     "User Interface",
     "Performance",
     "File Handling",
@@ -87,6 +87,12 @@ const LINE_STYLE: &[(&str, &str)] = &[("lines", "Lines"), ("dots", "Dots")];
 /// `automatic` (#502).
 pub const GPU_PREFERENCES: &[(&str, &str)] =
     &[("automatic", "Automatic"), ("lowPower", "Power Saving (integrated)"), ("highPerformance", "High Performance (discrete)")];
+/// Performance › Linux Display Server (`linuxDisplayServer`), read by the desktop app at startup:
+/// `x11` opens the window through XWayland on a Wayland session, where dropped files arrive
+/// (winit 0.30 has no Wayland drag and drop, #1151); `x11WithPen` does the same only when a pen is
+/// attached as the app starts: under XWayland a drawing tablet's pen draws as a mouse (#2028).
+const LINUX_DISPLAY_SERVERS: &[(&str, &str)] =
+    &[("automatic", "Automatic"), ("x11", "X11 (XWayland)"), ("x11WithPen", "X11 (XWayland) When a Pen Is Attached")];
 const BLACK: &[(&str, &str)] = &[("accurate", "Display All Blacks Accurately"), ("rich", "Display All Blacks as Rich Black")];
 const BLACK_OUT: &[(&str, &str)] = &[("accurate", "Output All Blacks Accurately"), ("rich", "Output All Blacks as Rich Black")];
 
@@ -134,6 +140,7 @@ pub const PREF_SPECS: &[PrefSpec] = &[
     p!("scaleStrokes", "General", "Options", "Scale Strokes & Effects", bool),
     p!("zoomWithMouseWheel", "General", "Options", "Zoom with Mouse Wheel", bool),
     p!("scrubNumericFields", "General", "Options", "Scrub Numeric Fields by Dragging", bool),
+    p!("trackpadRotateView", "General", "Options", "Trackpad Gesture to Rotate View", bool),
     // Selection & Anchor Display
     p!("selectionTolerance", "Selection & Anchor Display", "Selection", "Tolerance", num(1.0, 8.0, "px")),
     p!("objectSelectionByPathOnly", "Selection & Anchor Display", "Selection", "Object Selection by Path Only", bool),
@@ -227,7 +234,10 @@ pub const PREF_SPECS: &[PrefSpec] = &[
     p!("anchorPathLabels", "Smart Guides", "Display Options", "Anchor/Path Labels", bool),
     p!("measurementLabels", "Smart Guides", "Display Options", "Measurement Labels", bool),
     p!("spacingGuides", "Smart Guides", "Display Options", "Spacing Guides", bool),
+    p!("distanceGuides", "Smart Guides", "Display Options", "Invoke Distance Guides", bool),
     p!("snappingTolerance", "Smart Guides", "", "Snapping Tolerance", num(0.0, 40.0, "pt")),
+    p!("snapTangent", "Smart Guides", "Geometric Guides", "Snap to Tangent", bool),
+    p!("snapPerpendicular", "Smart Guides", "Geometric Guides", "Snap to Perpendicular", bool),
     // Slices
     p!("showSliceNumbers", "Slices", "", "Show Slice Numbers", bool),
     p!("sliceLineColor", "Slices", "", "Line Color", color),
@@ -249,10 +259,10 @@ pub const PREF_SPECS: &[PrefSpec] = &[
         ])
     ),
     p!("hyphenationExceptions", "Hyphenation", "", "Exceptions (comma separated)", text),
-    // Performance & Storage
-    p!("pluginsFolder", "Performance & Storage", "Plug-ins", "Additional Plug-ins Folder", text),
-    p!("scratchPrimary", "Performance & Storage", "Scratch Disks", "Primary", text),
-    p!("scratchSecondary", "Performance & Storage", "Scratch Disks", "Secondary", text),
+    // Plug-ins & Scratch Disks
+    p!("pluginsFolder", "Plug-ins & Scratch Disks", "Plug-ins", "Additional Plug-ins Folder", text),
+    p!("scratchPrimary", "Plug-ins & Scratch Disks", "Scratch Disks", "Primary", text),
+    p!("scratchSecondary", "Plug-ins & Scratch Disks", "Scratch Disks", "Secondary", text),
     // User Interface
     p!(
         "uiBrightness",
@@ -260,6 +270,14 @@ pub const PREF_SPECS: &[PrefSpec] = &[
         "",
         "Brightness",
         choice(&[("dark", "Dark"), ("mediumDark", "Medium Dark"), ("mediumLight", "Medium Light"), ("light", "Light")])
+    ),
+    p!("uiColorScheme", "User Interface", "", "Color Scheme", choice(&[("modern", "Modern"), ("classic", "Classic")])),
+    p!(
+        "uiAccent",
+        "User Interface",
+        "",
+        "Accent Color",
+        choice(&[("coral", "Coral"), ("blue", "Blue"), ("violet", "Violet"), ("green", "Green"), ("amber", "Amber"), ("pink", "Pink")])
     ),
     p!(
         "canvasColor",
@@ -278,6 +296,7 @@ pub const PREF_SPECS: &[PrefSpec] = &[
     p!("toolGroupLabels", "User Interface", "", "Show Tool Group Labels", bool),
     p!("openDocumentsAsTabs", "User Interface", "", "Open Documents As Tabs", bool),
     p!("largeTabs", "User Interface", "", "Large Tabs", bool),
+    p!("systemTitleBar", "User Interface", "", "System Title Bar", bool),
     p!("uiScaling", "User Interface", "UI Scaling", "Scale", num(0.75, 2.0, "×")),
     p!("scaleCursorWithUi", "User Interface", "UI Scaling", "Scale Cursor Proportional to UI", bool),
     // `auto` or a language code the shell registers (`zh-hant`); the shell shows it as a dropdown.
@@ -289,6 +308,7 @@ pub const PREF_SPECS: &[PrefSpec] = &[
     p!("historyStates", "Performance", "", "History States", int(5, 1000)),
     p!("realTimeDrawing", "Performance", "", "Real-time Drawing and Editing", bool),
     p!("renderThreads", "Performance", "", "Render Threads (-1 = Automatic)", int(-1, 64)),
+    p!("linuxDisplayServer", "Performance", "", "Linux Display Server", choice(LINUX_DISPLAY_SERVERS)),
     // File Handling
     p!("backgroundSave", "File Handling", "", "Enable Background Save", bool),
     p!("backgroundExport", "File Handling", "", "Enable Background Export", bool),
@@ -345,6 +365,7 @@ pub const PREF_SPECS: &[PrefSpec] = &[
     p!("useCompression", "File Handling", "Files", "Use Compression", bool),
     // The W/H link of the Transform panel, the Properties panel and the Control bar
     p!("constrainProportions", "General", "Transform Panel", "Constrain Width and Height Proportions", bool),
+    p!("singleCornerRadius", "General", "Transform Panel", "Single Corner Radius", bool),
 ];
 
 pub fn spec(key: &str) -> Option<&'static PrefSpec> {
@@ -449,6 +470,39 @@ impl Prefs {
         Ok(())
     }
 
+    /// The folders the app reads (fonts, plug-ins) or writes (Data Recovery copies, the Templates
+    /// folder it makes for its dialogs) on its own, with the access each needs.
+    fn folders_mut(&mut self) -> [(&mut String, &'static [crate::file_access::Access]); 4] {
+        use crate::file_access::Access;
+        [
+            (&mut self.fonts_folder, &[Access::Read][..]),
+            (&mut self.plugins_folder, &[Access::Read][..]),
+            // Data Recovery lists and restores what is in its folder too.
+            (&mut self.recovery_folder, &[Access::Write, Access::Read][..]),
+            (&mut self.templates_folder, &[Access::Write][..]),
+        ]
+    }
+
+    /// Put back the folders `next` sets in place of these preferences' that the automation roots
+    /// in force refuse: automation may only point them inside its roots ([`crate::file_access`]).
+    /// → why each was refused. Nothing is refused without roots, nor a folder cleared or kept.
+    fn keep_folders(&self, next: &mut Prefs) -> Vec<String> {
+        let Some(roots) = crate::file_access::current() else { return vec![] };
+        let mut before = self.clone();
+        let mut refused = vec![];
+        for ((old, _), (new, access)) in before.folders_mut().into_iter().zip(next.folders_mut()) {
+            let folder = new.trim();
+            if folder.is_empty() || folder == old.trim() {
+                continue;
+            }
+            if let Err(e) = access.iter().try_for_each(|a| roots.check(folder, *a)) {
+                refused.push(e);
+                *new = old.clone();
+            }
+        }
+        refused
+    }
+
     /// Values of one category (`None` = all) reset to defaults.
     pub fn reset(&mut self, category: Option<&str>) {
         let d = Prefs::default().to_json();
@@ -465,16 +519,27 @@ impl Prefs {
             *self = p;
         }
     }
+
+    /// The document grid Guides & Grid › Gridline every and Subdivisions set.
+    pub fn grid(&self) -> GridPrefs {
+        GridPrefs { spacing: self.gridline_every, subdivisions: self.grid_subdivisions }
+    }
 }
 
 impl Session {
     /// Replace the preferences and push the ones with engine-side consumers into open documents
     /// and the renderer (grid, history depth, render threads).
-    pub fn apply_prefs(&mut self, p: Prefs) {
+    pub fn apply_prefs(&mut self, mut p: Prefs) {
+        // However they are set (a dialog driven by automation too), the folders stay inside the
+        // automation roots in force: a refused one keeps its value.
+        for e in self.prefs.keep_folders(&mut p) {
+            log::warn!("{e}");
+        }
         let grid_changed = p.gridline_every != self.prefs.gridline_every || p.grid_subdivisions != self.prefs.grid_subdivisions;
         let history_changed = p.history_states != self.prefs.history_states;
         let tile_edge_changed = p.pattern_tile_edge_color != self.prefs.pattern_tile_edge_color;
         let fonts_folder_changed = p.fonts_folder != self.prefs.fonts_folder;
+        let hyphen_exceptions_changed = p.hyphenation_exceptions != self.prefs.hyphenation_exceptions;
         self.prefs = p;
         if fonts_folder_changed {
             let folder = self.prefs.fonts_folder.trim();
@@ -486,12 +551,15 @@ impl Session {
                 let _ = super::fonts::rescan(self, &serde_json::Value::Null);
             }
         }
+        if hyphen_exceptions_changed {
+            // Preferences › Hyphenation › Exceptions (#394): the layout reads the process-wide list.
+            vectorcraft_text::set_hyphenation_exceptions(&self.prefs.hyphenation_exceptions);
+        }
         vectorcraft_render::set_default_threads(u16::try_from(self.prefs.render_threads).ok());
         for st in &mut self.docs {
             if history_changed {
                 st.history.limit = self.prefs.history_states as usize;
-                let over = st.history.undo.len().saturating_sub(st.history.limit);
-                st.history.undo.drain(..over);
+                st.history.trim();
             }
             // Documents in pattern editing mode redraw their tile edge.
             if tile_edge_changed && st.doc.pattern_edit.is_some() {
@@ -499,8 +567,11 @@ impl Session {
             }
             if grid_changed {
                 let d = std::sync::Arc::make_mut(&mut st.doc);
-                d.grid.spacing = self.prefs.gridline_every;
-                d.grid.subdivisions = self.prefs.grid_subdivisions;
+                d.grid = self.prefs.grid();
+                st.revision += 1;
+            }
+            // Hyphenation exceptions change every text object's line breaks.
+            if hyphen_exceptions_changed {
                 st.revision += 1;
             }
         }
@@ -545,6 +616,9 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let mut next = s.prefs.clone();
     next.set_values(&values).map_err(|e| bad("prefs.set", e))?;
+    if let Some(e) = s.prefs.keep_folders(&mut next).into_iter().next() {
+        return Err(EngineError::Other(e));
+    }
     s.apply_prefs(next);
     // Units ▸ General is also the open document's units (as Document Setup sets them).
     if values.contains_key("unitsGeneral") && s.active().is_some() {

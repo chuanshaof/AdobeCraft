@@ -1,14 +1,14 @@
 //! The appearance of groups, layers and type: a container's own fills and strokes paint its
 //! members' geometry below or above them (the contents slot), its effects apply to the composite
-//! (one combined shadow) and reshape its members as one piece; type's own fills paint under or
-//! over its characters.
+//! (one combined shadow) and reshape its members as one piece; type's own fills and strokes paint
+//! under or over its characters, reshaped by their geometry effects.
 
 use std::sync::Arc;
 
 use serde_json::{Value, json};
 use vectorcraft_color::{Color, Paint};
 use vectorcraft_doc::text::{CharStyle, TextObject};
-use vectorcraft_doc::{Appearance, AppearanceItem, Effect, FillLayer, Knockout, Node, NodeKind, StrokeLayer};
+use vectorcraft_doc::{Appearance, AppearanceItem, Document, Effect, FillLayer, ImageBlob, ImageObject, Knockout, Node, NodeKind, StrokeLayer};
 use vectorcraft_geom::{Point, shapes};
 
 use super::*;
@@ -85,6 +85,22 @@ fn a_group_fill_paints_every_member_above_or_below_them() {
 }
 
 #[test]
+fn a_group_fill_paints_the_underline_of_its_type() {
+    // The group holds underlined black "IIII" at 40 pt with its baseline at y 60, and has a green fill.
+    let mut d = Document::new(100.0, 100.0);
+    let style = CharStyle { size: 40.0, fill: Paint::solid(Color::BLACK), underline: true, ..Default::default() };
+    let t = Arc::new(Node::new(d.alloc_id(), NodeKind::Text(Box::new(TextObject::point(Point::new(5.0, 60.0), "IIII", style)))));
+    let mut g = Node::group(d.alloc_id(), vec![t]);
+    green_fill(&mut g);
+    let l = d.layers[0].id;
+    d.insert(Some(l), 0, g).unwrap();
+    // The glyphs have no ink below the baseline: the bar's pixels there are green, none black.
+    let img = render(&d);
+    let bar: Vec<[u8; 4]> = (61..70).flat_map(|y| (0..100).map(move |x| (x, y))).map(|(x, y)| img.pixel(x, y)).filter(|p| p[0] < 160).collect();
+    assert!(bar.len() > 50 && bar.iter().all(|p| p[1] > p[0] + 20 && p[1] > p[2] + 20), "{bar:?}");
+}
+
+#[test]
 fn a_group_fill_with_opacity_composites_as_one_layer() {
     // Two overlapping members under a 50 % group fill: the overlap is as light as the rest.
     let mut d = Document::new(100.0, 100.0);
@@ -131,6 +147,104 @@ fn group_geometry_effects_move_the_members_as_one_piece() {
         green_fill(g);
     }));
     assert_eq!((img.pixel(25, 75), img.pixel(65, 75)), (GREEN, GREEN));
+}
+
+/// #2023: a Transform effect on a group moves and copies its images as it does its paths (the
+/// image's placement takes the map, and every copy is drawn at its own place).
+#[test]
+fn group_geometry_effects_move_and_copy_images_too() {
+    let mut d = Document::new(100.0, 100.0);
+    let mut png = Vec::new();
+    image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255])).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    d.images.insert("red".into(), ImageBlob::new("image/png", png));
+    let b = rect(&mut d, Rect::new(0.0, 0.0, 20.0, 20.0), solid(0.0, 0.0, 1.0));
+    let im = ImageObject {
+        key: "red".into(),
+        width: 30,
+        height: 30,
+        xf: Affine::translate((10.0, 30.0)),
+        link: None,
+        placement: Default::default(),
+        pixels: None,
+    };
+    let image = Arc::new(Node::new(d.alloc_id(), NodeKind::Image(Box::new(im))));
+    let mut g = Node::group(d.alloc_id(), vec![b, image]);
+    g.appearance.effects.push(fx("distort.transform", json!({"moveH": 50, "copies": 1})));
+    let l = d.layers[0].id;
+    d.insert(Some(l), 0, g).unwrap();
+    let img = render(&d);
+    assert_eq!(img.pixel(25, 45), RED, "the image itself");
+    assert_eq!(img.pixel(75, 45), RED, "its copy, 50 pt to the right");
+    assert_eq!(img.pixel(60, 10), BLUE, "the path's copy");
+    assert_eq!(img.pixel(5, 10), BLUE, "the path itself");
+}
+
+/// A 100×100 document holding a group of a red square (10..90) and black 40 pt type "IIII" over
+/// it, the type changed by `ty` and the group changed by `group`.
+fn type_group_doc(ty: impl FnOnce(&mut Node), group: impl FnOnce(&mut Node)) -> Document {
+    let mut d = Document::new(100.0, 100.0);
+    let a = rect(&mut d, Rect::new(10.0, 10.0, 90.0, 90.0), solid(1.0, 0.0, 0.0));
+    let style = CharStyle { size: 40.0, fill: Paint::solid(Color::BLACK), ..Default::default() };
+    let mut t = Node::new(d.alloc_id(), NodeKind::Text(Box::new(TextObject::point(Point::new(5.0, 60.0), "IIII", style))));
+    ty(&mut t);
+    let mut g = Node::group(d.alloc_id(), vec![a, Arc::new(t)]);
+    group(&mut g);
+    let l = d.layers[0].id;
+    d.insert(Some(l), 0, g).unwrap();
+    d
+}
+
+#[test]
+fn type_in_a_group_keeps_its_transparency_and_visibility_under_the_groups_geometry_effects() {
+    // Offset Path 0 leaves every path as it is, so the group is drawn the same with it as without
+    // it, for type at 50 %, hidden type, and type at 50 % defining its knockout shape in a
+    // knockout group.
+    let half: fn(&mut Node) = |t| t.opacity = 0.5;
+    let hidden: fn(&mut Node) = |t| t.visible = false;
+    let shape: fn(&mut Node) = |t| (t.opacity, t.knockout_shape) = (0.5, true);
+    let plain: fn(&mut Node) = |_| {};
+    let knockout: fn(&mut Node) = |g| g.knockout = Knockout::On;
+    for (case, ty, group) in [("50 %", half, plain), ("hidden", hidden, plain), ("knockout shape", shape, knockout)] {
+        let without = render(&type_group_doc(ty, group));
+        let with = render(&type_group_doc(ty, |g| {
+            group(g);
+            g.appearance.effects.push(fx("path.offsetPath", json!({"offset": 0})));
+        }));
+        let worst = without.pixels.iter().zip(&with.pixels).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+        assert!(worst <= 4, "{case}: max channel difference {worst}");
+    }
+}
+
+#[test]
+fn type_in_a_clipping_path_clips_alike_under_the_groups_geometry_effects() {
+    // The red square is clipped by type with a Transform of its own, which the clip leaves out,
+    // then by a group of that type and a small square, with the type shown and hidden. Offset
+    // Path 0 on the clip group leaves every path as it is.
+    let doc = |effect: bool, grouped: bool, hidden: bool| {
+        let mut d = Document::new(100.0, 100.0);
+        let style = CharStyle { size: 40.0, fill: Paint::None, ..Default::default() };
+        let mut t = Node::new(d.alloc_id(), NodeKind::Text(Box::new(TextObject::point(Point::new(5.0, 60.0), "IIII", style))));
+        t.appearance.effects.push(fx("distort.transform", json!({"moveH": 30})));
+        t.visible = !hidden;
+        let mut clip = Arc::new(t);
+        if grouped {
+            let small = rect(&mut d, Rect::new(0.0, 0.0, 20.0, 20.0), Paint::None);
+            clip = Arc::new(Node::group(d.alloc_id(), vec![clip, small]));
+        }
+        let a = rect(&mut d, Rect::new(0.0, 0.0, 100.0, 100.0), solid(1.0, 0.0, 0.0));
+        let mut g = Node::new(d.alloc_id(), NodeKind::Group { children: vec![clip, a], clip: true });
+        if effect {
+            g.appearance.effects.push(fx("path.offsetPath", json!({"offset": 0})));
+        }
+        let l = d.layers[0].id;
+        d.insert(Some(l), 0, g).unwrap();
+        d
+    };
+    for (grouped, hidden) in [(false, false), (true, false), (true, true)] {
+        let (without, with) = (render(&doc(false, grouped, hidden)), render(&doc(true, grouped, hidden)));
+        let worst = without.pixels.iter().zip(&with.pixels).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+        assert!(worst <= 4, "grouped {grouped}, hidden {hidden}: max channel difference {worst}");
+    }
 }
 
 #[test]
@@ -185,4 +299,60 @@ fn red_pixels(img: &Rendered) -> usize {
 fn a_fill_below_the_characters_is_hidden_by_the_glyphs() {
     assert!(red_pixels(&render(&type_doc(false))) > 50, "above: the red fill covers the glyphs");
     assert_eq!(red_pixels(&render(&type_doc(true))), 0, "below: the black glyphs cover it");
+}
+
+/// "IIII" in black at 40 pt with its own red 2 pt stroke under the characters. The stroke carries
+/// the effects `row`, and the type carries the effects `object`.
+fn stroked_type_doc(row: &[Effect], object: &[Effect]) -> Document {
+    let mut d = Document::new(100.0, 100.0);
+    let style = CharStyle { size: 40.0, fill: Paint::solid(Color::BLACK), ..Default::default() };
+    let mut n = Node::new(d.alloc_id(), NodeKind::Text(Box::new(TextObject::point(Point::new(5.0, 60.0), "IIII", style))));
+    let mut stroke = StrokeLayer::new(solid(1.0, 0.0, 0.0), 2.0);
+    stroke.effects = row.to_vec();
+    n.appearance.items.push(AppearanceItem::Stroke(stroke));
+    n.appearance.set_contents_at(1);
+    n.appearance.effects = object.to_vec();
+    let l = d.layers[0].id;
+    d.insert(Some(l), 0, n).unwrap();
+    d
+}
+
+/// The red pixels more than 2 px outside the box of the black ones.
+fn red_past_the_glyphs(img: &Rendered) -> usize {
+    let all = || (0..100).flat_map(|y| (0..100).map(move |x| (x, y)));
+    let black: Vec<(u32, u32)> = all().filter(|&(x, y)| img.pixel(x, y)[..3].iter().all(|c| *c < 60)).collect();
+    let (x0, x1) = (black.iter().map(|p| p.0).min().unwrap(), black.iter().map(|p| p.0).max().unwrap());
+    let (y0, y1) = (black.iter().map(|p| p.1).min().unwrap(), black.iter().map(|p| p.1).max().unwrap());
+    let past = |x: u32, y: u32| x + 2 < x0 || x > x1 + 2 || y + 2 < y0 || y > y1 + 2;
+    all().filter(|&(x, y)| past(x, y) && matches!(img.pixel(x, y), [r, g, _, _] if r > 200 && g < 60)).count()
+}
+
+#[test]
+fn an_offset_path_on_the_types_own_stroke_draws_the_offset_outline() {
+    assert_eq!(red_past_the_glyphs(&render(&stroked_type_doc(&[], &[]))), 0, "the stroke without the effect stays at the glyphs");
+    let offset = [fx("path.offsetPath", json!({"offset": 4}))];
+    assert!(red_past_the_glyphs(&render(&stroked_type_doc(&offset, &[]))) > 50, "the stroke runs 4 pt outside the glyphs");
+}
+
+#[test]
+fn a_shadow_on_the_type_keeps_the_offset_outline_of_its_own_stroke() {
+    let offset = [fx("path.offsetPath", json!({"offset": 4}))];
+    let shadow = [fx("stylize.dropShadow", json!({"x": 0, "y": 30, "blur": 0, "opacity": 50, "mode": "normal"}))];
+    assert!(red_past_the_glyphs(&render(&stroked_type_doc(&offset, &shadow))) > 50);
+}
+
+#[test]
+fn the_offset_outline_of_the_types_own_stroke_is_drawn_when_only_it_is_in_view() {
+    // The view's right edge is 5 pt left of the glyphs, so only the stroke 8 pt outside them
+    // reaches into it. The second case also gives the type object Offset Path 0, which leaves its
+    // outlines as they are.
+    let offset = [fx("path.offsetPath", json!({"offset": 8}))];
+    for object in [vec![], vec![fx("path.offsetPath", json!({"offset": 0}))]] {
+        let d = stroked_type_doc(&offset, &object);
+        let glyphs = effects::outline_text(&d.layers[0].children().unwrap()[0]).unwrap().geometric_bounds().unwrap();
+        let view = Affine::translate((105.0 - glyphs.x0, 0.0));
+        let opts = RenderOptions { background: Some([255, 255, 255, 255]), ..Default::default() };
+        let img = Renderer::new().render(&d, 100, 100, view, &opts);
+        assert!(red_pixels(&img) > 20, "{} object effects: {} red pixels", object.len(), red_pixels(&img));
+    }
 }

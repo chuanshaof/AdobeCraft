@@ -7,7 +7,7 @@ use vectorcraft_geom::Point;
 use vectorcraft_tools::{Mods, PointerEvent, PointerKind, ToolKey};
 
 use super::*;
-use crate::cmd::clipboard::{BITMAP, FILE_HEAD, PASTE_ORDER, PDF, PNG, SVG, TEXT, file_flavour};
+use crate::cmd::clipboard::{AI, BITMAP, EPS, FILE_HEAD, PASTE_ORDER, PDF, PNG, SVG, TEXT, file_flavour};
 
 fn session() -> Session {
     let mut s = Session::new();
@@ -98,6 +98,38 @@ fn exported_pdf_pastes_back_as_vectors() {
 }
 
 #[test]
+fn the_png_and_pdf_say_when_an_image_or_a_font_is_missing() {
+    const NOTE: &str = "an image couldn't be decoded and is missing from the picture";
+    let warnings = |r: &Value| -> Vec<String> { r["warnings"].as_array().unwrap().iter().filter_map(Value::as_str).map(str::to_string).collect() };
+    let mut s = session();
+    copy_red_square(&mut s);
+    assert_eq!(run(&mut s, "clipboard.exportPng", json!({}))["warnings"], json!([]));
+    assert_eq!(run(&mut s, "clipboard.exportPdf", json!({}))["warnings"], json!([]));
+    // Type in a family that isn't installed: the PNG and the PDF each name it.
+    let text = run(&mut s, "text.create", json!({"x": 5, "y": 20, "text": "Ab", "font": "Nonexistent Sans Probe"}))["id"].clone();
+    run(&mut s, "select.set", json!({"ids": [text]}));
+    run(&mut s, "edit.copy", json!({}));
+    let png = warnings(&run(&mut s, "clipboard.exportPng", json!({})));
+    assert!(png.iter().any(|w| w.contains("Nonexistent Sans Probe")), "{png:?}");
+    let pdf = warnings(&run(&mut s, "clipboard.exportPdf", json!({})));
+    assert!(pdf.iter().any(|w| w.contains("Nonexistent Sans Probe")), "{pdf:?}");
+    // Copy's formats carry the notes of both, each once.
+    let (flavours, notes) = s.clipboard.flavours_with_warnings(false, true);
+    assert_eq!(flavours.iter().map(|f| f.mime).collect::<Vec<_>>(), [TEXT, PDF, PNG]);
+    for w in png.iter().chain(&pdf) {
+        assert_eq!(notes.iter().filter(|n| *n == w).count(), 1, "{w} in {notes:?}");
+    }
+    // An image the renderer can't decode: the PNG leaves it out and says so.
+    let image = crate::tests_menucmds::place_undecodable_png(&mut s);
+    run(&mut s, "select.set", json!({"ids": [image.0]}));
+    run(&mut s, "edit.copy", json!({}));
+    assert_eq!(warnings(&run(&mut s, "clipboard.exportPng", json!({}))), [NOTE]);
+    let (flavours, notes) = s.clipboard.flavours_with_warnings(false, false);
+    assert_eq!(flavours.iter().map(|f| f.mime).collect::<Vec<_>>(), [PNG]);
+    assert_eq!(notes, [NOTE]);
+}
+
+#[test]
 fn import_image_then_paste_gives_an_image() {
     let mut s = session();
     copy_red_square(&mut s);
@@ -116,6 +148,66 @@ fn import_image_then_paste_gives_an_image() {
     assert!(s.execute("clipboard.importImage", &json!({"dataBase64": png["dataBase64"], "mime": "image/svg+xml"})).is_err());
     assert!(s.execute("clipboard.importImage", &json!({"dataBase64": vectorcraft_format::base64_encode(b"hello")})).is_err());
     assert!(s.execute("clipboard.importImage", &json!({"dataBase64": "!!"})).is_err());
+}
+
+#[test]
+fn copied_svgz_files_paste_as_svg() {
+    let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"40\" height=\"40\"><rect width=\"40\" height=\"40\" fill=\"#ff0000\"/></svg>";
+    let svgz = vectorcraft_svg::compress(svg);
+    let of = |name: &str, bytes: &[u8]| file_flavour(name, &bytes[..bytes.len().min(FILE_HEAD)], &PASTE_ORDER);
+    assert_eq!(of("art.svgz", &svgz), Some(SVG));
+    assert_eq!(of("art.gz", &svgz), Some(SVG), "the content tells");
+    assert_eq!(file_flavour("art.svgz", &svgz, &[BITMAP]), None);
+    // A file larger than FILE_HEAD: the head is a gzip stream cut short.
+    let mut seed = 1u32;
+    let mut big = String::from("<?xml version=\"1.0\"?>\n<svg xmlns=\"http://www.w3.org/2000/svg\">");
+    for _ in 0..2000 {
+        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        big += &format!("<circle cx=\"{}\" cy=\"{}\" r=\"{}\"/>", seed >> 20, (seed >> 8) & 0xfff, seed & 0xff);
+    }
+    big += "</svg>";
+    // UTF-16 after a byte order mark, as SVG Options' UTF-16 encoding writes it.
+    let utf16 =
+        |text: &str, unit: fn(u16) -> [u8; 2], bom: [u8; 2]| -> Vec<u8> { bom.into_iter().chain(text.encode_utf16().flat_map(unit)).collect() };
+    assert_eq!(of("be.svgz", &vectorcraft_svg::compress_bytes(&utf16(svg, u16::to_be_bytes, [0xfe, 0xff]))), Some(SVG));
+    assert_eq!(of("le.svgz", &vectorcraft_svg::compress_bytes(&utf16(svg, u16::to_le_bytes, [0xff, 0xfe]))), Some(SVG));
+    // Stored without compression, the head unpacks to fewer than FILE_HEAD bytes (an odd number)
+    // before it ends.
+    let stored = |bytes: &[u8]| {
+        let mut gz = flate2::write::GzEncoder::new(vec![], flate2::Compression::none());
+        std::io::Write::write_all(&mut gz, bytes).unwrap();
+        gz.finish().unwrap()
+    };
+    assert_eq!(of("stored.svgz", &stored(big.as_bytes())), Some(SVG));
+    assert_eq!(of("stored16.svgz", &stored(&utf16(&big, u16::to_be_bytes, [0xfe, 0xff]))), Some(SVG));
+    let big = vectorcraft_svg::compress(&big);
+    assert!(big.len() > 2 * FILE_HEAD, "{}", big.len());
+    assert_eq!(of("big.svgz", &big), Some(SVG));
+    // Other gzip data, whole or cut short, pastes as nothing.
+    let notes = vectorcraft_svg::compress("plain text, not SVG");
+    assert_eq!(of("notes.txt.gz", &notes), None);
+    assert_eq!(of("notes.svgz", &notes), None);
+    let mut text = String::new();
+    for i in 0..3000 {
+        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        text += &format!("line {i}: {seed}\n");
+    }
+    let text = vectorcraft_svg::compress(&text);
+    assert!(text.len() > FILE_HEAD, "{}", text.len());
+    assert_eq!(of("log.gz", &text), None);
+    // Cut within the gzip header (10 bytes) or at its end: nothing unpacks.
+    for cut in [2, 5, 10] {
+        assert_eq!(of("art.svgz", &svgz[..cut]), None, "{cut} bytes");
+    }
+    // The SVG flavor's command reads the SVGZ bytes: the red square pastes.
+    let mut s = session();
+    let r = run(&mut s, "clipboard.importSvg", json!({"dataBase64": vectorcraft_format::base64_encode(&svgz), "center": [200, 150]}));
+    assert_eq!(r["count"], 1, "{r}");
+    run(&mut s, "edit.paste", json!({}));
+    let n = &pasted(&s)[0];
+    assert_eq!(n.appearance.fill_paint().color().map(|c| c.to_hex()).as_deref(), Some("#ff0000"));
+    let b = n.geometric_bounds().unwrap();
+    assert!((b.width() - 40.0).abs() < 1e-6 && (b.height() - 40.0).abs() < 1e-6, "{b:?}");
 }
 
 #[test]
@@ -139,6 +231,28 @@ fn copied_files_paste_by_their_content() {
     // Only what was asked for.
     assert_eq!(file_flavour("red.png", &png, &[TEXT, SVG]), None);
     assert_eq!(file_flavour("art.svg", svg, &[BITMAP]), None);
+}
+
+#[test]
+fn copied_ai_files_paste_as_the_pdf_or_postscript_inside() {
+    let mut s = session();
+    copy_red_square(&mut s);
+    let pdf = decode(&run(&mut s, "clipboard.exportPdf", json!({})));
+    let ps = b"%!PS-Adobe-3.0\n%%BoundingBox: 0 0 40 40\n%%EndComments\n1 0 0 setrgbcolor\nnewpath 0 0 moveto 40 0 lineto 40 40 lineto closepath fill\nshowpage\n";
+    let of = |name: &str, bytes: &[u8]| file_flavour(name, &bytes[..bytes.len().min(FILE_HEAD)], &PASTE_ORDER);
+    for name in ["art.ai", "art.ait", "ART.AI"] {
+        // Asked for as PDF; Paste reads it from its editing data (tests_aiimport).
+        assert_eq!(of(name, &pdf), Some(AI), "{name}");
+        assert_eq!(of(name, ps), Some(EPS), "{name}");
+    }
+    // Neither PDF nor PostScript: nothing to paste, whatever the name says.
+    assert_eq!(of("art.ai", b"hello"), None);
+    // Only what was asked for.
+    assert_eq!(file_flavour("art.ai", &pdf, &[EPS]), None);
+    assert_eq!(file_flavour("art.ait", ps, &[PDF]), None);
+    // clipboard.importEps, the EPS flavor's command, reads the PostScript.
+    let r = run(&mut s, "clipboard.importEps", json!({"dataBase64": vectorcraft_format::base64_encode(ps)}));
+    assert_eq!(r["count"], 1, "{r}");
 }
 
 #[test]
@@ -200,6 +314,53 @@ fn copy_offers_flavours_by_the_preferences() {
     run(&mut s, "prefs.set", json!({"key": "copyAsSvg", "value": true}));
     let f = s.clipboard_flavours();
     assert_eq!((f[0].data.as_slice(), f[1].mime), (b"Words".as_slice(), SVG));
+}
+
+/// A PNG of `side` × `side` noise pixels: noise keeps it about `side² × 3` bytes, as a photo.
+fn noise_png(side: u32) -> Vec<u8> {
+    let mut x: u32 = 0x9e37_79b9;
+    let px = (0..side * side * 3)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x >> 24) as u8
+        })
+        .collect();
+    let mut out = vec![];
+    image::RgbImage::from_raw(side, side, px).unwrap().write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).unwrap();
+    out
+}
+
+/// #2213: a placed photo in the plain-text flavour made every paste read megabytes of SVG back
+/// through the system clipboard. Past 1 MiB of embedded images the SVG goes out under its own type
+/// and the PNG only; a small picture, vector art of any size and type keep their text.
+#[test]
+fn a_copy_with_a_large_image_offers_no_svg_text() {
+    let mut s = session();
+    let mimes = |s: &Session| s.clipboard_flavours().iter().map(|f| f.mime).collect::<Vec<_>>();
+    for (side, text) in [(700, false), (64, true)] {
+        let png = noise_png(side);
+        assert_eq!(png.len() > 1 << 20, !text, "{} bytes", png.len());
+        run(&mut s, "clipboard.importImage", json!({"dataBase64": vectorcraft_format::base64_encode(&png)}));
+        run(&mut s, "edit.paste", json!({}));
+        run(&mut s, "edit.copy", json!({}));
+        let want: &[&str] = if text { &[TEXT, SVG, PNG] } else { &[SVG, PNG] };
+        assert_eq!(mimes(&s), want, "{side} px");
+        assert_eq!(run(&mut s, "clipboard.flavours", json!({}))["flavours"], json!(want), "{side} px");
+        // The SVG still embeds the picture, for apps that read it.
+        let svg = s.clipboard_flavours().into_iter().find(|f| f.mime == SVG).unwrap();
+        assert!(String::from_utf8_lossy(&svg.data).contains("data:image/png;base64,"));
+        run(&mut s, "edit.clear", json!({}));
+    }
+    // Vector art of more than 1 MiB of SVG keeps its text: only embedded images count.
+    let rects: String =
+        (0..30_000).map(|i| format!(r##"<rect x="{}.25" y="{}.75" width="3.5" height="3.5" fill="#{:06x}"/>"##, i % 400, i / 100, i * 977)).collect();
+    run(&mut s, "clipboard.importSvg", json!({"svg": format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300">{rects}</svg>"#)}));
+    run(&mut s, "edit.paste", json!({}));
+    run(&mut s, "edit.copy", json!({}));
+    let f = s.clipboard_flavours();
+    assert!(f[0].mime == TEXT && f[0].data.len() > 1 << 20, "{} bytes of text", f[0].data.len());
 }
 
 /// The Type tool pastes the text it copied with its formatting, unless pasted text is kept plain.

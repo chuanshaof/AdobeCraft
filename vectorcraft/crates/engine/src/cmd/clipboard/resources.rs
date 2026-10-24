@@ -107,10 +107,10 @@ fn attrs_refs(attrs: &Map<String, Value>, f: Visit) {
 fn node_refs(n: &Node, f: Visit) {
     n.walk(&mut |m| {
         appearance_refs(&m.appearance, f);
-        if let Some(id) = m.graphic_style {
+        if let Some(id) = m.extras().graphic_style {
             f(Ref::Style(id));
         }
-        if let Some(mask) = &m.mask {
+        if let Some(mask) = &m.extras().mask {
             node_refs(&mask.art, f);
         }
         match &m.kind {
@@ -427,8 +427,8 @@ impl Relink {
     /// Relink a node tree (the mirror of [`node_refs`]).
     fn node(&self, n: &mut Node) {
         self.appearance(&mut n.appearance);
-        n.graphic_style = n.graphic_style.and_then(|id| self.styles.get(&id).copied());
-        if let Some(m) = &mut n.mask {
+        n.extras_mut().graphic_style = n.extras().graphic_style.and_then(|id| self.styles.get(&id).copied());
+        if let Some(m) = n.extras_if_any().and_then(|e| e.mask.as_mut()) {
             self.node(Arc::make_mut(&mut m.art));
         }
         match &mut n.kind {
@@ -500,7 +500,7 @@ impl Imported {
 
 impl Clipboard {
     /// `nodes` (from `src`) and the resources of `src` they use.
-    pub(super) fn gather(src: &Document, nodes: Vec<Node>) -> Self {
+    pub(crate) fn gather(src: &Document, nodes: Vec<Node>) -> Self {
         let used = Used::of(&Defs::of(src), &nodes);
         let pick = |r: Res, list: &[TextStyleDef]| list.iter().filter(|s| used.has(r, &s.name)).cloned().collect::<Vec<_>>();
         let brushes = match used.names.get(&Res::Brush) {

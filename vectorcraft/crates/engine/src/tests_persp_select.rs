@@ -11,7 +11,8 @@ use super::*;
 /// An 800 × 600 document with a two-point grid and a rectangle attached to the right plane.
 pub(crate) fn persp_session() -> (Session, NodeId) {
     let mut s = Session::new();
-    s.execute("file.new", &json!({"width": 800, "height": 600})).unwrap();
+    // Separately created fixtures must compare equal across clock ticks.
+    s.execute("file.new", &json!({"width": 800, "height": 600, "created": null})).unwrap();
     s.execute("perspective.grid.preset", &json!({"kind": 2})).unwrap();
     // Snap to Grid (on by default) would land moved edges on gridlines: these tests measure exact moves.
     s.execute("perspective.grid.snap", &json!({"on": false})).unwrap();

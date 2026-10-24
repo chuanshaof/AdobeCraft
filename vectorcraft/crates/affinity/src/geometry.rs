@@ -6,15 +6,77 @@ use crate::stream::{ObjId, Tag, Value};
 
 /// Nodes per curve object.
 const MAX_NODES: usize = 4_000_000;
+/// A shared-object stream is bounded, but a compound graph can expand exponentially. Count
+/// each visit and each curve record / generated contour / transformed segment across the whole
+/// outline, including repeated references. Match the document reader's nesting limit.
+const MAX_OUTLINE_DEPTH: usize = 128;
+const MAX_OUTLINE_VISITS: usize = 100_000;
+
+struct OutlineBudget {
+    active: Vec<ObjId>,
+    visits: usize,
+    work: usize,
+    failed: bool,
+}
+
+impl OutlineBudget {
+    fn fail(&mut self, r: &mut Reader, warning: &'static str) -> Option<()> {
+        if !self.failed {
+            r.warn(warning);
+        }
+        self.failed = true;
+        None
+    }
+
+    fn spend(&mut self, r: &mut Reader, work: usize) -> Option<()> {
+        if work > self.work {
+            return self.fail(r, "compound outlines exceeding the geometry work limit");
+        }
+        self.work -= work;
+        Some(())
+    }
+
+    fn path(&mut self, r: &mut Reader, path: &Path) -> Option<()> {
+        for subpath in &path.subpaths {
+            self.spend(r, 1)?;
+            self.spend(r, subpath.segments.len())?;
+        }
+        Some(())
+    }
+}
 
 /// The node-space outline of a curve, shape or compound node, and whether it fills even-odd.
 /// Instances (master-page or symbol copies) take the geometry of their master.
 pub(crate) fn outline(r: &mut Reader, id: ObjId, class: Tag, world: Affine) -> Option<(Path, bool)> {
+    let mut budget = OutlineBudget { active: Vec::new(), visits: MAX_OUTLINE_VISITS, work: MAX_NODES, failed: false };
+    bounded_outline(r, id, class, world, &mut budget)
+}
+
+fn bounded_outline(r: &mut Reader, id: ObjId, class: Tag, world: Affine, budget: &mut OutlineBudget) -> Option<(Path, bool)> {
+    if budget.active.contains(&id) {
+        budget.fail(r, "a compound outline that contains itself")?;
+    }
+    if budget.active.len() >= MAX_OUTLINE_DEPTH {
+        budget.fail(r, "compound outlines nested deeper than 128 levels")?;
+    }
+    if budget.visits == 0 {
+        budget.fail(r, "compound outlines exceeding the operand visit limit")?;
+    }
+    budget.visits -= 1;
+    budget.active.push(id);
+    let result = outline_inner(r, id, class, world, budget);
+    // The popped value is our own stack marker, and is no longer needed.
+    let _ = budget.active.pop();
+    result
+}
+
+fn outline_inner(r: &mut Reader, id: ObjId, class: Tag, world: Affine, budget: &mut OutlineBudget) -> Option<(Path, bool)> {
     let s = r.s;
     match &class.0.to_be_bytes() {
         b"PCrv" | b"TxtC" => {
             let crvs = s.obj(id, b"Crvs").or_else(|| s.obj(id, b"MCrM").and_then(|m| s.obj(m, b"Crvs")))?;
-            let path = curves(r, crvs)?;
+            let path = curves(r, crvs, budget)?;
+            budget.path(r, &path)?;
             let multi = path.subpaths.len() > 1;
             Some((path, multi))
         }
@@ -29,8 +91,24 @@ pub(crate) fn outline(r: &mut Reader, id: ObjId, class: Tag, world: Affine) -> O
                 if s.enumeration(c, b"ComO").is_some_and(|(op, _)| op != 0 && op != 2) {
                     r.warn("compound shapes that intersect or exclude (imported as add)");
                 }
-                if let Some((p, _)) = outline(r, c, class, local.then(world)) {
-                    path.subpaths.extend(p.transformed(local).subpaths);
+                let child_world = local.then(world);
+                if !child_world.is_finite() {
+                    budget.fail(r, "a compound operand with an invalid transform")?;
+                }
+                if let Some((mut p, _)) = bounded_outline(r, c, class, child_world, budget) {
+                    // Charge before transforming or extending. Transform the owned path in place
+                    // so nested compounds do not make an additional copy of every contour.
+                    budget.path(r, &p)?;
+                    for subpath in &mut p.subpaths {
+                        subpath.start = local.apply(subpath.start);
+                        for segment in &mut subpath.segments {
+                            *segment = segment.map(|point| local.apply(point));
+                        }
+                    }
+                    path.subpaths.extend(p.subpaths);
+                } else if budget.failed {
+                    // Never present a partial compound as complete after a cycle or budget limit.
+                    return None;
                 }
             }
             Some((path, true))
@@ -44,7 +122,9 @@ pub(crate) fn outline(r: &mut Reader, id: ObjId, class: Tag, world: Affine) -> O
                 }
             };
             let b = s.floats::<4>(box_owner, b"ShpB")?;
-            crate::shapes::shape(r, shape, b, world).map(|p| (p, false))
+            let path = crate::shapes::shape(r, shape, b, world)?;
+            budget.path(r, &path)?;
+            Some((path, false))
         }
     }
 }
@@ -53,7 +133,7 @@ pub(crate) fn outline(r: &mut Reader, id: ObjId, class: Tag, world: Affine) -> O
 /// A record is (f64 x, f64 y, u8 kind, u8 role): role 0 is an anchor, 1 the out-handle of the
 /// anchor before it, 2 the in-handle of the anchor after it. A closed subpath repeats its first
 /// anchor at the end. `CnrD` live corners are rounded on the stored polyline.
-pub(crate) fn curves(r: &mut Reader, crvs: ObjId) -> Option<Path> {
+fn curves(r: &mut Reader, crvs: ObjId, budget: &mut OutlineBudget) -> Option<Path> {
     let s = r.s;
     let data = s.obj(crvs, b"Data")?;
     let mut fields = s.positional(data);
@@ -62,6 +142,7 @@ pub(crate) fn curves(r: &mut Reader, crvs: ObjId) -> Option<Path> {
         Value::UInt(n) => usize::try_from(*n).ok()?,
         _ => return None,
     };
+    budget.spend(r, count)?;
     let corners = s.obj(crvs, b"CnrD").and_then(|c| corner_radii(s.positional(c).collect()));
     let mut path = Path::default();
     let mut seen = 0usize;
@@ -73,9 +154,9 @@ pub(crate) fn curves(r: &mut Reader, crvs: ObjId) -> Option<Path> {
         let Value::Array(records) = fields.next()? else { return None };
         seen = seen.checked_add(records.len())?;
         if seen > MAX_NODES {
-            r.warn("curves with more than four million nodes");
-            return None;
+            budget.fail(r, "curves with more than four million nodes")?;
         }
+        budget.spend(r, records.len())?;
         let anchors = anchors(records)?;
         let radii = if index == 0 { corners.as_ref() } else { None };
         if let Some(sp) = subpath(&anchors, closed, radii) {
@@ -134,7 +215,13 @@ fn anchors(records: &[Value]) -> Option<Vec<Anchor>> {
 fn subpath(anchors: &[Anchor], closed: bool, radii: Option<&Vec<(usize, f64)>>) -> Option<SubPath> {
     let first = anchors.first()?;
     if let Some(radii) = radii.filter(|r| !r.is_empty()) {
-        let corner = |a: &Anchor| radii.iter().filter(|(rec, _)| *rec == a.record).map(|(_, r)| *r).fold(0.0, f64::max);
+        // The largest radius of each record, once (not a scan of all of them for each anchor).
+        let mut largest: std::collections::HashMap<usize, f64> = std::collections::HashMap::new();
+        for (rec, r) in radii {
+            let e = largest.entry(*rec).or_insert(0.0);
+            *e = e.max(*r);
+        }
+        let corner = |a: &Anchor| largest.get(&a.record).copied().unwrap_or(0.0);
         let polyline = anchors.iter().all(|a| a.inh.is_none_or(|h| h == a.p) && a.out.is_none_or(|h| h == a.p));
         if polyline {
             let mut pts: Vec<(Point, f64)> = anchors.iter().map(|a| (a.p, corner(a))).collect();

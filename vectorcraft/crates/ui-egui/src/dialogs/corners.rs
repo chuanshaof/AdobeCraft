@@ -27,8 +27,8 @@ pub(super) const SPEC: DialogSpec = DialogSpec { heading: |_| tl!("Corners").int
 /// `corners` (default: the selected corners), filled in with their kind and radius.
 pub fn open(app: &mut VectorcraftApp, p: &Value) -> Result<Value, String> {
     let st = app.session.active().ok_or("no document")?;
-    let id = match p.get("id").and_then(Value::as_u64) {
-        Some(id) => NodeId(id),
+    let id = match p.get("id") {
+        Some(v) => NodeId(v.as_u64().ok_or_else(|| format!("object ids are non-negative integers, not {v}"))?),
         None => match st.selection.objects[..] {
             [id] => id,
             _ => return Err("select one path, or give its `id`".into()),
@@ -37,20 +37,32 @@ pub fn open(app: &mut VectorcraftApp, p: &Value) -> Result<Value, String> {
     let Some(live) = st.doc.node(id).and_then(LiveCorners::of) else {
         return Err("Corners edits the corners of a path".into());
     };
-    let corners: BTreeSet<usize> = match p.get("corners").and_then(Value::as_array) {
-        Some(a) => a.iter().filter_map(Value::as_u64).filter_map(|k| usize::try_from(k).ok()).filter(|k| live.corner(*k).is_some()).collect(),
+    let corners: BTreeSet<usize> = match p.get("corners") {
+        Some(v) => v
+            .as_array()
+            .and_then(|a| a.iter().map(|k| usize::try_from(k.as_u64()?).ok()).collect())
+            .ok_or_else(|| format!("`corners` must be an array of anchor indices, not {v}"))?,
         None => live.picked(st.selection.partial(id)),
     };
-    if corners.is_empty() {
-        return Err("give corners of the path: anchors between two straight sides".into());
+    // Every corner given is one of the path's: none is left out of the edit.
+    if corners.is_empty() || !corners.iter().all(|k| live.corner(*k).is_some()) {
+        return Err("give corners of the path: anchors where its sides meet at an angle".into());
     }
     let (radius, kind) = live.style(&corners);
-    let mut fields = json!({"id": id.0, "corners": corners});
+    let relative = st.doc.node(id).and_then(|n| n.live_shape()).map(|l| l.radii_relative()).unwrap_or(false);
+    let mut fields = json!({"id": id.0, "corners": corners, "relativeRadii": relative});
     if let Some(k) = kind {
         fields["kind"] = json!(k);
     }
     if let Some(r) = radius {
-        fields["radius"] = json!(r);
+        if relative {
+            let pct = corners.iter().find_map(|k| live.corner(*k).map(|_| live.radius(*k) * 100.0));
+            if let Some(pct) = pct {
+                fields["radius"] = json!(pct);
+            }
+        } else {
+            fields["radius"] = json!(r);
+        }
     }
     app.ui.dialog = Some(Dialog::new(KIND, fields));
     Ok(Value::Null)
@@ -63,22 +75,42 @@ fn body(app: &mut VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) -> bool {
         label(ui, tl!("Corner:"));
         ui.vertical(|ui| {
             for k in CornerKind::ALL {
-                let name = match k {
-                    CornerKind::Round => tl!("Round"),
-                    CornerKind::InvertedRound => tl!("Inverted Round"),
-                    CornerKind::Chamfer => tl!("Chamfer"),
-                };
-                if widgets::radio(ui, name, Some(k) == current, true) {
+                if widgets::radio(ui, kind_label(k), Some(k) == current, true) {
                     d.fields.insert("kind".into(), json!(k));
                 }
             }
         });
         ui.end_row();
+        ui.horizontal(|ui| {
+            for (label, on) in [(tl!("Relative"), true), (tl!("Absolute"), false)] {
+                let cur = d.fields.get("relativeRadii").and_then(|v| v.as_bool()).unwrap_or(false);
+                if widgets::radio(ui, label, cur == on, true) {
+                    d.fields.insert("relativeRadii".into(), json!(on));
+                }
+            }
+        });
+        ui.end_row();
         label(ui, tl!("Radius:"));
-        form::length(ui, d, "radius", unit, 120.0);
+        let relative = d.fields.get("relativeRadii").and_then(|v| v.as_bool()).unwrap_or(false);
+        if relative {
+            if let Some(n) = widgets::range_field(ui, ("corners", "radius"), d.f64("radius", 0.0), 0.0..=100.0, "%", 1, 120.0) {
+                d.fields.insert("radius".into(), json!(n));
+            }
+        } else {
+            form::length(ui, d, "radius", unit, 120.0);
+        }
         ui.end_row();
     });
     false
+}
+
+/// A corner kind's name, in the UI language.
+pub(crate) fn kind_label(k: CornerKind) -> &'static str {
+    match k {
+        CornerKind::Round => tl!("Round"),
+        CornerKind::InvertedRound => tl!("Inverted Round"),
+        CornerKind::Chamfer => tl!("Chamfer"),
+    }
 }
 
 fn confirm(app: &mut VectorcraftApp, d: &Dialog) -> Result<Value, String> {
@@ -86,8 +118,24 @@ fn confirm(app: &mut VectorcraftApp, d: &Dialog) -> Result<Value, String> {
     if let Some(k) = d.fields.get("kind") {
         p["kind"] = k.clone();
     }
+    if let Some(v) = d.fields.get("relativeRadii") {
+        p["relativeRadii"] = v.clone();
+    }
     if d.fields.contains_key("radius") {
-        p["radius"] = json!(d.f64("radius", 0.0));
+        let relative = d.fields.get("relativeRadii").and_then(|v| v.as_bool()).unwrap_or(false);
+        let mut r = d.f64("radius", 0.0);
+        if relative {
+            let id = NodeId(d.fields.get("id").and_then(|v| v.as_u64()).unwrap_or(0));
+            let st = app.session.active().ok_or("no document")?;
+            if let Some(lc) = st.doc.node(id).and_then(LiveCorners::of) {
+                let corners: BTreeSet<usize> = serde_json::from_value(d.fields.get("corners").cloned().unwrap_or(json!([]))).unwrap_or_default();
+                if let Some(k) = corners.iter().next() {
+                    let max = lc.corner(*k).map(|c| c.max_radius()).unwrap_or(0.0);
+                    r = (r / 100.0).clamp(0.0, 1.0) * max;
+                }
+            }
+        }
+        p["radius"] = json!(r);
     }
     run_and_close(app, "object.setLiveShape", p)
 }
@@ -112,7 +160,7 @@ mod tests {
         let Some(NodeKind::Path { live: Some(l), .. }) = app.session.active().unwrap().doc.node(NodeId(id)).map(|n| n.kind.clone()) else {
             panic!("not live")
         };
-        l
+        *l
     }
 
     fn corners(app: &VectorcraftApp, id: u64) -> ([f64; 4], [CornerKind; 4]) {
@@ -143,6 +191,25 @@ mod tests {
         let mut v = vec![];
         out.shapes.iter().for_each(|c| texts(&c.shape, &mut v));
         v
+    }
+
+    /// Explicit UI-command parameters cannot silently fall back to the selection or drop corners.
+    #[test]
+    fn malformed_explicit_corner_targets_never_open_a_partial_edit() {
+        let (mut app, id) = app();
+        for params in [
+            json!({"id": "invalid"}),
+            json!({"id": -1}),
+            json!({"id": id, "corners": [0, "bad", 2]}),
+            json!({"id": id, "corners": [0, 1.5]}),
+            json!({"id": id, "corners": [0, 9]}),
+            json!({"id": id, "corners": "bad"}),
+        ] {
+            assert!(app.run("ui.corners", params.clone()).is_err(), "accepted {params}");
+            assert!(app.ui.dialog.is_none(), "opened a partial edit for {params}");
+        }
+        app.run("ui.corners", json!({"id": id, "corners": [0, 2]})).unwrap();
+        assert_eq!(app.ui.dialog.as_ref().unwrap().fields["corners"], json!([0, 2]));
     }
 
     #[test]
@@ -212,7 +279,7 @@ mod tests {
         d.fields.insert("radius".into(), json!(5));
         super::super::confirm(&mut app).unwrap();
         let n = app.session.active().unwrap().doc.node(NodeId(id)).unwrap().clone();
-        assert!(matches!(&n.kind, NodeKind::Path { live: Some(LiveShape::Path { .. }), .. }));
+        assert!(matches!(&n.kind, NodeKind::Path { live: Some(l), .. } if matches!(**l, LiveShape::Path { .. })));
         assert_eq!(crate::panels::corner_radius(&app, &n), Some(5.0));
     }
 }

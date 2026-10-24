@@ -118,11 +118,126 @@ fn kmeans(px: &[[f64; 3]], k: usize, seed: u64) -> (Vec<[f64; 3]>, Vec<usize>, f
 
 /// Up to `max_colors` flat colours, most common first. White is left out (it is always a class of
 /// its own), as are colours that make up under 0.1% of the solid pixels (noise).
+///
+/// Line art (thin strokes on paper) has no solid area of any colour but the paper's: a stroke one
+/// or two pixels wide never fills a uniform 3 × 3 neighbourhood, so its colour is a few pixels in
+/// tens of thousands of paper and is cut as noise. Where the solid pixels give no colour, the
+/// colours are read from the strokes' cores instead ([`line_art_palette`]).
 pub(crate) fn auto_palette(pix: &[Px], w: usize, h: usize, max_colors: usize) -> Vec<[u8; 3]> {
     let mut px = solid_pixels(pix, w, h, 20.0);
     if px.len() < max_colors.max(2) * 20 {
         px = pix.iter().filter(|p| p[3] > 0.9).map(rgb255).collect();
     }
+    let found = clustered(px, max_colors);
+    if !found.is_empty() {
+        return found.into_iter().map(|(c, _)| c).collect();
+    }
+    line_art_palette(pix, w, h, max_colors)
+}
+
+/// How much darker than white (in its darkest channel) a colour must be to be ink rather than the
+/// paper's grain or a light smudge.
+const INK_DEPTH: f64 = 48.0;
+
+/// The least share of the opaque pixels that ink must cover for a page with no solid colour but
+/// white to be line art rather than blank paper with a few specks or marks on it.
+const MIN_INK_SHARE: f64 = 0.01;
+
+/// Whether `c` is ink: at least [`INK_DEPTH`] darker than white in one channel.
+fn is_ink(c: [f64; 3]) -> bool {
+    c.iter().any(|&v| v <= 255.0 - INK_DEPTH)
+}
+
+/// The colours of line art, read from its strokes' cores ([`ink_cores`]): nothing when ink covers
+/// under [`MIN_INK_SHARE`] of the image, and the lighter shades the anti-aliasing of a stroke's
+/// edge leaves as cores of their own folded into the ink they are a blend of ([`fold_fringes`]).
+fn line_art_palette(pix: &[Px], w: usize, h: usize, max_colors: usize) -> Vec<[u8; 3]> {
+    let (mut opaque, mut ink) = (0usize, 0usize);
+    for p in pix.iter().filter(|p| p[3] > 0.98) {
+        opaque += 1;
+        if is_ink(rgb255(p)) {
+            ink += 1;
+        }
+    }
+    if (ink as f64) < MIN_INK_SHARE * opaque as f64 {
+        return Vec::new();
+    }
+    fold_fringes(clustered(ink_cores(pix, w, h), max_colors))
+}
+
+/// The opaque ink pixels ([`is_ink`]) that are at least as far from white as each of their four
+/// neighbours: the middle of every stroke, where its colour is least blended with the paper's
+/// (and every pixel of a wider area of one colour).
+fn ink_cores(pix: &[Px], w: usize, h: usize) -> Vec<[f64; 3]> {
+    let white = [255.0; 3];
+    let ink = |i: usize| pix.get(i).filter(|p| p[3] > 0.98).map(|p| dist2(rgb255(p), white)).unwrap_or(0.0);
+    let mut out = Vec::new();
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            let Some(p) = pix.get(i).filter(|p| p[3] > 0.98) else { continue };
+            let c = rgb255(p);
+            if !is_ink(c) {
+                continue;
+            }
+            let d = dist2(c, white);
+            let near = [(x > 0).then(|| i - 1), (x + 1 < w).then_some(i + 1), (y > 0).then(|| i - w), (y + 1 < h).then_some(i + w)];
+            if near.into_iter().flatten().all(|j| ink(j) <= d) {
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// How far (in RGB) a colour may lie from the line between white and an ink and still be a blend
+/// of the two.
+const FRINGE_APART: f64 = 20.0;
+
+/// `groups` (colours with their counts, most common first) with each colour that is a blend of white
+/// and a darker colour of the list (it lies on the line between them, within [`FRINGE_APART`])
+/// folded into that colour: the anti-aliased edge of a thin stroke, or a stroke thinner than a
+/// pixel, is lighter than its ink but no colour of its own. The ink keeps its colour.
+fn fold_fringes(mut groups: Vec<([u8; 3], usize)>) -> Vec<[u8; 3]> {
+    // Lightest first, so a blend of a blend goes to the darkest ink.
+    let depth = |c: [u8; 3]| c.iter().map(|&v| 255.0 - f64::from(v)).sum::<f64>();
+    groups.sort_by(|a, b| depth(a.0).total_cmp(&depth(b.0)));
+    let mut i = 0;
+    while i < groups.len() {
+        let a = groups[i].0.map(|v| 255.0 - f64::from(v));
+        // The ink `a` is the closest blend of, if any: (its index, the distance off the line).
+        let mut into: Option<(usize, f64)> = None;
+        for (j, g) in groups.iter().enumerate().skip(i + 1) {
+            let b = g.0.map(|v| 255.0 - f64::from(v));
+            let bb: f64 = b.iter().map(|v| v * v).sum();
+            if bb <= 0.0 {
+                continue;
+            }
+            let t = (0..3).map(|k| a[k] * b[k]).sum::<f64>() / bb;
+            if !(0.0..1.0).contains(&t) {
+                continue;
+            }
+            let off = (0..3).map(|k| (a[k] - t * b[k]).powi(2)).sum::<f64>().sqrt();
+            if off <= FRINGE_APART && into.is_none_or(|(_, o)| off < o) {
+                into = Some((j, off));
+            }
+        }
+        match into {
+            Some((j, _)) => {
+                let n = groups[i].1;
+                groups[j].1 += n;
+                groups.remove(i);
+            }
+            None => i += 1,
+        }
+    }
+    groups.sort_by_key(|g| std::cmp::Reverse(g.1));
+    groups.into_iter().map(|(c, _)| c).collect()
+}
+
+/// Up to `max_colors` colours that `px` clusters into, with how many of `px` each has, most common
+/// first; white and noise left out.
+fn clustered(mut px: Vec<[f64; 3]>, max_colors: usize) -> Vec<([u8; 3], usize)> {
     if px.is_empty() {
         return Vec::new();
     }
@@ -163,7 +278,62 @@ pub(crate) fn auto_palette(pix: &[Px], w: usize, h: usize, max_colors: usize) ->
         }
     }
     groups.sort_by_key(|g| std::cmp::Reverse(g.1));
-    groups.iter().map(|(c, _)| c.map(|v| v.round().clamp(0.0, 255.0) as u8)).collect()
+    groups.iter().map(|(c, n)| (c.map(|v| v.round().clamp(0.0, 255.0) as u8), *n)).collect()
+}
+
+/// How far apart (in RGB) two tones of one colour may be: a scan's paper is a tenth darker in one
+/// corner than in another.
+const TONES_APART: f64 = 60.0;
+
+/// `palette` with the tones of one colour made one colour. Two flat colours leave nothing between
+/// them but the pixels of their shared edges; where a scan's paper is unevenly lit, or a wash
+/// shades off, the pixels between two of its tones are as many as those at either: such a pair is
+/// one colour (their mean, by pixels), however many tones of it were found.
+pub(crate) fn fold_tones(pix: &[Px], mut palette: Vec<[u8; 3]>) -> Vec<[u8; 3]> {
+    let apart = |a: [u8; 3], b: [u8; 3]| dist2(a.map(f64::from), b.map(f64::from)).sqrt();
+    loop {
+        let close: Vec<(usize, usize)> = (0..palette.len())
+            .flat_map(|i| (i + 1..palette.len()).map(move |j| (i, j)))
+            .filter(|&(i, j)| palette.get(i).zip(palette.get(j)).is_some_and(|(a, b)| apart(*a, *b) <= TONES_APART))
+            .collect();
+        if close.is_empty() {
+            return palette;
+        }
+        // Each opaque pixel goes to its nearest colour; for a close pair, the pixels of either are
+        // counted by where they lie from one to the other: at one, between, at the other.
+        let mut thirds = vec![[0usize; 3]; close.len()];
+        for p in pix.iter().filter(|p| p[3] > 0.9) {
+            let c = rgb255(p);
+            let Some(near) = (0..palette.len()).min_by(|&i, &j| dist2(c, palette[i].map(f64::from)).total_cmp(&dist2(c, palette[j].map(f64::from))))
+            else {
+                continue;
+            };
+            for (k, &(i, j)) in close.iter().enumerate() {
+                if near == i || near == j {
+                    let (a, b) = (palette[i].map(f64::from), palette[j].map(f64::from));
+                    let t = (0..3).map(|ch| (c[ch] - a[ch]) * (b[ch] - a[ch])).sum::<f64>() / dist2(a, b).max(1e-9);
+                    thirds[k][if t < 1.0 / 3.0 {
+                        0
+                    } else if t <= 2.0 / 3.0 {
+                        1
+                    } else {
+                        2
+                    }] += 1;
+                }
+            }
+        }
+        // The pair with the most between it, if that is no fewer than a third of what the lesser
+        // end has.
+        let filled = |t: &[usize; 3]| t[1] as f64 / (t[0].min(t[2]).max(1)) as f64;
+        let Some((k, _)) = thirds.iter().enumerate().filter(|(_, t)| filled(t) >= 1.0 / 3.0).max_by(|a, b| filled(a.1).total_cmp(&filled(b.1)))
+        else {
+            return palette;
+        };
+        let ((i, j), t) = (close[k], thirds[k]);
+        let (na, nb) = ((t[0] + t[1] / 2).max(1) as f64, (t[2] + t[1] / 2).max(1) as f64);
+        palette[i] = [0, 1, 2].map(|ch| ((f64::from(palette[i][ch]) * na + f64::from(palette[j][ch]) * nb) / (na + nb)).round() as u8);
+        palette.remove(j);
+    }
 }
 
 /// Colours the current palette cannot explain. `residual` is each pixel's error after the best blend
@@ -273,6 +443,14 @@ mod tests {
         let pix = blocks(64, 16, |x, _| [(x * 4) as u8, 255 - (x * 4) as u8, 128, 255]);
         let pal = auto_palette(&pix, 64, 16, 6);
         assert!(flat_fraction(&pix, 64, 16, &pal) < 0.93, "gradient scored flat");
+    }
+
+    #[test]
+    fn edge_shades_fold_into_their_ink_and_other_colours_stay() {
+        // A blue ink, a blend of it with white (its anti-aliased edge), a red ink and an orange
+        // that lies on no ink's line from white.
+        let groups = vec![([30, 90, 200], 50), ([143, 173, 228], 40), ([210, 40, 50], 30), ([240, 150, 40], 5)];
+        assert_eq!(fold_fringes(groups), vec![[30, 90, 200], [210, 40, 50], [240, 150, 40]]);
     }
 
     #[test]

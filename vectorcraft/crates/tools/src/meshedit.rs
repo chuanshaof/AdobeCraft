@@ -1,13 +1,14 @@
 //! Dragging mesh points and their handles on the canvas, shared by the Mesh tool and Direct
 //! Selection: gradient meshes and mesh envelopes alike (`object.mesh.movePoint`). Clicking a
-//! point focuses it: its handles show and can be dragged too.
+//! point focuses it: its handles show and can be dragged too, and on a gradient mesh a solid fill
+//! colour recolours it (the tool's `meshPoint` option).
 
 use std::borrow::Cow;
 
-use serde_json::json;
+use serde_json::{Value, json};
 use vectorcraft_doc::live::{GradientMesh, envelope_grid};
 use vectorcraft_doc::{EnvelopeKind, Node, NodeId, NodeKind};
-use vectorcraft_geom::Point;
+use vectorcraft_geom::{Point, Vec2};
 
 use crate::{Action, Overlay, ToolContext};
 
@@ -18,9 +19,10 @@ const FEEDBACK: [u8; 3] = [0x4f, 0x9d, 0xff];
 pub fn grid_of(n: &Node) -> Option<Cow<'_, GradientMesh>> {
     match &n.kind {
         NodeKind::Mesh(m) => Some(Cow::Borrowed(m)),
-        NodeKind::Envelope { kind: EnvelopeKind::Mesh { rows, cols, points, handles }, editing: false, .. } => {
-            envelope_grid(*rows, *cols, points, handles).map(Cow::Owned)
-        }
+        NodeKind::Envelope { kind, editing: false, .. } => match &**kind {
+            EnvelopeKind::Mesh { rows, cols, points, handles } => envelope_grid(*rows, *cols, points, handles).map(Cow::Owned),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -33,12 +35,21 @@ pub struct MeshGrab {
     pub handle: Option<usize>,
 }
 
+/// An in-progress mesh point or handle drag.
+struct ActiveDrag {
+    grab: MeshGrab,
+    /// Where the grabbed point or handle was when the drag began.
+    origin: Point,
+    /// The current drag position (preview target); set on the first `drag_to`.
+    at: Option<Point>,
+}
+
 /// Point and handle drags on meshes.
 #[derive(Default)]
 pub struct MeshEdit {
     /// The point last clicked: its handles show and can be dragged.
     focus: Option<(NodeId, usize)>,
-    drag: Option<MeshGrab>,
+    drag: Option<ActiveDrag>,
 }
 
 impl MeshEdit {
@@ -54,22 +65,31 @@ impl MeshEdit {
         {
             return Some(MeshGrab { id, index, handle: Some(h) });
         }
-        ids.iter().filter(|id| cx.doc.is_editable(**id)).find_map(|id| {
+        let editable = cx.doc.editable();
+        ids.iter().filter(|id| editable(**id)).find_map(|id| {
             let index = grid_of(cx.doc.node(*id)?)?.point_near(p, tol)?;
             Some(MeshGrab { id: *id, index, handle: None })
         })
     }
 
     /// Start dragging `grab` (its point takes the focus).
-    pub fn press(&mut self, grab: MeshGrab) -> Vec<Action> {
+    pub fn press(&mut self, cx: &ToolContext, grab: MeshGrab) -> Vec<Action> {
         self.focus = Some((grab.id, grab.index));
-        self.drag = Some(grab);
+        let mut origin = Point::ZERO;
+        if let Some(grid) = cx.doc.node(grab.id).and_then(grid_of)
+            && let Some(q) = grid.points.get(grab.index)
+        {
+            origin = if let Some(h) = grab.handle { q.p + q.handles[h] } else { q.p };
+        }
+        self.drag = Some(ActiveDrag { grab, origin, at: None });
         vec![Action::Begin("Move Mesh Point".into())]
     }
 
     /// The preview of a drag to `p` (`None` when nothing is being dragged).
-    pub fn drag_to(&self, p: Point) -> Option<Vec<Action>> {
-        let g = self.drag?;
+    pub fn drag_to(&mut self, p: Point) -> Option<Vec<Action>> {
+        let d = self.drag.as_mut()?;
+        d.at = Some(p);
+        let g = d.grab;
         let mut params = json!({"id": g.id.0, "index": g.index, "x": p.x, "y": p.y});
         if let Some(h) = g.handle {
             params["handle"] = json!(h);
@@ -91,6 +111,12 @@ impl MeshEdit {
         self.focus = None;
     }
 
+    /// `{meshPoint: {id, index}|null}`: the focused point, which a solid fill colour recolours
+    /// (`paint.setFill` on a gradient mesh).
+    pub fn options(&self) -> Value {
+        json!({"meshPoint": self.focus.map(|(id, index)| json!({"id": id.0, "index": index}))})
+    }
+
     /// The focused point's handles (lines and ends).
     pub fn overlays(&self, cx: &ToolContext) -> Vec<Overlay> {
         let Some((id, index)) = self.focus else { return vec![] };
@@ -100,6 +126,13 @@ impl MeshEdit {
         for h in q.handles.iter().filter(|h| h.hypot() > 1e-6) {
             out.push(Overlay::Line { a: q.p, b: q.p + *h, color: FEEDBACK, dashed: false });
             out.push(Overlay::Handle { p: q.p + *h, color: FEEDBACK });
+        }
+        if cx.measurement_labels
+            && let Some(d) = &self.drag
+            && let Some(at) = d.at
+        {
+            let delta = at - d.origin;
+            out.push(Overlay::Measure { p: at + Vec2::new(cx.tol(12.0), cx.tol(12.0)), text: cx.offset_label(delta.x, delta.y) });
         }
         out
     }
@@ -125,11 +158,11 @@ mod tests {
         let kind = EnvelopeKind::Mesh { rows: 1, cols: 1, points: grid_points(Rect::new(100.0, 100.0, 200.0, 200.0), 1, 1), handles: vec![] };
         let env = NodeKind::Envelope {
             content: vec![Arc::new(rect)],
-            kind,
+            kind: Box::new(kind),
             fidelity: 50.0,
             editing: false,
             options: EnvelopeOptions::NEW,
-            frame: Affine::IDENTITY,
+            frame: Box::new(Affine::IDENTITY),
         };
         let l = d.layers[0].id;
         d.insert(Some(l), 0, Node::new(id, env)).unwrap();
@@ -179,5 +212,21 @@ mod tests {
             vec![Action::Preview("object.mesh.movePoint".into(), json!({"id": e.0, "index": 2, "x": 90.0, "y": 210.0}))]
         );
         assert_eq!(t.pointer(&c, &PointerEvent::new(PointerKind::Up, 90.0, 210.0)), vec![Action::Commit]);
+    }
+
+    #[test]
+    fn mesh_drag_honors_measurement_labels() {
+        let (d, _e) = doc_with_envelope();
+        let (s, p) = (Selection::default(), paint());
+        let base = cx(&d, &s, &p);
+        let on = ToolContext { measurement_labels: true, ..base };
+        let off = ToolContext { measurement_labels: false, ..base };
+        let mut t = crate::meshblend::create("mesh").unwrap();
+        t.pointer(&on, &PointerEvent::new(PointerKind::Down, 200.0, 100.0));
+        assert!(!t.overlays(&on).iter().any(|o| matches!(o, Overlay::Measure { .. })));
+        t.pointer(&on, &PointerEvent::new(PointerKind::Drag, 210.0, 90.0));
+        let want = on.offset_label(10.0, -10.0);
+        assert!(t.overlays(&on).iter().any(|o| matches!(o, Overlay::Measure { text, .. } if text == &want)));
+        assert!(!t.overlays(&off).iter().any(|o| matches!(o, Overlay::Measure { .. })));
     }
 }

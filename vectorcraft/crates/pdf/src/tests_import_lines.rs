@@ -131,6 +131,47 @@ fn a_stroke_written_as_stroked_glyph_outlines_is_the_types_stroke() {
     assert_eq!(d.layers[0].children().unwrap().len(), 2);
 }
 
+/// A `.ai` page moved right in the row, so its art past the artboard clears the page before it
+/// (#1528), still has the stroke drawn on its type's glyphs read as the type's stroke.
+#[test]
+fn a_stroke_on_the_type_of_a_moved_ai_page_is_still_the_types_stroke() {
+    let ai = "/PieceInfo << /Illustrator << /Private << /AIPrivateData1 7 /NumBlock 1 >> >> >>";
+    let content = format!(
+        "0 g -70 10 80 20 re f BT 1 0 0 rg /F1 24 Tf 10 50 Td (Hi) Tj ET 0 0 1 RG 0.5 w {}{}",
+        outline('H', 10.0),
+        outline('i', 10.0 + 0.722 * 24.0)
+    );
+    let pages = [("0 g 10 10 20 20 re f", String::new()), (content.as_str(), HELVETICA.to_string())].map(|(c, resources)| PdfPage {
+        entries: ai.into(),
+        resources,
+        ..PdfPage::new(100.0, 100.0, c)
+    });
+    let d = import(&vectorcraft_testkit::pdf::pdf(&pages, None)).unwrap();
+    assert!(d.artboards[1].rect.x0 > d.artboards[0].rect.x1 + 36.0 + 1.0, "page 2 moved: {:?}", d.artboards);
+    let art = d.layers[1].children().unwrap();
+    assert_eq!(art.len(), 2, "the note and the type: {art:?}");
+    assert!(matches!(art[1].appearance.items.as_slice(), [AppearanceItem::Stroke(_)]), "{:?}", art[1].appearance);
+}
+
+#[test]
+fn glyphs_each_followed_by_their_stroked_outline_stay_one_object() {
+    // Type on a path is written glyph by glyph: each glyph, then its outline stroked in the same
+    // colour (a shadow under the type).
+    let glyph = |c: char, x: f64, stroke: &str| format!("BT 0 0 1 rg /F1 24 Tf {x} 50 Td ({c}) Tj ET {stroke} 0.5 w {}", outline(c, x));
+    let i_at = 10.0 + 0.722 * 24.0;
+    let d = import(&page(&(glyph('H', 10.0, "0 0 1 RG") + &glyph('i', i_at, "0 0 1 RG")))).unwrap();
+    let art = d.layers[0].children().unwrap();
+    assert_eq!(art.len(), 1, "one object: {art:?}");
+    let NodeKind::Text(t) = &art[0].kind else { panic!("{:?}", art[0].kind) };
+    assert_eq!(t.plain_text(), "Hi");
+    let [AppearanceItem::Stroke(st)] = art[0].appearance.items.as_slice() else { panic!("{:?}", art[0].appearance) };
+    assert_eq!(st.paint.color(), Some(Color::rgb(0.0, 0.0, 1.0)));
+    // A stroke of another colour drawn over each glyph in turn would also cover the next one's
+    // neighbour as one object's stroke: the glyphs stay as the file draws them.
+    let d = import(&page(&(glyph('H', 10.0, "1 1 1 RG") + &glyph('i', i_at, "1 1 1 RG")))).unwrap();
+    assert_eq!(texts(&d).len(), 2);
+}
+
 /// A 300 × 200 pt page with `lines` of (x, y from the top, size, text) in Source Sans 3.
 fn source_sans(lines: &[(f32, f32, f32, &str)]) -> Vec<u8> {
     crate::tests_live_text::text_pdf(lines, false)
@@ -148,6 +189,41 @@ fn spaces_read_from_wide_gaps_keep_the_glyphs_after_them_in_place() {
     let at = |byte: usize| (t[0].xf * laid.glyphs.iter().find(|g| g.byte == byte).unwrap().origin).x;
     assert!((at(2) - f64::from(x1)).abs() < 0.05, "the second group starts where the file has it: {} vs {x1}", at(2));
     assert!((at(9) - f64::from(x2)).abs() < 0.05, "the third group starts where the file has it: {} vs {x2}", at(9));
+}
+
+#[test]
+fn words_set_ems_apart_keep_their_place() {
+    // Gaps of about 1.75 and 2.6 em (#2384): each space's own tracking is more than an em.
+    let (x1, x2) = (48.0, 84.0);
+    let bytes = source_sans(&[(20.0, 50.0, 10.0, "ab"), (x1, 50.0, 10.0, "cd"), (x2, 50.0, 10.0, "ef")]);
+    let t = texts(&import(&bytes).unwrap());
+    assert_eq!(t.len(), 1);
+    assert_eq!(t[0].plain_text(), "ab cd ef");
+    let laid = vectorcraft_text::layout(vectorcraft_text::FontDb::global(), &t[0]);
+    let at = |byte: usize| (t[0].xf * laid.glyphs.iter().find(|g| g.byte == byte).unwrap().origin).x;
+    assert!((at(3) - f64::from(x1)).abs() < 0.05, "the second word starts where the file has it: {} vs {x1}", at(3));
+    assert!((at(6) - f64::from(x2)).abs() < 0.05, "the third word starts where the file has it: {} vs {x2}", at(6));
+}
+
+#[test]
+fn words_set_ems_apart_beside_the_spaces_the_file_draws_keep_their_place() {
+    // The same words, the file drawing each space (2 pt wide) after a word, before the next one,
+    // or alone with a gap on each side.
+    let (x1, x2) = (48.0, 84.0);
+    let drawings: [&[(f32, f32, f32, &str)]; 3] = [
+        &[(20.0, 50.0, 10.0, "ab "), (x1, 50.0, 10.0, "cd "), (x2, 50.0, 10.0, "ef")],
+        &[(20.0, 50.0, 10.0, "ab"), (x1 - 2.0, 50.0, 10.0, " cd"), (x2 - 2.0, 50.0, 10.0, " ef")],
+        &[(20.0, 50.0, 10.0, "ab"), (36.0, 50.0, 10.0, " "), (x1, 50.0, 10.0, "cd"), (70.0, 50.0, 10.0, " "), (x2, 50.0, 10.0, "ef")],
+    ];
+    for (k, lines) in drawings.iter().enumerate() {
+        let t = texts(&import(&source_sans(lines)).unwrap());
+        assert_eq!(t.len(), 1, "drawing {k}");
+        assert_eq!(t[0].plain_text(), "ab cd ef", "drawing {k}");
+        let laid = vectorcraft_text::layout(vectorcraft_text::FontDb::global(), &t[0]);
+        let at = |byte: usize| (t[0].xf * laid.glyphs.iter().find(|g| g.byte == byte).unwrap().origin).x;
+        assert!((at(3) - f64::from(x1)).abs() < 0.05, "drawing {k}: the second word starts where the file has it: {} vs {x1}", at(3));
+        assert!((at(6) - f64::from(x2)).abs() < 0.05, "drawing {k}: the third word starts where the file has it: {} vs {x2}", at(6));
+    }
 }
 
 /// A document of area type `text` (Source Sans 3, 10 pt) `width` wide at (20, 30).
@@ -190,6 +266,33 @@ fn lines_wrapped_in_a_frame_come_back_as_area_type() {
         let origin = t[0].xf * Point::ZERO;
         assert!((origin.x - 20.0).abs() < 0.05, "{origin:?}");
     }
+}
+
+#[test]
+fn justified_lines_come_back_as_area_type_only_with_their_word_gaps_alike() {
+    // "aa bb cc", "aa bb cc", "aa" with the file's spaces drawn, the wrapped lines 44 pt wide: "cc"
+    // ends at 64, and "bb" starts where both gaps are 4.87 pt wider than a space, or elsewhere.
+    let lines = |bb: f32| {
+        [
+            (20.0, 50.0, 10.0, "aa "),
+            (bb, 50.0, 10.0, "bb "),
+            (54.88, 50.0, 10.0, "cc "),
+            (20.0, 62.0, 10.0, "aa "),
+            (bb, 62.0, 10.0, "bb "),
+            (54.88, 62.0, 10.0, "cc "),
+            (20.0, 74.0, 10.0, "aa"),
+        ]
+    };
+    let t = texts(&import(&source_sans(&lines(36.95))).unwrap());
+    assert_eq!(t.len(), 1, "one object: {:?}", t.iter().map(TextObject::plain_text).collect::<Vec<_>>());
+    assert_eq!(t[0].plain_text(), "aa bb cc aa bb cc aa");
+    assert_eq!(t[0].para.justify, Justify::JustifyLeft);
+    // Gaps 1 and 8.74 pt wider than a space were set by hand: the lines keep their words in place.
+    let t = texts(&import(&source_sans(&lines(33.08))).unwrap());
+    assert_eq!(t.len(), 3, "{:?}", t.iter().map(TextObject::plain_text).collect::<Vec<_>>());
+    let laid = vectorcraft_text::layout(vectorcraft_text::FontDb::global(), &t[0]);
+    let bb = (t[0].xf * laid.glyphs.iter().find(|g| g.byte == 3).unwrap().origin).x;
+    assert!((bb - 33.08).abs() < 0.05, "the second word starts where the file has it: {bb} vs 33.08");
 }
 
 #[test]

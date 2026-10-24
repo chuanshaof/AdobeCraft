@@ -12,6 +12,30 @@ fn key(k: egui::Key) -> Vec<egui::Event> {
     [true, false].map(|pressed| egui::Event::Key { key: k, physical_key: None, pressed, repeat: false, modifiers: Default::default() }).to_vec()
 }
 
+/// Recently used means applied, including an edited character range, never just hovered.
+#[test]
+fn recent_fonts_follow_committed_choices_and_the_count_preference() {
+    let mut app = VectorcraftApp::new(Session::new(), Default::default());
+    app.run("file.new", json!({})).unwrap();
+    let id = app.run("text.create", json!({"x": 20, "y": 50, "text": "Recent fonts", "font": "Inter"})).unwrap()["id"].clone();
+    let ctx = egui::Context::default();
+    crate::font_menu::apply(&mut app, &ctx, FontPick::Preview("Source Serif 4".into(), None));
+    assert!(app.recent_fonts().is_empty());
+    crate::font_menu::apply(&mut app, &ctx, FontPick::EndPreview);
+    assert!(app.recent_fonts().is_empty());
+    crate::font_menu::apply(&mut app, &ctx, FontPick::Chosen("Source Serif 4".into(), None));
+    app.run("text.setStyle", json!({"font": "Inter"})).unwrap();
+    app.run("text.setRangeStyle", json!({"id": id, "start": 0, "end": 6, "font": "Source Serif 4"})).unwrap();
+    assert_eq!(app.recent_fonts(), ["Source Serif 4", "Inter"]);
+    // A failed command must leave history alone.
+    assert!(app.run("text.setRangeStyle", json!({"id": 999999, "font": "Missing"})).is_err());
+    assert_eq!(app.recent_fonts(), ["Source Serif 4", "Inter"]);
+    app.run("prefs.set", json!({"values": {"recentFontsCount": 1}})).unwrap();
+    assert_eq!(MenuLook::of(&app).recent, ["Source Serif 4"]);
+    let restored: crate::state::UiState = serde_json::from_str(&serde_json::to_string(&app.ui).unwrap()).unwrap();
+    assert_eq!(restored.recent_fonts, ["Source Serif 4", "Inter"]);
+}
+
 #[test]
 fn arrows_preview_the_next_family_and_enter_applies_it() {
     let ctx = egui::Context::default();
@@ -222,6 +246,57 @@ fn right_arrow_lists_a_familys_styles_and_they_preview() {
     assert_eq!(picked, Some(FontPick::Preview("Source Sans 3".into(), Some(styles[1].clone()))));
     let (_, picked) = frame(key(egui::Key::Enter));
     assert_eq!(picked, Some(FontPick::Chosen("Source Sans 3".into(), Some(styles[1].clone()))));
+}
+
+/// #1116: styles listed above the highlight (a click on another family's triangle) leave it on its
+/// family; it doesn't land on one of those styles and preview it.
+#[test]
+fn styles_listed_above_the_highlight_leave_it_on_its_family() {
+    let ctx = egui::Context::default();
+    crate::theme::install_fonts(&ctx);
+    let frame = |events: Vec<egui::Event>| {
+        let input =
+            egui::RawInput { events, screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 800.0))), ..Default::default() };
+        let (mut at, mut picked) = (egui::Pos2::ZERO, None);
+        let mut out = ctx.run_ui(input, |ui| {
+            at = ui.next_widget_position();
+            picked = font_menu(ui, "test-rebuild", "Source Sans 3", 260.0, None, MenuLook::default());
+        });
+        out.textures_delta.clear();
+        // The family's row: the lowest text naming it (the menu's button above names it too).
+        let row = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.text() == "Source Sans 3" => Some(t.pos + egui::vec2(0.0, t.galley.size().y * 0.5)),
+                _ => None,
+            })
+            .max_by(|a, b| a.y.total_cmp(&b.y));
+        (at, picked, row)
+    };
+    let (at, ..) = frame(vec![]);
+    let click = at + egui::vec2(40.0, 10.0);
+    let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+    frame(vec![egui::Event::PointerMoved(click), button(click, true)]);
+    frame(vec![button(click, false)]);
+    let mut row = None;
+    for _ in 0..5 {
+        row = frame(vec![]).2;
+    }
+    // The family's disclosure triangle, left of its name: hovered, it highlights the family.
+    let triangle = row.expect("the family is listed") - egui::vec2(7.0, 0.0);
+    frame(vec![egui::Event::PointerMoved(triangle)]);
+    let (_, picked, _) = frame(key(egui::Key::ArrowDown));
+    let Some(FontPick::Preview(next, None)) = picked else { panic!("↓ previews the next family: {picked:?}") };
+    // A click on the triangle, the pointer still: the styles are listed between the two families.
+    frame(vec![button(triangle, true)]);
+    frame(vec![button(triangle, false)]);
+    for _ in 0..3 {
+        let (_, picked, _) = frame(vec![]);
+        assert_eq!(picked, None, "{next} stays highlighted and previewed");
+    }
+    let (_, picked, _) = frame(key(egui::Key::Enter));
+    assert_eq!(picked, Some(FontPick::Chosen(next, None)));
 }
 
 #[test]

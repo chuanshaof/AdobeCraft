@@ -55,13 +55,33 @@ impl egui::DroppedFile for Dropped {
     }
 }
 
+#[derive(Debug)]
+struct MockDrop {
+    path: std::path::PathBuf,
+    bytes: Result<Vec<u8>, String>,
+}
+
+impl egui::DroppedFile for MockDrop {
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        self.bytes.clone()
+    }
+}
+
 /// One headless frame of the whole window (800×600) with `events` and `dropped` files.
-fn frame(app: &mut VectorcraftApp, ctx: &egui::Context, mut events: Vec<egui::Event>, dropped: &[&str], shift: bool) {
+fn frame(app: &mut VectorcraftApp, ctx: &egui::Context, events: Vec<egui::Event>, dropped: &[&str], shift: bool) {
+    let files = dropped.iter().map(|p| Arc::new(Dropped(p.into())) as egui::DroppedFileHandle).collect();
+    frame_files(app, ctx, events, files, shift);
+}
+
+fn frame_files(app: &mut VectorcraftApp, ctx: &egui::Context, mut events: Vec<egui::Event>, dropped: Vec<egui::DroppedFileHandle>, shift: bool) {
     events.push(egui::Event::ModifiersChanged(egui::Modifiers { shift, ..Default::default() }));
     let raw = egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))),
         events,
-        dropped_files: dropped.iter().map(|p| Arc::new(Dropped(p.into())) as egui::DroppedFileHandle).collect(),
+        dropped_files: dropped,
         ..Default::default()
     };
     let mut out = ctx.run_ui(raw, |ui| {
@@ -79,7 +99,7 @@ fn selected_image(app: &VectorcraftApp) -> vectorcraft_doc::Node {
 }
 
 /// A tiny SVG document.
-const SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="50" height="40"><rect width="20" height="10"/></svg>"#;
+const SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="50" height="40"><path d="M5 5 L45 5 L30 30 Z"/></svg>"#;
 
 /// Two frames: fonts, then the canvas lays out → the canvas.
 fn laid_out(app: &mut VectorcraftApp, ctx: &egui::Context) -> egui::Rect {
@@ -88,8 +108,8 @@ fn laid_out(app: &mut VectorcraftApp, ctx: &egui::Context) -> egui::Rect {
     app.canvas_rect.expect("the canvas is laid out")
 }
 
-/// Where the platform tells where files were dropped (the web), they go as in Illustrator: placed
-/// at the pointer on the canvas whatever they are, opened off it (the tab bar).
+/// Where the platform tells where files were dropped (the web), documents, pictures and text go
+/// as in Illustrator: placed at the pointer on the canvas, opened off it (the tab bar).
 #[test]
 fn a_drop_with_a_position_places_on_the_canvas_and_opens_off_it() {
     let mut app = app();
@@ -119,6 +139,96 @@ fn a_drop_without_a_position_opens_documents_and_places_pictures() {
     for name in ["a.png", "a.jpg", "a.tiff", "a.webp", "a.txt"] {
         assert_eq!(app.drop_target(name, None, false), DropTarget::Place(DropAt { doc: uid, at: center, embed: false }), "{name}");
     }
+}
+
+/// Swatch libraries and color books, graphic style libraries, Libraries panel files, presets,
+/// plug-ins and scripts open as File → Open opens them, dropped with or without a position, on the
+/// canvas too.
+#[test]
+fn libraries_presets_and_plugins_open_wherever_they_are_dropped() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    let rect = laid_out(&mut app, &ctx);
+    let on_canvas = rect.center() + vec2(60.0, -40.0);
+    let libraries = ["a.vcswatches", "a.gpl", "a.ase", "a.acb", "a.vcstyles", "a.vclibrary"];
+    let presets_and_plugins = ["a.vcflattener", "a.vcpdfpresets", "a.vcprintpresets", "a.vcperspective", "a.wasm", "a.jsx", "a.jsxinc", "a.jsxbin"];
+    for name in libraries.into_iter().chain(presets_and_plugins) {
+        assert_eq!(app.drop_target(name, None, false), DropTarget::Open, "{name}");
+        assert_eq!(app.drop_target(name, Some(on_canvas), true), DropTarget::Open, "{name} on the canvas");
+    }
+}
+
+/// A swatch library dropped on the window while a document is open loads in the library panel,
+/// as File → Open loads it.
+#[test]
+fn a_dropped_swatch_library_opens_in_the_library_panel() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    laid_out(&mut app, &ctx);
+    let gpl = temp_file("dropped.gpl", b"GIMP Palette\nName: Dropped\n#\n255   0   0\tRed\n  0 128 255\tSky\n");
+    frame(&mut app, &ctx, vec![], &[&gpl], false);
+    let id = format!("loaded/{gpl}");
+    assert_eq!(crate::panels::library_panel::last_open(&app.ui).map(|o| o.id.as_str()), Some(id.as_str()), "{}", app.ui.status);
+    let lib = app.session.execute("swatch.library.get", &json!({"library": id})).unwrap();
+    let names: Vec<&str> = lib["swatches"].as_array().unwrap().iter().filter_map(|w| w["name"].as_str()).collect();
+    assert_eq!((lib["name"].as_str(), names), (Some("Dropped"), vec!["Red", "Sky"]));
+    assert_eq!((app.session.documents().len(), images(&app, 0)), (1, 0), "neither opened as a document nor placed");
+    assert_eq!(app.ui.recent_files.first(), Some(&gpl), "added to Open Recent Files as File → Open adds it");
+}
+
+/// A script dropped on the window while a document is open shows its check, as File → Open shows
+/// it, and the document is left as it was.
+#[test]
+fn a_dropped_script_shows_its_check() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    laid_out(&mut app, &ctx);
+    let path = temp_file("dropped.jsx", b"#target acme\napp.executeMenuCommand('acmecopyall');\n");
+    frame(&mut app, &ctx, vec![], &[&path], false);
+    let d = app.ui.dialog.as_ref().expect("the check is shown");
+    assert_eq!(d.kind, crate::dialogs::script_check::KIND, "{}", app.ui.status);
+    assert_eq!(
+        (d.fields["report"]["name"].as_str(), d.fields["report"]["needs"].clone()),
+        (Some("dropped.jsx"), json!(["language", "menuCommands"]))
+    );
+    assert_eq!((app.session.documents().len(), images(&app, 0)), (1, 0), "neither opened as a document nor placed");
+}
+
+/// A Libraries panel file dropped on the window while a document is open is added to the
+/// Libraries panel as a new library, as File → Open adds it.
+#[test]
+fn a_dropped_libraries_panel_file_is_added_as_a_new_library() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    laid_out(&mut app, &ctx);
+    let file = json!({"name": "Dropped", "colors": [{"name": "Red", "color": {"model": "rgb", "r": 1, "g": 0, "b": 0}}]});
+    let path = temp_file("dropped.vclibrary", file.to_string().as_bytes());
+    frame(&mut app, &ctx, vec![], &[&path], false);
+    assert_eq!(app.ui.status, "Imported library Dropped");
+    let lib = app.session.execute("library.get", &json!({})).unwrap();
+    let colors: Vec<&str> = lib["colors"].as_array().unwrap().iter().filter_map(|c| c["name"].as_str()).collect();
+    assert_eq!((lib["name"].as_str(), colors), (Some("Dropped"), vec!["Red"]));
+    assert_eq!((app.session.documents().len(), images(&app, 0)), (1, 0), "neither opened as a document nor placed");
+}
+
+/// A shortcut set dropped on the window while a document is open opens Import Shortcut Set, as
+/// File → Open opens it: from its path (desktop) and from its bytes dropped on the canvas (web).
+#[test]
+fn a_dropped_shortcut_set_opens_import_shortcut_set() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    let rect = laid_out(&mut app, &ctx);
+    let set = "/Menus {\n /Acme\\ Undo { /Modifiers 11 /Key 902 }\n}\n";
+    let path = temp_file("dropped.kys", set.as_bytes());
+    frame(&mut app, &ctx, vec![], &[&path], false);
+    let kind = |app: &VectorcraftApp| app.ui.dialog.as_ref().map(|d| d.kind.clone());
+    assert_eq!(kind(&app).as_deref(), Some(crate::dialogs::shortcut_import::KIND), "{}", app.ui.status);
+    app.ui.dialog = None;
+    let target = app.drop_target("sent.kys", Some(rect.center()), false);
+    assert_eq!(target, DropTarget::Open);
+    crate::place::drop_files(&mut app, vec![(target, ("sent.kys".into(), None, set.as_bytes().to_vec()))]);
+    assert_eq!(kind(&app).as_deref(), Some(crate::dialogs::shortcut_import::KIND), "{}", app.ui.status);
+    assert_eq!((app.session.documents().len(), images(&app, 0)), (1, 0), "neither opened as a document nor placed");
 }
 
 #[test]
@@ -155,6 +265,84 @@ fn a_dropped_document_opens_as_a_tab_of_its_own() {
     assert_eq!(app.session.active().unwrap().path.as_deref(), Some(svg.as_str()));
     assert_eq!((images(&app, 0), images(&app, 1)), (1, 0), "the picture is placed in the document that was open");
     assert_eq!(app.ui.recent_files.first(), Some(&svg));
+}
+
+#[test]
+fn a_native_svg_drop_uses_file_open_even_with_a_path_only_handle() {
+    let path = temp_file("path-only.svg", SVG.as_bytes());
+    let mut dropped = app();
+    let ctx = egui::Context::default();
+    laid_out(&mut dropped, &ctx);
+    let handle = Arc::new(MockDrop { path: path.clone().into(), bytes: Err("only a path".into()) }) as egui::DroppedFileHandle;
+    frame_files(&mut dropped, &ctx, vec![], vec![handle], false);
+
+    let mut opened = app();
+    opened.run("file.open", json!({ "path": path })).unwrap();
+    let anchors = |app: &VectorcraftApp| {
+        let mut count = 0;
+        app.session.active().unwrap().doc.walk(|n| {
+            if let NodeKind::Path { path, .. } = &n.kind {
+                count += path.anchors().count();
+            }
+        });
+        count
+    };
+    assert_eq!(anchors(&dropped), anchors(&opened), "same editable SVG anchors as File > Open");
+    assert!(anchors(&dropped) >= 3, "the imported path has editable anchors");
+    assert_eq!(dropped.session.active().unwrap().path, opened.session.active().unwrap().path);
+    assert_eq!(dropped.session.active().unwrap().selection.objects.len(), opened.session.active().unwrap().selection.objects.len());
+    assert_eq!(dropped.ui.recent_files, opened.ui.recent_files);
+}
+
+#[test]
+fn an_svg_drop_without_a_path_is_detected_from_its_bytes() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    laid_out(&mut app, &ctx);
+    let svg = Arc::new(MockDrop { path: Default::default(), bytes: Ok(SVG.as_bytes().to_vec()) }) as egui::DroppedFileHandle;
+    frame_files(&mut app, &ctx, vec![], vec![svg], false);
+    assert_eq!(app.session.documents().len(), 2, "SVG bytes open as a document, not placed art");
+    assert!(app.session.active().unwrap().path.is_none(), "no filesystem path was supplied");
+
+    frame(&mut app, &ctx, vec![], &[], false);
+    let image = Arc::new(MockDrop { path: Default::default(), bytes: Ok(png(6, 6, 72.0)) }) as egui::DroppedFileHandle;
+    frame_files(&mut app, &ctx, vec![], vec![image], false);
+    assert_eq!(app.session.documents().len(), 2, "an image is placed, not opened");
+    assert_eq!(images(&app, 1), 1);
+}
+
+#[test]
+fn multiple_svg_drops_open_individually() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    laid_out(&mut app, &ctx);
+    let a = temp_file("first.svg", SVG.as_bytes());
+    let b = temp_file("second.svg", SVG.as_bytes());
+    frame(&mut app, &ctx, vec![], &[&a, &b], false);
+    assert_eq!(app.session.documents().len(), 3);
+    assert_eq!(app.session.active().unwrap().path.as_deref(), Some(b.as_str()));
+    assert_eq!(&app.ui.recent_files[..2], &[b, a]);
+}
+
+#[test]
+fn unsupported_and_unreadable_drops_leave_the_document_open() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    laid_out(&mut app, &ctx);
+    let invalid = temp_file("not-art.xyz", b"not an image or document");
+    frame(&mut app, &ctx, vec![], &[&invalid], false);
+    assert!(app.ui.status.contains("Couldn't place not-art.xyz"), "{}", app.ui.status);
+
+    let invalid_svg = temp_file("broken.svg", b"<svg");
+    frame(&mut app, &ctx, vec![], &[&invalid_svg], false);
+    assert!(app.ui.status.contains("Couldn't open broken.svg"), "{}", app.ui.status);
+
+    let missing = temp_file("unreadable.svg", SVG.as_bytes());
+    std::fs::remove_file(&missing).unwrap();
+    frame(&mut app, &ctx, vec![], &[&missing], false);
+    assert!(app.ui.status.contains("Couldn't open unreadable.svg"), "{}", app.ui.status);
+    assert_eq!(app.session.documents().len(), 1);
+    assert!(app.ui.recent_files.is_empty(), "failed drops don't enter Open Recent");
 }
 
 #[test]
@@ -306,6 +494,44 @@ fn click_label(app: &mut VectorcraftApp, ctx: &egui::Context, label: &str) {
     click_control(app, ctx, p);
 }
 
+/// The Control bar's file name opens the link menu: Replace… puts the picked file in the image's
+/// place (an embedded image becomes linked) with the new file's own aspect ratio, fitted inside the
+/// old bounds; Placement Options… opens its dialog.
+#[test]
+fn the_control_bars_file_name_relinks_the_image() {
+    use crate::tests_removeanchors::{click_control, control_frame};
+    // Menu items are drawn after the space a check mark takes.
+    let item = |app: &mut VectorcraftApp, ctx: &egui::Context, label: &str| {
+        let texts = control_frame(app, ctx, vec![]);
+        texts.iter().find(|(t, _)| t.trim() == label).map(|(_, r)| r.center()).unwrap_or_else(|| panic!("no `{label}` in {texts:?}"))
+    };
+    let mut app = app();
+    let data = vectorcraft_format::base64_encode(&png(30, 30, 72.0));
+    app.run("file.place", json!({"name": "red.png", "dataBase64": data, "link": false})).unwrap();
+    let before = selected_image(&app).geometric_bounds().unwrap();
+    let ctx = egui::Context::default();
+    crate::theme::install_fonts(&ctx);
+    click_label(&mut app, &ctx, "red.png");
+    for s in ["Replace…", "Go To Link", "Edit Original", "Update Link", "Placement Options…"] {
+        item(&mut app, &ctx, s);
+    }
+    let other = temp_file("blue.png", &png(60, 30, 72.0));
+    let picked = other.clone();
+    app.services.pick_open = Some(Box::new(move |_: &crate::FilePick| Some(picked.clone())));
+    let p = item(&mut app, &ctx, "Replace…");
+    click_control(&mut app, &ctx, p);
+    let image = selected_image(&app);
+    let NodeKind::Image(im) = &image.kind else { panic!("an image") };
+    assert!(im.link.as_ref().is_some_and(|l| l.name() == "blue.png"), "relinked to the picked file");
+    let after = image.geometric_bounds().unwrap();
+    assert!((after.width() - before.width()).abs() < 1e-6 && (after.height() - before.height() / 2.0).abs() < 1e-6, "2:1, fitted: {after:?}");
+    assert!((after.center() - before.center()).hypot() < 1e-6, "centred where the old image was");
+    click_label(&mut app, &ctx, "blue.png");
+    let p = item(&mut app, &ctx, "Placement Options…");
+    click_control(&mut app, &ctx, p);
+    assert!(app.ui.dialog.is_some(), "Placement Options opens");
+}
+
 #[test]
 fn the_control_bar_and_properties_trace_a_selected_image() {
     use crate::panels::image_trace::{TRACE_BUTTON_W, selected_trace};
@@ -406,4 +632,179 @@ fn a_vectorcraft_document_places_linked_and_edit_original_opens_it() {
     app.run("file.place", json!({})).unwrap();
     let d = app.ui.dialog.as_ref().unwrap();
     assert!(crate::dialogs::place::link_tip(d).contains("VectorCraft documents"));
+}
+
+#[test]
+fn the_place_dialog_links_a_pdf_page_and_embeds_it_with_link_off() {
+    let mut app = app();
+    let mut src = Session::new();
+    src.execute("file.new", &json!({"width": 100, "height": 50})).unwrap();
+    src.execute("shape.rectangle", &json!({"x": 0, "y": 0, "width": 100, "height": 50})).unwrap();
+    let pdf = src.execute("document.serialize", &json!({"format": "pdf", "preserveEditing": false})).unwrap();
+    let path = temp_file("flyer.pdf", &vectorcraft_format::base64_decode(pdf["dataBase64"].as_str().unwrap()).unwrap());
+    // Link on (the default): one locked object, linked to the file.
+    place_picked(&mut app, &path);
+    let d = app.ui.dialog.as_ref().expect("the Place dialog");
+    assert!(d.bool("link") && d.bool("__documents") && !d.bool("__others"), "Link places it as one locked object");
+    assert!(crate::dialogs::place::link_tip(d).contains("locked object"));
+    crate::dialogs::confirm(&mut app).unwrap();
+    let st = app.session.active().unwrap();
+    let vectorcraft_doc::NodeKind::PlacedDocument(p) = &st.doc.node(st.selection.objects[0]).unwrap().kind else { panic!("not a placed document") };
+    assert_eq!(p.link.path, path);
+    // Link off: the page's art is embedded.
+    place_picked(&mut app, &path);
+    app.ui.dialog.as_mut().unwrap().fields.insert("link".into(), json!(false));
+    crate::dialogs::confirm(&mut app).unwrap();
+    let st = app.session.active().unwrap();
+    assert_eq!(st.doc.node(st.selection.objects[0]).unwrap().kind_label(), "Clip Group");
+}
+
+#[test]
+fn the_place_dialog_does_not_offer_a_postscript_ai_as_a_locked_object() {
+    let mut app = app();
+    let ps = b"%!PS-Adobe-3.0\n%%BoundingBox: 0 0 100 100\n%%EndComments\n1 0 0 setrgbcolor 10 10 50 50 rectfill\nshowpage\n%%EOF\n";
+    let path = temp_file("legacy.ai", ps);
+    // file.place embeds a .ai saved without PDF compatibility, even with Link on.
+    let r = app.session.execute("file.place", &json!({"path": path, "link": true})).unwrap();
+    assert_eq!(r["linked"], json!(false), "{r}");
+    let st = app.session.active().unwrap();
+    assert!(!matches!(st.doc.node(st.selection.objects[0]).unwrap().kind, NodeKind::PlacedDocument(_)));
+    // So Link's tooltip does not promise one locked object for it.
+    place_picked(&mut app, &path);
+    let d = app.ui.dialog.as_ref().expect("the Place dialog");
+    assert!(!d.bool("__documents") && d.bool("__others"), "{:?}", d.fields);
+    assert!(!crate::dialogs::place::link_tip(d).contains("locked object"));
+}
+
+/// Tool key `key` as the Control bar's Apply (Enter) and Cancel (Escape) send it.
+fn tool_key(app: &mut VectorcraftApp, key: vectorcraft_tools::ToolKey) {
+    let view = app.view_info();
+    let r = app.session.tool_key(key, vectorcraft_tools::Mods::default(), view);
+    crate::canvas::apply_requests(app, r);
+}
+
+/// #734: Crop Image shows a crop box on the image instead of cropping to the artboard at once (an
+/// image inside the artboard had nothing to cut); Apply crops to the box in one undo step, Cancel
+/// leaves the image whole, and both go back to the Selection tool.
+#[test]
+fn crop_image_shows_a_box_that_apply_crops_to() {
+    use vectorcraft_tools::ToolKey;
+    let mut app = app();
+    place_picked(&mut app, &temp_file("crop.png", &png(100, 50, 72.0)));
+    app.ui.dialog.as_mut().unwrap().fields.insert("link".into(), json!(false));
+    crate::dialogs::confirm(&mut app).unwrap();
+    let whole = selected_image(&app).geometric_bounds().unwrap();
+    assert!(crate::menus::enabled(&app, "ui.cropImage"));
+    app.run("ui.cropImage", json!({})).unwrap();
+    assert_eq!(app.session.tool_id(), "cropImage");
+    tool_key(&mut app, ToolKey::Escape);
+    assert_eq!(app.session.tool_id(), "selection");
+    assert_eq!(selected_image(&app).geometric_bounds(), Some(whole), "Cancel leaves it whole");
+    // The box set to the image's left half, as the Control bar's fields set it, then Apply.
+    app.run("ui.cropImage", json!({})).unwrap();
+    app.run("tool.setOption", json!({"key": "rect", "value": [whole.x0, whole.y0, whole.width() / 2.0, whole.height()]})).unwrap();
+    tool_key(&mut app, ToolKey::Enter);
+    assert_eq!(app.session.tool_id(), "selection");
+    let b = selected_image(&app).geometric_bounds().unwrap();
+    assert!(
+        (b.x0 - whole.x0).abs() < 1e-6 && (b.width() - whole.width() / 2.0).abs() < 1e-6 && (b.height() - whole.height()).abs() < 1e-6,
+        "{b:?} of {whole:?}"
+    );
+    app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(selected_image(&app).geometric_bounds(), Some(whole), "one undo step");
+    // Without an image selected there's nothing to crop.
+    app.run("select.none", json!({})).unwrap();
+    assert!(!crate::menus::enabled(&app, "ui.cropImage") && app.run("ui.cropImage", json!({})).is_err());
+}
+
+/// Crop Image's Apply and Object › Rasterize say in the status bar when the image couldn't be
+/// decoded, as raster exports do.
+#[test]
+fn crop_and_rasterize_say_in_the_status_bar_when_an_image_could_not_be_decoded() {
+    const WARNING: &str = "an image couldn't be decoded and is missing from the picture";
+    // A PNG whose header reads (so it places at its size) but whose pixel data is cut short.
+    let mut cut = png(100, 50, 72.0);
+    let idat = cut.windows(4).position(|w| w == b"IDAT").unwrap();
+    cut.truncate(idat + 8);
+    let mut app = app();
+    app.run("file.place", json!({"name": "cut.png", "dataBase64": vectorcraft_format::base64_encode(&cut)})).unwrap();
+    let whole = selected_image(&app).geometric_bounds().unwrap();
+    app.run("ui.cropImage", json!({})).unwrap();
+    app.run("tool.setOption", json!({"key": "rect", "value": [whole.x0, whole.y0, whole.width() / 2.0, whole.height()]})).unwrap();
+    app.status("");
+    tool_key(&mut app, vectorcraft_tools::ToolKey::Enter);
+    assert_eq!(app.ui.status, WARNING, "Crop Image's Apply");
+    // Undo puts the image back as placed; then Rasterize runs on it.
+    app.run("edit.undo", json!({})).unwrap();
+    app.status("");
+    app.run("object.rasterize", json!({"ppi": 72})).unwrap();
+    assert_eq!(app.ui.status, WARNING, "Rasterize");
+}
+
+/// One headless frame of the whole window at `time` → how long the app asked to wait before the
+/// next one.
+fn frame_at(app: &mut VectorcraftApp, ctx: &egui::Context, time: f64) -> std::time::Duration {
+    let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))), time: Some(time), ..Default::default() };
+    let mut out = ctx.run_ui(raw, |ui| {
+        app.logic(ui.ctx());
+        app.ui(ui);
+    });
+    out.textures_delta.clear();
+    out.viewport_output.get(&egui::ViewportId::ROOT).map_or(std::time::Duration::MAX, |v| v.repaint_delay)
+}
+
+/// The window sits idle for `secs` from `*time` (a frame now, then only the frames the app asks
+/// for) or until `done` → whether it was.
+fn idle(app: &mut VectorcraftApp, ctx: &egui::Context, time: &mut f64, secs: f64, done: &dyn Fn(&VectorcraftApp) -> bool) -> bool {
+    let end = *time + secs;
+    let real_end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let wait = frame_at(app, ctx, *time);
+        if done(app) {
+            return true;
+        }
+        let next = *time + wait.as_secs_f64().max(1.0 / 60.0);
+        if next > end {
+            *time = end;
+            return false;
+        }
+        // The look runs on a worker thread, in real time: the clock waits for it, else a busy
+        // machine's slow look outlasts the simulated seconds and the test fails at random.
+        if app.session.link_scan.is_some() && std::time::Instant::now() < real_end {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            continue;
+        }
+        *time = next;
+    }
+}
+
+/// A file placed into a document whose last look found no links, then changed by another app
+/// while the window sits idle in the background, follows Update Links: Automatically: the app
+/// wakes itself to see the new link before the change, so the change isn't taken for the file as
+/// first seen.
+#[test]
+fn a_file_placed_while_idle_follows_its_changes() {
+    let mut app = app();
+    app.run("prefs.set", json!({"key": "updateLinks", "value": "automatically"})).unwrap();
+    let ctx = egui::Context::default();
+    let mut time = 0.0;
+    idle(&mut app, &ctx, &mut time, 3.0, &|_| false);
+    // A look finds the new document without links: no wakes of its own for it.
+    assert_eq!(frame_at(&mut app, &ctx, time), std::time::Duration::MAX, "{:?}", ctx.repaint_causes());
+    // Half a second later, before the next look is due, a file is placed. The place itself is a
+    // frame (as any command); then nothing happens for 3 s.
+    time += 0.5;
+    let path = temp_file("idle-watch.png", &png(40, 30, 72.0));
+    app.run("file.place", json!({"path": path})).unwrap();
+    let id = app.session.active().unwrap().selection.objects[0];
+    idle(&mut app, &ctx, &mut time, 3.0, &|_| false);
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let changed = png(60, 30, 72.0);
+    std::fs::write(&path, &changed).unwrap();
+    let hash = vectorcraft_doc::links::hash_bytes(&changed);
+    let updated = |app: &VectorcraftApp| {
+        let st = app.session.active().unwrap();
+        matches!(&st.doc.node(id).unwrap().kind, NodeKind::Image(im) if im.link.as_ref().and_then(|l| l.hash.as_deref()) == Some(hash.as_str()))
+    };
+    assert!(idle(&mut app, &ctx, &mut time, 10.0, &updated), "the changed file was never read again");
 }

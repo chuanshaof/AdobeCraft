@@ -423,6 +423,7 @@ fn font_family(g: &[Pair<'_>]) -> String {
 /// objects but with paper-space art has one paper layout.
 fn layouts(objects: &[Record<'_>], block_records: &HashMap<String, String>, entities: &[Record<'_>]) -> Vec<LayoutDef> {
     let mut paper: Vec<(i64, LayoutDef)> = vec![];
+    let mut seen = std::collections::HashSet::new();
     for r in objects.iter().filter(|r| r.kind == "LAYOUT") {
         // The layout's own groups follow its subclass marker.
         let own = r.g.iter().position(|p| p.code == 100 && p.value.trim() == "AcDbLayout").and_then(|i| r.g.get(i + 1..)).unwrap_or(&[]);
@@ -432,7 +433,7 @@ fn layouts(objects: &[Record<'_>], block_records: &HashMap<String, String>, enti
             continue;
         }
         let Some(block) = block else { continue };
-        if !paper.iter().any(|(_, l)| l.name.eq_ignore_ascii_case(name)) {
+        if seen.insert(name.to_ascii_lowercase()) {
             paper.push((own.int_or(71, i64::MAX), LayoutDef { name: name.to_string(), block: Some(block) }));
         }
     }

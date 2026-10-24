@@ -10,14 +10,15 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use vectorcraft_color::{Color, Paint};
 use vectorcraft_doc::live::{
-    self, BlendDefaults, BlendOrientation, BlendSpacing, BlendSpec, EnvelopeKind, EnvelopeMap, EnvelopeOptions, GradientMesh, MeshAppearance,
-    PreserveShape, Spine,
+    self, BlendDefaults, BlendEase, BlendEaseType, BlendOrientation, BlendSpacing, BlendSpec, EnvelopeKind, EnvelopeMap, EnvelopeOptions,
+    GradientMesh, MeshAppearance, PreserveShape, Spine,
 };
 use vectorcraft_doc::{Appearance, Document, Node, NodeId, NodeKind, Selection};
-use vectorcraft_geom::{Affine, PathData, Point};
+use vectorcraft_geom::{Affine, Anchor, PathData, Point, Vec2};
 
 use super::edit::selected_roots;
 use super::expand::gradient_sampler;
+use super::pathops::Beside;
 use super::*;
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -28,7 +29,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Make",
             ["Object", "Blend"],
             Some("Cmd+Alt+B"),
-            "{ids?, steps?: n | distance?: pt | smooth?: bool, orientation?: page|path (default: the Blend Options set with nothing selected, else smooth colour and page), starts?: [anchor index | null, …] (per object of `ids`, else of the selection in paint order: the anchor of its first subpath the blend starts from; an open path's last anchor runs it the other way)} blend the selected objects (paint order) into a live blend; a blend among them takes the others in as more key objects (keeping its options, name and transparency) instead of nesting → {id}",
+            "{ids?, steps?: n | distance?: pt | smooth?: bool, orientation?: page|path (default: the Blend Options set with nothing selected, else smooth colour and page), starts?: [anchor index | null, …] (per object of `ids`, else of the selection in paint order: the anchor of its first subpath the blend starts from; an open path's last anchor runs it the other way), spacing?: smooth|steps|distance (with value), value?: n, easingType?: easeIn|easeOut|easeInOut|easeOutIn, ramp?: pct (0..100), colorShift?: pct (-100..100; 0: even)} blend the selected objects (paint order) into a live blend; a blend among them takes the others in as more key objects (keeping its options, name and transparency) instead of nesting → {id}",
             has_doc,
             blend_make
         ),
@@ -46,7 +47,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Blend Options…",
             ["Object", "Blend"],
             None,
-            "{spacing?: smooth|steps|distance, value?: n, steps?: n, distance?: pt, orientation?: page|path} set the options of the selected blends; with no blend selected, the options new blends start with (a tool setting, not an undo step) → {defaults?: true}",
+            "{spacing?: smooth|steps|distance, value?: n, steps?: n, distance?: pt, orientation?: page|path, smooth?: bool, easingType?: easeIn|easeOut|easeInOut|easeOutIn, ramp?: pct, colorShift?: pct} set the options of the selected blends; easingType chooses the distribution, ramp sets its strength (0..100; 0 = even), colorShift (-100..100; 0 = even) shifts colours independently of shape/position easing (omitted ones keep their value; out of range is an error); with no blend selected, the options new blends start with (spacing and orientation only; a tool setting, not an undo step) → {defaults?: true}",
             always,
             blend_options
         ),
@@ -82,7 +83,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Blend Info",
             [],
             None,
-            "{} the options of the first selected blend, else those new blends start with → {target: blend|defaults, id?, spacing: smooth|steps|distance, steps, distance, orientation: page|path, keys?: [ids], starts?: [anchor|null], spine?: {anchors: [{x, y, in: [x, y], out: [x, y]}], closed, keyAnchors: [anchor each key sits on] | null (keys spread evenly: a spine from Replace Spine), explicit: false for the straight lines between the key centres}}",
+            "{} the options of the first selected blend, else those new blends start with → {target: blend|defaults, id?, spacing: smooth|steps|distance, steps, distance, orientation: page|path, easingType?: easeIn|easeOut|easeInOut|easeOutIn, ramp?: pct, colorShift?: pct, keys?: [ids], starts?: [anchor|null], spine?: {anchors: [{x, y, in: [x, y], out: [x, y]}], closed, keyAnchors: [anchor each key sits on] | null (keys spread evenly: a spine from Replace Spine), explicit: false for the straight lines between the key centres}}",
             always,
             blend_info
         ),
@@ -94,6 +95,24 @@ pub fn specs() -> Vec<CommandSpec> {
             "{id? (default: the selected blend), anchor: index, x, y, handle?: in|out, independent?: bool} move a point of the blend's spine (its handles along), or with `handle` place that handle's end at (x, y) (a smooth point keeps the other handle in line unless `independent`). A key object sitting on the point moves with it. The first edit turns the straight spine into a path",
             has_doc,
             spine_move_anchor
+        ),
+        cmd!(
+            "object.blend.spine.convertAnchor",
+            "Convert Anchor Point",
+            [],
+            None,
+            "{id? (default: the selected blend), anchor: index, to: smooth|corner, x?, y?} convert a blend spine point: dragging a corner creates symmetric smooth handles, clicking a point with handles retracts both. Without x/y, smooth uses the neighbouring spine points",
+            has_doc,
+            spine_convert_anchor
+        ),
+        cmd!(
+            "object.blend.spine.reshapeSegment",
+            "Reshape Spine Segment",
+            [],
+            None,
+            "{id? (default: the selected blend), segment: index, t: 0..1, dx, dy, perpendicular?: bool} bend a segment of the blend's spine so its point at t moves by (dx, dy), as path.reshapeSegment bends a path's (perpendicular too): a straight spine turns into a curve (#1111)",
+            has_doc,
+            spine_reshape_segment
         ),
         cmd!(
             "object.blend.spine.addAnchor",
@@ -128,7 +147,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Make with Warp…",
             ["Object", "Envelope Distort"],
             Some("Cmd+Alt+Shift+W"),
-            "{ids?, style?: arc|arcLower|arcUpper|arch|bulge|shellLower|shellUpper|flag|wave|fish|rise|fisheye|inflate|squeeze|twist (arc), bend?: % -100..100 (50), h?: horizontal distortion % -100..100 (0), v?: vertical distortion % (0), horizontal?: bool (true) | orientation?: horizontal|vertical} envelope the selected objects with a warp (Envelope Options from object.envelope.options with nothing selected) → {id}",
+            "{ids?, style?: arc|arcLower|arcUpper|arch|bulge|shellLower|shellUpper|flag|wave|fish|rise|fisheye|inflate|squeeze|twist (arc), bend?: % -100..100 (50), h?: horizontal distortion % -100..100 (0), v?: vertical distortion % (0), horizontal?: bool (true) | orientation?: horizontal|vertical, horizontalDistortion?: as h, verticalDistortion?: as v} envelope the selected objects with a warp (Envelope Options from object.envelope.options with nothing selected) → {id}",
             has_selection,
             env_make_warp
         ),
@@ -137,7 +156,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Make with Mesh…",
             ["Object", "Envelope Distort"],
             Some("Cmd+Alt+M"),
-            "{ids?, rows?: 1..50 (4), cols?: 1..50 (4)} envelope the selected objects with a mesh of rows × cols patches → {id}",
+            "{ids?, rows?: 1..50 (4), cols?: 1..50 (4), columns?: as cols} envelope the selected objects with a mesh of rows × cols patches → {id}",
             has_selection,
             env_make_mesh
         ),
@@ -155,7 +174,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Reset with Warp…",
             ["Object", "Envelope Distort"],
             None,
-            "{style?, bend?, h?, v?, horizontal? | orientation? (as makeWithWarp; unset: the envelope's current warp, else arc 50 %)} make the selected envelopes warp envelopes, keeping their content",
+            "{style?, bend?, h?, v?, horizontal? | orientation? (as makeWithWarp; unset: the envelope's current warp, else arc 50 %), horizontalDistortion?: as h, verticalDistortion?: as v} make the selected envelopes warp envelopes, keeping their content",
             has_envelope,
             env_reset_warp
         ),
@@ -164,7 +183,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Reset with Mesh…",
             ["Object", "Envelope Distort"],
             None,
-            "{rows?: 1..50, cols?: 1..50 (unset: a mesh envelope's own, else 4), maintainShape?: bool (true: the mesh follows the current envelope shape; false: a flat grid over the content)} make the selected envelopes mesh envelopes, keeping their content",
+            "{rows?: 1..50, cols?: 1..50 (unset: a mesh envelope's own, else 4), maintainShape?: bool (true: the mesh follows the current envelope shape; false: a flat grid over the content), columns?: as cols} make the selected envelopes mesh envelopes, keeping their content",
             has_envelope,
             env_reset_mesh
         ),
@@ -191,7 +210,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Envelope Options…",
             ["Object", "Envelope Distort"],
             None,
-            "{fidelity?: 0..100, antiAlias?: bool, preserveShape?: clippingMask|transparency, distortAppearance?: bool, distortLinearGradients?: bool, distortPatternFills?: bool (the last two work with distortAppearance), style?, bend?, h?, v?, horizontal? (warp envelopes)} set the selected envelopes' options; with no envelope selected, the options new envelopes get (see object.envelope.info)",
+            "{fidelity?: 0..100, antiAlias?: bool, preserveShape?: clippingMask|transparency, distortAppearance?: bool, distortLinearGradients?: bool, distortPatternFills?: bool (the last two work with distortAppearance), style?, bend?, h?, v?, horizontal? (warp envelopes), horizontalDistortion?: as h, verticalDistortion?: as v, orientation?: horizontal|vertical} set the selected envelopes' options; with no envelope selected, the options new envelopes get (see object.envelope.info)",
             has_doc,
             env_options
         ),
@@ -228,7 +247,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Create Gradient Mesh…",
             ["Object"],
             None,
-            "{ids?, rows?: n (4), cols?: n (4), appearance?: flat|center|edge, highlight?: % (100), at?: [x,y]} convert filled paths into gradient meshes in their fill colour (a gradient fill: the colour it paints at each point), lightened per `appearance` (with `at`: 1×1 mesh plus lines through that point) → {ids, index?}",
+            "{ids?, rows?: n (4), cols?: n (4), appearance?: flat|center|edge, highlight?: % (100), at?: [x,y], columns?: as cols} convert filled paths into gradient meshes in their fill colour (a gradient fill: the colour it paints at each point), lightened per `appearance` (with `at`: 1×1 mesh plus lines through that point); an embedded image becomes a mesh over its rectangle (its transform kept) whose points take the average colour and opacity of the picture around them (a linked image is refused: embed it first) → {ids, index?}",
             has_selection,
             mesh_create
         ),
@@ -237,7 +256,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Set Mesh Point Color",
             [],
             None,
-            "{id, index, color, opacity?: 0..1} colour of one mesh point",
+            "{id, index, color, keepModel?: bool (as paint.setFill), opacity?: 0..1} colour of one mesh point",
             has_doc,
             mesh_set_color
         ),
@@ -255,7 +274,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add Mesh Line",
             [],
             None,
-            "{id, x, y, color?} add a row and a column through (x, y) to a gradient mesh (new point in `color`) or a mesh envelope → {index}",
+            "{id, x, y, color?, keepModel?: bool (as paint.setFill)} add a row and a column through (x, y) to a gradient mesh (new point in `color`) or a mesh envelope → {index}",
             has_doc,
             mesh_add_line
         ),
@@ -351,14 +370,11 @@ fn has_mesh(s: &Session) -> std::result::Result<(), String> {
 
 /// Wrap `roots` (paint order) into a new node built by `make`, placed where the topmost root was.
 fn wrap(d: &mut Document, sel: &mut Selection, roots: &[NodeId], make: impl FnOnce(NodeId, Vec<Arc<Node>>) -> Node) -> Result<NodeId> {
-    let top = *roots.last().ok_or_else(|| EngineError::Other("nothing to wrap".into()))?;
-    let (par, idx, _) = d.position(top).ok_or(EngineError::NoNode(top))?;
-    let nodes: Vec<Arc<Node>> = roots.iter().filter_map(|id| d.node(*id).cloned()).map(Arc::new).collect();
-    let id = d.alloc_id();
-    d.insert(par, idx + 1, make(id, nodes))?;
-    for r in roots {
-        d.remove(*r)?;
+    if roots.is_empty() {
+        return Err(EngineError::Other("nothing to wrap".into()));
     }
+    let id = d.alloc_id();
+    d.wrap(roots, |nodes| make(id, nodes))?;
     sel.set([id]);
     Ok(id)
 }
@@ -376,7 +392,7 @@ fn replace_with(d: &mut Document, id: NodeId, nodes: Vec<Node>) -> Result<Vec<No
 }
 
 /// Fresh ids for any id-0 (generated) node in `n`'s subtree; keeps real ids.
-fn fix_ids(d: &mut Document, n: &mut Node) {
+pub(super) fn fix_ids(d: &mut Document, n: &mut Node) {
     if n.id == NodeId(0) {
         n.id = d.alloc_id();
     }
@@ -394,20 +410,26 @@ const DEFAULT_STEPS: u32 = 5;
 const DEFAULT_DISTANCE: f64 = 10.0;
 
 fn spacing_param(p: &Value, cmd: &str, current: BlendSpacing) -> Result<BlendSpacing> {
+    check_numbers(p, &["value", "steps", "distance"], cmd)?;
+    let smooth = switch_or(p, "smooth", false, cmd)?;
     let num = |k: &str| p.get(k).and_then(Value::as_f64);
+    let steps = |k: &str, n: f64| whole(n, k, cmd).map(|n| BlendSpacing::Steps(n as u32));
     let mode = str_param(p, "spacing");
     let value = num("value");
     let sp = match mode {
         Some("smooth") | Some("smoothColor") => BlendSpacing::SmoothColor,
-        Some("steps") => BlendSpacing::Steps(value.or(num("steps")).unwrap_or(DEFAULT_STEPS as f64) as u32),
+        Some("steps") => match value {
+            Some(v) => steps("value", v)?,
+            None => steps("steps", num("steps").unwrap_or(DEFAULT_STEPS as f64))?,
+        },
         Some("distance") => BlendSpacing::Distance(value.or(num("distance")).unwrap_or(DEFAULT_DISTANCE)),
         Some(o) => return Err(bad(cmd, format!("unknown spacing `{o}` (smooth|steps|distance)"))),
         None => {
             if let Some(n) = num("steps") {
-                BlendSpacing::Steps(n as u32)
+                steps("steps", n)?
             } else if let Some(d) = num("distance") {
                 BlendSpacing::Distance(d)
-            } else if bool_or(p, "smooth", false) {
+            } else if smooth {
                 BlendSpacing::SmoothColor
             } else {
                 current
@@ -426,6 +448,32 @@ fn orientation_param(p: &Value, current: BlendOrientation) -> BlendOrientation {
         Some("path") | Some("alignToPath") => BlendOrientation::AlignToPath,
         Some("page") | Some("alignToPage") => BlendOrientation::AlignToPage,
         _ => current,
+    }
+}
+
+/// Blend panel Type and Ramp, validated before any document mutation.
+fn ease_param(p: &Value, cmd: &str, current: BlendEase) -> Result<BlendEase> {
+    let kind = match p.get("easingType").filter(|v| !v.is_null()) {
+        None => current.kind,
+        Some(v) => match v.as_str() {
+            Some("easeIn") => BlendEaseType::In,
+            Some("easeOut") => BlendEaseType::Out,
+            Some("easeInOut") => BlendEaseType::InOut,
+            Some("easeOutIn") => BlendEaseType::OutIn,
+            _ => return Err(bad(cmd, "easingType must be easeIn, easeOut, easeInOut or easeOutIn")),
+        },
+    };
+    Ok(BlendEase { kind, ramp: percent_param(p, cmd, "ramp", current.ramp * 100.0, 0.0)? / 100.0 })
+}
+
+/// Bounded percentage input; missing or null preserves the current value.
+fn percent_param(p: &Value, cmd: &str, key: &str, current: f64, min: f64) -> Result<f64> {
+    match p.get(key).filter(|v| !v.is_null()) {
+        None => Ok(current),
+        Some(v) => v
+            .as_f64()
+            .filter(|n| n.is_finite() && (min..=100.0).contains(n))
+            .ok_or_else(|| bad(cmd, format!("{key} must be a percentage {min}..100"))),
     }
 }
 
@@ -511,6 +559,12 @@ fn blend_make(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let spacing = spacing_param(p, C, cur.spacing)?;
     let orientation = orientation_param(p, cur.orientation);
+    let (ease0, color0) = match base.as_ref().map(|n| &n.kind) {
+        Some(NodeKind::Blend { spec, .. }) => (spec.ease, spec.color_shift),
+        _ => Default::default(),
+    };
+    let ease = ease_param(p, C, ease0)?;
+    let color_shift = percent_param(p, C, "colorShift", color0, -100.0)?;
     let id = s.edit("Make Blend", |d, sel| {
         wrap(d, sel, &roots, |id, nodes| {
             let (children, starts) = merge_keys(nodes, &starts);
@@ -521,12 +575,12 @@ fn blend_make(s: &mut Session, p: &Value) -> Result<Value> {
                 n.knockout = vectorcraft_doc::Knockout::On;
                 n
             });
-            let mut spec = BlendSpec { spacing, orientation, starts, ..Default::default() };
+            let mut spec = BlendSpec { spacing, orientation, ease, color_shift, starts, ..Default::default() };
             if let NodeKind::Blend { children: old, spec: old_spec } = &n.kind {
                 extend_spine(&mut spec, old, old_spec, &children);
             }
             n.id = id;
-            n.kind = NodeKind::Blend { children, spec };
+            n.kind = NodeKind::Blend { children, spec: Box::new(spec) };
             n
         })
     })?;
@@ -537,6 +591,7 @@ fn blend_release(s: &mut Session, _: &Value) -> Result<Value> {
     let blends = selected_of(s, is_blend);
     let (ids, spines, groups) = s.edit("Release Blend", |d, sel| {
         let (mut keys, mut spines, mut groups) = (vec![], vec![], vec![]);
+        let mut released = Beside::replacing(d, &blends);
         for b in &blends {
             let Some(n) = d.node(*b).cloned() else { continue };
             let NodeKind::Blend { children, spec } = &n.kind else { continue };
@@ -554,7 +609,7 @@ fn blend_release(s: &mut Session, _: &Value) -> Result<Value> {
                 || n.opacity < 1.0
                 || n.blend != vectorcraft_color::BlendMode::Normal
                 || n.isolate
-                || n.mask.is_some()
+                || n.extras().mask.is_some()
                 || !n.appearance.items.is_empty()
                 || !n.appearance.effects.is_empty()
             {
@@ -563,8 +618,9 @@ fn blend_release(s: &mut Session, _: &Value) -> Result<Value> {
                 groups.push(g.id);
                 nodes = vec![g];
             }
-            replace_with(d, *b, nodes)?;
+            released.put(d, *b, nodes)?;
         }
+        released.finish(d)?;
         if groups.is_empty() {
             sel.set(spines.iter().chain(&keys).copied());
         } else {
@@ -620,7 +676,7 @@ fn spine_move_anchor(s: &mut Session, p: &Value) -> Result<Value> {
         Some("in") => Some(false),
         Some(_) => return Err(bad(C, "handle must be in or out")),
     };
-    let independent = bool_or(p, "independent", false);
+    let independent = switch_or(p, "independent", false, C)?;
     edit_spine(s, p, C, "Reshape Spine", |sp, anchors, keys| {
         let a = sp.anchors.get_mut(index).ok_or_else(|| bad(C, "no such spine point"))?;
         if let Some(out) = handle {
@@ -636,6 +692,53 @@ fn spine_move_anchor(s: &mut Session, p: &Value) -> Result<Value> {
             }
         }
         Ok(())
+    })?;
+    ok()
+}
+
+fn spine_convert_anchor(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "object.blend.spine.convertAnchor";
+    let index = index_param(p, "anchor", C)?;
+    let smooth = match str_param(p, "to") {
+        Some("smooth") => true,
+        Some("corner") => false,
+        _ => return Err(bad(C, "to must be smooth or corner")),
+    };
+    let target = match (p.get("x"), p.get("y")) {
+        (None, None) => None,
+        (Some(_), Some(_)) => Some(finite_point(p, C)?),
+        _ => return Err(bad(C, "x and y must be given together")),
+    };
+    edit_spine(s, p, C, "Convert Anchor Point", |sp, _, _| {
+        if smooth && target.is_none() {
+            if index >= sp.anchors.len() {
+                return Err(bad(C, "no such spine point"));
+            }
+            vectorcraft_tools::draw2::curvature_smooth(sp, index);
+            return Ok(());
+        }
+        let a = sp.anchors.get_mut(index).ok_or_else(|| bad(C, "no such spine point"))?;
+        match target {
+            Some(q) if smooth && q.distance(a.p) > 1e-9 => *a = Anchor::smooth(a.p, q),
+            _ => a.retract(),
+        }
+        Ok(())
+    })?;
+    ok()
+}
+
+fn spine_reshape_segment(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "object.blend.spine.reshapeSegment";
+    let seg = index_param(p, "segment", C)?;
+    let t = number_or(p, "t", 0.5, C)?.clamp(0.05, 0.95);
+    let dv = Vec2::new(number_or(p, "dx", 0.0, C)?, number_or(p, "dy", 0.0, C)?);
+    if !(t.is_finite() && dv.x.is_finite() && dv.y.is_finite() && dv.hypot() < 1e9) {
+        return Err(bad(C, "t, dx and dy must be finite"));
+    }
+    let perpendicular = switch_or(p, "perpendicular", false, C)?;
+    edit_spine(s, p, C, "Reshape Spine", |sp, _, _| {
+        let bent = if perpendicular { sp.bend_segment_perpendicular(seg, t, dv) } else { sp.bend_segment(seg, t, dv) };
+        if bent { Ok(()) } else { Err(bad(C, "no such spine segment")) }
     })?;
     ok()
 }
@@ -693,7 +796,7 @@ fn edit_blends(s: &mut Session, label: &str, f: impl Fn(&mut Vec<Arc<Node>>, &mu
 fn selected_spec(s: &Session) -> Option<(NodeId, BlendSpec, Vec<NodeId>)> {
     let b = *selected_of(s, is_blend).first()?;
     match &s.doc().ok()?.doc.node(b)?.kind {
-        NodeKind::Blend { spec, children } => Some((b, spec.clone(), children.iter().map(|c| c.id).collect())),
+        NodeKind::Blend { spec, children } => Some((b, (**spec).clone(), children.iter().map(|c| c.id).collect())),
         _ => None,
     }
 }
@@ -701,7 +804,10 @@ fn selected_spec(s: &Session) -> Option<(NodeId, BlendSpec, Vec<NodeId>)> {
 fn blend_options(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "object.blend.options";
     let Some((_, cur, _)) = selected_spec(s) else {
-        // Nothing to set them on: the options new blends start with.
+        if ["easingType", "ramp", "colorShift"].iter().any(|key| p.get(*key).is_some_and(|v| !v.is_null())) {
+            return Err(bad(C, "select a blend to set easing or color shift"));
+        }
+        // Nothing to set them on: the options new blends start with (easing is per blend).
         let d = s.prefs.blend_options.unwrap_or_default();
         let spacing = spacing_param(p, C, d.spacing)?;
         s.prefs.blend_options = Some(BlendDefaults { spacing, orientation: orientation_param(p, d.orientation) });
@@ -709,9 +815,13 @@ fn blend_options(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let spacing = spacing_param(p, C, cur.spacing)?;
     let orientation = orientation_param(p, cur.orientation);
+    let ease = ease_param(p, C, cur.ease)?;
+    let color_shift = percent_param(p, C, "colorShift", cur.color_shift, -100.0)?;
     edit_blends(s, "Blend Options", |_, spec| {
         spec.spacing = spacing;
         spec.orientation = orientation;
+        spec.ease = ease;
+        spec.color_shift = color_shift;
     })
 }
 
@@ -733,6 +843,9 @@ fn blend_info(s: &mut Session, _: &Value) -> Result<Value> {
             let mut v = blend_options_json(spec.spacing, spec.orientation);
             v["target"] = json!("blend");
             v["id"] = json!(id.0);
+            v["easingType"] = json!(spec.ease.kind.id());
+            v["ramp"] = json!(spec.ease.ramp * 100.0);
+            v["colorShift"] = json!(spec.color_shift);
             v["starts"] = json!((0..keys.len()).map(|i| spec.start(i)).collect::<Vec<_>>());
             v["keys"] = json!(keys.iter().map(|k| k.0).collect::<Vec<_>>());
             if let Some(NodeKind::Blend { children, .. }) = s.doc()?.doc.node(id).map(|n| &n.kind)
@@ -902,7 +1015,11 @@ fn blend_reverse_stack(s: &mut Session, _: &Value) -> Result<Value> {
 
 // ---------- Envelope ----------
 
+/// The number keys of a warp: `bend`, and the two distortions by their short and long names.
+const WARP_NUMBERS: &[&str] = &["bend", "h", "v", "horizontalDistortion", "verticalDistortion"];
+
 fn warp_kind(p: &Value, cmd: &str, cur: Option<&EnvelopeKind>) -> Result<EnvelopeKind> {
+    check_numbers(p, WARP_NUMBERS, cmd)?;
     let (mut style, mut bend, mut h, mut v, mut horizontal) = ("arc".to_string(), 50.0, 0.0, 0.0, true);
     if let Some(EnvelopeKind::Warp { style: s0, bend: b0, h: h0, v: v0, horizontal: z0 }) = cur {
         (style, bend, h, v, horizontal) = (s0.clone(), *b0, *h0, *v0, *z0);
@@ -917,10 +1034,11 @@ fn warp_kind(p: &Value, cmd: &str, cur: Option<&EnvelopeKind>) -> Result<Envelop
     bend = f64_or(p, "bend", bend).clamp(-100.0, 100.0);
     h = f64_or(p, "h", f64_or(p, "horizontalDistortion", h)).clamp(-100.0, 100.0);
     v = f64_or(p, "v", f64_or(p, "verticalDistortion", v)).clamp(-100.0, 100.0);
+    let given = switch_or(p, "horizontal", horizontal, cmd)?;
     horizontal = match str_param(p, "orientation") {
         Some("vertical") => false,
         Some("horizontal") => true,
-        _ => bool_or(p, "horizontal", horizontal),
+        _ => given,
     };
     Ok(EnvelopeKind::Warp { style, bend, h, v, horizontal })
 }
@@ -931,17 +1049,19 @@ fn envelope_defaults(s: &Session) -> (EnvelopeOptions, f64) {
 }
 
 fn envelope(id: NodeId, content: Vec<Arc<Node>>, kind: EnvelopeKind, (options, fidelity): (EnvelopeOptions, f64)) -> Node {
-    Node::new(id, NodeKind::Envelope { content, kind, fidelity, editing: false, options, frame: Affine::IDENTITY })
+    Node::new(id, NodeKind::Envelope { content, kind: Box::new(kind), fidelity, editing: false, options, frame: Box::new(Affine::IDENTITY) })
 }
 
-/// `rows` and `cols` (or `columns`), 1..50 each, defaulting to `default`.
+/// `rows` and `cols` (or `columns`), whole numbers 1..50 each, defaulting to `default`.
 fn rows_cols(p: &Value, cmd: &str, default: (u32, u32)) -> Result<(u32, u32)> {
+    check_numbers(p, &["rows", "cols", "columns"], cmd)?;
     let rows = f64_or(p, "rows", default.0 as f64);
-    let cols = f64_or(p, "cols", f64_or(p, "columns", default.1 as f64));
+    let cols_key = if p.get("cols").and_then(Value::as_f64).is_some() { "cols" } else { "columns" };
+    let cols = f64_or(p, cols_key, default.1 as f64);
     if !(1.0..=50.0).contains(&rows) || !(1.0..=50.0).contains(&cols) {
         return Err(bad(cmd, "rows and cols must be 1..50"));
     }
-    Ok((rows as u32, cols as u32))
+    Ok((whole(rows, "rows", cmd)? as u32, whole(cols, cols_key, cmd)? as u32))
 }
 
 fn env_make_warp(s: &mut Session, p: &Value) -> Result<Value> {
@@ -1027,7 +1147,7 @@ fn set_kinds(s: &mut Session, label: &str, kinds: Vec<(NodeId, EnvelopeKind)>) -
     s.edit(label, |d, _| {
         for (e, k) in kinds {
             if let Some(NodeKind::Envelope { kind, .. }) = d.node_mut(e).map(|n| &mut n.kind) {
-                *kind = k;
+                **kind = k;
             }
         }
         Ok(())
@@ -1043,7 +1163,7 @@ fn env_reset_warp(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn env_reset_mesh(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "object.envelope.resetWithMesh";
-    let maintain = bool_or(p, "maintainShape", true);
+    let maintain = switch_or(p, "maintainShape", true, C)?;
     let kinds = reshaped(s, |env, kind| {
         let own = match kind {
             EnvelopeKind::Mesh { rows, cols, .. } => (*rows, *cols),
@@ -1074,11 +1194,11 @@ fn options_param(p: &Value, cmd: &str, cur: EnvelopeOptions) -> Result<EnvelopeO
         None => cur.preserve_shape,
     };
     Ok(EnvelopeOptions {
-        anti_alias: bool_or(p, "antiAlias", cur.anti_alias),
+        anti_alias: switch_or(p, "antiAlias", cur.anti_alias, cmd)?,
         preserve_shape,
-        distort_appearance: bool_or(p, "distortAppearance", cur.distort_appearance),
-        distort_linear_gradients: bool_or(p, "distortLinearGradients", cur.distort_linear_gradients),
-        distort_pattern_fills: bool_or(p, "distortPatternFills", cur.distort_pattern_fills),
+        distort_appearance: switch_or(p, "distortAppearance", cur.distort_appearance, cmd)?,
+        distort_linear_gradients: switch_or(p, "distortLinearGradients", cur.distort_linear_gradients, cmd)?,
+        distort_pattern_fills: switch_or(p, "distortPatternFills", cur.distort_pattern_fills, cmd)?,
     })
 }
 
@@ -1089,7 +1209,7 @@ fn env_info(s: &mut Session, _: &Value) -> Result<Value> {
         let (options, fidelity) = envelope_defaults(s);
         return Ok(envelope_options_json(json!({ "id": null }), &options, fidelity));
     };
-    let v = match kind {
+    let v = match &**kind {
         EnvelopeKind::Warp { style, bend, h, v, horizontal } => {
             json!({"type": "warp", "style": style, "bend": bend, "h": h, "v": v, "horizontal": horizontal})
         }
@@ -1133,7 +1253,7 @@ fn carry_transparency(d: &mut Document, env: &Node, mut nodes: Vec<Node>) -> Vec
         n.isolate = env.isolate;
         n.knockout = env.knockout;
         n.knockout_shape = env.knockout_shape;
-        n.mask = env.mask.clone();
+        n.extras_mut().mask = env.extras().mask.clone();
     };
     if let [one] = nodes.as_mut_slice()
         && one.has_default_transparency()
@@ -1150,6 +1270,7 @@ fn env_release(s: &mut Session, _: &Value) -> Result<Value> {
     let envs = selected_of(s, is_envelope);
     let ids = s.edit("Release Envelope", |d, sel| {
         let mut out = vec![];
+        let mut released = Beside::replacing(d, &envs);
         for e in &envs {
             let Some(n) = d.node(*e).cloned() else { continue };
             let NodeKind::Envelope { content, kind, .. } = &n.kind else { continue };
@@ -1158,8 +1279,10 @@ fn env_release(s: &mut Session, _: &Value) -> Result<Value> {
                 shape.id = d.alloc_id();
                 nodes.push(shape);
             }
-            out.extend(replace_with(d, *e, nodes)?);
+            out.extend(nodes.iter().map(|c| c.id));
+            released.put(d, *e, nodes)?;
         }
+        released.finish(d)?;
         sel.set(out.iter().copied());
         Ok(out)
     })?;
@@ -1168,6 +1291,9 @@ fn env_release(s: &mut Session, _: &Value) -> Result<Value> {
 
 fn env_options(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "object.envelope.options";
+    check_numbers(p, &["fidelity"], C)?;
+    check_numbers(p, WARP_NUMBERS, C)?;
+    check_switches(p, &["horizontal"], C)?;
     let fid = p.get("fidelity").and_then(Value::as_f64);
     if fid.is_some_and(|f| !(0.0..=100.0).contains(&f)) {
         return Err(bad(C, "fidelity must be 0..100"));
@@ -1184,8 +1310,8 @@ fn env_options(s: &mut Session, p: &Value) -> Result<Value> {
     let mut updates = vec![];
     for e in &envs {
         if let Some(NodeKind::Envelope { kind, options, fidelity, .. }) = doc.node(*e).map(|n| &n.kind) {
-            let kind = match kind {
-                EnvelopeKind::Warp { .. } => warp_kind(p, C, Some(kind))?,
+            let kind = match &**kind {
+                k @ EnvelopeKind::Warp { .. } => warp_kind(p, C, Some(k))?,
                 k => k.clone(),
             };
             updates.push((*e, kind, options_param(p, C, *options)?, fid.unwrap_or(*fidelity)));
@@ -1194,7 +1320,7 @@ fn env_options(s: &mut Session, p: &Value) -> Result<Value> {
     s.edit("Envelope Options", |d, _| {
         for (e, k, o, f) in updates {
             if let Some(NodeKind::Envelope { kind, options, fidelity, .. }) = d.node_mut(e).map(|n| &mut n.kind) {
-                (*kind, *options, *fidelity) = (k, o, f);
+                (**kind, *options, *fidelity) = (k, o, f);
             }
         }
         Ok(())
@@ -1208,6 +1334,8 @@ fn expand_envelope(d: &mut Document, id: NodeId) -> Result<()> {
     let n = d.node(id).cloned().ok_or(EngineError::NoNode(id))?;
     let mut g = vectorcraft_render::effects::expanded_live_group(Some(d), &n);
     fix_ids(d, &mut g);
+    // Outlined type's emoji take their pixels into the document.
+    d.adopt_pixels(&mut g);
     // Outlined type repeats its object's id on its pieces.
     vectorcraft_render::effects::fresh_ids(d, &mut g, &mut Default::default());
     *d.node_mut(id).ok_or(EngineError::NoNode(id))? = g;
@@ -1249,9 +1377,10 @@ fn env_expand(s: &mut Session, _: &Value) -> Result<Value> {
 }
 
 fn env_edit_contents(s: &mut Session, p: &Value) -> Result<Value> {
+    const C: &str = "object.envelope.editContents";
     let envs = selected_of(s, is_envelope);
     let cur = matches!(envs.first().and_then(|e| s.doc().ok()?.doc.node(*e)).map(|n| &n.kind), Some(NodeKind::Envelope { editing: true, .. }));
-    let want = bool_or(p, "editing", !cur);
+    let want = switch_or(p, "editing", !cur, C)?;
     s.edit(if want { "Edit Contents" } else { "Edit Envelope" }, |d, sel| {
         let mut content_ids = vec![];
         for e in &envs {
@@ -1275,11 +1404,14 @@ fn env_edit_contents(s: &mut Session, p: &Value) -> Result<Value> {
 fn env_set_mesh_point(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "object.envelope.setMeshPoint";
     let id = id_param(p, "id").ok_or_else(|| bad(C, "missing `id`"))?;
-    let index = f64_req(p, "index", C)? as usize;
+    let index = index_param(p, "index", C)?;
     let q = Point::new(f64_req(p, "x", C)?, f64_req(p, "y", C)?);
     let handle = handle_param(p, C)?;
     s.edit("Move Envelope Point", |d, _| {
-        let Some(NodeKind::Envelope { kind: EnvelopeKind::Mesh { rows, cols, points, handles }, .. }) = d.node_mut(id).map(|n| &mut n.kind) else {
+        let Some(NodeKind::Envelope { kind, .. }) = d.node_mut(id).map(|n| &mut n.kind) else {
+            return Err(bad(C, "not a mesh envelope point"));
+        };
+        let EnvelopeKind::Mesh { rows, cols, points, handles } = &mut **kind else {
             return Err(bad(C, "not a mesh envelope point"));
         };
         let at = *points.get(index).ok_or_else(|| bad(C, "not a mesh envelope point"))?;
@@ -1310,25 +1442,45 @@ fn mesh_create(s: &mut Session, p: &Value) -> Result<Value> {
         Some(a) => MeshAppearance::parse(a).ok_or_else(|| bad(C, "appearance must be flat|center|edge"))?,
         None => MeshAppearance::Flat,
     };
+    check_numbers(p, &["highlight"], C)?;
     let highlight = f64_or(p, "highlight", 100.0).clamp(0.0, 100.0);
-    let at = point_param(p, "at");
+    let at = match p.get("at") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(finite_numbers(v).map(|[x, y]| Point::new(x, y)).ok_or_else(|| bad(C, "`at` must be [x, y]"))?),
+    };
     let (rows, cols) = if at.is_some() { (1, 1) } else { (rows, cols) };
     let roots = roots_param(s, p)?;
     let (ids, index) = s.edit("Create Gradient Mesh", |d, sel| {
         let mut out = vec![];
         let mut index = None;
+        let mut refused = None;
+        let model = d.color_mode.model();
         for id in &roots {
             let Some(n) = d.node(*id).cloned() else { continue };
-            let Some(path) = outline_of(&n) else { continue };
-            let m = match n.appearance.fill_paint() {
-                // The points take the colours the gradient paints there.
-                Paint::Gradient(g) => {
-                    path.bounds().and_then(|b| GradientMesh::for_path_with(&path, rows, cols, &*gradient_sampler(&g, b))).map(|mut m| {
+            let m = if let NodeKind::Image(im) = &n.kind {
+                // An embedded image: the points take the picture's colours there.
+                match image_mesh(d, im, rows, cols) {
+                    Ok(mut m) => {
                         m.highlight(app, highlight);
-                        m
-                    })
+                        Some(m)
+                    }
+                    Err(why) => {
+                        refused.get_or_insert(why);
+                        continue;
+                    }
                 }
-                p => GradientMesh::for_path(&path, rows, cols, p.color().unwrap_or(Color::WHITE), app, highlight),
+            } else {
+                let Some(path) = outline_of(&n) else { continue };
+                match n.appearance.fill_paint() {
+                    // The points take the colours the gradient paints there.
+                    Paint::Gradient(g) => {
+                        path.bounds().and_then(|b| GradientMesh::for_path_with(&path, rows, cols, &*gradient_sampler(&g, b, model))).map(|mut m| {
+                            m.highlight(app, highlight);
+                            m
+                        })
+                    }
+                    p => GradientMesh::for_path(&path, rows, cols, p.color().unwrap_or(Color::WHITE), app, highlight),
+                }
             };
             let Some(mut m) = m else { continue };
             if let Some(q) = at {
@@ -1344,7 +1496,7 @@ fn mesh_create(s: &mut Session, p: &Value) -> Result<Value> {
             out.push(*id);
         }
         if out.is_empty() {
-            return Err(bad(C, "select a path or compound path"));
+            return Err(bad(C, refused.unwrap_or("select a path, a compound path or an embedded image")));
         }
         sel.set(out.iter().copied());
         Ok((out, index))
@@ -1356,6 +1508,31 @@ fn mesh_create(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(r)
 }
 
+/// Create Gradient Mesh on an embedded image: a `rows` × `cols` mesh over the picture's rectangle
+/// (placed with the image's transform), each point taking the average colour and opacity of the
+/// area around it. Linked images are refused: the documentation allows embedded ones only.
+fn image_mesh(d: &Document, im: &vectorcraft_doc::ImageObject, rows: u32, cols: u32) -> std::result::Result<GradientMesh, &'static str> {
+    if im.link.is_some() {
+        return Err("a linked image can't become a gradient mesh: embed it first");
+    }
+    let xf = im.xf.as_coeffs();
+    if im.width == 0 || im.height == 0 || !xf.iter().all(|k| k.is_finite()) {
+        return Err("the image has no usable size or position");
+    }
+    let samples = d.images.get(&im.key).and_then(|b| b.grid_samples(rows, cols)).ok_or("the image's pixels can't be read")?;
+    let (w, h) = (im.width as f64, im.height as f64);
+    let at = |u: f64, v: f64| im.xf * Point::new(u * w, v * h);
+    if ![at(0.0, 0.0), at(1.0, 0.0), at(0.0, 1.0), at(1.0, 1.0)].iter().all(|p| p.x.abs() < 1e15 && p.y.abs() < 1e15) {
+        return Err("the image has no usable size or position");
+    }
+    let cols_n = cols as usize + 1;
+    let steps = |n: u32| (0..=n).map(|i| i as f64 / n as f64).collect::<Vec<_>>();
+    Ok(GradientMesh::from_grid(&steps(cols), &steps(rows), &at, &|r, c, _| {
+        let [pr, pg, pb, pa] = samples.get(r * cols_n + c).copied().unwrap_or([0; 4]);
+        (Color::rgb8(pr, pg, pb), pa as f32 / 255.0)
+    }))
+}
+
 /// Run `f` on the gradient mesh `p.id` (one undo step `label`); with `envelopes`, a mesh
 /// envelope's grid too (its points and handles are written back: editing fills in the handles).
 fn with_mesh<T>(s: &mut Session, p: &Value, cmd: &str, label: &str, envelopes: bool, f: impl FnOnce(&mut GradientMesh) -> Result<T>) -> Result<T> {
@@ -1363,7 +1540,10 @@ fn with_mesh<T>(s: &mut Session, p: &Value, cmd: &str, label: &str, envelopes: b
     let c = cmd.to_string();
     s.edit(label, move |d, _| match d.node_mut(id).map(|n| &mut n.kind) {
         Some(NodeKind::Mesh(m)) => f(m),
-        Some(NodeKind::Envelope { kind: EnvelopeKind::Mesh { rows, cols, points, handles }, .. }) if envelopes => {
+        Some(NodeKind::Envelope { kind, .. }) if envelopes && matches!(**kind, EnvelopeKind::Mesh { .. }) => {
+            let EnvelopeKind::Mesh { rows, cols, points, handles } = &mut **kind else {
+                return Err(bad(&c, "not a gradient mesh or mesh envelope"));
+            };
             let mut m = live::envelope_grid(*rows, *cols, points, handles).ok_or_else(|| bad(&c, "the envelope's mesh is malformed"))?;
             let r = f(&mut m)?;
             (*rows, *cols) = (m.rows, m.cols);
@@ -1392,13 +1572,20 @@ fn index_param(p: &Value, key: &str, cmd: &str) -> Result<usize> {
     if i < 0.0 {
         return Err(bad(cmd, "index must be ≥ 0"));
     }
-    Ok(i as usize)
+    Ok(whole(i, key, cmd)? as usize)
+}
+
+/// `x`, the value of `key`, when it is a whole number, and an error otherwise.
+fn whole(x: f64, key: &str, cmd: &str) -> Result<f64> {
+    if x.fract() == 0.0 { Ok(x) } else { Err(bad(cmd, format!("`{key}` must be a whole number"))) }
 }
 
 fn mesh_set_color(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "object.mesh.setPointColor";
+    check_numbers(p, &["opacity"], C)?;
+    super::paint::check_keep_model(p, C)?;
     let index = index_param(p, "index", C)?;
-    let color = p.get("color").and_then(color_value);
+    let color = p.get("color").and_then(color_value).map(|c| super::paint::new_color(s, p, c));
     let opacity = p.get("opacity").and_then(Value::as_f64);
     if color.is_none() && opacity.is_none() {
         return Err(bad(C, "missing `color` or `opacity`"));
@@ -1435,7 +1622,8 @@ fn mesh_move_point(s: &mut Session, p: &Value) -> Result<Value> {
 fn mesh_add_line(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "object.mesh.addLine";
     let q = Point::new(f64_req(p, "x", C)?, f64_req(p, "y", C)?);
-    let color = p.get("color").and_then(color_value);
+    super::paint::check_keep_model(p, C)?;
+    let color = p.get("color").and_then(color_value).map(|c| super::paint::new_color(s, p, c));
     let index = with_mesh(s, p, C, "Add Mesh Line", true, |m| {
         let i = m.add_lines_at(q).ok_or_else(|| bad(C, "point is outside the mesh"))?;
         if let Some(c) = color {

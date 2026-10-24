@@ -311,6 +311,22 @@ fn view_toggles_redraw_without_dirtying() {
     s.execute("view.overprintPreview", &json!({"on": false})).unwrap();
 }
 
+#[test]
+fn proof_setup_simulates_tritanopia() {
+    let _g = GLOBAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut s = session();
+    rect(&mut s, 0.0, 0.0, 100.0, 100.0, json!("#0000ff"));
+    let r = s.execute("view.proofSetup", &json!({"target": "tritanopia", "proof": true})).unwrap();
+    assert_eq!(r["target"], "tritanopia");
+    let setup = vectorcraft_render::proof::active_proof().unwrap();
+    assert_eq!(setup.target, ProofTarget::Tritanopia);
+    let doc = s.doc().unwrap().doc.clone();
+    let px = render(&doc, RenderOptions { proof: Some(setup), ..Default::default() }).pixel(50, 50);
+    // A tritanope sees blue as a dark teal.
+    assert!(px[0] < 8 && px[1] > 80 && px[2] > 110 && px[2] < 150, "{px:?}");
+    s.execute("view.proofSetup", &json!({"target": "workingCmyk", "proof": false})).unwrap();
+}
+
 /// Whether the content has a DeviceCMYK fill/stroke operator (`c m y k k` / `K`).
 fn has_cmyk_op(pdf: &str) -> bool {
     let toks: Vec<&str> = pdf.split_ascii_whitespace().collect();

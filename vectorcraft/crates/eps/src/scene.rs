@@ -9,7 +9,7 @@ use std::sync::Arc;
 use kurbo::Shape;
 use vectorcraft_color::{BlendMode, Color, GradientKind, GradientPaint, Paint};
 use vectorcraft_doc::{
-    AppearanceItem, ColorMode, Document, Effect, ImageObject, LineCap, LineJoin, Node, NodeKind, StrokeAlign, StrokeLayer, TextObject,
+    AppearanceItem, ColorMode, Document, Effect, ImageBlob, LineCap, LineJoin, Node, NodeKind, StrokeAlign, StrokeLayer, SymbolBoxes, TextObject,
 };
 use vectorcraft_effects::stroke::{self, WrittenShape};
 use vectorcraft_geom::{Affine, BezPath, FillRule, PathData, Point, Rect, Vec2};
@@ -33,6 +33,10 @@ const TRANSPARENCY: &str =
 const RASTER_FX: &str = "raster effects (shadows, glows, blurs, feathering) are left out: EPS has no transparency, flatten them first";
 const IMAGE_ALPHA_L2: &str = "transparent image pixels are written white at PostScript Level 2 (Level 3 masks them out)";
 const IMAGE_PARTLY: &str = "partly transparent image pixels are written over white";
+/// The warning for an image left out because it can't be decoded: the note raster exports give
+/// (`vectorcraft-engine`'s `rasterfx::undecoded_warning`).
+const UNDECODED: &str = "an image couldn't be decoded and is missing from the picture";
+const LARGE_IMAGE: &str = "an image that is too large for EPS was left out";
 const SPOT_GRADIENTS: &str = "gradients of spot colours are written in process colours";
 const MISSING_PATTERN: &str = "missing patterns are written as mid-grey";
 
@@ -94,6 +98,11 @@ fn overlaps(a: Rect, b: Rect) -> bool {
 
 pub(crate) struct Scene<'a> {
     doc: &'a Document,
+    /// The art boxes of `doc`'s symbols, which the walk measures symbol instances by when it
+    /// leaves out objects outside the region ([`SymbolBoxes::quick`]). The box of an instance whose
+    /// art holds brushed strokes grows by as far as their brush art can paint
+    /// ([`SymbolBoxes::with_brush_art`]).
+    symbols: SymbolBoxes<'a>,
     o: &'a EpsOptions,
     /// RGB and Lab colours are written as CMYK.
     cmyk: bool,
@@ -114,6 +123,7 @@ impl<'a> Scene<'a> {
     pub fn new(doc: &'a Document, o: &'a EpsOptions) -> Self {
         Self {
             doc,
+            symbols: doc.symbol_boxes().quick().with_brush_art(),
             o,
             cmyk: o.cmyk || doc.color_mode == ColorMode::Cmyk,
             cms: vectorcraft_color::cms::active(),
@@ -254,7 +264,7 @@ impl<'a> Scene<'a> {
         if let NodeKind::Layer { template: true, .. } = n.kind {
             return;
         }
-        match n.visual_bounds() {
+        match n.visual_bounds_with(&self.symbols) {
             Some(b) if !force && !overlaps(b.inflate(1.0, 1.0), self.o.region) => return,
             None if !n.is_container() => return,
             _ => {}
@@ -278,7 +288,7 @@ impl<'a> Scene<'a> {
                 self.shape(n, &bp, *rule);
             }
             NodeKind::Text(t) => self.text(n, t),
-            NodeKind::Image(im) => self.image(im),
+            NodeKind::Image(im) => self.image(&im.key, self.doc.image_blob(im), im.width, im.height, im.xf),
             NodeKind::SymbolInstance { symbol, xf } => {
                 if let Some(sym) = self.doc.symbols.iter().find(|s| &s.name == symbol)
                     && self.nest < MAX_NEST
@@ -291,7 +301,12 @@ impl<'a> Scene<'a> {
                 }
             }
             // Live blends, envelopes, meshes and repeats are written as their evaluated art.
-            NodeKind::Blend { .. } | NodeKind::Envelope { .. } | NodeKind::Mesh(_) | NodeKind::Repeat(_) | NodeKind::PlacedDocument(_) => {
+            NodeKind::Blend { .. }
+            | NodeKind::Envelope { .. }
+            | NodeKind::Mesh(_)
+            | NodeKind::Repeat(_)
+            | NodeKind::PlacedDocument(_)
+            | NodeKind::Intertwine { .. } => {
                 let g = vectorcraft_effects::expand_live_deep(Some(self.doc), n);
                 for c in g.children().into_iter().flatten() {
                     self.node(c, false);
@@ -322,7 +337,7 @@ impl<'a> Scene<'a> {
 
     /// Warn about what EPS can't hold in `n`'s look.
     fn note_losses(&mut self, n: &Node) {
-        if n.opacity < 1.0 || n.blend != BlendMode::Normal || n.mask.as_ref().is_some_and(|m| !m.disabled) {
+        if n.opacity < 1.0 || n.blend != BlendMode::Normal || n.extras().mask.as_ref().is_some_and(|m| !m.disabled) {
             self.warn(TRANSPARENCY);
         }
         let raster = |fx: &[Effect]| fx.iter().any(|e| e.visible && vectorcraft_effects::is_raster(&e.id));
@@ -536,7 +551,7 @@ impl<'a> Scene<'a> {
         let doc = self.doc;
         let brushes = self.brushes.get_or_insert_with(|| vectorcraft_brush::library(doc));
         let Some(b) = st.brush.as_deref().and_then(|name| brushes.iter().find(|b| b.name == name)) else { return false };
-        let art = vectorcraft_brush::stroke_pieces(b, bp, st);
+        let art = vectorcraft_brush::stroke_pieces(doc, b, bp, st);
         self.note_item(st.opacity, st.blend);
         self.nest += 1;
         for piece in &art {
@@ -571,6 +586,15 @@ impl<'a> Scene<'a> {
             let mut bp = BezPath::new();
             for g in layout.glyphs.iter().filter(|g| g.run == i) {
                 bp.extend(g.outline.iter());
+                // Colour bitmap glyphs (emoji): their images, which the run's paint doesn't paint.
+                if let Some((image, to_text)) = g.placed_image() {
+                    let key = format!("\u{0}glyph\u{0}{}", image.blob.content_key());
+                    self.image(&key, Some(&image.blob), image.width, image.height, to_text);
+                }
+                // COLR glyphs: their layers, as art (in text space, as the images).
+                if let Some(art) = g.placed_colour(Affine::IDENTITY) {
+                    self.node(&art, true);
+                }
             }
             if bp.elements().is_empty() {
                 continue;
@@ -825,18 +849,18 @@ impl<'a> Scene<'a> {
         }
     }
 
-    /// A placed image: its pixel grid stretched over its `width` × `height` (each image file
-    /// encoded once).
-    fn image(&mut self, im: &ImageObject) {
-        let place = im.xf * Affine::scale_non_uniform(f64::from(im.width.max(1)), f64::from(im.height.max(1)));
+    /// A placed image (`blob`, cached under `key`): its pixel grid of `width` × `height` placed
+    /// by `xf` (each image file encoded once).
+    fn image(&mut self, key: &str, blob: Option<&ImageBlob>, width: u32, height: u32, xf: Affine) {
+        let place = xf * Affine::scale_non_uniform(f64::from(width.max(1)), f64::from(height.max(1)));
         if !invertible(place) {
             return;
         }
-        let encoded = match self.images.get(&im.key) {
+        let encoded = match self.images.get(key) {
             Some(e) => e.clone(),
             None => {
-                let e = self.decode_image(&im.key).and_then(|img| self.encode_image(img.as_raw(), img.width(), img.height())).map(Arc::new);
-                self.images.insert(im.key.clone(), e.clone());
+                let e = self.decode_image(blob).and_then(|img| self.encode_image(img.as_raw(), img.width(), img.height())).map(Arc::new);
+                self.images.insert(key.to_string(), e.clone());
                 e
             }
         };
@@ -845,14 +869,14 @@ impl<'a> Scene<'a> {
         }
     }
 
-    /// Image `key` as RGBA pixels; `None` (with a warning) when it can't be written.
-    fn decode_image(&mut self, key: &str) -> Option<image::RgbaImage> {
-        let Some(img) = self.doc.images.get(key).and_then(|blob| image::load_from_memory(&blob.bytes).ok()) else {
-            self.warn(&format!("image '{key}' could not be decoded and was left out"));
+    /// Image `blob` as RGBA pixels; `None` (with a warning) when it can't be written.
+    fn decode_image(&mut self, blob: Option<&ImageBlob>) -> Option<image::RgbaImage> {
+        let Some(img) = blob.and_then(|blob| image::load_from_memory(&blob.bytes).ok()) else {
+            self.warn(UNDECODED);
             return None;
         };
         if u64::from(img.width()) * u64::from(img.height()) > MAX_IMAGE_PIXELS {
-            self.warn(&format!("image '{key}' is too large for EPS and was left out"));
+            self.warn(LARGE_IMAGE);
             return None;
         }
         Some(img.to_rgba8())

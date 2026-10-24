@@ -263,6 +263,21 @@ impl<'a> Archive<'a> {
     }
 
     /// Extract an entry by name: decompress, undo the byte predictor and verify the CRC.
+    /// What is left of the limits for documents embedded in this one.
+    pub(crate) fn remaining(&self) -> Limits {
+        Limits { max_entry: self.limits.max_entry, max_total: self.limits.max_total.saturating_sub(self.extracted) }
+    }
+
+    /// Count `n` bytes extracted elsewhere (from embedded documents) against this import.
+    pub(crate) fn charge(&mut self, n: usize) -> Result<(), Error> {
+        let total = self.extracted.checked_add(n).ok_or(Error::Limit("document too large"))?;
+        if total > self.limits.max_total {
+            return Err(Error::Limit("document too large"));
+        }
+        self.extracted = total;
+        Ok(())
+    }
+
     pub fn read(&mut self, name: &str) -> Result<Vec<u8>, Error> {
         let e = self.entries.get(name).ok_or(Error::Malformed("missing archive entry"))?.clone();
         let size = usize::try_from(e.size).map_err(|_| Error::Limit("archive entry too large"))?;
@@ -337,7 +352,7 @@ fn unpredict(b: &mut [u8], compression: u8) -> Result<(), Error> {
         (0x40, _) => byte_delta(b),
         (0x80, false) => {
             let mut prev = 0u16;
-            for pair in b.chunks_exact_mut(2) {
+            for pair in b.as_chunks_mut::<2>().0.iter_mut() {
                 let v = u16::from_le_bytes([pair[0], pair[1]]).wrapping_add(prev);
                 pair.copy_from_slice(&v.to_le_bytes());
                 prev = v;
@@ -349,7 +364,7 @@ fn unpredict(b: &mut [u8], compression: u8) -> Result<(), Error> {
             if b.len() == 0x10000 {
                 let planes = b.to_vec();
                 let (hi, lo) = planes.split_at(0x8000);
-                for (i, out) in b.chunks_exact_mut(4).enumerate() {
+                for (i, out) in b.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                     let (Some(h), Some(l)) = (hi.get(2 * i..2 * i + 2), lo.get(2 * i..2 * i + 2)) else {
                         return Err(Error::Malformed("tile size"));
                     };

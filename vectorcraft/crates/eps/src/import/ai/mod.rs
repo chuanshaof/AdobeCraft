@@ -17,18 +17,22 @@
 //! objects and points. Anything it doesn't read is an error: the caller opens the file the way it
 //! did before (the printed page, or the PDF), with a warning saying why.
 
+mod frames;
 mod lex;
+mod mesh;
 mod obj;
 mod paint;
 mod read;
+mod style;
 
 use std::io::Read as _;
 
 use super::lex::find;
 use crate::ps;
 
-pub(crate) use read::slot_of;
-pub use read::{Structure, read};
+pub(crate) use frames::text_frames;
+pub use read::{IMAGE_TOO_LARGE, Structure, artboards, read, variables};
+pub(crate) use read::{slot_frame, slot_of};
 
 #[cfg(test)]
 mod tests;
@@ -50,6 +54,11 @@ pub fn eps_data(ps: &[u8]) -> Option<Result<Vec<u8>, String>> {
     let rest = ps.get(start..)?;
     let section = rest.get(..find(rest, EPS_END).unwrap_or(rest.len())).unwrap_or_default();
     Some(eps_section(section))
+}
+
+/// Does the EPS `ps` carry editing data ([`eps_data`] isn't `None`)?
+pub fn has_eps_data(ps: &[u8]) -> bool {
+    find(ps, EPS_BEGIN).is_some()
 }
 
 /// The editing data between the EPS markers: header comments, then the data (encoded or not).

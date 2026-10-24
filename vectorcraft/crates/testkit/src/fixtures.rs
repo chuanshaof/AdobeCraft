@@ -154,6 +154,15 @@ pub fn rich_session() -> Session {
     exec(&mut s, "symbol.new", json!({"name": "Dot"}));
     let t = id_of(&exec(&mut s, "text.create", json!({"x": 250, "y": 370, "text": "Tap  to add", "size": 18})));
     exec(&mut s, "text.insertInline", json!({"id": t.0, "at": 4, "symbol": "Dot"}));
+    // Variables (data merge): both kinds, bound to art, with two dataset rows and one applied,
+    // so format round trips cover the definitions, the bindings and the rows.
+    exec(&mut s, "variable.define", json!({"name": "Title", "kind": "text"}));
+    exec(&mut s, "variable.define", json!({"name": "Badge", "kind": "visibility"}));
+    exec(&mut s, "variable.bind", json!({"variable": "Title", "ids": [tx.0]}));
+    exec(&mut s, "variable.bind", json!({"variable": "Badge", "ids": [a]}));
+    exec(&mut s, "dataset.new", json!({"name": "Row 1", "values": {"Title": "Merged", "Badge": true}}));
+    exec(&mut s, "dataset.new", json!({"name": "Row 2", "values": {"Title": "Other"}}));
+    exec(&mut s, "dataset.select", json!({"name": "Row 1"}));
     let _ = (a, b, c, l);
     exec(&mut s, "select.none", json!({}));
     s

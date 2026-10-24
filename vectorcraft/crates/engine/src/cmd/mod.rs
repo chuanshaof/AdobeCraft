@@ -9,9 +9,10 @@ pub mod clipboard;
 mod colorcmds;
 pub mod colormgmt;
 pub mod colortheme;
-mod create;
+pub(crate) mod create;
 mod css;
 mod cut;
+pub(crate) mod dimension;
 pub(crate) mod distortcmds;
 mod docinfo;
 mod docmenu;
@@ -22,16 +23,24 @@ mod effectcmd;
 pub mod expand;
 pub(crate) mod fileinfo;
 pub mod fileio;
+pub mod findfiles;
 pub mod flatten;
+pub mod fontfiles;
 mod fonts;
 pub(crate) mod freeform;
+pub mod globaledit;
 pub(crate) mod gradient;
 pub(crate) mod graph;
 mod halftone;
 pub mod help;
+pub mod importmatches;
 pub(crate) mod inline;
+mod interactivity;
+mod intertwine;
 mod layer;
 mod layerpanel;
+pub mod library;
+pub mod linkfiles;
 pub mod links;
 mod live;
 pub(crate) mod maskedit;
@@ -39,17 +48,19 @@ pub(crate) mod menucmds;
 pub(crate) mod newart;
 pub mod newdoc;
 mod object;
+pub(crate) mod objects_on_path;
 mod opacitymask;
 mod overprint;
-mod package;
+pub mod package;
 mod paint;
 mod panelcmds;
+pub mod params;
 mod path;
-mod pathops;
+pub(crate) mod pathops;
 mod patterncmds;
 pub mod pdfcmds;
 pub mod perspgrid;
-pub(crate) mod place;
+pub mod place;
 pub mod plugin;
 pub mod prefscmds;
 pub mod print;
@@ -59,14 +70,17 @@ pub mod printtiling;
 pub mod rasterfx;
 mod recolor;
 pub mod recovery;
+pub mod scripts;
 mod select;
 pub(crate) mod shaper;
+pub mod shortcutset;
 pub(crate) mod slices;
 mod stroke;
 mod style;
 pub mod stylelib;
 mod swatch;
 pub mod swatchlib;
+pub mod symbollib;
 pub(crate) mod tabs;
 mod textedit;
 pub mod textstyles;
@@ -74,6 +88,7 @@ pub(crate) mod textwrap;
 pub(crate) mod threads;
 pub(crate) mod typecmd;
 mod typemenu;
+mod variablecmds;
 pub(crate) mod views;
 pub mod wand;
 pub mod webexport;
@@ -169,6 +184,10 @@ pub fn can_undo(s: &Session) -> std::result::Result<(), String> {
 pub fn can_redo(s: &Session) -> std::result::Result<(), String> {
     s.active().filter(|d| !d.history.redo.is_empty()).map(|_| ()).ok_or_else(|| "nothing to redo".into())
 }
+/// The active document has a step to undo or to redo (Clear History).
+pub fn can_clear_history(s: &Session) -> std::result::Result<(), String> {
+    s.active().filter(|d| !d.history.undo.is_empty() || !d.history.redo.is_empty()).map(|_| ()).ok_or_else(|| "no history to clear".into())
+}
 pub fn has_clipboard(s: &Session) -> std::result::Result<(), String> {
     has_doc(s)?;
     if s.clipboard.is_empty() { Err("clipboard is empty".into()) } else { Ok(()) }
@@ -193,9 +212,11 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(recolor::specs());
         v.extend(fileio::specs());
         v.extend(create::specs());
+        v.extend(dimension::specs());
         v.extend(object::specs());
         v.extend(path::specs());
         v.extend(select::specs());
+        v.extend(globaledit::specs());
         v.extend(wand::specs());
         v.extend(paint::specs());
         // Split out of `paint` (M3.8); kept next to it so lists in registry order (the command
@@ -222,6 +243,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(inline::specs());
         v.extend(textstyles::specs());
         v.extend(fonts::specs());
+        v.extend(fontfiles::specs());
         v.extend(help::specs());
         v.extend(threads::specs());
         v.extend(textwrap::specs());
@@ -231,12 +253,15 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(maskedit::specs());
         v.extend(tabs::specs());
         v.extend(docmenu::specs());
+        v.extend(variablecmds::specs());
         v.extend(docinfo::specs());
         v.extend(panelcmds::specs());
         v.extend(buildcmds::specs());
         v.extend(shaper::specs());
         v.extend(brushsym::specs());
         v.extend(patterncmds::specs());
+        v.extend(intertwine::specs());
+        v.extend(objects_on_path::specs());
         v.extend(prefscmds::specs());
         v.extend(distortcmds::specs());
         v.extend(paint::proxy_specs());
@@ -245,8 +270,11 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(freeform::specs());
         v.extend(flatten::specs());
         v.extend(stylelib::specs());
+        v.extend(symbollib::specs());
+        v.extend(library::specs());
         v.extend(expand::specs());
         v.extend(attributes::specs());
+        v.extend(interactivity::specs());
         v.extend(newart::specs());
         v.extend(colortheme::specs());
         v.extend(fileio::pdf::specs());
@@ -254,6 +282,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(newdoc::specs());
         v.extend(place::specs());
         v.extend(links::specs());
+        v.extend(linkfiles::specs());
         v.extend(pdfcmds::specs());
         v.extend(fileio::dxf::specs());
         v.extend(fileio::eps::specs());
@@ -268,9 +297,12 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(printpresets::specs());
         v.extend(printtiling::specs());
         v.extend(plugin::specs());
+        v.extend(scripts::specs());
         v.extend(cut::specs());
         v.extend(halftone::specs());
         v.extend(perspgrid::specs());
+        v.extend(shortcutset::specs());
+        v.extend(importmatches::specs());
         v
     })
 }
@@ -290,8 +322,41 @@ pub(crate) fn f64_or(p: &Value, key: &str, default: f64) -> f64 {
 pub(crate) fn f64_req(p: &Value, key: &str, cmd: &str) -> Result<f64> {
     p.get(key).and_then(Value::as_f64).ok_or_else(|| bad(cmd, format!("missing number `{key}`")))
 }
+/// The number `p` gives for `key`, or `default` when `p` leaves it out or gives null. Any other
+/// value, such as `"40"`, is an error: "`{key}` must be a number, not {v}".
+pub(crate) fn number_or(p: &Value, key: &str, default: f64, cmd: &str) -> Result<f64> {
+    match p.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v.as_f64().ok_or_else(|| bad(cmd, format!("`{key}` must be a number, not {v}"))),
+    }
+}
+/// Error unless each of `keys` that `p` gives is a number (or null), as [`number_or`] reads them: an
+/// optional number read with [`f64_or`] would otherwise fall back to its default for a string such as
+/// `"60 mm"` (#1952).
+pub(crate) fn check_numbers(p: &Value, keys: &[&str], cmd: &str) -> Result<()> {
+    for key in keys {
+        number_or(p, key, 0.0, cmd)?;
+    }
+    Ok(())
+}
 pub(crate) fn bool_or(p: &Value, key: &str, default: bool) -> bool {
     p.get(key).and_then(Value::as_bool).unwrap_or(default)
+}
+/// The true or false `p` gives for `key`, or `default` when `p` leaves it out or gives null. Any
+/// other value, such as `"false"`, is an error: "`{key}` must be true or false".
+pub(crate) fn switch_or(p: &Value, key: &str, default: bool, cmd: &str) -> Result<bool> {
+    match p.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v.as_bool().ok_or_else(|| bad(cmd, format!("`{key}` must be true or false"))),
+    }
+}
+/// Error unless each of `keys` that `p` gives is true or false (or null), as [`switch_or`] reads
+/// them.
+pub(crate) fn check_switches(p: &Value, keys: &[&str], cmd: &str) -> Result<()> {
+    for key in keys {
+        switch_or(p, key, false, cmd)?;
+    }
+    Ok(())
 }
 pub(crate) fn str_param<'a>(p: &'a Value, key: &str) -> Option<&'a str> {
     p.get(key).and_then(Value::as_str)
@@ -302,6 +367,48 @@ pub(crate) fn id_param(p: &Value, key: &str) -> Option<NodeId> {
 pub(crate) fn ids_param(p: &Value, key: &str) -> Option<Vec<NodeId>> {
     p.get(key).and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_u64).map(NodeId).collect())
 }
+/// `v` as an index, a count or a byte offset: past `usize::MAX` reads as `usize::MAX`, past the end of any list.
+pub(crate) fn index(v: u64) -> usize {
+    usize::try_from(v).unwrap_or(usize::MAX)
+}
+/// Validate all explicit targets before a command changes the document or selection.
+pub(crate) fn checked_ids_param(s: &Session, p: &Value, key: &str, command: &str) -> Result<Vec<NodeId>> {
+    let values =
+        p.get(key).and_then(Value::as_array).ok_or_else(|| bad(command, format!("{key} must be an array of non-negative integer object ids")))?;
+    values.iter().map(|value| checked_id(s, value, command)).collect()
+}
+
+/// The objects a command acts on: `ids` when given (every one checked, and those inside another
+/// given one dropped), else the selected objects.
+pub(crate) fn checked_ids_or_selection(s: &Session, p: &Value, command: &str) -> Result<Vec<NodeId>> {
+    if p.get("ids").is_some() { Ok(edit::outermost(&s.doc()?.doc, checked_ids_param(s, p, "ids", command)?)) } else { edit::selected_roots(s) }
+}
+
+pub(crate) fn checked_id(s: &Session, value: &Value, command: &str) -> Result<NodeId> {
+    let id = value.as_u64().map(NodeId).ok_or_else(|| bad(command, format!("invalid object id {value}: expected a non-negative integer")))?;
+    if s.doc()?.doc.node(id).is_none() {
+        return Err(bad(command, format!("no such object id {value}")));
+    }
+    Ok(id)
+}
+
+/// `v` as exactly `N` finite numbers (`[x, y]`, `[x, y, width, height]`…): `None` when it isn't an
+/// array of that length or an entry isn't a number, so nothing malformed is left out or padded.
+pub(crate) fn finite_numbers<const N: usize>(v: &Value) -> Option<[f64; N]> {
+    let a = v.as_array().filter(|a| a.len() == N)?;
+    let mut out = [0.0; N];
+    for (o, n) in out.iter_mut().zip(a) {
+        *o = n.as_f64().filter(|n| n.is_finite())?;
+    }
+    Some(out)
+}
+
+/// `v` as a list of point indices: `None` unless it is an array of non-negative integers, so no
+/// malformed index is dropped or wrapped round.
+pub(crate) fn point_indices(v: &Value) -> Option<Vec<usize>> {
+    v.as_array()?.iter().map(|i| usize::try_from(i.as_u64()?).ok()).collect()
+}
+
 pub(crate) fn point_param(p: &Value, key: &str) -> Option<Point> {
     let a = p.get(key)?.as_array()?;
     Some(Point::new(a.first()?.as_f64()?, a.get(1)?.as_f64()?))
@@ -319,7 +426,7 @@ pub fn matrix_param(p: &Value, key: &str) -> Option<Affine> {
     Some(Affine::new(c))
 }
 /// A colour from `"#rrggbb"`, a colour key (`"cmyk 0 100 100 0"`, `"lab 55 60 40"`), `[r,g,b]` (0..1),
-/// `{"c":..,"m":..,"y":..,"k":..}`, `{"gray":..}` or `{"l":..,"a":..,"b":..}` (CIE Lab: L 0..100, a and b about
+/// `{"c":..,"m":..,"y":..,"k":..}` (percent when any component is above 1, else 0..1), `{"gray":..}` or `{"l":..,"a":..,"b":..}` (CIE Lab: L 0..100, a and b about
 /// −128..127).
 pub fn color_value(v: &Value) -> Option<Color> {
     match v {
@@ -328,8 +435,12 @@ pub fn color_value(v: &Value) -> Option<Color> {
         Value::Array(a) if a.len() >= 3 => Some(Color::rgb(a[0].as_f64()? as f32, a[1].as_f64()? as f32, a[2].as_f64()? as f32)),
         Value::Object(o) => {
             if let (Some(c), Some(m), Some(y), Some(k)) = (o.get("c"), o.get("m"), o.get("y"), o.get("k")) {
-                let f = |v: &Value| v.as_f64().map(|x| if x > 1.0 { x / 100.0 } else { x } as f32);
-                return Some(Color::cmyk(f(c)?, f(m)?, f(y)?, f(k)?));
+                // One scale for the whole colour: percent when any component is above 1, else 0..1.
+                // Deciding per component read {c: 18, k: 0.79} as K 79 %.
+                let v = [c.as_f64()?, m.as_f64()?, y.as_f64()?, k.as_f64()?];
+                let scale = if v.iter().any(|x| *x > 1.0) { 100.0 } else { 1.0 };
+                let f = |x: f64| (x / scale) as f32;
+                return Some(Color::cmyk(f(v[0]), f(v[1]), f(v[2]), f(v[3])));
             }
             if let Some(g) = o.get("gray") {
                 let g = g.as_f64()?;
@@ -346,13 +457,23 @@ pub fn color_value(v: &Value) -> Option<Color> {
 
 /// Objects a command targets: explicit `ids` param or the selection.
 pub(crate) fn targets(s: &Session, p: &Value) -> Result<Vec<NodeId>> {
-    if let Some(ids) = ids_param(p, "ids") {
-        return Ok(ids);
+    // Objects given are used as given: a value that isn't an object id fails rather than the
+    // command acting on the selection instead (#785).
+    let object_id = |v: &Value| v.as_u64().map(NodeId).ok_or_else(|| EngineError::Other(format!("object ids are non-negative integers, not {v}")));
+    match p.get("ids").filter(|v| !v.is_null()) {
+        Some(Value::Array(a)) => return a.iter().map(object_id).collect(),
+        Some(v) => return Err(EngineError::Other(format!("`ids` must be an array of object ids, not {v}"))),
+        None => {}
     }
-    if let Some(id) = id_param(p, "id") {
-        return Ok(vec![id]);
+    match p.get("id").filter(|v| !v.is_null()) {
+        Some(v @ Value::Number(_)) => Ok(vec![object_id(v)?]),
+        // A step reference a batch couldn't resolve (other strings are other ids, such as an
+        // effect's).
+        Some(Value::String(r)) if r.starts_with('$') => {
+            Err(EngineError::Other(format!("`id` is the step reference {r:?}, which only `run` and `command_batch` resolve")))
+        }
+        _ => Ok(s.doc()?.selection.objects.clone()),
     }
-    Ok(s.doc()?.selection.objects.clone())
 }
 
 pub(crate) fn ok() -> Result<Value> {
@@ -360,10 +481,12 @@ pub(crate) fn ok() -> Result<Value> {
 }
 
 /// Leaves whose appearance a paint command changes: groups and layers expand to their contents,
-/// and compound paths own their children's appearance.
+/// and compound paths own their children's appearance, so a member stands for its compound path
+/// (#3692), which is listed once.
 pub(crate) fn leaf_targets(s: &Session, ids: &[NodeId]) -> Result<Vec<NodeId>> {
     use vectorcraft_doc::NodeKind;
     let d = &s.doc()?.doc;
+    let compound = |id: NodeId| d.parent_of(id).filter(|p| matches!(d.node(*p).map(|n| &n.kind), Some(NodeKind::Compound { .. })));
     let mut out = vec![];
     for id in ids {
         let Some(n) = d.node(*id) else { continue };
@@ -373,11 +496,13 @@ pub(crate) fn leaf_targets(s: &Session, ids: &[NodeId]) -> Result<Vec<NodeId>> {
                     out.push(c.id)
                 }
             }),
-            _ => out.push(*id),
+            _ => out.push(compound(*id).unwrap_or(*id)),
         }
     }
     let comp: Vec<NodeId> = out.iter().filter(|id| matches!(d.node(**id).map(|n| &n.kind), Some(NodeKind::Compound { .. }))).copied().collect();
     out.retain(|id| !comp.iter().any(|c| d.parent_of(*id) == Some(*c)));
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|id| seen.insert(*id));
     Ok(out)
 }
 
@@ -394,6 +519,8 @@ pub(crate) fn unique_name(base: &str, taken: impl Fn(&str) -> bool) -> String {
     (2..).map(|i| format!("{base} {i}")).find(|n| !taken(n)).unwrap_or_else(|| base.to_string())
 }
 
+pub(crate) use edit::{settle_interaction, typing_in_progress};
+pub(crate) use object::bounds_rewrite;
 pub(crate) use vectorcraft_doc::range::parse_range;
 
 /// A date param in Unix seconds that defaults to the clock: `None` when absent (now, see
@@ -410,7 +537,7 @@ pub(crate) fn date_param(p: &Value, key: &str, cmd: &str) -> Result<Option<Optio
 /// no clock). It joins the running command's journal entry as `key`, so a replay of the journal
 /// gives the same date whenever it runs (an action leaves it out: [`crate::Session::journal_for_action`]).
 pub(crate) fn clock_date(s: &mut Session, key: &str, given: Option<Option<i64>>) -> Option<i64> {
-    let t = given.unwrap_or_else(vectorcraft_doc::metadata::now_unix);
+    let t = given.unwrap_or_else(vectorcraft_doc::metadata::output_time);
     s.note_journal(key, serde_json::json!(t));
     t
 }
@@ -429,6 +556,12 @@ pub use flatten::FlattenOptions;
 
 /// A built-in or saved flattener preset ([`crate::Prefs::flattener_presets`]).
 pub use flatten::FlattenerPreset;
+
+/// The shapes a group selected alone gives the Pathfinder panel.
+pub use pathops::shape_count;
+
+/// The gaps View › Show Live Paint Gaps shows on a Live Paint group.
+pub use buildcmds::live_paint_gaps;
 
 /// Command ids kept only so older scripts keep working: `(alias, the command it duplicates)`.
 /// They run as before but the command palette leaves them out (it lists the command once).

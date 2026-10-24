@@ -113,7 +113,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Color Guide",
             [],
             None,
-            "{color, rule: complementary|complementary2|splitComplementary|leftComplement|rightComplement|analogous|analogous2|monochromatic|shades|triad|triad2|triad3|tetrad|tetrad2|tetrad3|compound|compound2|highContrast|highContrast2|highContrast3|pentagram (or its label), steps?: 1..20 (4), variation?: \"tintsShades\"|\"warmCool\"|\"vividMuted\", amount?: 0..100 (50; how far the outermost steps go), limitTo?: swatch library id or name, or \"document\" (the document's swatches): every colour snaps to its nearest colour there (ΔE 2000)} the Color Guide for a base colour → {rule, colors: [\"#rrggbb\", the base first], grid: [per colour, 2·steps+1 variations from shades/cool/muted to tints/warm/vivid with the colour itself in the centre]}",
+            "{color, rule: complementary|complementary2|splitComplementary|leftComplement|rightComplement|analogous|analogous2|monochromatic|shades|triad|triad2|triad3|tetrad|tetrad2|tetrad3|compound|compound2|highContrast|highContrast2|highContrast3|pentagram (or its label), steps?: 1..20 (4), variation?: \"tintsShades\"|\"warmCool\"|\"vividMuted\", amount?: 0..100 (50; how far the outermost steps go), limitTo?: swatch library id or name; or \"document\" (the document's swatches): every colour snaps to its nearest colour there (ΔE 2000)} the Color Guide for a base colour → {rule, colors: [\"#rrggbb\", the base first], grid: [per colour, 2·steps+1 variations from shades/cool/muted to tints/warm/vivid with the colour itself in the centre]}",
             always,
             harmony
         ),
@@ -202,6 +202,12 @@ impl<'a> Recolor<'a> {
     /// (`links`); meshes and images keep their colours.
     pub(crate) fn links(scope: Scope, links: &'a LinkMap<'a>) -> Self {
         Self { links: Some(links), ..Self::new(Scope { images: false, ..scope }, &same) }
+    }
+
+    /// A pass that maps solid colours and gradient stops with their swatch link and tint
+    /// (`links`), and meshes, images and patterns through `f`.
+    pub(crate) fn with_links(scope: Scope, f: &'a dyn Fn(Color) -> Color, links: &'a LinkMap<'a>) -> Self {
+        Self { links: Some(links), ..Self::new(scope, f) }
     }
 
     /// Recolour the objects `ids` and everything inside them (each once), add the new images and

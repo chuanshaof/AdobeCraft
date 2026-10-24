@@ -24,8 +24,10 @@ pub struct Clip {
 }
 
 /// Deepest nesting of clips, and of groups, an importer records ([`nest`] goes one level deeper
-/// for each): deeper ones are left out.
-pub const MAX_NEST: usize = 128;
+/// for each): deeper ones are left out. As deep as a document's objects may nest
+/// ([`crate::MAX_DEPTH`]) under a layer, around the art; clips in groups that deep together are
+/// merged by [`Document::limit_depth`].
+pub const MAX_NEST: usize = crate::MAX_DEPTH - 2;
 
 /// The warning for clips left out for nesting deeper than [`MAX_NEST`].
 pub fn deep_clips() -> String {

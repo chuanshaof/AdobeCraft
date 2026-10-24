@@ -39,9 +39,11 @@ fn style_word(w: &str) -> String {
     .to_string()
 }
 
-/// A font's family and style from its PostScript name: `Helvetica-BoldOblique` → (`Helvetica`,
-/// `Bold Oblique`), `TimesNewRomanPS-BoldMT` → (`Times New Roman`, `Bold`), without a subset
-/// prefix (`ABCDEF+`) or the `*1` of a re-encoded copy (`ABCDEF+RollerBabyBV*1`).
+/// A font's family and style from its PostScript name, without a subset prefix (`ABCDEF+`) or the
+/// `*1` of a re-encoded copy (`ABCDEF+RollerBabyBV*1`): an installed or bundled face of that
+/// exact name gives its own (a family can hold hyphens: `rounded-x-mplus-1c-black` is Rounded-X
+/// M+ 1c, black); else the name is split, `Helvetica-BoldOblique` → (`Helvetica`, `Bold
+/// Oblique`), `TimesNewRomanPS-BoldMT` → (`Times New Roman`, `Bold`).
 pub fn family_style(name: &str) -> (String, String) {
     let name = match name.split_once('+') {
         Some((prefix, rest)) if prefix.len() == 6 && prefix.bytes().all(|b| b.is_ascii_uppercase()) => rest,
@@ -51,6 +53,9 @@ pub fn family_style(name: &str) -> (String, String) {
         Some((base, n)) if !base.is_empty() && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => base,
         _ => name,
     };
+    if let Some(face) = vectorcraft_text::FontDb::global().find_postscript(name) {
+        return (face.family.clone(), face.style.clone());
+    }
     let (family, style) = name.split_once('-').unwrap_or((name, ""));
     let trim = |s: &str| -> String {
         let s = ["PSMT", "MT", "PS"].iter().find_map(|suffix| s.strip_suffix(suffix)).unwrap_or(s);
@@ -384,7 +389,7 @@ impl Interp<'_> {
         d.insert(Key::name("FontMatrix"), matrix_obj(Affine::scale(0.001)));
         d.insert(Key::name("FontBBox"), Obj::array(vec![Obj::Int(0), Obj::Int(-250), Obj::Int(1000), Obj::Int(1000)]));
         d.insert(Key::name("Encoding"), Obj::array(vec![Obj::name(".notdef"); 256]));
-        let font = Rc::new(std::cell::RefCell::new(d));
+        let font = DictRef::new(d);
         self.fonts.borrow_mut().insert(key, Obj::Dict(font.clone()));
         Ok(font)
     }
@@ -398,7 +403,10 @@ impl Interp<'_> {
         let f = font.borrow();
         let name = f.get(&Key::name("FontName")).and_then(Obj::text).map_or_else(|| DEFAULT_FONT.to_string(), |n| n.to_string());
         let m = f.get(&Key::name("FontMatrix")).and_then(|o| o.items().and_then(|i| matrix_of(&i.borrow()))).unwrap_or(Affine::scale(0.001));
-        Ok((name, m * Affine::scale(1000.0)))
+        // Type 1 glyphs are in 1000-unit space; a Type 42 font's glyph space is one unit an em
+        // (its FontMatrix, usually the identity, is already the em's).
+        let units = if f.get(&Key::name("FontType")).and_then(Obj::as_num) == Some(42.0) { 1.0 } else { 1000.0 };
+        Ok((name, m * Affine::scale(units)))
     }
 
     /// `s` (read as Latin-1) set in the current font at user point `at`: point type placed there,
@@ -481,7 +489,7 @@ fn transformed(font: &DictRef, m: Affine) -> DictRef {
     let mut d = font.borrow().clone();
     let fm = d.get(&Key::name("FontMatrix")).and_then(|o| o.items().and_then(|i| matrix_of(&i.borrow()))).unwrap_or(Affine::scale(0.001));
     d.insert(Key::name("FontMatrix"), matrix_obj(m * fm));
-    Rc::new(std::cell::RefCell::new(d))
+    DictRef::new(d)
 }
 
 /// The character a glyph name stands for (`A`, `space`, `uni20AC`), else a bullet.

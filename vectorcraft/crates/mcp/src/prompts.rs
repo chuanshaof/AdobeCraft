@@ -405,7 +405,10 @@ pub fn get(name: &str, args: &Value) -> Result<Value, String> {
         let ids: Vec<&str> = PROMPTS.iter().map(|p| p.name).collect();
         return Err(format!("unknown prompt `{name}` ({})", ids.join("|")));
     };
-    let mut text = flow(p.text);
+    let template = flow(p.text);
+    // (placeholder, value): filled in one pass over the template, so a value that looks like a
+    // placeholder stays as it is.
+    let mut values: Vec<(String, String)> = vec![];
     for a in p.arguments {
         let given = args.get(a.name).filter(|v| !v.is_null()).map(|v| match v {
             Value::String(s) => s.clone(),
@@ -416,7 +419,21 @@ pub fn get(name: &str, args: &Value) -> Result<Value, String> {
             _ if a.required => return Err(format!("prompt `{name}` needs the `{a_name}` argument", a_name = a.name)),
             _ => a.default.to_string(),
         };
-        text = text.replace(&format!("{{{}}}", a.name), &value);
+        values.push((format!("{{{}}}", a.name), value));
+    }
+    let mut text = String::with_capacity(template.len());
+    let mut rest = template.as_str();
+    while let Some(c) = rest.chars().next() {
+        match values.iter().find(|(placeholder, _)| rest.starts_with(placeholder.as_str())) {
+            Some((placeholder, value)) => {
+                text.push_str(value);
+                rest = rest.get(placeholder.len()..).unwrap_or_default();
+            }
+            None => {
+                text.push(c);
+                rest = rest.get(c.len_utf8()..).unwrap_or_default();
+            }
+        }
     }
     Ok(json!({
         "description": p.description,

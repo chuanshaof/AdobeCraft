@@ -17,14 +17,16 @@
 # To remove your names, delete your entry (or set fields empty) in a PR. The next
 # contributors.py run, and the next build, drop them.
 
+[people.lollinoo]
+sync_github_name = true
+
 [people.echelon]
 real_name = "Brandon Thomas"
 display_name = "Brandon Thomas"
 sync_github_name = false
 
-[people.callmeBalloch]
-real_name = "Riccardo Balloch"
-sync_github_name = false
+[people.crqch]
+sync_github_name = true
 
 [people.mo0kid]
 sync_github_name = true
@@ -35,3 +37,125 @@ sync_github_name = true
 [people.dotCooCoo]
 real_name = "Robert Lee"
 sync_github_name = true
+
+[people.AutoHenry]
+real_name = "Hal Goff"
+display_name = "Hal Goff, HG Studio"
+sync_github_name = false
+
+[people.hamada147]
+real_name = "Ahmed Moussa"
+display_name = "Ahmed Moussa"
+sync_github_name = true
+
+[people.vbasky]
+real_name = "Vikram Bhaskaran"
+display_name = "Vikram Bhaskaran"
+sync_github_name = false
+
+[people.Messhias]
+real_name = "Fabio William Conceição"
+display_name = "Messhias"
+sync_github_name = false
+
+[people.KattKnight]
+display_name = "KattKnight (ayla.dsc)"
+sync_github_name = false
+
+[people.NoJuanNobody]
+real_name = "Alejandro Londono"
+display_name = "alex"
+sync_github_name = false
+
+[people.webdevtodayjason]
+display_name = "Jason Brashear"
+
+[people.Losminek]
+sync_github_name = true
+
+[people.atoslins]
+real_name = "Atos Lins"
+display_name = "Atos Lins"
+sync_github_name = false
+
+[people.sanyamsingh001]
+display_name = "sanyamsingh001"
+sync_github_name = false
+
+[people.aguo890]
+real_name = "Aaron Guo"
+display_name = "Aaron Guo"
+sync_github_name = false
+
+[people.Nael-Nathanael]
+sync_github_name = true
+
+[people.switch87]
+real_name = "Gert Pellin"
+sync_github_name = false
+
+[people.lewandowskit]
+real_name = "Tomasz Lewandowski"
+display_name = "Tomasz Lewandowski"
+sync_github_name = false
+
+[people.osamaamin2011]
+real_name = "Osama Amin"
+display_name = "Osama Amin"
+sync_github_name = false
+
+[people.giang17]
+real_name = "Giang Nguyen"
+
+[people.Silvertree2010]
+display_name = "Netter"
+sync_github_name = false
+
+[people.limackk]
+real_name = "Kamil Kwiatkowski"
+display_name = "Kamil Kwiatkowski"
+sync_github_name = false
+
+[people.marcoarnulfo]
+real_name = "Marco Arnulfo"
+display_name = "Marco Arnulfo"
+sync_github_name = false
+
+[people.theromis]
+sync_github_name = true
+
+[people.dennismutuku2005]
+sync_github_name = true
+
+[people.krinry]
+display_name = "krinry"
+sync_github_name = true
+
+[people.makesomethingshit]
+sync_github_name = true
+
+[people.MiQ71]
+real_name = "Mirko Kerezovic"
+sync_github_name = false
+
+[people.KaboomFox]
+sync_github_name = true
+
+[people.odysseexp]
+real_name = "Harley Paiva"
+sync_github_name = true
+
+[people.addibble]
+sync_github_name = true
+
+[people.mockydevs]
+real_name = "Don Omondi"
+display_name = "Don Omondi"
+
+[people.alpha-rock]
+display_name = "Aditya Sisodiya"
+
+[people.Ronfo2013]
+real_name = "Angelo Bernardini"
+display_name = "Angelo Bernardini"
+sync_github_name = false

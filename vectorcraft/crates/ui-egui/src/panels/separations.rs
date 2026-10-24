@@ -12,13 +12,14 @@ use crate::VectorcraftApp;
 use crate::theme::Tokens;
 use crate::widgets::{self, dim_label, menu_item};
 
-const PROOF_TARGETS: [(&str, &str); 6] = [
+const PROOF_TARGETS: [(&str, &str); 7] = [
     ("workingCmyk", "Working CMYK"),
     ("legacyMacRgb", "Legacy Macintosh RGB (Gamma 1.8)"),
     ("srgb", "Internet Standard RGB (sRGB)"),
     ("monitorRgb", "Monitor RGB"),
     ("protanopia", "Color blindness – Protanopia-type"),
     ("deuteranopia", "Color blindness – Deuteranopia-type"),
+    ("tritanopia", "Color blindness – Tritanopia-type"),
 ];
 
 fn run(app: &mut VectorcraftApp, id: &str, p: Value) {
@@ -50,7 +51,7 @@ fn plates_section(app: &mut VectorcraftApp, ui: &mut Ui) {
                     run(app, "view.separationsPreview", json!({"plates": plates.iter().map(|p| p.name.clone()).collect::<Vec<_>>()}));
                 }
             });
-            ui.label(egui::RichText::new("CMYK").size(12.0).color(if on { t.text } else { t.text_dim }));
+            ui.label(egui::RichText::new(tl!("CMYK")).size(12.0).color(if on { t.text } else { t.text_dim }));
         });
         for p in &plates {
             ui.horizontal(|ui| {
@@ -86,13 +87,13 @@ fn settings_section(app: &mut VectorcraftApp, ui: &mut Ui) {
     let st = cms::active_settings();
     widgets::section_header(ui, tl!("Color Settings"));
     ui.horizontal(|ui| {
-        ui.label("RGB:");
+        ui.label(tl!("RGB:"));
         if let Some(n) = profile_dropdown(ui, "cms-rgb", &st.rgb, ProfileKind::Rgb, None) {
             run(app, "edit.colorSettings", json!({"rgb": n}));
         }
     });
     ui.horizontal(|ui| {
-        ui.label("CMYK:");
+        ui.label(tl!("CMYK:"));
         if let Some(n) = profile_dropdown(ui, "cms-cmyk", &st.cmyk, ProfileKind::Cmyk, None) {
             run(app, "edit.colorSettings", json!({"cmyk": n}));
         }
@@ -108,14 +109,14 @@ fn settings_section(app: &mut VectorcraftApp, ui: &mut Ui) {
         run(app, "edit.colorSettings", json!({"bpc": !st.bpc}));
     }
     ui.horizontal(|ui| {
-        if widgets::flat_button(ui, tl!("Load Profile…"), 110.0).clicked()
-            && let Some(path) = app
-                .services
-                .pick_open
-                .as_mut()
-                .and_then(|f| f(&crate::FilePick { filters: vec![("ICC Profiles", &["icc", "icm"])], ..Default::default() }))
-        {
-            run(app, "color.loadProfile", json!({ "path": path }));
+        if widgets::flat_button(ui, tl!("Load Profile…"), 110.0).clicked() {
+            // Its file dialog, shown off the UI thread, loads the profile when it answers.
+            crate::picks::button(app, |app| {
+                let pick = crate::FilePick { filters: vec![crate::FilePick::filter("ICC Profiles", &["icc", "icm"])], ..Default::default() };
+                if let Some(path) = crate::picks::open(app, &pick) {
+                    run(app, "color.loadProfile", json!({ "path": path }));
+                }
+            });
         }
         if widgets::flat_button(ui, tl!("Gamut Check"), 100.0).clicked() {
             match app.run("color.gamutCheck", json!({})) {
@@ -183,5 +184,27 @@ pub fn menu(app: &mut VectorcraftApp, ui: &mut Ui) {
     if menu_item(ui, tl!("Show All Plates"), v.separations.is_some(), false) {
         run(app, "view.separationsPreview", json!({"on": false}));
         run(app, "view.separationsPreview", json!({"on": true}));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vectorcraft_engine::Session;
+
+    /// The panel's Proof Setup list offers the targets of View › Proof Setup, in the same order and
+    /// with the same labels, and each one is a target `view.proofSetup` accepts.
+    #[test]
+    fn proof_targets_match_the_proof_setup_menu() {
+        let app = VectorcraftApp::new(Session::new(), Default::default());
+        let menu: Vec<(String, String)> = crate::menus::menu_entries(&app)
+            .into_iter()
+            .filter(|e| e.path == ["View", "Proof Setup"] && e.command.as_deref() == Some("view.proofSetup"))
+            .map(|e| (e.params["target"].as_str().unwrap_or_default().to_string(), e.label))
+            .collect();
+        let panel: Vec<(String, String)> = PROOF_TARGETS.iter().map(|(id, label)| (id.to_string(), label.to_string())).collect();
+        assert_eq!(menu, panel);
+        assert!(panel.iter().any(|(id, _)| id == "tritanopia"));
+        assert!(panel.iter().all(|(id, _)| cms::ProofTarget::parse(id).is_some_and(|t| t.id() == *id)));
     }
 }

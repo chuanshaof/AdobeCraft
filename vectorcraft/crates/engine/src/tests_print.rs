@@ -66,6 +66,66 @@ fn print_writes_the_saved_setup_with_overrides() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A document with four 300 × 200 artboards, set up to print two copies, and a saved print preset
+/// "Sheet" that prints artboard 4 only.
+fn four_artboards_and_a_preset() -> Session {
+    let mut s = Session::new();
+    s.execute("file.new", &json!({"width": 300, "height": 200, "artboards": 4})).unwrap();
+    s.execute("print.setup", &json!({"settings": {"copies": 2}})).unwrap();
+    s.execute("print.presets.save", &json!({"name": "Sheet", "settings": {"artboards": "range", "range": "4"}})).unwrap();
+    s
+}
+
+#[test]
+fn print_takes_a_print_preset_by_name() {
+    let mut s = four_artboards_and_a_preset();
+    // The preset's settings stand in for the document's: one copy of artboard 4.
+    let (bytes, v) = print(&mut s, json!({"preset": "sheet"}));
+    assert_eq!((v["pages"].clone(), vectorcraft_pdf::info(&bytes, None).unwrap().pages.len()), (json!(1), 1));
+    let (_, v) = print(&mut s, json!({"preset": "Sheet", "settings": {"copies": 3}}));
+    assert_eq!(v["pages"], 3, "settings apply over the preset's");
+    let (_, v) = print(&mut s, json!({"preset": "[Default]"}));
+    assert_eq!(v["pages"], 4, "[Default]: every artboard, one copy");
+    assert_eq!(s.execute("print.setup", &json!({})).unwrap()["settings"]["copies"], 2, "printing doesn't change the saved setup");
+    // A PostScript file too.
+    let v = s.execute("file.print", &json!({"preset": "Sheet", "format": "postscript"})).unwrap();
+    assert_eq!(v["pages"], 1);
+}
+
+#[test]
+fn an_unknown_print_preset_is_refused_with_the_presets() {
+    let mut s = four_artboards_and_a_preset();
+    for c in ["file.print", "print.preview", "print.setup"] {
+        // Agents (MCP, the control channel) may pass `preset`.
+        s.check_params(c, &json!({"preset": "Sheet", "settings": {}})).unwrap();
+        let e = s.execute(c, &json!({"preset": "Nope"})).unwrap_err();
+        assert!(matches!(e, EngineError::BadParams { .. }), "{c}: {e}");
+        assert!(e.to_string().contains("no print preset named `Nope` (presets: [Default], Sheet)"), "{c}: {e}");
+        assert!(matches!(s.execute(c, &json!({"preset": 4})), Err(EngineError::BadParams { .. })), "{c}");
+    }
+    assert_eq!(s.doc().unwrap().doc.print_setup.as_ref().unwrap()["copies"], 2);
+}
+
+#[test]
+fn setup_with_a_preset_stores_its_settings() {
+    let mut s = four_artboards_and_a_preset();
+    let undo = s.doc().unwrap().history.undo.len();
+    let v = s.execute("print.setup", &json!({"preset": "Sheet"})).unwrap();
+    let got = (v["settings"]["copies"].clone(), v["settings"]["artboards"].clone(), v["settings"]["range"].clone());
+    assert_eq!(got, (json!(1), json!("range"), json!("4")));
+    let stored = s.doc().unwrap().doc.print_setup.clone().unwrap();
+    assert_eq!(stored, v["settings"]);
+    assert_eq!(s.doc().unwrap().history.undo.len(), undo + 1, "one undo step");
+    // The same preset again is no new step; settings apply over it.
+    s.execute("print.setup", &json!({"preset": "Sheet"})).unwrap();
+    assert_eq!(s.doc().unwrap().history.undo.len(), undo + 1);
+    let v = s.execute("print.setup", &json!({"preset": "Sheet", "settings": {"collate": false}})).unwrap();
+    assert_eq!((v["settings"]["range"].clone(), v["settings"]["collate"].clone()), (json!("4"), json!(false)));
+    s.execute("edit.undo", &json!({})).unwrap();
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.doc().unwrap().doc.print_setup.as_ref().unwrap()["copies"], 2);
+}
+
 #[test]
 fn preview_lists_pages_tiles_inks_and_warnings() {
     let (mut s, _) = session();
@@ -110,4 +170,45 @@ fn raster_effects_print_as_images() {
     s.execute("effect.apply", &json!({"effect": "stylize.dropShadow", "ids": [id]})).unwrap();
     let (bytes, _) = print(&mut s, json!({}));
     assert!(String::from_utf8_lossy(&bytes).contains("/Image"));
+}
+
+#[test]
+fn type_in_a_missing_family_warns_as_pdf_export_does() {
+    let (mut s, _) = session();
+    let id = s.execute("text.create", &json!({"x": 10, "y": 100, "text": "Ab", "font": "Nonexistent Sans Probe"})).unwrap()["id"].clone();
+    let fallback = |v: &Value| -> Vec<String> {
+        v["warnings"].as_array().unwrap().iter().filter_map(Value::as_str).filter(|w| w.contains("fallback font")).map(str::to_string).collect()
+    };
+    let export = fallback(&s.execute("document.exportPdf", &json!({})).unwrap());
+    assert!(export.first().is_some_and(|w| w.contains("Nonexistent Sans Probe")), "{export:?}");
+    let (_, v) = print(&mut s, json!({}));
+    assert_eq!(fallback(&v), export);
+    // Type printed as an image (a raster effect, Print as Bitmap) is drawn in the fallback font too.
+    s.execute("effect.apply", &json!({"effect": "stylize.dropShadow", "ids": [id]})).unwrap();
+    for settings in [json!({}), json!({"advanced": {"printAsBitmap": true}})] {
+        let (_, v) = print(&mut s, json!({ "settings": settings }));
+        assert_eq!(fallback(&v), export, "{settings}");
+    }
+}
+
+#[test]
+fn type_that_does_not_fit_its_frame_is_named() {
+    let (mut s, _) = session();
+    let p = json!({"x": 10, "y": 100, "text": "Ab\nCd\nEf\nGh", "size": 12, "area": {"width": 100, "height": 20}});
+    let id = s.execute("text.create", &p).unwrap()["id"].clone();
+    let over = |v: &Value| -> Vec<String> {
+        v["warnings"].as_array().unwrap().iter().filter_map(Value::as_str).filter(|w| w.contains("fit its frame")).map(str::to_string).collect()
+    };
+    let (_, v) = print(&mut s, json!({}));
+    assert_eq!(over(&v), [format!("1 text object doesn't fit its frame: the text past the end of the frame doesn't print (id {id})")]);
+    assert_eq!(over(&v), over(&s.execute("print.preview", &json!({})).unwrap()));
+    // Type printed as an image is named too.
+    s.execute("effect.apply", &json!({"effect": "stylize.dropShadow", "ids": [id]})).unwrap();
+    for settings in [json!({}), json!({"advanced": {"printAsBitmap": true}})] {
+        let (_, v) = print(&mut s, json!({ "settings": settings }));
+        assert_eq!(over(&v).len(), 1, "{settings}");
+    }
+    s.execute("text.areaOptions", &json!({"ids": [id], "height": 150})).unwrap();
+    let (_, v) = print(&mut s, json!({}));
+    assert_eq!(over(&v), Vec::<String>::new());
 }

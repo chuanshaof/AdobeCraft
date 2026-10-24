@@ -1,9 +1,11 @@
 //! Real text: type exported as selectable, searchable text in embedded subset fonts with a
 //! ToUnicode map, where the outlines would be; fonts whose licence forbids it stay outlines.
 
+use std::sync::Arc;
+
 use serde_json::json;
 use vectorcraft_color::{Color, Gradient, GradientPaint, Paint};
-use vectorcraft_doc::{CharStyle, Document, Node, NodeKind, TextKind, TextObject, TextRun};
+use vectorcraft_doc::{CharStyle, Document, Effect, Node, NodeKind, TextKind, TextObject, TextRun};
 use vectorcraft_geom::{Affine, BezPath, PathData, Point, Rect};
 use vectorcraft_text::{FALLBACK_FAMILY, FontDb};
 
@@ -76,6 +78,25 @@ fn type_is_written_as_text_in_embedded_subset_fonts() {
     assert!(!String::from_utf8_lossy(&pdf(&d, true).bytes).contains("/Font"));
 }
 
+/// Type that a Transform effect only moves and copies, on the type or on its group, is written as
+/// text, the copies too.
+#[test]
+fn type_copied_by_a_transform_effect_is_written_as_text() {
+    let copies = Effect { id: "distort.transform".into(), params: json!({"moveH": 200, "copies": 1}), visible: true };
+    for on_group in [false, true] {
+        let mut d = Document::new(400.0, 300.0);
+        let mut n = Node::new(d.alloc_id(), NodeKind::Text(Box::new(TextObject::point(Point::new(20.0, 60.0), "Hello", style(24.0)))));
+        if on_group {
+            n = Node::group(d.alloc_id(), vec![Arc::new(n)]);
+        }
+        n.appearance.effects.push(copies.clone());
+        let l = d.layers[0].id;
+        d.insert(Some(l), 0, n).unwrap();
+        let back = import_as(&pdf(&d, false).bytes, TextAs::Text);
+        assert_eq!(texts(&back), ["Hello", "Hello"], "on the group: {on_group}");
+    }
+}
+
 /// A curve type runs along.
 fn arc() -> PathData {
     let mut p = BezPath::new();
@@ -110,6 +131,58 @@ fn real_text_lands_within_half_a_point_of_the_outlines() {
     }
 }
 
+/// A run shifted two billion points off its baseline is left out, as real text or outlines, and
+/// the rest of the type is written. On a page 50 points high, the page's y flip puts the shifted
+/// run's baseline at -2,147,483,648, which the PDF writer panics on in builds with overflow checks.
+#[test]
+fn a_run_shifted_two_billion_points_is_left_out() {
+    let mut t = TextObject::point(Point::new(5.0, 40.0), "", style(12.0));
+    t.runs = vec![
+        TextRun { text: "in".into(), style: style(12.0), inline: None },
+        TextRun { text: "out".into(), style: CharStyle { baseline_shift: -2_147_483_649.0, ..style(12.0) }, inline: None },
+    ];
+    let mut d = doc(vec![t]);
+    d.artboards[0].rect = Rect::new(0.0, 0.0, 50.0, 50.0);
+    assert_eq!(texts(&import_as(&pdf(&d, false).bytes, TextAs::Text)), ["in"]);
+    let b = ink(&import_as(&pdf(&d, true).bytes, TextAs::Outlines));
+    assert!(b.y0 > 0.0 && b.y1 < 50.0, "{b:?}");
+}
+
+/// An overprinting run is written, or left out, as the same run is without overprint: the form
+/// marked to overprint the run holds the type's transform. For type moved 2,147,483,689 points down
+/// with its run shifted back onto a page 50 points high, a form placed through that transform would
+/// sit at y = -2,147,483,648, which the PDF writer panics on in builds with overflow checks. For
+/// type scaled 3 times, a form without that transform would hold a run shifted 500,000,000 points
+/// up, and the export would write the run 1,500,000,000 points up.
+#[test]
+fn overprinting_runs_are_written_or_left_out_as_other_runs_are() {
+    let moved = |overprint_fill| {
+        let back = CharStyle { baseline_shift: 2_147_483_649.0, overprint_fill, ..style(12.0) };
+        TextObject::point(Point::new(5.0, 2_147_483_689.0), "moved", back)
+    };
+    let scaled = |overprint_fill| {
+        let mut t = TextObject::point(Point::new(5.0, 40.0), "", style(12.0));
+        t.xf *= Affine::scale(3.0);
+        let up = CharStyle { baseline_shift: 500_000_000.0, overprint_fill, ..style(12.0) };
+        t.runs = vec![TextRun { text: "in".into(), style: style(12.0), inline: None }, TextRun { text: "out".into(), style: up, inline: None }];
+        t
+    };
+    let written = |mut t: TextObject| {
+        // The export culls type by the laid-out bounds that the engine keeps in `cached_bounds`.
+        t.cached_bounds = Some(vectorcraft_text::layout(FontDb::global(), &t).bounds);
+        let mut d = doc(vec![t]);
+        d.artboards[0].rect = Rect::new(0.0, 0.0, 50.0, 50.0);
+        pdf(&d, false).bytes
+    };
+    let text_of = |bytes: &[u8]| texts(&import_as(bytes, TextAs::Text));
+    let (on, off) = (written(moved(true)), written(moved(false)));
+    assert!(String::from_utf8_lossy(&on).contains("/VCop gs"), "an overprinting form");
+    assert_eq!(text_of(&on), ["moved"]);
+    assert_eq!(text_of(&off), ["moved"]);
+    assert_eq!(text_of(&written(scaled(true))), ["in"]);
+    assert_eq!(text_of(&written(scaled(false))), ["in"]);
+}
+
 /// A named instance of a variable font is real text in that instance: its embedded subset draws
 /// the instance's glyphs where the outlines would be, not the default instance's (#296).
 #[test]
@@ -130,6 +203,29 @@ fn variable_font_instances_are_real_text_in_their_own_glyphs() {
         widths.push(real.width());
     }
     assert!(widths[1] > widths[0] * 1.2, "Bold is wider: {widths:?}");
+}
+
+/// Type with Variable Font settings is real text in a font embedded at those settings: it draws
+/// where its outlines would, between the named instances on either side.
+#[test]
+fn variable_font_settings_are_real_text_in_their_own_glyphs() {
+    use vectorcraft_text::test_fonts::{TWO_AXIS_FAMILY, VARIABLE_CHARS, two_axis_font};
+    FontDb::global().add_font(two_axis_font().unwrap());
+    let mut widths = vec![];
+    for (s, wght) in [("Regular", None), ("Regular", Some(650.0)), ("Bold", None)] {
+        let font_axes = wght.map(|w| [("wght".to_string(), w)].into_iter().collect()).unwrap_or_default();
+        let st = CharStyle { font_family: TWO_AXIS_FAMILY.into(), font_style: s.into(), font_axes, ..style(48.0) };
+        let d = doc(vec![TextObject::point(Point::new(20.0, 80.0), VARIABLE_CHARS, st)]);
+        let r = pdf(&d, false);
+        assert!(r.warnings.is_empty(), "{s} {wght:?}: {:?}", r.warnings);
+        assert_eq!(texts(&import_as(&r.bytes, TextAs::Text)), [VARIABLE_CHARS], "{s} {wght:?}: real text");
+        let (real, outlined) = (ink(&import_as(&r.bytes, TextAs::Outlines)), ink(&import_as(&pdf(&d, true).bytes, TextAs::Outlines)));
+        let off =
+            [real.x0 - outlined.x0, real.y0 - outlined.y0, real.x1 - outlined.x1, real.y1 - outlined.y1].iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        assert!(off < 0.5, "{s} {wght:?}: {real:?} vs {outlined:?}");
+        widths.push(real.width());
+    }
+    assert!(widths[0] * 1.1 < widths[1] && widths[1] < widths[2], "{widths:?}");
 }
 
 #[test]
@@ -196,12 +292,71 @@ fn fonts_whose_licence_forbids_embedding_fall_back_to_outlines() {
 }
 
 #[test]
+fn type_with_outline_object_is_written_as_paths_with_no_font() {
+    let mut d = doc(vec![TextObject::point(Point::new(20.0, 60.0), "Hello World", style(24.0))]);
+    let id = d.layers[0].children().unwrap()[0].id;
+    d.node_mut(id).unwrap().appearance.effects.push(vectorcraft_doc::Effect { id: "path.outlineObject".into(), params: json!({}), visible: true });
+    let r = pdf(&d, false);
+    let text = String::from_utf8_lossy(&r.bytes);
+    assert!(!text.contains("/FontFile") && !text.contains("/Font"), "no font");
+    // Reopened, it is paths, even when type is asked for.
+    let back = import_as(&r.bytes, TextAs::Text);
+    assert!(texts(&back).is_empty());
+    let b = ink(&back);
+    assert!(b.width() > 50.0 && b.height() > 10.0, "{b:?}");
+}
+
+#[test]
 fn subset_thresholds_below_100_percent_are_accepted_with_a_warning() {
     let d = doc(vec![TextObject::point(Point::new(20.0, 60.0), "Subset", style(24.0))]);
     let settings: PdfSettings = serde_json::from_value(json!({"advanced": {"outlineText": false, "fontSubsetPercent": 40}})).unwrap();
     let r = export_with_report(&d, &PdfOptions { settings, ..Default::default() }).unwrap();
     assert!(r.warnings.iter().any(|w| w.contains("subset")), "{:?}", r.warnings);
     assert_eq!(texts(&import_as(&r.bytes, TextAs::Text)), ["Subset"]);
+}
+
+/// Characters with neither fill nor stroke (a scanned page's recognized text, as a PDF opens) are
+/// written as invisible text, in rendering mode 3: searchable, drawing nothing, and type without
+/// paint again when the file opens. Compressed or not, in PDF/X-1a and PDF/A too (#2675).
+#[test]
+fn type_without_paint_is_written_as_invisible_text() {
+    let unpainted = CharStyle { fill: Paint::None, ..style(24.0) };
+    let d = doc(vec![
+        TextObject::point(Point::new(20.0, 60.0), "Recognized", unpainted),
+        TextObject::point(Point::new(20.0, 160.0), "Visible", style(24.0)),
+    ]);
+    let r = pdf(&d, false);
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    let ops = String::from_utf8_lossy(&r.bytes).split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(ops.contains("3 Tr") && ops.contains("0 Tr"), "the invisible text in mode 3, the visible in mode 0");
+    let written = |v: serde_json::Value| {
+        let settings: PdfSettings = serde_json::from_value(v).unwrap();
+        export(&d, &PdfOptions { settings, created: Some(0), ..Default::default() }).unwrap()
+    };
+    let files = [
+        ("uncompressed", r.bytes.clone()),
+        ("compressed", written(json!({"advanced": {"outlineText": false}}))),
+        ("PDF/X-1a", written(json!({"standard": "pdfX1a", "compatibility": "1.3", "advanced": {"outlineText": false}}))),
+        ("PDF/A-2b", written(json!({"standard": "pdfA2b", "advanced": {"outlineText": false}}))),
+    ];
+    for (what, bytes) in files {
+        let back = import_as(&bytes, TextAs::Text);
+        assert_eq!(texts(&back), ["Recognized", "Visible"], "{what}");
+        let mut paints = vec![];
+        back.walk(|n| {
+            if let NodeKind::Text(t) = &n.kind {
+                paints.push(t.runs.iter().all(|r| r.style.fill.is_none() && !r.style.has_stroke()));
+            }
+        });
+        assert_eq!(paints, [true, false], "{what}: only the recognized text has no paint");
+        // It draws nothing: as outlines, only the visible text is there (its baseline on 160).
+        let drawn = ink(&import_as(&bytes, TextAs::Outlines));
+        assert!(drawn.y0 > 100.0, "{what}: {drawn:?}");
+    }
+    // Text exported as outlines has no invisible text: there is nothing to draw.
+    let outlined = import_as(&pdf(&d, true).bytes, TextAs::Text);
+    assert!(texts(&outlined).is_empty());
+    assert!(ink(&outlined).y0 > 100.0);
 }
 
 #[test]
@@ -248,17 +403,33 @@ fn digits_unnamed(text: &str) -> Vec<u8> {
     out
 }
 
-/// #708: a glyph whose ToUnicode value is U+FFFD isn't type showing "�". This subset font has no
-/// character map of its own, so the digits keep their outlines, drawn as the file draws them, and
-/// a warning names the font.
+/// #708, #811: a glyph whose ToUnicode value is U+FFFD isn't type showing "�". This subset font
+/// has no character map of its own, but the font is installed: each digit is found by its outline
+/// there, so the whole text stays one type object, with no outlines left behind.
 #[test]
-fn glyphs_mapped_to_the_replacement_character_keep_their_outlines() {
+fn unnamed_glyphs_of_an_installed_font_are_found_by_their_outline() {
     let bytes = digits_unnamed("Tel 02-12345");
     let report = import_with_report(&bytes, &ImportOptions { text_as: TextAs::Text, ..Default::default() }).unwrap();
-    let all = texts(&report.document).concat();
-    assert!(!all.contains('\u{FFFD}') && all.contains("Tel"), "no replacement characters: {all:?}");
-    assert!(ink(&report.document).width() > 50.0, "the digits are outlines");
-    assert!(report.warnings.iter().any(|w| w.contains("U+FFFD")), "{:?}", report.warnings);
+    assert_eq!(texts(&report.document), ["Tel 02-12345"]);
+    let mut paths = 0;
+    report.document.walk(|n| paths += usize::from(matches!(n.kind, NodeKind::Path { .. } | NodeKind::Compound { .. })));
+    assert_eq!(paths, 0, "no outlines left: {:?}", report.warnings);
+    assert!(!report.warnings.iter().any(|w| w.contains("U+FFFD")), "{:?}", report.warnings);
+}
+
+/// #811: an outline is named only by a glyph that draws it exactly; one moved off its place, or an
+/// empty glyph (which every space draws), stays unnamed and keeps its outlines.
+#[test]
+fn glyphs_are_named_only_by_an_exact_outline() {
+    let db = FontDb::global();
+    let face = db.face("Source Sans 3", "Regular").unwrap();
+    let k = 1000.0 / face.units_per_em();
+    let pdf_space = |c: char| Affine::new([k, 0.0, 0.0, -k, 0.0, 0.0]) * db.outline(&face, face.glyph_for(c)).as_ref().clone();
+    for c in ['R', 'a', '7', '&', 'é'] {
+        assert_eq!(crate::import::identify_glyph(&face, &pdf_space(c)), Some(c));
+    }
+    assert_eq!(crate::import::identify_glyph(&face, &(Affine::translate((100.0, 0.0)) * pdf_space('R'))), None);
+    assert_eq!(crate::import::identify_glyph(&face, &BezPath::new()), None);
 }
 
 /// #708: where the embedded font program has a character map, a glyph's character comes from it.
@@ -273,4 +444,154 @@ fn an_embedded_fonts_own_cmap_names_its_glyphs() {
         assert_eq!(chars.get(&g), Some(&c));
     }
     assert!(crate::import::font_chars(b"not a font").is_none());
+}
+
+/// Type whose text matrix shears its glyphs (slanted as a whole, as Illustrator writes type
+/// turned and skewed) reopens as type that still leans: drawn, it covers what its outlines do.
+#[test]
+fn slanted_type_reopens_as_type_that_still_leans() {
+    for (turn, lean) in [(0.0, 0.25), (-0.2, 0.25), (0.3, -0.15)] {
+        let mut t = TextObject::point(Point::new(80.0, 150.0), "LEAN", style(60.0));
+        t.xf *= Affine::rotate(turn) * Affine::skew(lean, 0.0);
+        let d = doc(vec![t]);
+        let reopened = import_as(&pdf(&d, false).bytes, TextAs::Text);
+        assert_eq!(texts(&reopened), ["LEAN"], "{turn} {lean}: reopened as type");
+        let (a, b) = (ink(&import_as(&pdf(&reopened, true).bytes, TextAs::Outlines)), ink(&import_as(&pdf(&d, true).bytes, TextAs::Outlines)));
+        let off = [a.x0 - b.x0, a.y0 - b.y0, a.x1 - b.x1, a.y1 - b.y1].iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        assert!(off < 0.5, "{turn} {lean}: {a:?} vs {b:?}");
+    }
+}
+
+/// Type set in an installed font's older version (a library keeps both, one name) reopens as type
+/// in that version: the file's glyphs are matched to it rather than kept as outlines, and the type
+/// names the version, which the family and style alone don't pick.
+#[test]
+fn type_in_another_installed_version_reopens_in_that_version() {
+    use vectorcraft_text::test_fonts::{TWIN_FAMILY, TWIN_VERSIONS, twin_font};
+    // The newer version first: the one the family and style resolve to.
+    FontDb::global().add_font(twin_font(true).unwrap());
+    FontDb::global().add_font(twin_font(false).unwrap());
+    for version in [None, Some(TWIN_VERSIONS[0])] {
+        let st = CharStyle { font_family: TWIN_FAMILY.into(), font_version: version.map(Into::into), ..style(40.0) };
+        let d = doc(vec![TextObject::point(Point::new(20.0, 80.0), "Hamburgefonstiv", st)]);
+        let back = import_as(&pdf(&d, false).bytes, TextAs::Text);
+        let mut found = vec![];
+        back.walk(|n| {
+            if let NodeKind::Text(t) = &n.kind {
+                found.push((t.plain_text(), t.first_style().font_version.clone()));
+            }
+        });
+        assert_eq!(found, [("Hamburgefonstiv".to_string(), version.map(String::from))], "{version:?}");
+    }
+}
+
+/// The glyph origins of the type objects of `d`, in document space, in order.
+fn origins(d: &Document) -> Vec<Point> {
+    let mut out = vec![];
+    d.walk(|n| {
+        if let NodeKind::Text(t) = &n.kind {
+            out.extend(vectorcraft_text::layout(FontDb::global(), t).glyphs.iter().map(|g| t.xf * g.origin));
+        }
+    });
+    out
+}
+
+/// Type spaced glyph by glyph (character tightening, optical kerning) comes back with each glyph
+/// in its place, not evened out by one tracking value; evenly spaced type keeps one run.
+#[test]
+fn glyphs_spaced_each_their_own_way_keep_their_place() {
+    let runs = [("T", 0.0), ("i", -120.0), ("g", 160.0), ("h", -60.0), ("tl", 0.0), ("y", 0.0)];
+    let mut t = TextObject::point(Point::new(20.0, 100.0), "", style(40.0));
+    t.runs = runs.iter().map(|(s, tr)| TextRun { text: s.to_string(), style: CharStyle { tracking: *tr, ..style(40.0) }, inline: None }).collect();
+    let d = doc(vec![t]);
+    let want = origins(&d);
+    let back = import_as(&pdf(&d, false).bytes, TextAs::default());
+    let got = origins(&back);
+    assert_eq!(got.len(), want.len(), "{:?}", texts(&back));
+    for (g, w) in got.iter().zip(&want) {
+        assert!((g.x - w.x).abs() < 0.1 && (g.y - w.y).abs() < 0.1, "{got:?}\nvs {want:?}");
+    }
+    let mut runs_back = 0;
+    back.walk(|n| {
+        if let NodeKind::Text(t) = &n.kind {
+            runs_back += t.runs.len();
+        }
+    });
+    assert!(runs_back > 1, "one tracking can't place them");
+    // Evenly tracked: one run.
+    let even = doc(vec![TextObject::point(Point::new(20.0, 100.0), "Tightly", CharStyle { tracking: -50.0, ..style(40.0) })]);
+    let back = import_as(&pdf(&even, false).bytes, TextAs::default());
+    back.walk(|n| {
+        if let NodeKind::Text(t) = &n.kind {
+            assert_eq!(t.runs.len(), 1, "{:?}", t.runs.iter().map(|r| r.style.tracking).collect::<Vec<_>>());
+        }
+    });
+}
+
+/// Words set apart by spaces tracked past an em (#2384) come back with each glyph in its place:
+/// the file draws each space and leaves the gap after it. Evenly tracked words keep one run.
+#[test]
+fn words_set_apart_by_spaces_tracked_past_an_em_keep_their_place() {
+    let runs = [("Hooks", 0.0), (" ", 1800.0), ("and", 0.0), (" ", 2400.0), ("leads", 0.0)];
+    let mut t = TextObject::point(Point::new(20.0, 100.0), "", style(12.0));
+    t.runs = runs.iter().map(|(s, tr)| TextRun { text: s.to_string(), style: CharStyle { tracking: *tr, ..style(12.0) }, inline: None }).collect();
+    let d = doc(vec![t]);
+    let want = origins(&d);
+    let back = import_as(&pdf(&d, false).bytes, TextAs::default());
+    assert_eq!(texts(&back), ["Hooks and leads"]);
+    let got = origins(&back);
+    assert_eq!(got.len(), want.len());
+    for (g, w) in got.iter().zip(&want) {
+        assert!((g.x - w.x).abs() < 0.1 && (g.y - w.y).abs() < 0.1, "{got:?}\nvs {want:?}");
+    }
+    // Evenly tracked, the spaces too: one run.
+    let even = doc(vec![TextObject::point(Point::new(20.0, 100.0), "Hooks and leads", CharStyle { tracking: 150.0, ..style(12.0) })]);
+    let back = import_as(&pdf(&even, false).bytes, TextAs::default());
+    assert_eq!(texts(&back), ["Hooks and leads"]);
+    back.walk(|n| {
+        if let NodeKind::Text(t) = &n.kind {
+            assert_eq!(t.runs.len(), 1, "{:?}", t.runs.iter().map(|r| r.style.tracking).collect::<Vec<_>>());
+        }
+    });
+}
+
+/// Evenly tracked type on a path comes back with its tracking: each glyph where it was along the
+/// curve, not closed up to the font's advances.
+#[test]
+fn evenly_tracked_type_on_a_path_keeps_its_length() {
+    let mut arc = BezPath::new();
+    arc.move_to((40.0, 200.0));
+    arc.curve_to((100.0, 80.0), (260.0, 80.0), (320.0, 200.0));
+    let mut t = TextObject::point(Point::ORIGIN, "ARCHING TYPE", CharStyle { tracking: 80.0, ..style(24.0) });
+    t.kind = TextKind::OnPath { path: PathData::from_bezpath(&arc), start: 0.0, end: None };
+    let d = doc(vec![t]);
+    let want = origins(&d);
+    let back = import_as(&pdf(&d, false).bytes, TextAs::default());
+    let got = origins(&back);
+    assert_eq!(got.len(), want.len(), "{:?}", texts(&back));
+    for (g, w) in got.iter().zip(&want) {
+        assert!(g.distance(*w) < 0.3, "{got:?}\nvs {want:?}");
+    }
+}
+
+/// Type filled with a dithered gradient is an image clipped to its outlines, sampled at the raster
+/// effects resolution on the page however the type is scaled, with its characters under it as
+/// invisible text (rendering mode 3), so they can still be selected and searched.
+#[test]
+fn dithered_type_keeps_its_resolution_when_scaled_and_stays_searchable() {
+    let fill = Paint::Gradient(Box::new(GradientPaint::new(Gradient { dither: true, ..Default::default() })));
+    let big = TextObject::point(Point::new(20.0, 80.0), "Dither", CharStyle { fill: fill.clone(), ..style(40.0) });
+    let mut scaled = TextObject::point(Point::new(5.0, 20.0), "Dither", CharStyle { fill, ..style(10.0) });
+    scaled.xf = Affine::scale(4.0) * scaled.xf;
+    let width = |bytes: &[u8]| -> u32 {
+        let s = String::from_utf8_lossy(bytes);
+        s.split("/Width ").nth(1).and_then(|w| w.split(|c: char| !c.is_ascii_digit()).next()).and_then(|n| n.parse().ok()).unwrap()
+    };
+    let (big, scaled) = (pdf(&doc(vec![big]), false).bytes, pdf(&doc(vec![scaled]), false).bytes);
+    let (wb, ws) = (width(&big), width(&scaled));
+    // At 72 ppi a pixel a point: 40 pt "Dither" is about 100 points wide.
+    assert!(wb >= 80 && wb.abs_diff(ws) <= 2, "40 pt type {wb} pixels wide, 10 pt type scaled 4 times {ws}");
+    let ops = String::from_utf8_lossy(&scaled).split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(ops.contains("3 Tr"), "the characters as invisible text");
+    assert_eq!(texts(&import_as(&scaled, TextAs::Text)), ["Dither"]);
 }

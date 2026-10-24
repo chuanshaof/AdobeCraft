@@ -14,27 +14,76 @@ type Row = (&'static [&'static str], Option<&'static str>, &'static [&'static st
 /// The Liquify tools.
 pub const LIQUIFY: &[&str] = &["warp", "twirl", "pucker", "bloat", "scallop", "crystallize", "wrinkle"];
 
-const SYMBOLISM: &[&str] =
+/// The Symbolism tools.
+pub const SYMBOLISM: &[&str] =
     &["symbolSprayer", "symbolShifter", "symbolScruncher", "symbolSizer", "symbolSpinner", "symbolStainer", "symbolScreener", "symbolStyler"];
 
 const ROWS: &[Row] = &[
+    (&["dimension"], None, &["mode", "style"]),
     // Global Brush Dimensions.
     (LIQUIFY, Some("liquify"), &["width", "height", "angle", "intensity", "usePressure", "showBrush"]),
     (LIQUIFY, None, &["detail", "simplify", "simplifyOn", "rate", "complexity", "horizontal", "vertical", "affectAnchors", "affectIn", "affectOut"]),
     (SYMBOLISM, Some("symbolism"), &["diameter", "intensity", "density"]),
     (&["mirrorCut"], None, &["axis", "keep"]),
     (&["puppetWarp"], None, &["showMesh", "expand"]),
-    (&["arc"], None, &["closed"]),
+    (&["arc"], None, &["closed", "lengthX", "lengthY", "reference", "baseAlong", "slope", "fillArc"]),
     (&["spiral"], None, &["decay", "segments", "clockwise"]),
-    (&["rectangularGrid"], None, &["rows", "columns"]),
-    (&["polarGrid"], None, &["concentric", "radial"]),
-    (&["pencil", "paintbrush"], None, &["fidelity", "fill", "editWithin", "closeWithin"]),
+    // The grids' Tool Options: the dividers and switches the drag uses, the Default Size and
+    // Reference Point a click's dialog opens with.
+    (&["rectangularGrid"], None, &["rows", "columns", "rowSkew", "columnSkew", "frame", "fill", "width", "height", "reference"]),
+    (&["polarGrid"], None, &["concentric", "radial", "concentricSkew", "radialSkew", "compound", "fill", "width", "height", "reference"]),
+    // Line Segment Tool Options: the Length and Angle a click's dialog opens with, Fill Line.
+    (&["lineSegment"], None, &["length", "angle", "fillLine"]),
+    (&["pencil", "paintbrush"], None, &["fidelity", "fill", "keepSelected", "editWithin", "closeWithin"]),
+    // Pencil Tool Options' Alt key toggles to Smooth Tool (the Paintbrush has no such option).
+    (&["pencil"], None, &["altSmooth"]),
     (&["smooth"], None, &["fidelity"]),
     (&["blobBrush", "eraser"], None, &["size"]),
+    (&["blobBrush"], None, &["keepSelected", "mergeOnlySelection"]),
+    // Live Paint Selection Tool Options (`builder::LivePaintSelectionTool`).
+    (&["livePaintSelection"], None, &["selectFills", "selectStrokes", "color", "width"]),
     (&["polygon"], None, &["sides"]),
     (&["star"], None, &["points"]),
     (&["freeTransform"], None, &["constrain"]),
-    (&["artboard"], None, &["moveArt"]),
+    // Shape Builder Tool Options (`builder::ShapeBuilderOptions`).
+    (
+        &["shapeBuilder"],
+        None,
+        &[
+            "openFilledAsClosed",
+            "pickColorFrom",
+            "cursorSwatchPreview",
+            "selection",
+            "highlightFill",
+            "gapDetection",
+            "gapLength",
+            "clickStrokeSplitsPath",
+            "highlightStroke",
+            "highlightColor",
+        ],
+    ),
+    (&["artboard"], None, &["moveArt", "scaleArt"]),
+    // Flare Tool Options (`extra::FLARE_OPTIONS` and the Rays and Rings checkboxes).
+    (
+        &["flare"],
+        None,
+        &[
+            "diameter",
+            "opacity",
+            "brightness",
+            "growth",
+            "fuzziness",
+            "raysOn",
+            "rays",
+            "longest",
+            "rayFuzziness",
+            "ringsOn",
+            "pathLength",
+            "rings",
+            "largest",
+            "direction",
+        ],
+    ),
 ];
 
 /// The stores `tool`'s persistent options live in, each with the option keys it holds.

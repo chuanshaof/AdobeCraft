@@ -110,6 +110,38 @@ fn right_click_on_empty_canvas_offers_the_view_and_a_dismissing_click_does_nothi
     assert_eq!(app.session.active().unwrap().doc.art_bounds(), None);
 }
 
+/// A right-click over a locked object adds an Unlock submenu that lists the object by its name.
+/// Choosing the name unlocks the object in one undo step; once the menu is closed, the menu lists
+/// no Unlock items.
+#[test]
+fn right_click_on_a_locked_object_offers_unlock_by_its_name() {
+    let mut app = app();
+    let id = rect(&mut app, 50.0, 50.0);
+    app.run("layer.setProps", json!({"ids": [id.0], "name": "Sky", "locked": true})).unwrap();
+    let steps = app.session.active().unwrap().history.undo.len();
+    let ctx = egui::Context::default();
+    frame(&mut app, &ctx, vec![]);
+    let p = screen(&app, 100.0, 100.0);
+    let texts = click(&mut app, &ctx, p, PointerButton::Secondary);
+    assert!(has(&texts, "Unlock"), "{texts:?}");
+    // Agents see the item under the Unlock path, by the object's name.
+    let entries = menus::context_entries(&app);
+    let item = entries.iter().find(|e| e.path == ["Unlock"]).unwrap();
+    assert_eq!((item.label.as_str(), item.command.as_deref()), ("Sky", Some("layer.setProps")));
+    assert_eq!(item.params, json!({"ids": [id.0], "locked": false}));
+    // Hovering Unlock opens the submenu.
+    frame(&mut app, &ctx, vec![Event::PointerMoved(at(&texts, "Unlock"))]);
+    let texts = frame(&mut app, &ctx, vec![]);
+    let texts = click(&mut app, &ctx, at(&texts, "Sky"), PointerButton::Primary);
+    let st = app.session.active().unwrap();
+    assert!(!st.doc.node(id).unwrap().locked, "the object is unlocked");
+    assert_eq!(st.history.undo.len(), steps + 1, "in one undo step");
+    assert!(!has(&texts, "Unlock"), "the menu closed: {texts:?}");
+    // Locked again, it is not listed until the next right-click over it.
+    app.run("layer.setProps", json!({"ids": [id.0], "locked": true})).unwrap();
+    assert!(menus::context_entries(&app).iter().all(|e| e.path.first().map(String::as_str) != Some("Unlock")));
+}
+
 /// #528: right-clicking a ruler offers the document units, the current one checked, and choosing one
 /// swaps them — the same effect as Preferences ▸ Units ▸ General (`document.setUnits`).
 #[test]
@@ -153,10 +185,14 @@ fn the_menu_follows_the_selection() {
     let (a, b) = (rect(&mut app, 0.0, 0.0), rect(&mut app, 50.0, 50.0));
     app.run("select.set", json!({"ids": [a.0, b.0]})).unwrap();
     let l = labels(&menus::context_items(&app));
-    for label in ["Group", "Join", "Make Clipping Mask", "Make Compound Path", "Bring to Front", "Move…"] {
+    for label in ["Group", "Join", "Make Clipping Mask", "Make Compound Path", "Objects on Path", "Bring to Front", "Move…"] {
         assert!(l.contains(&label), "{label} in {l:?}");
     }
     assert!(!l.contains(&"Ungroup") && !l.contains(&"Isolate Selected Group"));
+    // Objects on Path chooses its tool, which attaches the selection to the path clicked next.
+    menus::invoke(&mut app, "object.objectsOnPath.attach", json!({}));
+    assert_eq!(app.session.tool_id(), "objectsOnPath");
+    app.select_tool("selection");
     app.run("object.group", json!({})).unwrap();
     let l = labels(&menus::context_items(&app));
     assert!(l.contains(&"Ungroup") && l.contains(&"Isolate Selected Group"));
@@ -175,6 +211,26 @@ fn the_menu_follows_the_selection() {
     let items = menus::context_items(&app);
     assert!(!matches!(items.first(), Some(Item::Sep)) && !matches!(items.last(), Some(Item::Sep)));
     assert!(items.windows(2).all(|w| !matches!(w, [Item::Sep, Item::Sep])));
+}
+
+/// Selected type has Bullets and Numbering › Apply Bullets in the context menu and the Type menu,
+/// which makes its paragraphs a bulleted list; other art has no such item.
+#[test]
+fn selected_type_has_apply_bullets() {
+    let mut app = app();
+    let r = rect(&mut app, 0.0, 0.0);
+    app.run("select.set", json!({"ids": [r.0]})).unwrap();
+    let bullets = |app: &VectorcraftApp| menus::context_entries(app).into_iter().find(|e| e.command.as_deref() == Some("type.applyBullets"));
+    assert!(bullets(&app).is_none(), "a rectangle has no paragraphs");
+    let t = NodeId(app.run("text.create", json!({"x": 10, "y": 200, "text": "Item"})).unwrap()["id"].as_u64().unwrap());
+    app.run("select.set", json!({"ids": [t.0]})).unwrap();
+    let e = bullets(&app).expect("Apply Bullets");
+    assert_eq!((e.path.as_slice(), e.label.as_str(), e.enabled), (&["Bullets and Numbering".to_string()][..], "Apply Bullets", true));
+    let typed = menus::menu_entries(&app).into_iter().find(|e| e.command.as_deref() == Some("type.applyBullets")).expect("in the Type menu");
+    assert_eq!(typed.path, ["Type", "Bullets and Numbering"]);
+    menus::invoke(&mut app, "type.applyBullets", json!({}));
+    let Some(NodeKind::Text(text)) = app.session.active().unwrap().doc.node(t).map(|n| &n.kind) else { panic!("text") };
+    assert!(text.para_at(0).list.is_some());
 }
 
 /// Every label the context menu can show is a menu string, so complete catalogs must translate it.
@@ -198,6 +254,11 @@ fn every_context_label_is_a_menu_string() {
     app.run("object.group", json!({})).unwrap();
     shown.extend(labels(&menus::context_items(&app)));
     menus::invoke(&mut app, "object.isolate", json!({}));
+    shown.extend(labels(&menus::context_items(&app)));
+    // The Unlock submenu that a right-click over a locked object adds.
+    menus::invoke(&mut app, "object.exitIsolation", json!({}));
+    app.run("layer.setProps", json!({"ids": [a.0], "locked": true})).unwrap();
+    app.ui.context_locked = Some((app.session.active().unwrap().uid, vec![a]));
     shown.extend(labels(&menus::context_items(&app)));
     let missing: Vec<_> = shown.iter().filter(|l| !strings.contains(**l)).collect();
     assert!(missing.is_empty(), "context menu labels missing from menu_strings: {missing:?}");

@@ -64,10 +64,10 @@ fn an_object_slice_follows_its_object_and_releases_back_to_it() {
     // Make again changes nothing; Release leaves the object.
     assert_eq!(run(&mut s, "object.slice.make", json!({}))["ids"], json!([]));
     assert_eq!(run(&mut s, "object.slice.release", json!({}))["ids"], json!([a]));
-    assert!(s.doc().unwrap().doc.node(NodeId(a)).unwrap().slice.is_none());
+    assert!(s.doc().unwrap().doc.node(NodeId(a)).unwrap().extras().slice.is_none());
     assert!(slices(&mut s).is_empty());
     run(&mut s, "edit.undo", json!({}));
-    assert!(s.doc().unwrap().doc.node(NodeId(a)).unwrap().slice.is_some());
+    assert!(s.doc().unwrap().doc.node(NodeId(a)).unwrap().extras().slice.is_some());
 }
 
 #[test]
@@ -140,6 +140,9 @@ fn divide_two_by_three_and_by_size() {
     assert_eq!(hs, [25.0, 25.0, 10.0]);
     assert!(s.execute("object.slice.divide", &json!({"rows": 0})).is_err());
     assert!(s.execute("object.slice.divide", &json!({"columns": 5000})).is_err());
+    // A 32-bit build read 2^32 + 2 as 2, passed the check and went on to list 2^32 + 3 cuts.
+    let e = s.execute("object.slice.divide", &json!({"rows": (1u64 << 32) + 2})).unwrap_err().to_string();
+    assert!(e.contains("divide into 1 to"), "{e}");
     assert!(s.execute("object.slice.divide", &json!({})).is_err(), "nothing to divide by");
 }
 
@@ -155,7 +158,7 @@ fn combine_and_duplicate() {
     let c = run(&mut s, "object.slice.combine", json!({}))["id"].as_u64().unwrap();
     assert_eq!(rect_of(&mut s, c), [0.0, 0.0, 60.0, 50.0]);
     assert_eq!(user_count(&s), 1);
-    assert!(s.doc().unwrap().doc.node(NodeId(b)).unwrap().slice.is_none(), "the object slice was released");
+    assert!(s.doc().unwrap().doc.node(NodeId(b)).unwrap().extras().slice.is_none(), "the object slice was released");
     assert_eq!(s.doc().unwrap().selection.slices, vec![NodeId(c)]);
     let dup = run(&mut s, "object.slice.duplicate", json!({}))["ids"][0].as_u64().unwrap();
     assert_eq!(rect_of(&mut s, dup), [10.0, 10.0, 60.0, 50.0]);
@@ -191,7 +194,7 @@ fn slice_options_set_read_and_undo_in_one_step() {
     run(&mut s, "select.set", json!({"ids": [t]}));
     let o = run(&mut s, "object.slice.options", json!({"kind": "htmlText"}));
     assert_eq!((o["kind"].clone(), o["htmlText"].clone()), (json!("htmlText"), json!(true)));
-    assert_eq!(s.doc().unwrap().doc.node(NodeId(t)).unwrap().slice.as_ref().unwrap().kind, SliceKind::HtmlText);
+    assert_eq!(s.doc().unwrap().doc.node(NodeId(t)).unwrap().extras().slice.as_ref().unwrap().kind, SliceKind::HtmlText);
 }
 
 #[test]
@@ -225,7 +228,7 @@ fn clip_to_artboard_hide_lock_select_and_delete_all() {
 
     assert_eq!(run(&mut s, "object.slice.deleteAll", json!({}))["count"], 2);
     assert_eq!(user_count(&s), 0);
-    assert!(s.doc().unwrap().doc.node(NodeId(a)).unwrap().slice.is_none());
+    assert!(s.doc().unwrap().doc.node(NodeId(a)).unwrap().extras().slice.is_none());
     assert!(s.execute("object.slice.deleteAll", &json!({})).is_err(), "nothing to delete");
 }
 
@@ -243,7 +246,7 @@ fn slices_survive_a_native_round_trip() {
     vectorcraft_testkit::invariants::check_native_roundtrip_exact(&doc).unwrap();
     let back = vectorcraft_format::load(&vectorcraft_format::save(&doc, false)).unwrap();
     assert_eq!(back.slices, doc.slices);
-    assert_eq!(back.node(NodeId(a)).unwrap().slice.as_ref().unwrap().alt, "logo");
+    assert_eq!(back.node(NodeId(a)).unwrap().extras().slice.as_ref().unwrap().alt, "logo");
     assert!(!back.slices_clip_to_artboard);
     // A copy of an object slice is an object slice too, under its own id.
     run(&mut s, "select.set", json!({"ids": [a]}));

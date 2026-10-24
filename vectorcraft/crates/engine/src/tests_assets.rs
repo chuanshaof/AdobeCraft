@@ -1,6 +1,7 @@
 //! Asset Export: collecting art as assets (single and multiple), assets following their art
 //! (moves, deletions), names, undo, the native round trip, the shared export settings and
-//! exporting assets alone, cropped to their art.
+//! exporting assets alone, cropped to their art. Art Optimized PNG exports are supersampled
+//! so abutting shapes leave no ghost seam (#983 / #1037).
 
 use serde_json::{Value, json};
 use vectorcraft_color::{Color, Paint};
@@ -67,12 +68,35 @@ fn multiple_gives_an_asset_per_object_and_single_one_of_them_all() {
     let again = run(&mut s, "assets.add", json!({"ids": [b, a]}));
     assert_eq!((again["added"].clone(), again["assets"].clone()), (json!(0), json!([list[0]["id"], list[1]["id"]])));
     assert_eq!(undo_len(&s), steps);
-    // Layers aren't art; nothing to collect is an error.
+    // A layer id collects the art under it (Layers panel Collect for Export / MCP).
     let layer = s.doc().unwrap().doc.layers[0].id.0;
-    assert!(s.execute("assets.add", &json!({"ids": [layer]})).is_err());
+    let from_layer = run(&mut s, "assets.add", json!({"ids": [layer]}));
+    assert_eq!(from_layer["added"], 0, "those objects are assets already");
+    assert_eq!(from_layer["assets"], json!([list[0]["id"], list[1]["id"]]));
+    // An empty layer has nothing to collect.
+    let empty = run(&mut s, "layer.new", json!({}))["id"].as_u64().unwrap();
+    assert!(s.execute("assets.add", &json!({"ids": [empty]})).is_err());
     run(&mut s, "select.set", json!({"ids": []}));
     assert!(s.execute("assets.add", &json!({})).is_err());
     assert!(s.execute("assets.add", &json!({"ids": [a, b], "name": "Two"})).is_err(), "a name names one asset");
+}
+
+#[test]
+fn a_layer_id_collects_the_art_under_it_including_sublayers() {
+    let mut s = session();
+    let a = rect(&mut s, 10.0, 10.0, 20.0, 20.0);
+    let sub = run(&mut s, "layer.newSublayer", json!({}))["id"].as_u64().unwrap();
+    run(&mut s, "layer.setCurrent", json!({"id": sub}));
+    let b = rect(&mut s, 50.0, 10.0, 30.0, 20.0);
+    let layer = s.doc().unwrap().doc.layers[0].id.0;
+    let r = run(&mut s, "assets.add", json!({"ids": [layer]}));
+    assert_eq!(r["added"], 2);
+    let list = assets(&mut s);
+    assert_eq!(list.len(), 2);
+    assert_eq!((list[0]["nodes"].clone(), list[1]["nodes"].clone()), (json!([a]), json!([b])));
+    let one = run(&mut s, "assets.add", json!({"ids": [layer], "multiple": false}));
+    assert_eq!(one["added"], 1);
+    assert_eq!(assets(&mut s).last().unwrap()["nodes"], json!([a, b]));
 }
 
 #[test]
@@ -125,6 +149,24 @@ fn an_asset_exports_its_art_alone() {
     assert_eq!(svg[0].0, "Asset-1.svg");
     assert!(text.contains("viewBox=\"10 10 20 20\"") || text.contains("viewBox=\"0 0 20 20\""), "{text}");
     assert!(!text.to_lowercase().contains("#0000ff"), "no blue: {text}");
+}
+
+/// The crop of an asset takes in its effects: the drop shadow is inside the exported image, and
+/// assets.list gives that crop.
+#[test]
+fn an_assets_crop_takes_in_its_drop_shadow() {
+    let mut s = session();
+    let a = rect(&mut s, 50.0, 50.0, 20.0, 20.0);
+    run(&mut s, "assets.add", json!({"ids": [a]}));
+    assert_eq!(assets(&mut s)[0]["bounds"], json!([50.0, 50.0, 20.0, 20.0]), "the plain square");
+    run(&mut s, "effect.apply", json!({"effect": "stylize.dropShadow", "ids": [a], "params": {"x": 10, "y": 0, "blur": 0}}));
+    // The shadow's reach (10 pt) on every side.
+    assert_eq!(assets(&mut s)[0]["bounds"], json!([40.0, 40.0, 40.0, 40.0]));
+    let out = files(&run(&mut s, "assets.export", json!({"formats": [{"format": "png", "scale": "1x"}]})));
+    let img = image::load_from_memory(&out[0].1).unwrap().to_rgba8();
+    assert_eq!(img.dimensions(), (40, 40));
+    // The shadow's right half, x 70 to 80.
+    assert!(img.get_pixel(35, 20)[3] > 0, "the shadow is in the image");
 }
 
 #[test]
@@ -264,4 +306,47 @@ fn assets_export_into_a_folder() {
     assert_eq!(r["files"], json!([format!("{folder}/2x/Logo@2x.png"), format!("{folder}/PDF/Logo.pdf")]));
     assert!(dir.join("2x/Logo@2x.png").is_file() && dir.join("PDF/Logo.pdf").is_file());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #983: Asset Export Art Optimized PNG supersamples, so two abutting fills leave no white seam
+/// on the shared edge (same idea as `supersampled_art_leaves_no_seam_between_shapes_that_meet`).
+#[test]
+fn assets_export_leaves_no_seam_between_abutting_shapes() {
+    let mut s = session();
+    s.paint.fill = Paint::solid(Color::rgb(1.0, 0.0, 0.0));
+    // Share the edge at x = 30; the crop is (10, 10)–(50, 30).
+    let (a, b) = (rect(&mut s, 10.0, 10.0, 20.0, 20.0), rect(&mut s, 30.0, 10.0, 20.0, 20.0));
+    run(&mut s, "assets.add", json!({"ids": [a, b], "multiple": false}));
+    let out = files(&run(
+        &mut s,
+        "assets.export",
+        json!({
+            "formats": [{"format": "png", "scale": "1x", "background": "white"}],
+            "antiAlias": "art",
+        }),
+    ));
+    assert_eq!(out[0].0, "Asset-1.png");
+    let img = image::load_from_memory(&out[0].1).unwrap().to_rgba8();
+    assert_eq!(img.dimensions(), (40, 20));
+    // Column 20 is the shared edge in crop space; green must stay red (no white bleed).
+    let palest_g = (2..18).map(|y| img.get_pixel(20, y).0[1].max(img.get_pixel(19, y).0[1])).max().unwrap();
+    assert_eq!(palest_g, 0, "supersampled Asset Export: no seam on the shared edge (G={palest_g})");
+}
+
+#[test]
+fn collecting_explicit_assets_rejects_invalid_ids_without_adding_anything() {
+    let mut s = session();
+    let a = rect(&mut s, 10.0, 10.0, 20.0, 20.0);
+    let b = rect(&mut s, 50.0, 10.0, 20.0, 20.0);
+    let original_selection = s.doc().unwrap().selection.objects.clone();
+    let before = undo_len(&s);
+    for ids in [json!([a, "not an object"]), json!([a, 3.5]), json!([a, u64::MAX]), json!({"id": a})] {
+        assert!(s.execute("assets.add", &json!({"ids": ids})).is_err(), "invalid ids: {ids}");
+        assert!(assets(&mut s).is_empty(), "invalid ids must not collect only the valid subset");
+        assert_eq!(undo_len(&s), before);
+        assert_eq!(s.doc().unwrap().selection.objects, original_selection);
+    }
+    // Valid ids still collect art in document paint order.
+    assert_eq!(run(&mut s, "assets.add", json!({"ids": [b, a]}))["added"], 2);
+    assert_eq!(assets(&mut s).len(), 2);
 }

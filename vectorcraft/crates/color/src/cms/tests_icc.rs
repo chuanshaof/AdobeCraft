@@ -22,7 +22,8 @@ fn cmyk_profiles_convert_like_the_cms() {
         assert_eq!(parse(&bytes).color_space, moxcms::DataColorSpace::Cmyk);
         let p = IccProfile::from_bytes(None, &bytes).unwrap();
         assert_eq!((p.name.as_str(), p.kind), (name, ProfileKind::Cmyk));
-        let cms = Cms::new(&ColorSettings { cmyk: name.into(), ..Default::default() }).unwrap();
+        // The encoded profile converts without black-point compensation, so compare without it.
+        let cms = Cms::new(&ColorSettings { cmyk: name.into(), bpc: false, ..Default::default() }).unwrap();
         for cmyk in [[0.0; 4], [1.0, 0.0, 0.0, 0.0], [0.2, 0.7, 0.1, 0.3], [0.0, 0.0, 0.0, 1.0], [0.5, 0.5, 0.5, 0.0]] {
             let want = cms.cmyk_to_srgb(cmyk, false);
             let got = p.to_srgb(&cmyk, Intent::RelativeColorimetric).unwrap();
@@ -110,4 +111,44 @@ fn black_point_compensation_maps_the_darkest_ink_to_rgb_black() {
     assert!(white.iter().all(|v| *v > 0.99), "{white:?}");
     let abs = |bpc| icc_cmyk(bpc).cmyk_to_rgb(rich, Intent::AbsoluteColorimetric);
     assert_eq!(abs(true), abs(false));
+}
+
+/// #1584: every built-in profile (RGB, CMYK and gray) has each tag on a 4-byte boundary and a size
+/// that is a multiple of 4 (ICC.1 §7.1.2), and still reads back as the same space.
+#[test]
+fn builtin_profiles_align_their_sizes_and_tags() {
+    for name in BUILTIN_RGB.into_iter().chain(BUILTIN_CMYK).chain([GRAY]) {
+        let icc = super::icc_bytes(name).unwrap();
+        let be = |at: usize| u32::from_be_bytes([icc[at], icc[at + 1], icc[at + 2], icc[at + 3]]) as usize;
+        assert_eq!(be(0), icc.len(), "{name}: header size");
+        assert_eq!(icc.len() % 4, 0, "{name}: {} bytes", icc.len());
+        let n = be(128);
+        for i in 0..n {
+            let (off, size) = (be(132 + 12 * i + 4), be(132 + 12 * i + 8));
+            assert_eq!(off % 4, 0, "{name}: tag {i} at {off}");
+            assert!(off + size <= icc.len());
+        }
+        let back = moxcms::ColorProfile::new_from_slice(&icc).unwrap();
+        let orig = moxcms::ColorProfile::new_srgb();
+        if name == super::SRGB {
+            assert_eq!((back.red_colorant, back.green_colorant, back.blue_colorant), (orig.red_colorant, orig.green_colorant, orig.blue_colorant));
+        }
+    }
+}
+
+/// #2707: the CMYK profiles written here carry every tag ICC.1 requires of an output profile (the
+/// tables of all three intents and the gamut tag): Windows rejects one without them, and Photos
+/// then can't show a CMYK TIFF that embeds it.
+#[test]
+fn cmyk_profiles_have_the_tags_of_an_output_profile() {
+    for name in BUILTIN_CMYK {
+        let icc = icc_bytes(name).unwrap();
+        let be = |at: usize| u32::from_be_bytes([icc[at], icc[at + 1], icc[at + 2], icc[at + 3]]) as usize;
+        let tags: Vec<&[u8]> = (0..be(128)).map(|i| &icc[132 + 12 * i..136 + 12 * i]).collect();
+        for want in [b"desc", b"cprt", b"wtpt", b"A2B0", b"A2B1", b"A2B2", b"B2A0", b"B2A1", b"B2A2", b"gamt"] {
+            assert!(tags.contains(&&want[..]), "{name}: no {}", String::from_utf8_lossy(want));
+        }
+        let p = parse(&icc);
+        assert!(p.lut_a_to_b_saturation.is_some() && p.lut_b_to_a_saturation.is_some() && p.gamut.is_some(), "{name}");
+    }
 }

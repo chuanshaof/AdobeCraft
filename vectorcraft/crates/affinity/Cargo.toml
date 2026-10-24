@@ -16,7 +16,8 @@ synth = []
 [dependencies]
 crc32fast = { workspace = true }
 flate2 = { workspace = true }
-ruzstd = "0.9"
+image = { workspace = true }
+ruzstd = "0.9.1"
 
 [dev-dependencies]
 proptest = { workspace = true }

@@ -77,7 +77,7 @@ fn opacity_defines_the_knockout_shape() {
             let blue = Arc::make_mut(&mut g.children_mut().unwrap()[1]);
             blue.opacity = 1.0;
             blue.knockout_shape = shape;
-            blue.mask = Some(Box::new(vectorcraft_doc::OpacityMask::new(white, true)));
+            blue.extras_mut().mask = Some(Box::new(vectorcraft_doc::OpacityMask::new(white, true)));
         }));
         let want = if shape { HALF_KNOCKED } else { BLUE_OVER_WHITE };
         // A mid-grey mask is ~50% (luminance 0.5, not gamma-corrected): allow a little more slack.
@@ -125,4 +125,62 @@ fn page_knockout_and_isolated_blending() {
     assert!(close(render(&d).pixel(30, 50), [0, 255, 255, 255]), "inverts the white: {:?}", render(&d).pixel(30, 50));
     d.page_isolate = true;
     assert!(close(render(&d).pixel(30, 50), [255, 0, 0, 255]), "isolated: {:?}", render(&d).pixel(30, 50));
+}
+
+#[test]
+fn page_knockout_looks_the_same_when_another_object_blends() {
+    // With Page Knockout Group on, a Multiply square on the page makes the renderer draw the page
+    // over a copy of what is below it (white, or nothing). Four objects knock out part of the
+    // orange page: a blue square whose left edge covers half of pixel column 10, a 50% blue square
+    // whose opacity defines its knockout shape, a 50% blue square, and an isolated group of a green
+    // square and a 50% group holding a Multiply square, which draws its middle half transparent.
+    // Each looks the same with and without the Multiply square.
+    let rect = |d: &mut Document, r: Rect, (red, green, blue): (f32, f32, f32)| {
+        Node::path(d.alloc_id(), shapes::rectangle(r), Appearance::basic(Paint::solid(Color::rgb(red, green, blue)), Paint::None, 0.0))
+    };
+    let page = |blending: bool| {
+        let mut d = Document::new(100.0, 100.0);
+        d.page_knockout = true;
+        let orange = rect(&mut d, Rect::new(0.0, 0.0, 100.0, 100.0), (0.8, 0.6, 0.2));
+        let edge = rect(&mut d, Rect::new(10.5, 10.0, 30.5, 30.0), (0.1, 0.3, 0.9));
+        let mut shaped = rect(&mut d, Rect::new(40.0, 10.0, 60.0, 30.0), (0.1, 0.3, 0.9));
+        (shaped.opacity, shaped.knockout_shape) = (0.5, true);
+        let mut translucent = rect(&mut d, Rect::new(70.0, 10.0, 90.0, 30.0), (0.1, 0.3, 0.9));
+        translucent.opacity = 0.5;
+        let green = rect(&mut d, Rect::new(10.0, 40.0, 60.0, 90.0), (0.2, 0.9, 0.4));
+        let mut multiply = rect(&mut d, Rect::new(20.0, 50.0, 50.0, 80.0), (0.5, 0.5, 1.0));
+        multiply.blend = Blend::Multiply;
+        let mut inner = Node::group(d.alloc_id(), vec![Arc::new(multiply)]);
+        inner.opacity = 0.5;
+        let mut isolated = Node::group(d.alloc_id(), vec![Arc::new(green), Arc::new(inner)]);
+        isolated.isolate = true;
+        let mut objects = vec![orange, edge, shaped, translucent, isolated];
+        if blending {
+            let mut other = rect(&mut d, Rect::new(70.0, 70.0, 90.0, 90.0), (0.5, 0.5, 1.0));
+            other.blend = Blend::Multiply;
+            objects.push(other);
+        }
+        let l = d.layers[0].id;
+        for n in objects {
+            d.insert(Some(l), usize::MAX, n).unwrap();
+        }
+        d
+    };
+    // Half of the orange stays and blue takes the other half: 0.5 · orange + 0.5 · blue. The 50%
+    // square knocks out all of the orange and shows over what is below the page: 0.5 · white +
+    // 0.5 · blue, or blue at 50% over nothing.
+    let half_blue = [115, 115, 140, 255];
+    for (below, half_square) in [(Some([255, 255, 255, 255]), [140, 166, 242, 255]), (None, [26, 77, 230, 128])] {
+        let opts = RenderOptions { background: below, ..Default::default() };
+        let draw = |d: &Document| Renderer::new().render(d, 100, 100, Affine::IDENTITY, &opts);
+        let (plain, blending) = (draw(&page(false)), draw(&page(true)));
+        let cases = [("half-covered edge", 10, 20, half_blue), ("knockout shape", 50, 20, half_blue), ("50%", 80, 20, half_square)];
+        for (what, x, y, want) in cases {
+            for r in [&plain, &blending] {
+                assert!(close(r.pixel(x, y), want), "{what} over {below:?}: {:?}", r.pixel(x, y));
+            }
+        }
+        let (a, b) = (plain.pixel(35, 65), blending.pixel(35, 65));
+        assert!(close(a, b), "the group's middle over {below:?}: {a:?} alone, {b:?} with the Multiply square");
+    }
 }

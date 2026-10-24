@@ -19,7 +19,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add Freeform Point",
             [],
             None,
-            "{at: [x,y] (document coordinates), color? (default: the gradient's colour there), opacity? 0..1 (or 0..100), spread? 0..1 (or 0..100 %; the radius of pure colour around the point, a fraction of half the object's larger side; default 0), line?: true (join it to the selected point: extends the line ending there, else starts one), ids?, stroke?: bool (default: the targeted item's kind, else the active proxy), item?: fill/stroke item index|null (omitted: the Appearance panel's active item when it is of the edited kind)} add a point to the freeform gradient (an unplaced one keeps its automatic points first) and select it → {index}",
+            "{at: [x,y] (document coordinates), color? (default: the gradient's colour there), keepModel?: bool (as paint.setFill), opacity?: 0..1 (or 0..100), spread?: 0..1 (or 0..100 %; the radius of pure colour around the point, a fraction of half the object's larger side; default 0), line?: true (join it to the selected point: extends the line ending there, else starts one), ids?|id?, stroke?: bool (default: the targeted item's kind, else the active proxy), item?: fill/stroke item index|null (omitted: the Appearance panel's active item when it is of the edited kind), target?: \"object\"|\"contents\"} add a point to the freeform gradient (an unplaced one keeps its automatic points first) and select it → {index}",
             has_doc,
             add_point
         ),
@@ -28,7 +28,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit Freeform Point",
             [],
             None,
-            "{index? (default: the selected point), at?: [x,y] (document coordinates), color?, opacity? 0..1 (or 0..100), spread? 0..1 (or 0..100 %), ids?, stroke?: bool (default: the targeted item's kind, else the active proxy), item?: fill/stroke item index|null (omitted: the Appearance panel's active item when it is of the edited kind)} move or recolour a point of the freeform gradient → {index}",
+            "{index? (default: the selected point), at?: [x,y] (document coordinates), color?, keepModel?: bool (as paint.setFill), opacity?: 0..1 (or 0..100), spread?: 0..1 (or 0..100 %), ids?|id?, stroke?: bool (default: the targeted item's kind, else the active proxy), item?: fill/stroke item index|null (omitted: the Appearance panel's active item when it is of the edited kind), target?: \"object\"|\"contents\"} move or recolour a point of the freeform gradient → {index}",
             has_doc,
             set_point
         ),
@@ -37,7 +37,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Delete Freeform Point",
             [],
             None,
-            "{index? (default: the selected point), ids?, stroke?: bool (default: the targeted item's kind, else the active proxy), item?: fill/stroke item index|null (omitted: the Appearance panel's active item when it is of the edited kind)} remove a point (never the last one); lines through it close up around it and lines left with one point go → {index}",
+            "{index? (default: the selected point), ids?|id?, stroke?: bool (default: the targeted item's kind, else the active proxy), item?: fill/stroke item index|null (omitted: the Appearance panel's active item when it is of the edited kind), target?: \"object\"|\"contents\"} remove a point (never the last one); lines through it close up around it and lines left with one point go → {index}",
             has_doc,
             delete_point
         ),
@@ -46,7 +46,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add Freeform Line",
             [],
             None,
-            "{points: [index, …] (at least two), ids?, stroke?: bool (default: the targeted item's kind, else the active proxy), item?: fill/stroke item index|null (omitted: the Appearance panel's active item when it is of the edited kind)} join points with a smooth line through them, in order → {line}",
+            "{points: [index, …] (at least two), ids?|id?, stroke?: bool (default: the targeted item's kind, else the active proxy), item?: fill/stroke item index|null (omitted: the Appearance panel's active item when it is of the edited kind), target?: \"object\"|\"contents\"} join points with a smooth line through them, in order → {line}",
             has_doc,
             add_line
         ),
@@ -55,7 +55,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Split Freeform Line",
             [],
             None,
-            "{line: line index, segment: the segment from the line's point `segment` to the next, t?: 0..1 along it (default 0.5), ids?, stroke?: bool (default: the targeted item's kind, else the active proxy), item?: fill/stroke item index|null (omitted: the Appearance panel's active item when it is of the edited kind)} add a point on a line there (colour, opacity and spread between the segment's ends) and select it → {index}",
+            "{line: line index, segment: the segment from the line's point `segment` to the next, t?: 0..1 along it (default 0.5), ids?|id?, stroke?: bool (default: the targeted item's kind, else the active proxy), item?: fill/stroke item index|null (omitted: the Appearance panel's active item when it is of the edited kind), target?: \"object\"|\"contents\"} add a point on a line there (colour, opacity and spread between the segment's ends) and select it → {index}",
             has_doc,
             split_line
         ),
@@ -134,6 +134,12 @@ fn point_fields(v: &Value, pt: &mut FreeformPoint, to_paint: Affine) -> std::res
     Ok(())
 }
 
+/// The `color` of `p` as the document stores it: an RGB color in a CMYK document becomes CMYK
+/// through the color settings ([`super::paint::new_color`]). `None` without a valid one.
+fn given_color(s: &Session, p: &Value) -> Option<vectorcraft_color::Color> {
+    p.get("color").and_then(color_value).map(|c| super::paint::new_color(s, p, c))
+}
+
 /// Parse the `freeform` param of a gradient paint (`{points: [{at, color, opacity?, spread?}],
 /// lines?: [[index, …]], mode?}`; points in the paint's space). Lossless for
 /// `vectorcraft_tools::params::freeform_json`.
@@ -148,9 +154,12 @@ pub(crate) fn parse_freeform(v: &Value) -> std::result::Result<Freeform, String>
         point_fields(pv, &mut pt, Affine::IDENTITY).map_err(|e| format!("freeform point {i}: {e}"))?;
         f.points.push(pt);
     }
-    for l in v.get("lines").and_then(Value::as_array).into_iter().flatten() {
-        let ix = l.as_array().map(|a| a.iter().filter_map(Value::as_u64).map(|i| i as usize).collect()).unwrap_or_default();
-        f.add_line(ix)?;
+    if let Some(lines) = v.get("lines") {
+        let lines = lines.as_array().ok_or("`freeform.lines` must be an array")?;
+        for (i, l) in lines.iter().enumerate() {
+            let ix = point_indices(l).ok_or_else(|| format!("freeform line {i} must be an array of point indices"))?;
+            f.add_line(ix).map_err(|e| format!("freeform line {i}: {e}"))?;
+        }
     }
     if let Some(m) = str_param(v, "mode") {
         f.mode = parse_mode(m)?;
@@ -167,7 +176,7 @@ pub(crate) fn parse_mode(m: &str) -> std::result::Result<FreeformMode, String> {
 /// automatic points it shows first, and the stops follow the points' colours.
 fn edit<R>(s: &mut Session, p: &Value, cmd: &str, mut f: impl FnMut(&mut Freeform, Space) -> std::result::Result<R, String>) -> Result<R> {
     let item = item_target(s, p, cmd)?;
-    let stroke = edits_stroke(s, p, item, !s.fill_active)?;
+    let stroke = edits_stroke(s, p, item, !s.fill_active, cmd)?;
     let item = item.of_kind(s, !stroke);
     let ids = item.targets(s, p)?;
     if ids.is_empty() {
@@ -218,7 +227,7 @@ fn edit<R>(s: &mut Session, p: &Value, cmd: &str, mut f: impl FnMut(&mut Freefor
 /// The `index` param, else the selected point.
 fn point_index(s: &Session, p: &Value, cmd: &str) -> Result<usize> {
     match p.get("index") {
-        Some(v) => v.as_u64().map(|i| i as usize).ok_or_else(|| bad(cmd, "`index` must be a point index")),
+        Some(v) => v.as_u64().map(index).ok_or_else(|| bad(cmd, "`index` must be a point index")),
         None => s.selected_freeform_point().ok_or_else(|| bad(cmd, "no point selected (give `index`)")),
     }
 }
@@ -235,11 +244,16 @@ fn add_point(s: &mut Session, p: &Value) -> Result<Value> {
         Some(Value::Bool(true)) => s.selected_freeform_point(),
         Some(_) => return Err(bad(C, "`line` must be true or false")),
     };
+    super::paint::check_keep_model(p, C)?;
+    let given = given_color(s, p);
     let index = edit(s, p, C, |f, sp| {
         let q = sp.to_paint * at;
         let (color, opacity) = f.sample(q, sp.scale);
         let mut pt = FreeformPoint { opacity, ..FreeformPoint::new(q, color) };
         point_fields(p, &mut pt, sp.to_paint)?;
+        if let Some(c) = given {
+            pt.color = c;
+        }
         let i = f.add_point(pt);
         if let Some(from) = join {
             f.connect(from, i);
@@ -253,9 +267,15 @@ fn add_point(s: &mut Session, p: &Value) -> Result<Value> {
 fn set_point(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "paint.freeform.setPoint";
     let i = point_index(s, p, C)?;
+    super::paint::check_keep_model(p, C)?;
+    let given = given_color(s, p);
     edit(s, p, C, |f, sp| {
         check_index(f, i)?;
-        point_fields(p, &mut f.points[i], sp.to_paint)
+        point_fields(p, &mut f.points[i], sp.to_paint)?;
+        if let Some(c) = given {
+            f.points[i].color = c;
+        }
+        Ok(())
     })?;
     Ok(json!({ "index": i }))
 }
@@ -279,11 +299,7 @@ fn delete_point(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn add_line(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "paint.freeform.addLine";
-    let points: Vec<usize> = p
-        .get("points")
-        .and_then(Value::as_array)
-        .and_then(|a| a.iter().map(|v| v.as_u64().map(|i| i as usize)).collect())
-        .ok_or_else(|| bad(C, "`points` must be an array of point indices"))?;
+    let points = p.get("points").and_then(point_indices).ok_or_else(|| bad(C, "`points` must be an array of point indices"))?;
     let line = edit(s, p, C, |f, _| f.add_line(points.clone()))?;
     Ok(json!({ "line": line }))
 }
@@ -292,7 +308,7 @@ fn split_line(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "paint.freeform.splitLine";
     let line = index_param(p, "line", C)?;
     let segment = index_param(p, "segment", C)?;
-    let t = f64_or(p, "t", 0.5);
+    let t = number_or(p, "t", 0.5, C)?;
     let index = edit(s, p, C, |f, _| f.split_line(line, segment, t).ok_or_else(|| format!("no segment {segment} on line {line}")))?;
     s.select_freeform_point(Some(index));
     Ok(json!({ "index": index }))
@@ -304,7 +320,7 @@ fn select_point(s: &mut Session, p: &Value) -> Result<Value> {
         None => return Err(bad(C, "missing `index` (a point index, or null to clear)")),
         Some(Value::Null) => None,
         Some(v) => {
-            let i = v.as_u64().ok_or_else(|| bad(C, "`index` must be a whole number or null"))? as usize;
+            let i = v.as_u64().map(index).ok_or_else(|| bad(C, "`index` must be a whole number or null"))?;
             let (f, _) = s.proxy_freeform(!s.fill_active).ok_or_else(|| bad(C, NOT_FREEFORM))?;
             check_index(&f, i).map_err(|e| bad(C, e))?;
             Some(i)
@@ -316,10 +332,31 @@ fn select_point(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn get(s: &mut Session, p: &Value) -> Result<Value> {
     const C: &str = "paint.freeform.get";
-    let stroke = bool_or(p, "stroke", !s.fill_active);
+    let stroke = switch_or(p, "stroke", !s.fill_active, C)?;
     let (f, _) = s.proxy_freeform(stroke).ok_or_else(|| bad(C, NOT_FREEFORM))?;
     let selected = if stroke != s.fill_active { s.selected_freeform_point().filter(|i| *i < f.points.len()) } else { None };
     let mut v = vectorcraft_tools::params::freeform_json(&f);
     v["selected"] = json!(selected);
     Ok(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A line with an index that isn't a point's is refused, not shortened to the indices that are.
+    #[test]
+    fn malformed_freeform_lines_are_not_silently_shortened() {
+        let points = json!([
+            {"at": [0, 0], "color": "#ff0000"},
+            {"at": [50, 0], "color": "#00ff00"},
+            {"at": [100, 0], "color": "#0000ff"}
+        ]);
+        for lines in [json!([[0, "broken", 2]]), json!([[0, -1, 2]]), json!([[0, 1.5, 2]]), json!([{"points": [0, 1]}]), json!("not an array")] {
+            let value = json!({"points": points, "lines": lines, "mode": "lines"});
+            assert!(parse_freeform(&value).is_err(), "invalid lines accepted: {value}");
+        }
+        let good = parse_freeform(&json!({"points": points, "lines": [[0, 1, 2]], "mode": "lines"})).unwrap();
+        assert_eq!(good.lines, vec![vec![0, 1, 2]]);
+    }
 }

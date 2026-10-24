@@ -127,6 +127,134 @@ fn pdf_info_carries_author_subject_and_keywords() {
 }
 
 #[test]
+fn an_exported_pdf_opens_with_its_file_info() {
+    let mut s = session();
+    s.execute("file.info", &info()).unwrap();
+    let exported = s.execute("document.export", &json!({"format": "pdf", "preserveEditing": false})).unwrap();
+    let r = s.execute("document.open", &json!({"name": "poster.pdf", "dataBase64": exported["dataBase64"]})).unwrap();
+    assert_eq!(r["restored"], false, "opened from its pages");
+    let back = s.execute("file.info", &json!({})).unwrap();
+    assert_eq!(back["author"], "Ada Lovelace");
+    assert_eq!(back["description"], "A poster\nfor the fair");
+    assert_eq!(back["keywords"], json!(["fair", "Poster", "print"]));
+    assert!(back["created"].as_str().is_some_and(|c| c.ends_with('Z')), "the file's creation date: {}", back["created"]);
+    assert_eq!(back["title"], "poster.pdf", "the title stays the file name");
+    assert_eq!(back["copyrightStatus"], "copyrighted");
+    assert_eq!(back["copyrightNotice"], "(c) 2026 Ada");
+    assert_eq!(back["copyrightUrl"], "https://example.com/rights");
+}
+
+#[test]
+fn a_pdf_compatible_ai_carries_the_copyright() {
+    let mut s = session();
+    let rights = json!({"copyrightStatus": "publicDomain", "copyrightNotice": "No rights reserved", "copyrightUrl": "https://example.com/cc0"});
+    s.execute("file.info", &rights).unwrap();
+    let path = std::env::temp_dir().join(format!("vc-fileinfo-rights-{}.ai", std::process::id()));
+    let saved = s.execute("document.save", &json!({"path": path.to_string_lossy()}));
+    let ai = std::fs::read(&path);
+    let _ = std::fs::remove_file(&path);
+    saved.unwrap();
+    let f = vectorcraft_pdf::file_info(&ai.unwrap(), None).expect("a PDF-compatible .ai");
+    assert_eq!(f.copyrighted, Some(false));
+    assert_eq!(f.copyright_notice.as_deref(), Some("No rights reserved"));
+    assert_eq!(f.copyright_url.as_deref(), Some("https://example.com/cc0"));
+}
+
+/// Unix seconds of 2020-01-01 00:00:00 UTC.
+const CREATED: i64 = 1_577_836_800;
+
+/// A session whose document was created at `created` (Unix seconds, or `null` for none).
+fn created_at(created: Value) -> Session {
+    let mut s = Session::new();
+    s.execute("file.new", &json!({"width": 100, "height": 80, "created": created})).unwrap();
+    s
+}
+
+/// The PDF date the writer gives Unix seconds `t` (UTC).
+fn pdf_date(t: i64) -> String {
+    let [y, mo, d, h, mi, s] = vectorcraft_doc::metadata::civil(t);
+    format!("(D:{y:04}{mo:02}{d:02}{h:02}{mi:02}{s:02}Z)")
+}
+
+/// Check that a PDF or PDF-compatible `.ai` was created at a time in `created` and modified at a
+/// time in `modified`: in the XMP packet (`vectorcraft_pdf::file_info`) and in the document
+/// information dictionary.
+fn assert_dated(bytes: &[u8], created: std::ops::RangeInclusive<i64>, modified: std::ops::RangeInclusive<i64>) {
+    let xmp = vectorcraft_pdf::file_info(bytes, None).expect("a PDF");
+    assert!(xmp.created.is_some_and(|t| created.contains(&t)), "xmp:CreateDate {:?} in {created:?}", xmp.created);
+    assert!(xmp.modified.is_some_and(|t| modified.contains(&t)), "xmp:ModifyDate {:?} in {modified:?}", xmp.modified);
+    let text = String::from_utf8_lossy(bytes);
+    let trailer = &text[text.rfind("trailer").expect("a trailer")..];
+    let n = trailer.split("/Info ").nth(1).and_then(|r| r.split(' ').next()).expect("an /Info entry");
+    let info = &text[text.find(&format!("\n{n} 0 obj")).expect("the document information")..];
+    let info = &info[..info.find("endobj").expect("its end")];
+    assert!(created.clone().any(|t| info.contains(&format!("/CreationDate{}", pdf_date(t)))), "/CreationDate in {created:?}: {info}");
+    assert!(modified.clone().any(|t| info.contains(&format!("/ModDate{}", pdf_date(t)))), "/ModDate in {modified:?}: {info}");
+}
+
+/// Run `f` → (its result, the time of writing: the Unix seconds before and after it).
+fn written<T>(f: impl FnOnce() -> T) -> (T, std::ops::RangeInclusive<i64>) {
+    let before = vectorcraft_doc::metadata::output_time().unwrap();
+    let out = f();
+    (out, before..=vectorcraft_doc::metadata::output_time().unwrap())
+}
+
+#[test]
+fn an_exported_pdf_is_created_with_the_document_and_modified_when_it_is_written() {
+    let mut s = created_at(json!(CREATED));
+    for p in [json!({}), json!({"preset": "PDF/X-4:2010"})] {
+        let (pdf, now) = written(|| b64(&s.execute("document.exportPdf", &p).unwrap()));
+        assert_dated(&pdf, CREATED..=CREATED, now);
+    }
+    let (pdf, now) = written(|| b64(&s.execute("document.export", &json!({"format": "pdf", "preserveEditing": false})).unwrap()));
+    assert_dated(&pdf, CREATED..=CREATED, now);
+}
+
+#[test]
+fn a_pdf_compatible_ai_is_created_with_the_document_and_modified_when_it_is_written() {
+    let mut s = created_at(json!(CREATED));
+    let path = std::env::temp_dir().join(format!("vc-fileinfo-created-{}.ai", std::process::id()));
+    let (saved, now) = written(|| s.execute("document.save", &json!({"path": path.to_string_lossy()})));
+    saved.unwrap();
+    let ai = std::fs::read(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_dated(&ai, CREATED..=CREATED, now);
+    assert_eq!(s.doc().unwrap().doc.metadata.created, Some(CREATED), "the save keeps the creation date");
+}
+
+#[test]
+fn a_pdf_of_a_document_without_a_creation_date_is_dated_when_it_is_written() {
+    let mut s = created_at(Value::Null);
+    assert_eq!(s.doc().unwrap().doc.metadata.created, None);
+    let (pdf, now) = written(|| b64(&s.execute("document.exportPdf", &json!({})).unwrap()));
+    assert_dated(&pdf, now.clone(), now);
+    let xmp = vectorcraft_pdf::file_info(&pdf, None).unwrap();
+    assert_eq!(xmp.created, xmp.modified, "created and modified at the same time of writing");
+}
+
+#[test]
+fn a_pdf_compatible_ai_opens_with_the_file_info_of_its_xmp_packet() {
+    use vectorcraft_testkit::pdf::{PdfPage, first_extra, pdf_with_catalog};
+    let xmp = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\
+               <rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:xmpRights=\"http://ns.adobe.com/xap/1.0/rights/\" xmpRights:Marked=\"False\">\
+               <dc:creator><rdf:Seq><rdf:li>Grace Hopper</rdf:li></rdf:Seq></dc:creator>\
+               <dc:subject><rdf:Bag><rdf:li>navy</rdf:li><rdf:li>cobol</rdf:li></rdf:Bag></dc:subject>\
+               <dc:rights><rdf:Alt><rdf:li xml:lang=\"x-default\">No rights reserved</rdf:li></rdf:Alt></dc:rights>\
+               <xmpRights:WebStatement>https://example.com/a page</xmpRights:WebStatement>\
+               </rdf:Description></rdf:RDF></x:xmpmeta>";
+    let stream = format!("<< /Type /Metadata /Subtype /XML /Length {} >>\nstream\n{xmp}\nendstream", xmp.len());
+    let catalog = format!("/Metadata {} 0 R ", first_extra(1));
+    let bytes = pdf_with_catalog(&[PdfPage::new(100.0, 100.0, "0 0 1 rg 10 10 50 50 re f")], &[&stream], &catalog, None);
+    let mut s = Session::new();
+    s.execute("document.open", &json!({"name": "notes.ai", "dataBase64": vectorcraft_format::base64_encode(&bytes)})).unwrap();
+    let m = &s.doc().unwrap().doc.metadata;
+    assert_eq!((m.author.as_str(), m.keywords.clone()), ("Grace Hopper", vec!["navy".to_string(), "cobol".into()]));
+    assert_eq!((m.copyright_status, m.copyright_notice.as_str()), (CopyrightStatus::PublicDomain, "No rights reserved"));
+    // A URL with a space is one `file.info` refuses: it is left out.
+    assert_eq!(m.copyright_url, "");
+}
+
+#[test]
 fn png_exports_carry_text_chunks() {
     let mut s = session();
     s.execute("file.info", &info()).unwrap();
@@ -160,4 +288,64 @@ fn svg_metadata_carries_file_info_as_dublin_core() {
     // Without the option: no <metadata>, but the title and description stay.
     let plain = String::from_utf8(b64(&s.execute("document.export", &json!({"format": "svg"})).unwrap())).unwrap();
     assert!(!plain.contains("<metadata>") && plain.contains("<desc>"));
+}
+
+/// The PDF `document.exportPdf` and `document.export` write of the active document (text
+/// uncompressed, so its metadata reads).
+fn pdf_texts(s: &mut Session) -> [String; 2] {
+    let p = json!({"compression": {"compressText": false}, "preserveEditing": false});
+    let a = b64(&s.execute("document.exportPdf", &p).unwrap());
+    let b = b64(&s.execute("document.export", &json!({"format": "pdf", "compression": {"compressText": false}, "preserveEditing": false})).unwrap());
+    [a, b].map(|pdf| String::from_utf8_lossy(&pdf).into_owned())
+}
+
+/// The XMP `dc:title` of a PDF's text.
+fn xmp_title(pdf: &str) -> &str {
+    let from = pdf.find("<dc:title>").expect("XMP title");
+    &pdf[from..from + pdf[from..].find("</dc:title>").unwrap()]
+}
+
+#[test]
+fn an_untitled_document_saved_to_a_file_exports_titled_after_it() {
+    let dir = std::env::temp_dir().join(format!("vc-pdftitle-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Document C.vectorcraft");
+    // Unsaved and untitled: viewers keep showing the file name, not "Untitled-1".
+    let mut untitled = Session::new();
+    untitled.execute("file.new", &json!({"width": 100, "height": 80})).unwrap();
+    for pdf in pdf_texts(&mut untitled) {
+        assert!(!pdf.contains("/DisplayDocTitle true"), "{pdf}");
+    }
+    // An explicitly empty document title is also not a title to display.
+    std::sync::Arc::make_mut(&mut untitled.doc_mut().unwrap().doc).title.clear();
+    for pdf in pdf_texts(&mut untitled) {
+        assert!(!pdf.contains("/DisplayDocTitle true"), "{pdf}");
+    }
+
+    // Saved as a file, then exported: Untitled-1 was only the name New gave it.
+    let mut s = Session::new();
+    s.execute("file.new", &json!({"width": 100, "height": 80})).unwrap();
+    s.execute("document.save", &json!({"path": path.to_str().unwrap()})).unwrap();
+    for pdf in pdf_texts(&mut s) {
+        assert!(pdf.contains("/Title(Document C)") && xmp_title(&pdf).contains("Document C"), "{}", xmp_title(&pdf));
+    }
+    // Non-object parameters still preserve that the file-stem title was not user supplied.
+    let pdf = String::from_utf8_lossy(&b64(&s.execute("document.exportPdf", &Value::Null).unwrap())).into_owned();
+    assert!(!pdf.contains("/DisplayDocTitle true"), "{pdf}");
+    // Opened from that file, in another session.
+    let mut s = Session::new();
+    s.execute("document.open", &json!({"path": path.to_str().unwrap()})).unwrap();
+    for pdf in pdf_texts(&mut s) {
+        assert!(pdf.contains("/Title(Document C)") && !pdf.contains("Untitled"), "{}", xmp_title(&pdf));
+    }
+    // The document's own title is left as it was.
+    assert_eq!(s.doc().unwrap().doc.title, "Untitled-1");
+    // A title of its own (File Info, New Document's Name) stays.
+    let mut s = session();
+    s.execute("document.save", &json!({"path": dir.join("Document D.vectorcraft").to_str().unwrap()})).unwrap();
+    for pdf in pdf_texts(&mut s) {
+        assert!(pdf.contains("/Title(Poster)") && xmp_title(&pdf).contains("Poster"));
+        assert!(pdf.contains("/ViewerPreferences<</DisplayDocTitle true>>"), "{pdf}");
+    }
+    let _ = std::fs::remove_dir_all(dir);
 }

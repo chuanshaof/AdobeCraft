@@ -87,6 +87,12 @@ fn about(o: Point, a: Affine) -> Affine {
     Affine::translate(o.to_vec2()) * a * Affine::translate(-o.to_vec2())
 }
 
+/// The transform `m` of the selection (of a copy with `copy`): of the anchors selected with Direct
+/// Selection alone, when there are some.
+fn preview(m: Affine, copy: bool) -> Action {
+    Action::Preview("object.transform".into(), json!({ "matrix": matrix_json(m), "copy": copy, "anchors": true }))
+}
+
 /// Reflection across the line through the origin at angle `theta` (radians, screen space).
 pub fn reflect_matrix(o: Point, theta: f64) -> Affine {
     about(o, Affine::rotate(theta) * Affine::scale_non_uniform(1.0, -1.0) * Affine::rotate(-theta))
@@ -106,7 +112,10 @@ impl TransformTool {
         {
             return Some(*p);
         }
-        selection_box(cx).map(|b| b.center())
+        // Anchors selected with Direct Selection transform alone, about their own centre.
+        vectorcraft_effects::preview::anchor_bounds(cx.selection, cx.doc, cx.preview_bounds)
+            .map(|b| b.center())
+            .or_else(|| selection_box(cx).map(|b| b.center()))
     }
 
     /// Transform for dragging from `start` to `p` about `o`; returns the matrix and a readout.
@@ -209,14 +218,14 @@ impl Tool for TransformTool {
                 d.last = m;
                 self.drag = Some(d);
                 self.measure = Some((p, text));
-                out.push(Action::Preview("object.transform".into(), json!({ "matrix": matrix_json(m), "copy": ev.mods.alt })));
+                out.push(preview(m, ev.mods.alt));
                 out
             }
             PointerKind::Up => {
                 let Some(d) = self.end_drag() else { return vec![] };
                 if d.began {
                     // The Alt state at release decides whether the result is a copy.
-                    vec![Action::Preview("object.transform".into(), json!({ "matrix": matrix_json(d.last), "copy": ev.mods.alt })), Action::Commit]
+                    vec![preview(d.last, ev.mods.alt), Action::Commit]
                 } else {
                     // A click sets the reference point; with Alt, it opens the dialog too.
                     self.origin = Some((d.pick, cx.selection.objects.clone()));

@@ -88,6 +88,22 @@ fn recovery_save_writes_modified_documents_once() {
     assert!(offered(&mut s).is_empty());
 }
 
+/// Selecting other art drops the Puppet Warp pins, which a copy never holds: no new copy is written.
+#[test]
+fn dropping_puppet_warp_pins_writes_no_new_copy() {
+    let (mut s, _) = session();
+    let id = s.doc().unwrap().selection.objects[0];
+    s.execute("object.puppetWarp", &json!({"id": id.0, "pins": [[35, 20]], "moved": [[35, 20]], "rest": true})).unwrap();
+    assert!(s.doc().unwrap().doc.puppet.is_some());
+    let r = s.execute("file.recovery.save", &json!({})).unwrap();
+    assert_eq!(r["saved"].as_array().unwrap().len(), 1, "{r}");
+    s.execute("select.none", &json!({})).unwrap();
+    assert!(s.doc().unwrap().doc.puppet.is_none());
+    let again = s.execute("file.recovery.save", &json!({})).unwrap();
+    assert!(again["saved"].as_array().unwrap().is_empty(), "{again}");
+    assert_eq!(again["skipped"][0]["reason"], "unchanged since its last recovery copy");
+}
+
 #[test]
 fn a_crash_leaves_copies_that_restore_modified_and_titled() {
     let (mut s, store) = session();
@@ -347,6 +363,33 @@ fn folder_areas_are_locked_by_running_apps() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The copies are unsaved documents: on Unix the folders the store makes are owner-only, and a
+/// store folder that already exists (one picked in Preferences) keeps its mode.
+#[cfg(unix)]
+#[test]
+fn the_folder_store_makes_owner_only_folders() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let base = std::env::temp_dir().join(format!("vc-recovery-modes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    // A store folder that doesn't exist yet is made with the first copy, owner-only like its area.
+    let new = base.join("new");
+    let store = FolderStore::new(&new);
+    store.write("1-1/Untitled-1-1.vectorcraft", b"copy").unwrap();
+    assert_eq!(mode(&new), 0o700);
+    assert_eq!(mode(&new.join("1-1")), 0o700);
+    assert!(matches!(store.lock("1-2"), Ok(cmd::recovery::Lock::Held(_))));
+    assert_eq!(mode(&new.join("1-2")), 0o700);
+    // A folder that already exists keeps its mode; the area made inside it is owner-only.
+    let picked = base.join("picked");
+    std::fs::create_dir_all(&picked).unwrap();
+    std::fs::set_permissions(&picked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    FolderStore::new(&picked).write("2-1/Untitled-1-1.vectorcraft", b"copy").unwrap();
+    assert_eq!(mode(&picked), 0o755);
+    assert_eq!(mode(&picked.join("2-1")), 0o700);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[test]
 fn saving_reverting_or_closing_removes_the_copy() {
     let dir = std::env::temp_dir().join(format!("vc-recovery-save-{}", std::process::id()));
@@ -457,4 +500,180 @@ fn without_a_store_the_commands_say_where_to_set_one() {
     s.execute("file.close", &json!({})).unwrap();
     assert!(!area.join("Untitled-1-1.vectorcraft").exists());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A store in memory that notes the entries written to it.
+#[derive(Default)]
+struct Counting {
+    inner: MemoryStore,
+    written: std::sync::Mutex<Vec<(String, usize)>>,
+}
+
+impl Counting {
+    /// The image entries written since the last call, with their sizes.
+    fn images_written(&self) -> Vec<(String, usize)> {
+        std::mem::take(&mut *self.written.lock().unwrap()).into_iter().filter(|(n, _)| n.ends_with(".blob")).collect()
+    }
+
+    fn images(&self) -> Vec<String> {
+        self.inner.list().unwrap().into_iter().filter(|n| n.ends_with(".blob")).collect()
+    }
+}
+
+impl RecoveryStore for Counting {
+    fn list(&self) -> std::result::Result<Vec<String>, String> {
+        self.inner.list()
+    }
+    fn read(&self, name: &str) -> std::result::Result<Vec<u8>, String> {
+        self.inner.read(name)
+    }
+    fn write(&self, name: &str, bytes: &[u8]) -> std::result::Result<(), String> {
+        self.written.lock().unwrap().push((name.to_string(), bytes.len()));
+        self.inner.write(name, bytes)
+    }
+    fn remove(&self, name: &str) -> std::result::Result<(), String> {
+        self.inner.remove(name)
+    }
+    fn location(&self) -> String {
+        self.inner.location()
+    }
+    fn lock(&self, area: &str) -> std::result::Result<crate::cmd::recovery::Lock, String> {
+        self.inner.lock(area)
+    }
+    fn now(&self) -> Option<i64> {
+        self.inner.now()
+    }
+}
+
+fn place_png(s: &mut Session, name: &str, rgb: [u8; 3]) -> Vec<u8> {
+    let png = crate::tests_links::png(64, 48, rgb);
+    s.execute("file.place", &json!({"name": name, "dataBase64": vectorcraft_format::base64_encode(&png), "link": false})).unwrap();
+    png
+}
+
+/// The document's images: their bytes by key.
+fn images_of(s: &Session) -> std::collections::BTreeMap<String, Vec<u8>> {
+    s.doc().unwrap().doc.images.iter().map(|(k, b)| (k.clone(), b.bytes.to_vec())).collect()
+}
+
+#[test]
+fn images_are_kept_apart_and_written_again_only_when_they_change() {
+    let store = Arc::new(Counting::default());
+    let mut s = Session::new();
+    s.recovery.set_store(store.clone());
+    s.execute("file.new", &json!({"width": 200, "height": 100})).unwrap();
+    let red = place_png(&mut s, "red.png", crate::tests_links::RED);
+    let r = s.execute("file.recovery.save", &json!({})).unwrap();
+    assert_eq!(r["saved"][0]["imageBytes"], red.len(), "{r}");
+    assert_eq!(store.images_written().len(), 1);
+    let area = s.recovery.own_area().unwrap().to_string();
+    // The document entry doesn't hold the image.
+    let doc = store.read(&format!("{area}/Untitled-1-1.vectorcraft")).unwrap();
+    assert!(vectorcraft_format::load(&doc).unwrap().images.is_empty());
+    // An edit that leaves the image alone: the copy is written again, its image isn't.
+    s.execute("shape.rectangle", &json!({"x": 10, "y": 10, "width": 50, "height": 20})).unwrap();
+    let r = s.execute("file.recovery.save", &json!({})).unwrap();
+    assert_eq!((r["saved"].as_array().unwrap().len(), r["saved"][0]["imageBytes"].as_u64()), (1, Some(0)), "{r}");
+    assert!(store.images_written().is_empty(), "the image isn't written again");
+    // A new image: only it is written.
+    let blue = place_png(&mut s, "blue.png", crate::tests_links::BLUE);
+    let r = s.execute("file.recovery.save", &json!({})).unwrap();
+    assert_eq!(r["saved"][0]["imageBytes"], blue.len());
+    assert_eq!(store.images_written().iter().map(|(_, n)| *n).collect::<Vec<_>>(), [blue.len()]);
+    assert_eq!(store.images().len(), 2);
+    let images = images_of(&s);
+    assert_eq!(images.len(), 2);
+
+    // A crash: the copy restores with its images.
+    drop(s);
+    let mut s = Session::new();
+    s.recovery.set_store(store.clone());
+    assert_eq!(restored(s.execute("file.recovery.restore", &json!({})).unwrap()), 1);
+    assert_eq!(images_of(&s), images);
+    let mine = s.recovery.own_area().unwrap().to_string();
+    assert!(store.images().iter().all(|n| n.starts_with(&format!("{mine}/"))), "the images moved with the copy, the old area went");
+    assert_eq!(store.images().len(), 2);
+    // Its copy and another document's: once the first is closed, the next copy sweeps its images.
+    s.execute("file.new", &json!({"width": 50, "height": 50})).unwrap();
+    s.execute("shape.rectangle", &json!({"x": 1, "y": 1, "width": 5, "height": 5})).unwrap();
+    s.execute("file.close", &json!({"index": 0})).unwrap();
+    s.execute("file.recovery.save", &json!({})).unwrap();
+    assert!(store.images().is_empty(), "{:?}", store.list());
+}
+
+#[test]
+fn copies_from_before_images_were_kept_apart_still_restore() {
+    let store = Arc::new(MemoryStore::default());
+    // The document entry is a whole native file, images inside; the details say nothing of them.
+    let mut s = session_in(&store);
+    place_png(&mut s, "red.png", crate::tests_links::RED);
+    let d = vectorcraft_doc::Document::clone(&s.doc().unwrap().doc);
+    let images = images_of(&s);
+    drop(s);
+    store.write("1-1/Old-1.vectorcraft", &vectorcraft_format::save_file(&d)).unwrap();
+    store.write("1-1/Old-1.json", br#"{"title": "Old", "format": "vectorcraft", "saved": 5}"#).unwrap();
+    let mut s = relaunch(&store);
+    assert_eq!(restored(s.execute("file.recovery.restore", &json!({})).unwrap()), 1);
+    assert_eq!(images_of(&s), images);
+    assert_eq!(s.doc().unwrap().title(), "Untitled-1 [Recovered]");
+}
+
+/// A store whose app dies right after writing a copy's document entry: later writes fail, so the
+/// copy's details stay as the last interval left them.
+struct DiesAfterDocument {
+    inner: Arc<MemoryStore>,
+    dead: std::sync::atomic::AtomicBool,
+}
+
+impl RecoveryStore for DiesAfterDocument {
+    fn list(&self) -> std::result::Result<Vec<String>, String> {
+        self.inner.list()
+    }
+    fn read(&self, name: &str) -> std::result::Result<Vec<u8>, String> {
+        self.inner.read(name)
+    }
+    fn write(&self, name: &str, bytes: &[u8]) -> std::result::Result<(), String> {
+        if self.dead.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("the app is gone".into());
+        }
+        self.inner.write(name, bytes)?;
+        if name.ends_with(".vectorcraft") {
+            self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+    fn remove(&self, name: &str) -> std::result::Result<(), String> {
+        self.inner.remove(name)
+    }
+    fn location(&self) -> String {
+        self.inner.location()
+    }
+    fn lock(&self, area: &str) -> std::result::Result<crate::cmd::recovery::Lock, String> {
+        self.inner.lock(area)
+    }
+    fn now(&self) -> Option<i64> {
+        self.inner.now()
+    }
+}
+
+/// A crash between writing a copy's document and its details restores the new document with
+/// every image, the one placed since the last copy too (and the first copy likewise).
+#[test]
+fn a_crash_between_a_copys_document_and_its_details_keeps_every_image() {
+    for first in [true, false] {
+        let store = Arc::new(MemoryStore::default());
+        let mut s = session_in(&store);
+        if !first {
+            place_png(&mut s, "red.png", crate::tests_links::RED);
+            s.execute("file.recovery.save", &json!({})).unwrap();
+        }
+        place_png(&mut s, "blue.png", crate::tests_links::BLUE);
+        let images = images_of(&s);
+        s.recovery.set_store(Arc::new(DiesAfterDocument { inner: store.clone(), dead: Default::default() }));
+        assert!(s.execute("file.recovery.save", &json!({})).is_err(), "the details weren't written");
+        drop(s);
+        let mut s = relaunch(&store);
+        assert_eq!(restored(s.execute("file.recovery.restore", &json!({})).unwrap()), 1, "first copy: {first}");
+        assert_eq!(images_of(&s), images, "first copy: {first}");
+    }
 }

@@ -4,8 +4,8 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use hayro_syntax::Pdf;
-use hayro_syntax::object::{Array, Dict, Name, ObjectIdentifier, Stream};
+use craft_pdf::syntax::Pdf;
+use craft_pdf::syntax::object::{Array, Dict, Name, ObjectIdentifier, Stream};
 use serde_json::{Value, json};
 use vectorcraft_color::cms::{self, Cms, ColorSettings, DEVICE_CMYK, GENERIC_CMYK, SRGB};
 use vectorcraft_color::{Color, Paint};
@@ -197,8 +197,9 @@ fn png(rgb: [u8; 3]) -> Vec<u8> {
 fn image_doc(bytes: Vec<u8>) -> Document {
     let mut d = Document::new(100.0, 100.0);
     d.images.insert("img".into(), ImageBlob::new("image/png", bytes));
-    let image = ImageObject { key: "img".into(), width: 4, height: 4, xf: Affine::scale(10.0), link: None, placement: Default::default() };
-    let n = Node::new(d.alloc_id(), NodeKind::Image(image));
+    let image =
+        ImageObject { key: "img".into(), width: 4, height: 4, xf: Affine::scale(10.0), link: None, placement: Default::default(), pixels: None };
+    let n = Node::new(d.alloc_id(), NodeKind::Image(Box::new(image)));
     let l = d.layers[0].id;
     d.insert(Some(l), 0, n).unwrap();
     d
@@ -266,7 +267,7 @@ fn the_output_intent_embeds_its_profile_and_trapped_is_written() {
         assert!(r.warnings.is_empty(), "{:?}", r.warnings);
         output_intent(&r.bytes, password, |oi| {
             assert_eq!(oi.get::<Name<'_>>(b"S").unwrap().as_ref(), b"GTS_PDFX");
-            let text = |k: &[u8]| oi.get::<hayro_syntax::object::String<'_>>(k).map(|s| s.as_bytes().to_vec());
+            let text = |k: &[u8]| oi.get::<craft_pdf::syntax::object::String<'_>>(k).map(|s| s.as_bytes().to_vec());
             assert_eq!(text(b"OutputCondition").unwrap(), b"Coated (press)");
             assert_eq!(text(b"RegistryName").unwrap(), b"http://example.com");
             // Non-ASCII text is UTF-16 with its byte order mark.
@@ -312,4 +313,80 @@ fn pdf_a_tags_cmyk_colours_with_the_cmyk_profile() {
     let d = doc(ColorMode::Cmyk, &[Color::cmyk(0.1, 0.2, 0.3, 0.4)]);
     let r = pdf(&d, json!({"standard": "pdfA2b"}));
     assert!(icc_profiles(&r.bytes).iter().any(|p| p.0 == 4));
+}
+
+/// The streams of `bytes` that hold an ICC profile (`acsp` at offset 36), decoded.
+fn icc_streams(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let file = Pdf::new(Arc::new(bytes.to_vec())).unwrap();
+    let count = crate::patch::Xref::read(bytes).unwrap().count() as i32;
+    (1..count)
+        .filter_map(|n| file.xref().get::<Stream<'_>>(ObjectIdentifier::new(n, 0)))
+        .map(|s| s.decoded().unwrap().into_owned())
+        .filter(|data| data.get(36..40) == Some(b"acsp"))
+        .collect()
+}
+
+/// [`pdf`] with the version and the creation date the standard of `settings` asks for.
+fn standard_pdf(d: &Document, settings: Value) -> ExportReport {
+    let mut settings: PdfSettings = serde_json::from_value(settings).unwrap();
+    (settings.compatibility, settings.compression.compress_text) = (settings.standard.version(), false);
+    export_with_report(d, &PdfOptions { settings, created: Some(1_700_000_000), ..Default::default() }).unwrap()
+}
+
+#[test]
+fn a_profile_that_tags_colours_and_is_the_output_intent_is_embedded_once() {
+    let d = doc(ColorMode::Cmyk, &[Color::cmyk(0.1, 0.2, 0.3, 0.4)]);
+    let working = cms::active_settings().cmyk;
+    let icc = cms::icc_bytes(&working).unwrap();
+    for set in [
+        json!({"standard": "pdfX4"}),
+        json!({"standard": "pdfX4", "output": {"outputIntent": working}}),
+        // PDF/X-3 and PDF/X-4 always tag their colours: `profiles` doesn't apply.
+        json!({"standard": "pdfX4", "output": {"profiles": "none", "outputIntent": working}}),
+        json!({"standard": "pdfX3"}),
+        json!({"output": {"profiles": "all", "outputIntent": working}}),
+    ] {
+        let r = standard_pdf(&d, set.clone());
+        let streams = icc_streams(&r.bytes);
+        assert_eq!(streams.len(), 1, "{set}: ICC profile streams");
+        assert!(streams[0] == *icc, "{set}: the working CMYK profile");
+        assert!(colours(&r.bytes).iter().all(|c| c.0 == "scn"), "{set}: tagged colours");
+        output_intent(&r.bytes, None, |oi| assert_eq!(oi.get::<Stream<'_>>(b"DestOutputProfile").unwrap().decoded().unwrap().as_ref(), &*icc));
+    }
+    // Another output intent profile is its own stream.
+    let r = standard_pdf(&d, json!({"standard": "pdfX4", "output": {"outputIntent": DEVICE_CMYK}}));
+    assert_eq!(icc_streams(&r.bytes).len(), 2);
+    output_intent(&r.bytes, None, |oi| {
+        assert_eq!(oi.get::<Stream<'_>>(b"DestOutputProfile").unwrap().decoded().unwrap().as_ref(), &*cms::icc_bytes(DEVICE_CMYK).unwrap())
+    });
+}
+
+/// The profiles assigned to a document (Edit › Assign Profile) are its colour spaces whatever the
+/// working spaces of the session that exports it: a document opened again in a new session,
+/// which starts with the default working spaces, keeps its profiles. Its CMYK colours are tagged
+/// with its CMYK profile, which is also the PDF/X output intent, and its RGB colours separate
+/// through it.
+#[test]
+fn colours_are_in_the_profiles_assigned_to_the_document() {
+    let working = cms::active_settings().cmyk;
+    assert_ne!(working, DEVICE_CMYK, "the document is assigned another profile than the working one");
+    let intent = cms::active_settings().intent;
+    let grey = Color::rgb(0.5, 0.5, 0.5);
+    let mut d = doc(ColorMode::Cmyk, &[Color::cmyk(0.1, 0.2, 0.3, 0.4), grey]);
+    d.color_profiles.cmyk = Some(DEVICE_CMYK.into());
+    let r = standard_pdf(&d, json!({"standard": "pdfX4"}));
+    assert!(!r.warnings.iter().any(|w| w.contains("profile")), "{:?}", r.warnings);
+    let own = cms::icc_bytes(DEVICE_CMYK).unwrap();
+    assert!(icc_streams(&r.bytes) == [own.to_vec()], "tagged with the document's CMYK profile, not the working one");
+    output_intent(&r.bytes, None, |oi| assert_eq!(oi.get::<Stream<'_>>(b"DestOutputProfile").unwrap().decoded().unwrap().as_ref(), &*own));
+    let c = colours(&r.bytes);
+    assert!(c[0].0 == "scn" && close(&c[0].1, &q8(&[0.1, 0.2, 0.3, 0.4])), "CMYK keeps its numbers: {c:?}");
+    let separated = q8(&to_cmyk(DEVICE_CMYK).to_cmyk(&grey, intent));
+    assert!(!close(&separated, &q8(&cms::active().to_cmyk(&grey, intent))), "the two profiles separate grey differently");
+    assert!(c[1].0 == "scn" && close(&c[1].1, &separated), "RGB separated through the document's profile: {c:?} vs {separated:?}");
+    // A profile that isn't available leaves the working space, with a warning.
+    d.color_profiles.cmyk = Some("No Such Press".into());
+    let r = standard_pdf(&d, json!({"standard": "pdfX4"}));
+    assert!(r.warnings.iter().any(|w| w.contains("No Such Press")), "{:?}", r.warnings);
+    assert!(icc_streams(&r.bytes) == [cms::icc_bytes(&working).unwrap().to_vec()]);
 }

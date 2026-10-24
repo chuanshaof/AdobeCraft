@@ -22,8 +22,9 @@ use crate::theme::Tokens;
 use crate::widgets::{self, PanelDrag, SwatchRows, menu_item, swatch_tile};
 use crate::{VectorcraftApp, icons};
 
-/// View modes of the swatch list (and of the library panel).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// View modes of the swatch list (and of the library panels: `ui.libraryPanel {view}`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum View {
     SmallThumb,
     #[default]
@@ -160,11 +161,18 @@ fn swatch_params(e: &Entry) -> Option<Value> {
     })
 }
 
-/// Apply a clicked swatch to the active proxy (Alt: the inactive one).
+/// Apply a clicked swatch to the active proxy (Alt: the inactive one). An Alt-click on a color
+/// swatch with a gradient stop selected recolors the stop as dropping the swatch on it does,
+/// and with a freeform gradient point selected it recolors the point.
 fn apply(app: &mut VectorcraftApp, ui: &Ui, e: &Entry) {
-    if let Some(params) = swatch_params(e) {
-        super::apply_click(app, ui, params);
+    let Some(params) = swatch_params(e) else { return };
+    if super::alt_held(ui)
+        && let Some(c) = drag_of(e, vec![]).color()
+        && super::gradient::recolor_selected(app, c, &params)
+    {
+        return;
     }
+    super::apply_click(app, ui, params);
 }
 
 /// A pattern swatch drawn as a rendered tile (cached by the definition's identity and size).
@@ -186,7 +194,7 @@ fn pattern_thumb(app: &VectorcraftApp, ui: &Ui, r: Rect, paint: &Paint) {
     );
     let tex = CACHE.with(|c| c.borrow().get(&key).cloned()).unwrap_or_else(|| {
         let tex = vectorcraft_render::render_pattern_swatch(&st.doc, pattern, px).map(|img| {
-            let color = egui::ColorImage::from_rgba_premultiplied([img.width as usize, img.height as usize], &img.pixels);
+            let color = crate::canvas::color_image(&img);
             ui.ctx().load_texture(format!("pattern-swatch-{pattern}-{px}"), color, egui::TextureOptions::LINEAR)
         });
         CACHE.with(|c| {
@@ -241,7 +249,10 @@ pub(crate) fn describe(paint: &Paint, global: bool, spot: bool) -> String {
             };
             crate::i18n::fmt(tl!("{kind}, {model}"), &[("kind", kind), ("model", color.model_name())])
         }
-        Paint::Gradient(g) => crate::i18n::fmt(tl!("{kind} Gradient"), &[("kind", tl!(g.gradient.kind.label()))]),
+        Paint::Gradient(g) => crate::i18n::fmt(
+            tl!("{kind} Gradient"),
+            &[("kind", crate::i18n::tr_ctx(crate::i18n::current(), "gradient-kind", g.gradient.kind.label()))],
+        ),
         Paint::Pattern { .. } => tl!("Pattern").into(),
         Paint::None => tl!("None").into(),
     }
@@ -354,11 +365,13 @@ pub(crate) fn click_selection(ui: &Ui, anchor_key: &str, mut sel: Vec<String>, o
 /// A drag released on the panel.
 enum Drop {
     /// Swatches (or colour groups) dropped before or `after` row `target`, into folder `target`, or
-    /// at the end (`None`).
-    Move { names: Vec<String>, target: Option<String>, after: bool },
+    /// at the end (`None`). With Alt held, `with` names the swatch grabbed: dropped on swatch
+    /// `target` of its kind (neither None, Registration nor a tint swatch; see [`replaces`]), it
+    /// gives that swatch its paint instead of moving.
+    Move { names: Vec<String>, target: Option<String>, after: bool, with: Option<String> },
     /// A paint from elsewhere (a Fill/Stroke proxy, the Gradient panel's thumbnail) dropped on row
     /// `target` (or between rows) becomes a swatch; with Alt held (`replace`) it replaces swatch
-    /// `target` when that is of its kind.
+    /// `target` when that is of its kind and not a tint swatch.
     New { paint: Paint, target: Option<String>, replace: bool },
     /// Art dragged off the canvas becomes a pattern swatch made of a copy of it (the art stays).
     Pattern { ids: Vec<u64> },
@@ -366,11 +379,15 @@ enum Drop {
 
 impl Drop {
     /// What releasing `d` before or `after` row `target` (`None`: at the end) does: move the rows
-    /// it carries, make a swatch of a paint dragged from elsewhere, or a pattern swatch of art dragged
-    /// off the canvas (appearances: nothing).
+    /// it carries (with Alt held, `replace`, a swatch grabbed may replace `target`), make a swatch of
+    /// a paint dragged from elsewhere, or a pattern swatch of art dragged off the canvas (appearances:
+    /// nothing).
     fn of(d: &PanelDrag, target: Option<String>, after: bool, replace: bool) -> Option<Self> {
         match d {
-            PanelDrag::Paint { rows: Some(r), .. } => Some(Drop::Move { names: r.names.clone(), target, after }),
+            PanelDrag::Paint { rows: Some(r), .. } => {
+                let with = (replace && !r.groups).then(|| r.grabbed.clone());
+                Some(Drop::Move { names: r.names.clone(), target, after, with })
+            }
             PanelDrag::Paint { paint, .. } => Some(Drop::New { paint: paint.clone(), target, replace }),
             PanelDrag::Art(ids) => Some(Drop::Pattern { ids: ids.iter().map(|id| id.0).collect() }),
             _ => None,
@@ -393,7 +410,7 @@ fn drag_of(e: &Entry, names: Vec<String>) -> PanelDrag {
         Entry::Folder(_) => Paint::None,
     };
     let rows = SwatchRows { grabbed: e.name().to_string(), names, groups: e.is_folder() };
-    PanelDrag::Paint { paint, params: swatch_params(e).unwrap_or_default(), rows: Some(rows) }
+    PanelDrag::Paint { paint, params: swatch_params(e).unwrap_or_default(), rows: Some(rows), library: None }
 }
 
 /// What the tiles or rows saw this frame.
@@ -426,12 +443,14 @@ fn tile_input(ui: &Ui, resp: Response, e: &Entry, items: &[Entry], sel: &[String
         egui::DragAndDrop::set_payload(ui.ctx(), drag_of(e, names));
     }
     tile_drop(ui, &resp, e, list, ev);
+    // The default swatches' names show in the UI's language; the document keeps them as they are.
+    let shown = crate::i18n::t_name("swatch", name);
     let resp = match e {
-        Entry::Folder(n) => resp.on_hover_text(crate::i18n::fmt(tl!("Color Group: {name}"), &[("name", n)])),
+        Entry::Folder(_) => resp.on_hover_text(crate::i18n::fmt(tl!("Color Group: {name}"), &[("name", shown)])),
         Entry::Swatch { paint, global, spot, .. } if list => resp.on_hover_ui(|ui| {
-            ui.label(format!("{name} ({})", describe(paint, *global, *spot)));
+            ui.label(format!("{shown} ({})", describe(paint, *global, *spot)));
         }),
-        _ => resp.on_hover_text(name),
+        _ => resp.on_hover_text(shown),
     };
     if resp.clicked() {
         ev.clicked = Some((e.clone(), ui.input(|i| i.modifiers)));
@@ -511,7 +530,7 @@ fn move_params(d: &Document, names: &[String], target: Option<&str>, after: bool
         Some(t) => {
             let (group, list) = match d.swatch_group_of(t) {
                 Some(g) => (Some(d.swatch_groups[g].name.as_str()), &d.swatch_groups[g].swatches),
-                None => (None, &d.swatches),
+                None => (None, &*d.swatches),
             };
             (group, list.iter().position(|w| w.name == t).map(|i| i + usize::from(after)))
         }
@@ -527,21 +546,34 @@ fn same_kind(a: &Paint, b: &Paint) -> bool {
     std::mem::discriminant(a) == std::mem::discriminant(b) && !a.is_none()
 }
 
-/// Run a drop on the panel: move the swatches or make a swatch of the proxy's paint (a colour
-/// dropped on a folder or a grouped swatch joins that group).
+/// Can swatch `with` give its paint to swatch `target`? Both are swatches of one kind, neither is
+/// None or Registration, and `target` is not a tint swatch (a tint swatch only takes a new name).
+fn replaces(d: &Document, with: &str, target: &str) -> bool {
+    match (d.swatch(with), d.swatch(target)) {
+        (Some(w), Some(t)) => with != target && !w.is_reserved() && !t.is_reserved() && t.tint_of().is_none() && same_kind(&t.paint, &w.paint),
+        _ => false,
+    }
+}
+
+/// Run a drop on the panel: move the swatches, give the paint of a swatch Alt-dropped on another of
+/// its kind to that one, or make a swatch of the proxy's paint (a color dropped on a folder or a
+/// grouped swatch joins that group).
 fn apply_drop(app: &mut VectorcraftApp, drop: Drop) {
     let Some(d) = app.session.active().map(|st| &st.doc) else { return };
     let (cmd, params) = match drop {
-        Drop::Move { names, target, after } => match move_params(d, &names, target.as_deref(), after) {
+        // Alt: the swatch grabbed replaces the color, gradient or pattern of the swatch of its kind
+        // it is dropped on, which keeps its name and place.
+        Drop::Move { with: Some(w), target: Some(t), .. } if replaces(d, &w, &t) => ("swatch.edit", json!({"name": t, "paint": {"swatch": w}})),
+        Drop::Move { names, target, after, .. } => match move_params(d, &names, target.as_deref(), after) {
             Some(p) => ("swatch.move", p),
             None => return,
         },
         // Alt: an edited gradient (or colour) replaces the swatch it is dropped on.
-        Drop::New { paint, target: Some(t), replace: true } if d.swatch(&t).is_some_and(|w| same_kind(&w.paint, &paint)) => {
-            ("swatch.edit", json!({"name": t, "paint": super::paint_params(&paint)}))
+        Drop::New { paint, target: Some(t), replace: true } if d.swatch(&t).is_some_and(|w| w.tint_of().is_none() && same_kind(&w.paint, &paint)) => {
+            ("swatch.edit", json!({"name": t, "paint": super::swatch_paint_params(&paint)}))
         }
         Drop::New { paint, target, .. } => {
-            let mut p = super::paint_params(&paint);
+            let mut p = super::swatch_paint_params(&paint);
             if paint.color().is_some()
                 && let Some(g) = target.and_then(|t| group_of(d, &t))
             {
@@ -577,10 +609,16 @@ pub(crate) fn drag_preview(app: &VectorcraftApp, ctx: &egui::Context) {
         },
         PanelDrag::GraphicStyle(name) => return pointer_chip(ctx, |ui, r| super::graphic_styles::paint_style(app, ui, r, name)),
         PanelDrag::Symbol(name) => match app.session.active() {
-            Some(st) => return pointer_chip(ctx, |ui, r| super::symbols::chip(ui, &st.doc, r, name)),
+            Some(st) => return pointer_chip(ctx, |ui, r| super::symbols::chip(ui, &st.doc, super::symbols::resources_key(&st.doc), r, name)),
+            None => return,
+        },
+        PanelDrag::LibrarySymbol { library, name } => match vectorcraft_engine::cmd::symbollib::library(&app.session, library) {
+            Some((_, lib)) => return pointer_chip(ctx, |ui, r| super::symbols::chip(ui, &lib.doc, super::symbols::resources_key(&lib.doc), r, name)),
             None => return,
         },
         PanelDrag::Brush { def, .. } => return pointer_chip(ctx, |ui, r| super::brushes::chip(ui, r, def)),
+        PanelDrag::LibraryGraphic { library, item } => return pointer_chip(ctx, |ui, r| super::libraries::chip(app, ui, r, library, item)),
+        PanelDrag::LibraryItem { .. } | PanelDrag::LibraryGroup { .. } => return,
     };
     pointer_chip(ctx, |ui, r| {
         if registration {
@@ -641,12 +679,16 @@ fn body(app: &mut VectorcraftApp, ui: &mut Ui, salt: &'static str) {
         }
     });
     ui.add_space(4.0);
-    super::recent_colors_row(app, ui);
+    // A recent colour paints the active proxy (Alt: the inactive one), as a swatch does.
+    if let Some(c) = super::recent_colors_row(app, ui) {
+        super::apply_click(app, ui, json!({"color": super::color_json(&c)}));
+    }
     widgets::divider(ui);
     widgets::subheader(ui, tl!("Swatch Tiles"));
     let query = if pstate(ui.ctx(), "swatch-show-find") { widgets::search_field(ui, find_id(), tl!("Find")) } else { String::new() };
     let items = entries(app, kind, &query);
     let active_swatch = active_swatch(app);
+    let focus = focus_swatch(app, ui, active_swatch.as_deref());
     let selected = selection(app, ui);
     // Without a selection the swatch of the active paint is highlighted.
     let fallback: Vec<String> = if selected.is_empty() { active_swatch.into_iter().collect() } else { vec![] };
@@ -662,6 +704,9 @@ fn body(app: &mut VectorcraftApp, ui: &mut Ui, salt: &'static str) {
                 for e in &items {
                     let name = e.name();
                     let (r, resp, chip) = list_row(ui, tile_id(salt, e), view, is_sel(name));
+                    if focus.as_deref() == Some(name) {
+                        ui.scroll_to_rect(r, Some(egui::Align::Center));
+                    }
                     match e {
                         Entry::Registration => draw_registration(ui, chip),
                         Entry::Swatch { paint, global, spot, .. } => {
@@ -671,13 +716,16 @@ fn body(app: &mut VectorcraftApp, ui: &mut Ui, salt: &'static str) {
                         }
                         Entry::Folder(_) => draw_folder(ui, chip),
                     }
-                    list_row_name(ui, r, chip, name);
+                    list_row_name(ui, r, chip, crate::i18n::t_name("swatch", name));
                     tile_input(ui, resp, e, &items, sel, true, &mut ev);
                 }
             } else {
                 for (e, cell) in tile_grid(ui, &items, view, Entry::is_folder) {
                     let resp = ui.interact(cell, tile_id(salt, e), Sense::click_and_drag());
                     let name = e.name();
+                    if focus.as_deref() == Some(name) {
+                        ui.scroll_to_rect(cell, Some(egui::Align::Center));
+                    }
                     match e {
                         Entry::Registration => draw_registration(ui, cell),
                         Entry::Swatch { paint, global, spot, .. } => {
@@ -722,14 +770,48 @@ fn body(app: &mut VectorcraftApp, ui: &mut Ui, salt: &'static str) {
     bottom(app, ui, &selected);
 }
 
+/// The document and the objects selected in it.
+type SelectedArt = (u64, Vec<u64>);
+
+/// The swatch the tiles scroll to this frame, once: the active paint's swatch when it changed, or
+/// when other art was selected. Selecting other art also clears the panel's own selection, so its
+/// swatch is the one highlighted.
+fn focus_swatch(app: &VectorcraftApp, ui: &Ui, active: Option<&str>) -> Option<String> {
+    let art: Option<SelectedArt> = app.session.active().map(|st| (st.uid, st.selection.objects.iter().map(|id| id.0).collect()));
+    // (None the first time the panel shows.)
+    let (last_art, last_swatch): (Option<Option<SelectedArt>>, Option<String>) = pstate(ui.ctx(), "swatch-focus");
+    let reselected = last_art.as_ref().is_some_and(|l| *l != art);
+    if reselected {
+        set_pstate(ui.ctx(), "swatch-selected", Vec::<String>::new());
+    }
+    let changed = reselected || last_art.is_none() || last_swatch.as_deref() != active;
+    set_pstate(ui.ctx(), "swatch-focus", (Some(art), active.map(str::to_string)));
+    active.filter(|_| changed).map(str::to_string)
+}
+
 /// The swatch the active paint comes from: a linked colour's global swatch (a tint's tint swatch
-/// when there is one), a gradient's gradient swatch, or None.
+/// when there is one), a process colour's swatch of that colour (a colour no swatch has: none, so
+/// text in a colour of its own highlights nothing), a gradient's gradient swatch, or None; nothing
+/// for selected images.
 fn active_swatch(app: &VectorcraftApp) -> Option<String> {
+    // Images and placed files have no fill or stroke: no swatch (not None).
+    let st = app.session.active()?;
+    let unpainted = |id: &vectorcraft_doc::NodeId| {
+        st.doc.node(*id).is_some_and(|n| matches!(n.kind, vectorcraft_doc::NodeKind::Image(_) | vectorcraft_doc::NodeKind::PlacedDocument(_)))
+    };
+    if !st.selection.objects.is_empty() && st.selection.objects.iter().all(unpainted) {
+        return None;
+    }
     match active_paint(app) {
         Paint::Solid { swatch: Some(n), tint, .. } => {
             let d = &app.session.active()?.doc;
             let tint_swatch = d.swatches_iter().find(|w| w.tint_of() == Some((n.as_str(), tint)));
             Some(tint_swatch.map_or(n.clone(), |w| w.name.clone()))
+        }
+        // A process colour isn't linked: the swatch of that very colour.
+        Paint::Solid { color, swatch: None, .. } => {
+            let d = &app.session.active()?.doc;
+            d.swatches_iter().find(|w| matches!(w.paint, Paint::Solid { color: c, swatch: None, .. } if c == color)).map(|w| w.name.clone())
         }
         Paint::Gradient(g) => g.swatch,
         Paint::None => Some("[None]".to_string()),
@@ -851,7 +933,7 @@ fn delete(app: &mut VectorcraftApp, names: Vec<String>, now: bool) {
 fn bottom(app: &mut VectorcraftApp, ui: &mut Ui, sel: &[String]) {
     let kind: Kind = pstate(ui.ctx(), "swatch-kind");
     widgets::bottom_bar(ui, |ui| {
-        let open = app.ui.library_panel.as_ref().is_some_and(|o| o.kind == SwatchLibraries::KIND);
+        let open = library_panel::any_open::<SwatchLibraries>(&app.ui);
         let lr = widgets::icon_button(ui, "library", SwatchLibraries::MENU, open, 24.0);
         egui::Popup::menu(&lr).show(|ui| {
             ui.set_min_width(200.0);
@@ -880,10 +962,10 @@ fn bottom(app: &mut VectorcraftApp, ui: &mut Ui, sel: &[String]) {
         if widgets::icon_button(ui, "dc-folder", tl!("New Color Group"), false, 24.0).clicked() {
             app.run("ui.newColorGroup", json!({"swatches": deletable(sel)})).ok();
         }
-        // Alt-click skips the dialog; Ctrl/Cmd-click makes a spot colour.
+        // Alt-click skips the dialog; Ctrl/Cmd-click makes a spot color, and Ctrl/Cmd+Shift-click
+        // makes a global process color.
         if widgets::icon_button(ui, "dc-new-item", tl!("New Swatch"), false, 24.0).clicked() {
-            let m = ui.input(|i| i.modifiers);
-            new_swatch(app, sel, m.command, m.alt);
+            new_swatch(app, sel, ui.input(|i| i.modifiers));
         }
         // Alt-click deletes without asking.
         let del = deletable(sel);
@@ -899,17 +981,22 @@ fn target_group(app: &VectorcraftApp, sel: &[String]) -> Option<String> {
     group_of(&app.session.active()?.doc, sel.last()?)
 }
 
-/// New Swatch from the active paint (a colour goes into the selected colour group): opens the
-/// dialog, or saves at once with `now` (Alt-click). `spot` (Cmd/Ctrl-click) makes a spot colour.
-fn new_swatch(app: &mut VectorcraftApp, sel: &[String], spot: bool, now: bool) {
+/// New Swatch from the active paint (a color goes into the selected color group), for a click
+/// with modifiers `m`: a plain click opens the dialog and an Alt-click saves at once. Cmd/Ctrl
+/// makes a color a spot color, and Cmd/Ctrl+Shift makes it a global process color.
+fn new_swatch(app: &mut VectorcraftApp, sel: &[String], m: egui::Modifiers) {
     let paint = active_paint(app);
     let group = paint.color().and_then(|_| target_group(app, sel));
-    if !now {
-        app.run("ui.newSwatch", json!({"spot": spot, "group": group})).ok();
+    let (spot, global) = (m.command && !m.shift, m.command && m.shift);
+    if !m.alt {
+        app.run("ui.newSwatch", json!({"spot": spot, "global": global, "group": group})).ok();
         return;
     }
-    let mut params = super::paint_params(&paint);
-    params["spot"] = json!(spot);
+    let mut params = super::swatch_paint_params(&paint);
+    if paint.color().is_some() {
+        params["spot"] = json!(spot);
+        params["global"] = json!(global);
+    }
     if let Some(g) = group {
         params["group"] = json!(g);
     }
@@ -922,7 +1009,7 @@ pub fn menu(app: &mut VectorcraftApp, ui: &mut Ui) {
     let del = deletable(&selected);
     let opts = editable(app, &selected);
     if menu_item(ui, tl!("New Swatch…"), true, false) {
-        new_swatch(app, &selected, false, false);
+        new_swatch(app, &selected, egui::Modifiers::NONE);
     }
     if menu_item(ui, tl!("New Color Group…"), true, false) {
         app.run("ui.newColorGroup", json!({"swatches": del})).ok();
@@ -1026,12 +1113,14 @@ pub(crate) fn limit_key(app: &VectorcraftApp, l: &str) -> Result<String, String>
     swatchlib::library(&app.session, l).map(|(info, _)| info.id).ok_or_else(|| format!("no swatch library `{l}` (see swatch.library.list)"))
 }
 
-/// Swatch libraries in the library panel (engine: `swatch.library.*`).
+/// Swatch libraries in library panels (engine: `swatch.library.*`).
 pub(crate) struct SwatchLibraries;
 
 impl LibraryKind for SwatchLibraries {
     const KIND: &'static str = "swatches";
     const OPEN: &'static str = "window.swatchLibrary";
+    const LIST: &'static str = "swatch.library.list";
+    const LOAD: &'static str = "swatch.library.load";
     const MENU: &'static str = "Swatch Libraries Menu";
     const ADD: &'static str = "Add to Swatches";
     type Lib = Arc<SwatchLibrary>;
@@ -1042,6 +1131,12 @@ impl LibraryKind for SwatchLibraries {
     }
     fn get(app: &VectorcraftApp, id: &str) -> Option<(String, Self::Lib)> {
         swatchlib::library(&app.session, id).map(|(info, lib)| (info.name, lib))
+    }
+    fn find(app: &VectorcraftApp, key: &str) -> Option<(String, String, usize)> {
+        swatchlib::library(&app.session, key).map(|(info, lib)| (info.id, info.name, lib.len()))
+    }
+    fn path(app: &VectorcraftApp, id: &str) -> Option<String> {
+        app.session.swatch_libraries.path(id).map(str::to_string)
     }
     /// Ungrouped swatches, then each colour group's folder and swatches (a group whose name
     /// matches shows all of them), as in the Swatches panel.
@@ -1088,8 +1183,10 @@ impl LibraryKind for SwatchLibraries {
     }
     fn menu_tail(app: &mut VectorcraftApp, ui: &mut Ui) {
         ui.separator();
+        // As a command, so its file dialog, shown off the UI thread, loads the library when it
+        // answers.
         if menu_item(ui, tl!("Other Library…"), true, false)
-            && let Err(e) = other_library(app, None)
+            && let Err(e) = app.run("window.swatchLibrary.other", json!({}))
         {
             app.status(e);
         }
@@ -1106,15 +1203,13 @@ fn add_from_library(app: &mut VectorcraftApp, params: Value) {
     }
 }
 
-/// `window.swatchLibrary {library}`: open a swatch library in the library panel (`library` null
-/// closes it).
+/// `window.swatchLibrary {library}`: open a swatch library in its own panel (`library` null closes
+/// every swatch library panel).
 pub(crate) fn open_library(app: &mut VectorcraftApp, p: &Value) -> Result<Value, String> {
-    library_panel::open_command::<SwatchLibraries>(app, p, "swatch.library.list", |app, key| {
-        swatchlib::library(&app.session, key).map(|(info, lib)| (info.id, info.name, lib.len()))
-    })
+    library_panel::open_command::<SwatchLibraries>(app, p)
 }
 
-/// `swatch.library.load` params, then open the library in the panel.
+/// `swatch.library.load` params, then open the library in its panel.
 pub(crate) fn load_library(app: &mut VectorcraftApp, params: Value) -> Result<Value, String> {
     let r = app.run("swatch.library.load", params)?;
     open_library(app, &json!({ "library": r["library"] }))
@@ -1123,7 +1218,7 @@ pub(crate) fn load_library(app: &mut VectorcraftApp, params: Value) -> Result<Va
 /// Other Library…: load the library (or document) at `path`, else one picked in an open dialog
 /// (on the web the picked file arrives later and opens through [`crate::io::open_bytes`]).
 pub(crate) fn other_library(app: &mut VectorcraftApp, path: Option<String>) -> Result<Value, String> {
-    match library_panel::pick_library_file(app, path)? {
+    match library_panel::pick_library_file(app, path, library_panel::library_pick_filters(SwatchLibraries::KIND))? {
         Some(path) => load_library(app, json!({ "path": path })),
         None => Ok(Value::Null),
     }
@@ -1302,6 +1397,67 @@ mod tests {
         assert_eq!(selected(&ctx), ["Grays"], "a plain click on a group selects it alone");
     }
 
+    /// The hex colors of the stops of the selection's gradient fill, and its stroke's color.
+    fn stops_and_stroke(app: &VectorcraftApp) -> (Vec<String>, String) {
+        let (fill, stroke) = crate::panels::current_paints(app);
+        let Paint::Gradient(g) = fill else { panic!("the fill is still a gradient: {fill:?}") };
+        (g.gradient.stops.iter().map(|s| s.color.to_hex()).collect(), stroke.color().map(|c| c.to_hex()).unwrap_or_default())
+    }
+
+    #[test]
+    fn alt_click_recolors_the_selected_gradient_stop() {
+        let mut app = app();
+        let ctx = context();
+        app.run("shape.rectangle", json!({"x": 0, "y": 0, "width": 50, "height": 50})).unwrap();
+        app.run("paint.setStroke", json!({"color": "#000000"})).unwrap();
+        let stops = json!([{"offset": 0, "color": "#ffffff"}, {"offset": 1, "color": "#000000"}]);
+        app.run("paint.setFill", json!({"gradient": {"stops": stops}})).unwrap();
+        app.run("gradient.selectStop", json!({"index": 1})).unwrap();
+        let undo = app.session.doc().unwrap().history.undo.len();
+        click_tile(&mut app, &ctx, "Red", Modifiers::ALT, 0.0);
+        assert_eq!(stops_and_stroke(&app), (vec!["#ffffff".into(), "#ed1c24".into()], "#000000".into()), "the stop, not the stroke");
+        assert_eq!(app.session.doc().unwrap().history.undo.len(), undo + 1, "one undo step");
+        assert_eq!(app.session.selected_stop(), Some(1), "the stop stays selected");
+        assert!(app.session.fill_active, "the Fill proxy stays in front");
+        // With no stop selected, Alt-click paints the inactive proxy.
+        app.run("gradient.selectStop", json!({"index": null})).unwrap();
+        click_tile(&mut app, &ctx, "Orange", Modifiers::ALT, 2.0);
+        let orange = app.session.doc().unwrap().doc.swatch("Orange").and_then(|w| w.paint.color()).unwrap().to_hex();
+        assert_eq!(stops_and_stroke(&app), (vec!["#ffffff".into(), "#ed1c24".into()], orange));
+    }
+
+    #[test]
+    fn alt_click_links_the_selected_stop_to_a_global_swatch() {
+        let mut app = app();
+        let ctx = context();
+        app.run("swatch.edit", json!({"name": "Red", "global": true})).unwrap();
+        app.run("shape.rectangle", json!({"x": 0, "y": 0, "width": 50, "height": 50})).unwrap();
+        let stops = json!([{"offset": 0, "color": "#ffffff"}, {"offset": 1, "color": "#000000"}]);
+        app.run("paint.setFill", json!({"gradient": {"stops": stops}})).unwrap();
+        app.run("gradient.selectStop", json!({"index": 0})).unwrap();
+        click_tile(&mut app, &ctx, "Red", Modifiers::ALT, 0.0);
+        let Paint::Gradient(g) = crate::panels::current_paints(&app).0 else { panic!("a gradient fill") };
+        assert_eq!(g.gradient.stops[0].swatch.as_deref(), Some("Red"), "linked as a drop on the ramp links it");
+        app.run("swatch.edit", json!({"name": "Red", "color": "#00ff00"})).unwrap();
+        assert_eq!(stops_and_stroke(&app).0, ["#00ff00", "#000000"], "editing the swatch recolors the stop");
+    }
+
+    #[test]
+    fn alt_click_recolors_the_selected_freeform_point() {
+        let mut app = app();
+        let ctx = context();
+        app.run("shape.rectangle", json!({"x": 0, "y": 0, "width": 50, "height": 50})).unwrap();
+        app.run("paint.setStroke", json!({"color": "#000000", "focus": false})).unwrap();
+        app.run("paint.editGradient", json!({"kind": "freeform"})).unwrap();
+        app.run("paint.freeform.selectPoint", json!({"index": 1})).unwrap();
+        click_tile(&mut app, &ctx, "Red", Modifiers::ALT, 0.0);
+        let (fill, stroke) = crate::panels::current_paints(&app);
+        let Paint::Gradient(g) = fill else { panic!("still a gradient: {fill:?}") };
+        assert_eq!(g.freeform.expect("placed points").points[1].color.to_hex(), "#ed1c24");
+        assert_eq!(stroke.color().map(|c| c.to_hex()).as_deref(), Some("#000000"), "the stroke keeps its color");
+        assert_eq!(app.session.selected_freeform_point(), Some(1), "the point stays selected");
+    }
+
     #[test]
     fn delete_asks_then_removes_the_selection_and_unlinks_art() {
         let mut app = app();
@@ -1335,7 +1491,7 @@ mod tests {
         let mut app = app();
         let ctx = context();
         app.run("paint.setFill", json!({"color": "#ff8000"})).unwrap();
-        new_swatch(&mut app, &["Bright Red".into()], true, false);
+        new_swatch(&mut app, &["Bright Red".into()], Modifiers::COMMAND);
         let d = app.ui.dialog.as_ref().expect("New Swatch opens its dialog");
         assert_eq!(
             (d.kind.as_str(), d.str("name").as_str(), d.str("group").as_str()),
@@ -1349,14 +1505,97 @@ mod tests {
         assert!(w.spot && doc.swatch_group_of(&w.name).is_some_and(|g| doc.swatch_groups[g].name == "Brights"));
         // Alt-click saves at once; a gradient takes only a name and stays out of colour groups.
         app.run("paint.setFill", json!({"swatch": "Sunset"})).unwrap();
-        new_swatch(&mut app, &["Brights".into()], false, true);
+        new_swatch(&mut app, &["Brights".into()], Modifiers::ALT);
         assert!(app.ui.dialog.is_none() && app.session.doc().unwrap().doc.swatch("New Gradient Swatch 1").is_some());
-        new_swatch(&mut app, &[], false, false);
+        new_swatch(&mut app, &[], Modifiers::NONE);
         let d = app.ui.dialog.as_ref().unwrap();
         assert_eq!((d.str("name").as_str(), d.fields.contains_key("__paint")), ("New Gradient Swatch 2", true));
         dialog_frame(&mut app, &ctx);
         crate::dialogs::confirm(&mut app).unwrap();
         assert!(app.session.doc().unwrap().doc.swatch("New Gradient Swatch 2").is_some_and(|w| matches!(w.paint, Paint::Gradient(_))));
+    }
+
+    #[test]
+    fn cmd_shift_click_on_new_swatch_makes_a_global_process_color() {
+        let mut app = app();
+        let ctx = context();
+        let global_process = Modifiers::COMMAND | Modifiers::SHIFT;
+        app.run("paint.setFill", json!({"color": "#2a6fb0"})).unwrap();
+        new_swatch(&mut app, &[], global_process);
+        let d = app.ui.dialog.as_ref().expect("New Swatch opens its dialog");
+        assert!(d.bool("global") && !d.bool("spot"), "Cmd/Ctrl+Shift-click opens a global process color");
+        let name = d.str("name");
+        dialog_frame(&mut app, &ctx);
+        crate::dialogs::confirm(&mut app).unwrap();
+        let w = app.session.doc().unwrap().doc.swatch(&name).cloned().expect("created");
+        assert!(w.global && !w.spot);
+        // With Alt also held it saves at once.
+        app.run("paint.setFill", json!({"color": "#00a050"})).unwrap();
+        new_swatch(&mut app, &[], global_process | Modifiers::ALT);
+        assert!(app.ui.dialog.is_none());
+        let w = app.session.doc().unwrap().doc.swatches.last().cloned().unwrap();
+        assert_eq!(w.paint.color().map(|c| c.to_hex()), Some("#00a050".into()));
+        assert!(w.global && !w.spot);
+        // A gradient saves as a gradient swatch whether or not Cmd/Ctrl and Shift are held.
+        app.run("paint.setFill", json!({"swatch": "Sunset"})).unwrap();
+        new_swatch(&mut app, &[], Modifiers::COMMAND | Modifiers::ALT);
+        new_swatch(&mut app, &[], global_process | Modifiers::ALT);
+        let doc = &app.session.doc().unwrap().doc;
+        for n in ["New Gradient Swatch 1", "New Gradient Swatch 2"] {
+            assert!(doc.swatch(n).is_some_and(|w| matches!(w.paint, Paint::Gradient(_)) && !w.global && !w.spot), "{n}");
+        }
+    }
+
+    /// In a CMYK document a swatch made from an RGB fill keeps RGB, as the Color Guide's copies
+    /// do: Alt-click on New Swatch, the New Swatch dialog, the Fill proxy dropped on the panel and
+    /// Alt-dropped on a color swatch, and the same for a gradient's stops.
+    #[test]
+    fn swatches_made_from_an_rgb_fill_stay_rgb_in_a_cmyk_document() {
+        let mut app = app();
+        let ctx = context();
+        app.run("file.documentColorMode", json!({"mode": "cmyk"})).unwrap();
+        let newest = |app: &VectorcraftApp| app.session.doc().unwrap().doc.swatches.last().map(|w| w.paint.clone()).expect("a swatch");
+        let stop_colors = |p: &Paint| match p {
+            Paint::Gradient(g) => g.gradient.stops.iter().map(|s| s.color).collect::<Vec<_>>(),
+            other => panic!("a gradient: {other:?}"),
+        };
+        let drop_on = |app: &mut VectorcraftApp, name: &str, paint: Paint, m: Modifiers, time: f64| {
+            frame(app, &ctx, vec![], time, show);
+            let at = tile_center(&ctx, name);
+            egui::DragAndDrop::set_payload(&ctx, PanelDrag::paint(paint));
+            let release = Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: false, modifiers: m };
+            frame_with(app, &ctx, vec![Event::PointerMoved(at), release], m, time + 0.5, show);
+        };
+        let rgb = Color::from_hex("#2a6fb0").unwrap();
+        app.run("shape.rectangle", json!({"x": 0, "y": 0, "width": 50, "height": 50})).unwrap();
+        app.run("paint.setFill", json!({"color": "#2a6fb0", "keepModel": true})).unwrap();
+        new_swatch(&mut app, &[], Modifiers::ALT);
+        assert_eq!(newest(&app), Paint::solid(rgb), "Alt-click on New Swatch");
+        new_swatch(&mut app, &[], Modifiers::NONE);
+        dialog_frame(&mut app, &ctx);
+        crate::dialogs::confirm(&mut app).unwrap();
+        assert_eq!(newest(&app), Paint::solid(rgb), "the New Swatch dialog");
+        drop_on(&mut app, "Red", Paint::solid(rgb), Modifiers::NONE, 3.0);
+        assert_eq!(newest(&app), Paint::solid(rgb), "the proxy dropped on the panel: {}", app.ui.status);
+        drop_on(&mut app, "Red", Paint::solid(rgb), Modifiers::ALT, 5.0);
+        assert_eq!(app.session.doc().unwrap().doc.swatch("Red").map(|w| w.paint.color()), Some(Some(rgb)), "Alt-dropped on Red");
+        // A gradient's RGB stops.
+        let stops = json!([{"offset": 0, "color": "#ff8000"}, {"offset": 1, "color": "#2a6fb0"}]);
+        app.run("paint.setFill", json!({"gradient": {"stops": stops}, "keepModel": true})).unwrap();
+        let grad = crate::panels::current_paints(&app).0;
+        let rgb_stops = vec![Color::from_hex("#ff8000").unwrap(), rgb];
+        assert_eq!(stop_colors(&grad), rgb_stops);
+        new_swatch(&mut app, &[], Modifiers::ALT);
+        assert_eq!(stop_colors(&newest(&app)), rgb_stops, "Alt-click on New Swatch");
+        new_swatch(&mut app, &[], Modifiers::NONE);
+        frame(&mut app, &ctx, vec![], 6.0, |app, ui| crate::dialogs::show(app, ui.ctx()));
+        crate::dialogs::confirm(&mut app).unwrap();
+        assert_eq!(stop_colors(&newest(&app)), rgb_stops, "the New Swatch dialog");
+        drop_on(&mut app, "Red", grad.clone(), Modifiers::NONE, 7.0);
+        assert_eq!(stop_colors(&newest(&app)), rgb_stops, "the gradient dropped on the panel");
+        drop_on(&mut app, "Ocean", grad, Modifiers::ALT, 9.0);
+        let ocean = app.session.doc().unwrap().doc.swatch("Ocean").map(|w| w.paint.clone()).expect("Ocean");
+        assert_eq!(stop_colors(&ocean), rgb_stops, "Alt-dropped on Ocean");
     }
 
     #[test]
@@ -1395,18 +1634,23 @@ mod tests {
 
     /// Press at `from`, drag to `to` and release there, a frame per step from `time`.
     fn drag(app: &mut VectorcraftApp, ctx: &egui::Context, from: Pos2, to: Pos2, time: f64) {
-        let button = |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
-        frame(app, ctx, vec![Event::PointerMoved(from), button(from, true)], time, show);
-        frame(app, ctx, vec![Event::PointerMoved(from + vec2(6.0, 4.0))], time + 0.1, show);
-        frame(app, ctx, vec![Event::PointerMoved(to)], time + 0.2, show);
-        frame(app, ctx, vec![Event::PointerMoved(to), button(to, false)], time + 0.3, show);
+        drag_with(app, ctx, from, to, Modifiers::NONE, time);
+    }
+
+    /// [`drag`] with `modifiers` held.
+    fn drag_with(app: &mut VectorcraftApp, ctx: &egui::Context, from: Pos2, to: Pos2, modifiers: Modifiers, time: f64) {
+        let button = |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers };
+        frame_with(app, ctx, vec![Event::PointerMoved(from), button(from, true)], modifiers, time, show);
+        frame_with(app, ctx, vec![Event::PointerMoved(from + vec2(6.0, 4.0))], modifiers, time + 0.1, show);
+        frame_with(app, ctx, vec![Event::PointerMoved(to)], modifiers, time + 0.2, show);
+        frame_with(app, ctx, vec![Event::PointerMoved(to), button(to, false)], modifiers, time + 0.3, show);
     }
 
     fn names_of(app: &VectorcraftApp, group: Option<&str>) -> Vec<String> {
         let d = &app.session.active().unwrap().doc;
         let list = match group {
             Some(g) => &d.swatch_groups.iter().find(|x| x.name == g).unwrap().swatches,
-            None => &d.swatches,
+            None => &*d.swatches,
         };
         list.iter().map(|w| w.name.clone()).collect()
     }
@@ -1523,7 +1767,7 @@ mod tests {
         let grad = |c: &str| {
             let stops =
                 vec![vectorcraft_color::GradientStop::new(0.0, Color::from_hex(c).unwrap()), vectorcraft_color::GradientStop::new(1.0, Color::WHITE)];
-            Paint::Gradient(Box::new(vectorcraft_color::GradientPaint::new(vectorcraft_color::Gradient { kind: GradientKind::Radial, stops })))
+            Paint::Gradient(Box::new(vectorcraft_color::GradientPaint::new(vectorcraft_color::Gradient::new(GradientKind::Radial, stops))))
         };
         let drop_on = |app: &mut VectorcraftApp, name: &str, paint: Paint, m: Modifiers, time: f64| {
             let at = tile_center(&ctx, name);
@@ -1541,6 +1785,58 @@ mod tests {
         drop_on(&mut app, "Red", grad("#00ff00"), Modifiers::ALT, 3.0);
         assert_eq!(app.session.doc().unwrap().doc.swatches_iter().count(), count + 1);
         assert!(app.session.doc().unwrap().doc.swatch("Red").is_some_and(|w| w.paint.color().is_some()));
+        // A tint swatch only takes a new name, so a color Alt-dropped on one becomes a new swatch.
+        app.run("swatch.edit", json!({"name": "Orange", "global": true})).unwrap();
+        app.run("swatch.new", json!({"swatch": "Orange", "tint": 40})).unwrap();
+        frame(&mut app, &ctx, vec![], 4.0, show);
+        frame(&mut app, &ctx, vec![], 4.5, show);
+        drop_on(&mut app, "Orange 40%", Paint::solid(Color::from_hex("#123456").unwrap()), Modifiers::ALT, 5.0);
+        let d = &app.session.doc().unwrap().doc;
+        assert_eq!(d.swatches_iter().count(), count + 3, "{}", app.ui.status);
+        assert!(d.swatch("Orange 40%").is_some_and(|w| w.tint_of().is_some()));
+    }
+
+    #[test]
+    fn alt_dragging_a_swatch_onto_another_of_its_kind_replaces_its_color() {
+        let mut app = app();
+        let ctx = context();
+        app.run("swatch.edit", json!({"name": "Orange", "global": true})).unwrap();
+        app.run("swatch.new", json!({"swatch": "Orange", "tint": 40})).unwrap();
+        let id = app.run("shape.rectangle", json!({"x": 0, "y": 0, "width": 50, "height": 50})).unwrap()["id"].as_u64().unwrap();
+        app.run("paint.setFill", json!({"ids": [id], "swatch": "Orange"})).unwrap();
+        frame(&mut app, &ctx, vec![], 0.0, show);
+        frame(&mut app, &ctx, vec![], 0.5, show);
+        let doc = |app: &VectorcraftApp| app.session.doc().unwrap().doc.clone();
+        let (before, undo) = (names_of(&app, None), app.session.doc().unwrap().history.undo.len());
+        let red = doc(&app).swatch("Red").and_then(|w| w.paint.color()).unwrap();
+        drag_with(&mut app, &ctx, tile_center(&ctx, "Red"), tile_center(&ctx, "Orange"), Modifiers::ALT, 1.0);
+        let d = doc(&app);
+        let orange = d.swatch("Orange").expect("Orange keeps its name");
+        assert_eq!((orange.paint.color(), orange.global), (Some(red), true), "Orange takes Red's color");
+        assert_eq!(names_of(&app, None), before, "Red stays and Orange keeps its place");
+        assert_eq!(app.session.doc().unwrap().history.undo.len(), undo + 1);
+        let fill = d.node(vectorcraft_doc::NodeId(id)).unwrap().appearance.fill_paint();
+        assert_eq!(fill.color(), Some(red), "art linked to Orange takes the new color");
+        // A gradient dropped on a color, and a swatch dropped without Alt, move as before.
+        frame(&mut app, &ctx, vec![], 2.0, show);
+        frame(&mut app, &ctx, vec![], 2.5, show);
+        drag_with(&mut app, &ctx, tile_center(&ctx, "Sunset"), tile_center(&ctx, "Amber") - vec2(4.0, 0.0), Modifiers::ALT, 3.0);
+        let n = names_of(&app, None);
+        assert_eq!(n[n.iter().position(|x| x == "Amber").unwrap() - 1], "Sunset");
+        assert!(doc(&app).swatch("Amber").is_some_and(|w| w.paint.color().is_some()));
+        frame(&mut app, &ctx, vec![], 4.0, show);
+        frame(&mut app, &ctx, vec![], 4.5, show);
+        drag(&mut app, &ctx, tile_center(&ctx, "Lime"), tile_center(&ctx, "Red") - vec2(4.0, 0.0), 5.0);
+        let n = names_of(&app, None);
+        assert_eq!(n[n.iter().position(|x| x == "Red").unwrap() - 1], "Lime");
+        assert_ne!(doc(&app).swatch("Red").and_then(|w| w.paint.color()), doc(&app).swatch("Lime").and_then(|w| w.paint.color()));
+        // A tint swatch only takes a new name, so a swatch Alt-dropped on one moves.
+        frame(&mut app, &ctx, vec![], 6.0, show);
+        frame(&mut app, &ctx, vec![], 6.5, show);
+        drag_with(&mut app, &ctx, tile_center(&ctx, "Lime"), tile_center(&ctx, "Orange 40%") - vec2(4.0, 0.0), Modifiers::ALT, 7.0);
+        let n = names_of(&app, None);
+        assert_eq!(n[n.iter().position(|x| x == "Orange 40%").unwrap() - 1], "Lime", "{}", app.ui.status);
+        assert_eq!(doc(&app).swatch("Orange 40%").and_then(|w| w.tint_of().map(|(base, _)| base.to_string())).as_deref(), Some("Orange"));
     }
 
     #[test]
@@ -1579,6 +1875,54 @@ mod tests {
         app.run("ui.swatchOptions", json!({"name": "Ink 40%"})).unwrap();
         let d = app.ui.dialog.as_ref().unwrap();
         assert_eq!((d.kind.as_str(), d.str("__swatch").as_str()), (KIND, "Ink"), "a tint swatch opens its base's options");
+    }
+
+    /// Selecting art scrolls the tiles to its swatch, once, and clears the panel's own selection so
+    /// that swatch is the one highlighted.
+    #[test]
+    fn selecting_art_scrolls_to_its_swatch() {
+        let mut app = app();
+        let colors: Vec<String> = (0..400).map(|i| format!("#{:02x}{:02x}{:02x}", i % 256, (i / 2) % 256, 128)).collect();
+        app.run("swatch.new", json!({ "colors": colors })).unwrap();
+        app.run("swatch.new", json!({"name": "Last Ink", "color": "#123456", "spot": true})).unwrap();
+        let id = app.run("shape.rectangle", json!({"x": 0, "y": 0, "width": 50, "height": 50})).unwrap()["id"].clone();
+        app.run("paint.setFill", json!({"ids": [id], "swatch": "Last Ink"})).unwrap();
+        app.run("select.none", json!({})).unwrap();
+        let ctx = context();
+        let tile = |ctx: &egui::Context| ctx.read_response(egui::Id::new(("swatch-tile", "Last Ink"))).unwrap().rect;
+        frame(&mut app, &ctx, vec![], 0.0, show);
+        frame(&mut app, &ctx, vec![], 0.1, show);
+        let far = tile(&ctx).top();
+        set_pstate(&ctx, "swatch-selected", vec!["Red".to_string()]);
+        app.run("select.set", json!({"ids": [id]})).unwrap();
+        for t in [0.2, 0.3, 0.4] {
+            frame(&mut app, &ctx, vec![], t, show);
+        }
+        let near = tile(&ctx).top();
+        assert!(near < far - 100.0, "scrolled to the swatch: {far} → {near}");
+        assert!(selected(&ctx).is_empty(), "the art's swatch is highlighted");
+        // Once: later frames leave the scroll where the user puts it.
+        assert_eq!(focus_swatch(&app, &egui::Ui::new(ctx.clone(), egui::Id::new("t"), egui::UiBuilder::new()), Some("Last Ink")), None);
+    }
+
+    /// A selected image, or text in a colour no swatch has, highlights no swatch (not None); text in
+    /// a swatch's colour highlights that swatch.
+    #[test]
+    fn images_and_unswatched_text_highlight_no_swatch() {
+        let mut app = app();
+        let mut png = vec![];
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let data = vectorcraft_format::base64_encode(&png);
+        app.run("file.place", json!({"name": "a.png", "dataBase64": data, "link": false})).unwrap();
+        assert_eq!(active_swatch(&app), None, "an image: no swatch");
+        let text = app.run("text.create", json!({"x": 10, "y": 50, "text": "Hi"})).unwrap()["id"].clone();
+        app.run("select.set", json!({"ids": [text]})).unwrap();
+        app.run("paint.setFill", json!({"color": "#3a7b5c"})).unwrap();
+        assert_eq!(active_swatch(&app), None, "a colour of its own: no swatch");
+        app.run("swatch.new", json!({"name": "Moss", "color": "#3a7b5c"})).unwrap();
+        assert_eq!(active_swatch(&app).as_deref(), Some("Moss"), "a swatch's colour");
     }
 
     #[test]

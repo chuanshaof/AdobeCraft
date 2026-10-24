@@ -37,5 +37,10 @@ fn export_with_a_range_writes_one_file_per_artboard() {
     let r = text(&call_tool(&mut h, "export", &json!({"format": "jpg", "options": {"useArtboards": true}})));
     let names: Vec<&str> = r["files"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
     assert_eq!(names, ["Untitled-1-Artboard-1.jpg", "Untitled-1-Artboard-2.jpg", "Untitled-1-Artboard-3.jpg"]);
+    // SVG, SVGZ and EPS write one file per artboard of a range without useArtboards.
+    for format in ["svg", "svgz", "eps"] {
+        let r = text(&call_tool(&mut h, "export", &json!({"format": format, "range": "1, 3"})));
+        assert_eq!(r["files"].as_array().map(Vec::len), Some(2), "{format}: {r}");
+    }
     let _ = std::fs::remove_dir_all(dir);
 }
