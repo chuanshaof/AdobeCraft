@@ -73,21 +73,36 @@ The release packages ship `designcraft-cli` alongside the desktop app, so no bui
 
 | Install | CLI |
 |---|---|
-| Windows (MSI) | `C:\Program Files\DesignCraft\designcraft-cli.exe` by default (wherever you installed it otherwise), not on `PATH` |
+| Windows (MSI) | `%LOCALAPPDATA%\Programs\ArtCraft\DesignCraft\designcraft-cli.exe` by default (`C:\Program Files\ArtCraft\DesignCraft\designcraft-cli.exe` for an all-users install, under `Program Files (x86)` instead for the 32-bit build, or wherever you installed it otherwise), not on `PATH` |
 | Linux (deb, rpm) | `/usr/bin/designcraft-cli` |
-| macOS | the separate `designcraft-cli-<version>-macos-<arch>.zip` release asset (the `.app` holds only the desktop app) |
+| macOS (DMG) | `/Applications/DesignCraft.app/Contents/MacOS/designcraft-cli` after installing the app; the separate CLI ZIP is also available |
 
 ```sh
-# Windows, default install folder
-claude mcp add designcraft -- "C:\Program Files\DesignCraft\designcraft-cli.exe" mcp
-# Linux, or macOS with the CLI unzipped onto PATH
+# Windows (PowerShell), default install folder
+claude mcp add designcraft -- "$env:LOCALAPPDATA\Programs\ArtCraft\DesignCraft\designcraft-cli.exe" mcp
+# macOS, app installed in Applications
+claude mcp add designcraft -- "/Applications/DesignCraft.app/Contents/MacOS/designcraft-cli" mcp
+# Linux, or the separate CLI unzipped onto PATH
 claude mcp add designcraft -- designcraft-cli mcp
 ```
+
+The bundled macOS CLI can also run headless jobs directly, without an MCP client or a window:
+
+```sh
+"/Applications/DesignCraft.app/Contents/MacOS/designcraft-cli" --version
+"/Applications/DesignCraft.app/Contents/MacOS/designcraft-cli" commands frame.create
+```
+
+If the app lives elsewhere, use its actual path. Updating the app updates its bundled CLI; moving
+it requires updating any saved command or MCP configuration path. Removing the app removes this
+CLI too. An independently installed CLI is unaffected, and the DMG adds nothing to `PATH`.
 
 ## Confining file access
 
 ```sh
 designcraft-cli mcp --automation-read-root /work/project --automation-write-root /work/project/out
+designcraft-cli mcp --automation-read-root /work/project --automation-read-root /work/shared-assets \
+  --automation-write-root /work/project/out --automation-write-root /tmp/scratch
 ```
 
 ```json
@@ -98,16 +113,16 @@ designcraft-cli mcp --automation-read-root /work/project --automation-write-root
 The two flags (VectorCraft, PhotoCraft and the other Craft apps take the same ones, so one client
 config works across the suite) keep the agent to the folders you give it:
 
-- Every file a command reads must lie inside the **read root**: `open_document`, `file.open`,
+- Every file a command reads must lie inside a **read root**: `open_document`, `file.open`,
   `file.openIdml`, `place_image` and `file.place` / `place.load` / `media.options` with a `path`,
   `links.relink`, `links.relinkFolder`, `color.loadProfile`, `swatch.load`, `library.open`,
   `book.open`, `data.source.select`, `data.merge` and `file.importXml` / `xml.loadDtd` with a `path`,
   and `file.recovery.list` / `file.recovery.open` with a `dir`. A DesignCraft document names more
   files than the agent does: linked images, data sources, book chapters, the `Document Fonts` folder
   beside a document, an IDML package's linked images and the files an image cell of a merge names.
-  Those are read through the same checks, so a path in a document that leads outside the read root
+  Those are read through the same checks, so a path in a document that leads outside the read roots
   reads as a file that isn't there.
-- Every file a command writes must lie inside the **write root**: `save_document`, `export_png`,
+- Every file a command writes must lie inside a **write root**: `save_document`, `export_png`,
   `render_page` with a `path`, `file.save`, `file.saveAs`, `file.saveACopy`, `file.exportPdf`,
   `file.exportEpub`, `file.exportFixedEpub`, `file.exportHtml`, `file.exportText`, `file.exportXml`,
   `file.exportIdml`, `file.printBooklet`, `snippet.export`, `swatch.save`, `library.new` and the
@@ -115,21 +130,29 @@ config works across the suite) keep the agent to the folders you give it:
   `file.package`, `links.copyTo` and `file.recovery.save` / `file.recovery.open` with a `dir`
   (reopening removes the entries it read). `file.package` and `links.copyTo` check their folder
   before they create anything.
-- Read and write access are separate. Give the same folder twice for both. A root left out grants
-  none of its access: with only `--automation-read-root` nothing can be written to disk. Without
-  either flag nothing changes.
+- Each flag may be given more than once (#1552): a path inside any of the read roots may be read,
+  one inside any of the write roots written, so one session can read a project folder and a shared
+  assets folder, or write to an output folder and a scratch folder, without widening a root to
+  their common parent (which the roots don't grant). A folder given twice counts once.
+- Read and write access are separate. Give the same folder to both flags for both. A kind left out
+  grants none of its access: with only `--automation-read-root` nothing can be written to disk.
+  Without either flag nothing changes.
 - A path is made absolute against the server's working directory, then its links are followed: a
-  file (or folder) link that leads out of a root is outside it. For a file that doesn't exist yet,
+  file (or folder) link that leads out of the roots is outside them. For a file that doesn't exist yet,
   its nearest existing folder's links are followed and the rest must be plain names, so `..` below a
   folder that doesn't exist is refused, as is a link that leads nowhere (writing through it would
-  create its target). The result is compared with the root by whole folder names: `/work2/x` is not
-  inside `/work`. On Windows case is ignored, UNC paths (`\\server\share\...`) are resolved like
-  drive-letter ones, and device names (`CON`, `NUL`, `COM1`...) are refused.
+  create its target). The result is compared with each root by whole folder names: `/work2/x` is not
+  inside `/work`. On Windows case is ignored, and device names (`CON`, `NUL`, `COM1`, `COM¹`, including before a colon) are refused.
+  A network path (`\\server\share\...`, `\\?\UNC\...`, WebDAV's `\\host@SSL\share\...`), a device path (`\\.\...`) or a
+  verbatim path that isn't a disk (a volume by its `\\?\Volume{…}` name is local) is refused by its name before anything looks it up, since looking it up would
+  contact that host, unless a root is on the same server and share (or the same verbatim prefix). A link whose
+  target is one of those is refused from the link's text, before it is followed. A \\?\ path with a `..` in it is refused, since Windows opens such a path as written and would follow a link before the `..`. On Windows a name that ends in a period or a space, in a path or as a link's target, is refused too, since Windows trims it where it looks a name up.
 - A refused path is an ordinary tool error the agent can read and correct, for example
-  `automation path rejected: outside the write root /work/project/out: /etc/x.designcraft` or
+  `automation path rejected: outside the write root /work/project/out: /etc/x.designcraft` (with
+  several, `outside the write roots /work/project/out, /tmp/scratch: ...`) or
   `automation filesystem access is not granted: write authority is absent: /work/project/out/x.designcraft`.
-- The roots must be existing folders; a missing one stops the server with an error. Each flag is
-  given once (`--flag <dir>` or `--flag=<dir>`).
+- The roots must be existing folders; a missing one stops the server with an error. Each flag takes
+  one folder per use (`--flag <dir>` or `--flag=<dir>`) and may be used again for more.
 
 The flags confine the in-process server, so `--connect` together with them is an error: the server
 would otherwise talk to an app that isn't confined. DesignCraft's desktop app has no equivalent flags
@@ -165,6 +188,12 @@ In connected mode every tool maps to a control-channel method (`engine.execute`,
 what the agent does shows up live in the window. A failed request is not resent: the operation may have completed,
 so inspect the document before retrying. The next request re-establishes the connection.
 
+## Table targets
+
+Table IDs can repeat across stories. For `execute` commands that target an existing table, supply `story` with `table`
+when an ID repeats. An ambiguous table-only request returns an error. Supplied `story` and `table` values must be
+nonnegative integers; `null` and values of other types return an error.
+
 ## Coordinates
 
 Points (1/72 in), y down, in **spread** space: on a single-page spread the page's top-left is (0, 0); on a facing
@@ -186,6 +215,14 @@ is an error that gives the story length in bytes, and the story is left unchange
 that has a `cell` (`{table, row, col}`) is in that table cell's text, and its `start` / `end` count from the start of
 the cell.
 
+## Tables without a selection
+
+A table command acts on the selected cells or on the table that holds the insertion point. A command whose params list
+`story?` and `table?` also runs when nothing in a table is selected, or the selection is one it can't act on, if the
+call passes `table` (the id that `table.insert` and `table.get` return) and, optionally, `story`. A `table` that is not
+in the document, or not in the given `story`, is an error, and so is a `story` that is not a non-negative integer. The
+Table menu items stay disabled while nothing in a table is selected.
+
 ## Text and image fitting
 
 Hyphenation is on by default for new text (`hyphenate: true`). To turn it off, select the text or a text frame,
@@ -196,6 +233,16 @@ execute          {"command": "type.para", "params": {"attrs": {"hyphenate": fals
 ```
 
 With a text selection, this formats the selected paragraphs; with selected text frames, it formats their whole stories.
+
+`object.textFrameOptions` (columns, inset spacing, vertical justification and the rest of Text Frame Options) acts on
+the selected frames or on the `ids` the call passes. With the Type tool and no frame selected, it acts on the frame that
+shows the insertion point, or on every frame that holds part of the selected text, not on the other frames of the
+thread. With the insertion point in a footnote or a table cell, it acts on the frame that shows the footnote or the
+cell. An empty `ids`, or an `ids` that is not a list of object ids, is an error. Options a frame already has leave the document unchanged and add no undo step.
+
+```text
+execute          {"command": "object.textFrameOptions", "params": {"verticalJustification": "center", "inset": 6}}
+```
 
 Use `execute` with `object.fit` to fit a selected graphic frame (or pass `ids`):
 
@@ -234,6 +281,19 @@ Use `execute` with `object.fit` to fit a selected graphic frame (or pass `ids`):
 
 Tool failures come back as results with `isError: true` and a message the model can act on; protocol errors use
 JSON-RPC error codes. Resources: `designcraft://document` (document.inspect) and `designcraft://commands`.
+
+Every input schema is closed (`additionalProperties: false`), and the server checks keys at every level it lists
+them: a misspelt key in a `batch` step, a `pointer` event or `mods` is a `-32602` error naming its path, e.g.
+``unknown argument `commands[0].parms` for `batch` ``. Command `params` are checked against the command's own
+description, as above. A `script` step written as JSON takes only `command` and `params`.
+
+Every tool carries all four MCP hints. The read-only tools (`list_commands`, `inspect_document`, `get_story`,
+`menu_list`, `ui_inspect`) are idempotent and not destructive. `new_document`, `open_document`, `select_tool`,
+`ui_set` and `dialog_cancel` change state without destroying any; the other tools that edit or write may.
+`set_story_text`, `save_document`, `export_png`, `render_page`, `screenshot`, `select_tool`, `ui_set`,
+`dialog_set` and `dialog_cancel` are idempotent. A panic that escapes outside a command (rendering, inspection,
+the connection to the app) is reported as a tool error and the server keeps running. Exports complete
+synchronously, so there is no progress or cancellation to report.
 
 ## Example
 

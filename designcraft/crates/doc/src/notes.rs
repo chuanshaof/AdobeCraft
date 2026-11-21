@@ -186,8 +186,12 @@ impl Story {
 
     /// Insert empty footnotes for `n` new reference characters before which `k` references sit.
     pub(crate) fn notes_inserted(&mut self, k: usize, n: usize) {
+        // The largest id so far, kept as ids are given out (finding it again for every new note
+        // was quadratic in a batch); past the largest id, the free-id search as before.
+        let mut max = self.notes.iter().map(|x| x.id).max().unwrap_or(0);
         for i in 0..n {
-            let id = self.next_note_id();
+            let id = max.checked_add(1).unwrap_or_else(|| self.next_note_id());
+            max = max.max(id);
             let mut text = Story::new(StoryId(0));
             text.chars[0].format = CharFormat::default();
             self.notes.insert((k + i).min(self.notes.len()), Arc::new(Footnote { id, text }));
@@ -262,7 +266,7 @@ impl crate::Document {
         let Some(me) = self.story(sid) else { return o.start_at };
         let mine = key(me);
         let before: usize = self.stories.values().filter(|st| st.id != sid && !st.notes.is_empty() && key(st) < mine).map(|st| st.notes.len()).sum();
-        o.start_at + before as u32
+        o.start_at.saturating_add(before as u32)
     }
 
     /// Absolute page an item sits on (its center), None on parent pages / pasteboard-only spreads.

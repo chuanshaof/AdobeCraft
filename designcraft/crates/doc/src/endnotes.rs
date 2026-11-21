@@ -103,8 +103,12 @@ impl Story {
 
     /// Insert empty endnotes for `n` new reference characters before which `k` references sit.
     pub(crate) fn endnotes_inserted(&mut self, k: usize, n: usize) {
+        // As for footnotes: the largest id kept as ids are given out, and the free-id search past
+        // the largest one (`+ 1` overflowed there).
+        let mut max = self.endnotes.iter().map(|x| x.id).max().unwrap_or(0);
         for i in 0..n {
-            let id = self.endnotes.iter().map(|x| x.id).max().unwrap_or(0) + 1;
+            let id = max.checked_add(1).unwrap_or_else(|| crate::ids::next_local_id(self.endnotes.iter().map(|x| x.id)));
+            max = max.max(id);
             let mut text = Story::new(StoryId(0));
             text.chars[0].format = CharFormat::default();
             self.endnotes.insert((k + i).min(self.endnotes.len()), Arc::new(Footnote { id, text }));
@@ -147,7 +151,7 @@ impl crate::Document {
             if st.id == sid {
                 break;
             }
-            n += st.endnotes.len() as u32;
+            n = n.saturating_add(st.endnotes.len() as u32);
         }
         n
     }
@@ -173,7 +177,7 @@ impl crate::Document {
                     let at = out.len();
                     out.insert_with(at, &note.text.text[r].replace('\n', " "), f.clone());
                 }
-                n += 1;
+                n = n.saturating_add(1);
             }
         }
         out
