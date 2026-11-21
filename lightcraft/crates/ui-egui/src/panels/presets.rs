@@ -62,7 +62,7 @@ impl AppliedByPhoto {
     /// Remember `preset` on the photos `preset.apply` just changed (the selection, else the active
     /// photo; an active photo outside the selection wasn't changed and isn't marked).
     fn remember(ctx: &egui::Context, session: &lightcraft_engine::Session, preset: &str) {
-        let id = egui::Id::new(Self::ID);
+        let id = egui::Id::unique(Self::ID);
         let mut map: Self = ctx.data(|d| d.get_temp(id)).unwrap_or_default();
         for photo in session.selected() {
             if let Some(d) = session.develop_of(photo) {
@@ -75,13 +75,15 @@ impl AppliedByPhoto {
     /// The preset to mark for `photo`: the one it was given, while its settings are unchanged since.
     fn of(ctx: &egui::Context, session: &lightcraft_engine::Session, photo: Option<lightcraft_catalog::PhotoId>) -> Option<String> {
         let photo = photo?;
-        let map: Self = ctx.data(|d| d.get_temp(egui::Id::new(Self::ID)))?;
+        let map: Self = ctx.data(|d| d.get_temp(egui::Id::unique(Self::ID)))?;
         let (preset, then) = map.0.get(&photo)?;
         let now = session.develop_of(photo)?;
         (Arc::ptr_eq(then, &now) || **then == *now).then(|| preset.clone())
     }
 }
 
+/// The Presets panel: the Favorites section of starred presets on top (issue #1999), then the
+/// groups of built-in and user presets, each row applying its preset on click.
 pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
     let t = Tokens::get(ui.ctx());
     egui::Frame::NONE.fill(t.chrome).stroke(egui::Stroke::new(1.0, t.divider)).show(ui, |ui| {
@@ -109,7 +111,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         let more = icon_button(&mut hdr, "presetMore", Icon::More, vec2(28.0, 28.0), false, true, crate::i18n::tr("More preset options"));
         egui::Popup::menu(&more).show(|ui| {
             let r = ui.checkbox(&mut app.ui.preset_thumbs, crate::i18n::tr("Show Thumbnails"));
-            register(ui.ctx(), "presetMenu:thumbnails", r.rect);
+            register(ui, "presetMenu:thumbnails", r.rect);
             ui.separator();
             if ui.button(crate::i18n::tr("Import Presets…")).clicked() {
                 let _ = app.run("file.importPresets", json!({}));
@@ -121,7 +123,7 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         });
         divider(ui);
         // amount slider (applies to the last applied preset)
-        let amt_id = egui::Id::new("preset-amount");
+        let amt_id = egui::Id::unique("preset-amount");
         let last: Option<AppliedPreset> = ui.data(|d| d.get_temp(amt_id));
         if let Some(last) = last.clone().filter(|last| last.is_current(&app.session)) {
             let spec = ControlSpec {
@@ -156,7 +158,6 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
         }
         let active = app.session.active();
         let marked = AppliedByPhoto::of(ui.ctx(), &app.session, active);
-        let current = active.and_then(|id| app.session.develop_of(id)).map(|d| (*d).clone());
         let thumbs = app.ui.preset_thumbs && active.is_some();
         let row_h = if thumbs { 54.0 } else { 26.0 };
         let groups = grouped(ui.ctx(), &app.session.presets);
@@ -166,12 +167,14 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
             // imported whole is 10 000+ presets, and building every row each frame took seconds.
             let visible = ui.clip_rect().expand(row_h);
             for grp in groups.iter() {
-                let (g, builtin) = (grp.name.clone(), grp.builtin);
-                let open_id = egui::Id::new(("preset-group", &g));
+                let (g, builtin, favorites) = (grp.name.clone(), grp.builtin, grp.favorites);
+                // the Favorites section opens and closes apart from a user group named "Favorites"
+                let open_id = egui::Id::unique(("preset-group", favorites, &g));
                 let open: bool = ui.data(|d| d.get_temp(open_id)).unwrap_or(true);
                 let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click());
                 crate::widgets::announce(&resp, g.to_string());
-                register(ui.ctx(), format!("presetGroup:{g}"), r);
+                // outside the `presetGroup:` ids, which a user group of any name can take
+                register(ui, if favorites { "presetFavorites".to_string() } else { format!("presetGroup:{g}") }, r);
                 paint(
                     ui.painter(),
                     Rect::from_center_size(pos2(r.left() + 22.0, r.center().y), vec2(16.0, 16.0)),
@@ -188,11 +191,13 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                 if resp.clicked() {
                     ui.data_mut(|d| d.insert_temp(open_id, !open));
                 }
-                crate::widgets::context_menu(&resp, |ui| {
-                    if ui.button(crate::i18n::tr("Export Group…")).clicked() {
-                        let _ = app.run("file.exportPresets", json!({"group": g}));
-                    }
-                });
+                if !favorites {
+                    crate::widgets::context_menu(&resp, |ui| {
+                        if ui.button(crate::i18n::tr("Export Group…")).clicked() {
+                            let _ = app.run("file.exportPresets", json!({"group": g}));
+                        }
+                    });
+                }
                 if !open {
                     continue;
                 }
@@ -205,15 +210,17 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                     let (pid, name, fav) = (pr.id.clone(), crate::i18n::builtin_label(&pr.name, pr.builtin).to_string(), pr.favorite);
                     let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
                     crate::widgets::announce(&resp, name.clone());
-                    register(ui.ctx(), format!("preset:{pid}"), r);
+                    // a starred preset is listed twice: in Favorites and in its group
+                    register(ui, if favorites { format!("presetFavorite:{pid}") } else { format!("preset:{pid}") }, r);
                     let is_last = marked.as_deref() == Some(pid.as_str());
                     if is_last {
-                        register(ui.ctx(), "presetApplied", r);
+                        register(ui, "presetApplied", r);
                         ui.painter().rect_filled(r, 0.0, t.tool_active);
                     } else if resp.hovered() {
                         ui.painter().rect_filled(r, 0.0, t.hover.gamma_multiply(0.7));
                     }
-                    let look = if thumbs || resp.hovered() { current.as_ref().map(|d| pr.apply(d, 1.0)) } else { None };
+                    // the preview is what a click commits: the same composition as `preset.apply` (`Session::preset_applied`)
+                    let look = if thumbs || resp.hovered() { active.and_then(|id| app.session.preset_applied(id, &pr, 1.0)) } else { None };
                     let mut text_x = r.left() + 40.0;
                     if thumbs && let (Some(id), Some(s)) = (active, look.as_ref()) {
                         let tr = Rect::from_min_size(pos2(r.left() + 36.0, r.top() + 5.0), vec2(66.0, row_h - 10.0));
@@ -221,13 +228,18 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                         if let Some(job) = app.session.variant_job(id, s, THUMB_EDGE)
                             && let Some(tex) = app.renderer.variant(job)
                         {
-                            ui.painter().image(tex.tex.id(), tr, cover_uv(tr, tex.size), Color32::WHITE);
+                            ui.painter().image(tex.id(), tr, cover_uv(tr, tex.size), Color32::WHITE);
                         }
                         text_x = tr.right() + 10.0;
                     }
                     ui.painter().text(pos2(text_x, r.center().y), Align2::LEFT_CENTER, &name, t.font(13.0), t.text_label);
                     if fav {
-                        paint(ui.painter(), Rect::from_center_size(pos2(r.right() - 20.0, r.center().y), vec2(16.0, 16.0)), Icon::StarFilled, t.star);
+                        crate::rating::paint_star(
+                            ui.painter(),
+                            Rect::from_center_size(pos2(r.right() - 20.0, r.center().y), vec2(16.0, 16.0)),
+                            true,
+                            t.star,
+                        );
                     }
                     // resting on a preset previews it in the loupe (no history entry)
                     if resp.hovered()
@@ -236,13 +248,13 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
                         let label = crate::i18n::tr_format!("Preset: {name}", name = name);
                         app.hover_preview = Some(HoverPreview { label: label.clone(), settings: s });
                         if let Some(id) = active {
-                            ui.data_mut(|d| d.insert_temp(egui::Id::new("last-preset-hover"), (id, pr.clone(), label)));
+                            ui.data_mut(|d| d.insert_temp(egui::Id::unique("last-preset-hover"), (id, pr.clone(), label)));
                         }
                     }
                     if resp.clicked() && app.run("preset.apply", json!({"id": pid, "amount": 100})).is_ok() {
                         AppliedByPhoto::remember(ui.ctx(), &app.session, &pid);
                         ui.data_mut(|d| d.insert_temp(amt_id, AppliedPreset::new(&app.session, pid.clone(), 100.0)));
-                        ui.data_mut(|d| d.remove::<(lightcraft_catalog::PhotoId, Preset, String)>(egui::Id::new("last-preset-hover")));
+                        ui.data_mut(|d| d.remove::<(lightcraft_catalog::PhotoId, Preset, String)>(egui::Id::unique("last-preset-hover")));
                         app.toast(ui.ctx(), crate::i18n::tr_format!("Preset: {name}", name = name));
                     }
                     let (builtin, group) = (pr.builtin, pr.group.clone());
@@ -296,16 +308,17 @@ pub fn show(app: &mut LightcraftApp, ui: &mut egui::Ui) {
             }
             ui.add_space(30.0);
         });
-        let last_hover_id = egui::Id::new("last-preset-hover");
+        let last_hover_id = egui::Id::unique("last-preset-hover");
         let pointer_in_scroll = ui.ctx().input(|i| i.pointer.hover_pos()).is_some_and(|pos| scroll.inner_rect.contains(pos));
         if pointer_in_scroll {
             if app.hover_preview.is_none()
-                && let (Some(id), Some(curr)) = (active, current.as_ref())
+                && let Some(id) = active
                 && let Some((saved_id, saved_preset, saved_label)) =
                     ui.data(|d| d.get_temp::<(lightcraft_catalog::PhotoId, Preset, String)>(last_hover_id))
                 && saved_id == id
+                && let Some(s) = app.session.preset_applied(id, &saved_preset, 1.0)
             {
-                app.hover_preview = Some(HoverPreview { label: saved_label, settings: saved_preset.apply(curr, 1.0) });
+                app.hover_preview = Some(HoverPreview { label: saved_label, settings: s });
             }
         } else {
             ui.data_mut(|d| d.remove::<(lightcraft_catalog::PhotoId, Preset, String)>(last_hover_id));
@@ -321,13 +334,15 @@ struct Group {
     builtin: bool,
     /// Holds a user preset (a Move to Group target).
     user: bool,
+    /// The Favorites section on top (issue #1999): the starred presets, each also in its own group.
+    favorites: bool,
     items: Vec<usize>,
 }
 
 /// The presets by group (groups sorted by name, presets in list order), rebuilt only when the
 /// list changed (its generation).
 fn grouped(ctx: &egui::Context, presets: &PresetList) -> Arc<Vec<Group>> {
-    let id = egui::Id::new("presets-grouped");
+    let id = egui::Id::unique("presets-grouped");
     if let Some((generation, groups)) = ctx.data(|d| d.get_temp::<(u64, Arc<Vec<Group>>)>(id))
         && generation == presets.generation()
     {
@@ -335,12 +350,21 @@ fn grouped(ctx: &egui::Context, presets: &PresetList) -> Arc<Vec<Group>> {
     }
     let mut by_name: BTreeMap<&str, Group> = BTreeMap::new();
     for (i, p) in presets.iter().enumerate() {
-        let g = by_name.entry(&p.group).or_insert_with(|| Group { name: p.group.clone(), builtin: false, user: false, items: Vec::new() });
+        let g = by_name.entry(&p.group).or_insert_with(|| Group {
+            name: p.group.clone(),
+            builtin: false,
+            user: false,
+            favorites: false,
+            items: Vec::new(),
+        });
         g.builtin |= p.builtin;
         g.user |= !p.builtin;
         g.items.push(i);
     }
-    let groups = Arc::new(by_name.into_values().collect::<Vec<_>>());
+    // starred presets first, in their own section, as Profiles does
+    let starred: Vec<usize> = presets.iter().enumerate().filter(|(_, p)| p.favorite).map(|(i, _)| i).collect();
+    let favorites = (!starred.is_empty()).then(|| Group { name: "Favorites".into(), builtin: true, user: false, favorites: true, items: starred });
+    let groups = Arc::new(favorites.into_iter().chain(by_name.into_values()).collect::<Vec<_>>());
     ctx.data_mut(|d| d.insert_temp(id, (presets.generation(), groups.clone())));
     groups
 }
@@ -349,7 +373,7 @@ fn grouped(ctx: &egui::Context, presets: &PresetList) -> Arc<Vec<Group>> {
 /// wherever the group changes. Only the rows in view are built (10 000+ presets made an open
 /// picker take seconds a frame). Returns the id of the preset clicked.
 pub fn picker_rows(ui: &mut egui::Ui, salt: &str, presets: &PresetList, selected: Option<&str>) -> Option<String> {
-    let id = egui::Id::new("preset-picker-rows");
+    let id = egui::Id::unique("preset-picker-rows");
     let rows = match ui.ctx().data(|d| d.get_temp::<(u64, Arc<Vec<PickRow>>)>(id)) {
         Some((generation, rows)) if generation == presets.generation() => rows,
         _ => {

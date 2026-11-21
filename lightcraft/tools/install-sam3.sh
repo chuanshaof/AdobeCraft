@@ -92,19 +92,20 @@ fi
 # resume the server refuses (416) starts over instead of counting as done.
 fetch() {
     file=$1 dest=$2 resume=${3:-}
+    # POSIX sh has no arrays: the auth option and its value travel as two plain words.
     if [ -n "$TOKEN" ]; then
-        CURL_AUTH=(--config "$AUTH_FILE")
+        auth_opt=--config auth_val=$AUTH_FILE
     else
         # not secret (no token is sent); kept in argv only to mirror the authenticated call shape
-        CURL_AUTH=(-H "X-No-Auth: 1")
+        auth_opt=-H auth_val="X-No-Auth: 1"
     fi
-    code=$(curl --proto '=https' -fsSL ${resume:+-C -} "${CURL_AUTH[@]}" -w '%{http_code}' -o "$dest" "$BASE/$file") || true
+    code=$(curl --proto '=https' -fsSL ${resume:+-C -} "$auth_opt" "$auth_val" -w '%{http_code}' -o "$dest" "$BASE/$file") || true
     case "$code" in
         200|206) return 0 ;;
         416)
             echo "the partial download of $file doesn't match the server's; starting over" >&2
             rm -f "$dest"
-            code=$(curl --proto '=https' -fsSL "${CURL_AUTH[@]}" -w '%{http_code}' -o "$dest" "$BASE/$file") || true
+            code=$(curl --proto '=https' -fsSL "$auth_opt" "$auth_val" -w '%{http_code}' -o "$dest" "$BASE/$file") || true
             [ "$code" = 200 ] && return 0
             echo "download of $REPO/$file failed ($code)" >&2; return 1 ;;
         401|403) echo "access denied to $REPO/$file (has your request for facebook/sam3 been approved?)" >&2; return 1 ;;

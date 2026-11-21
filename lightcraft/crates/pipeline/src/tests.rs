@@ -75,6 +75,38 @@ fn directional_sliders() {
     assert!(at("effects.dehaze", -100.0) != base);
 }
 
+/// Dehaze crushed dark regions next to bright ones to black: the dark channel is a blur, not a
+/// patch minimum, so near the boundary it credited the dark pixels with the bright side's veil and
+/// the subtraction went past zero (#2504). The veil credited to a pixel is now bounded by its own
+/// minimum channel, so a uniform dark region renders uniformly under dehaze.
+#[test]
+fn dehaze_does_not_crush_dark_regions_next_to_bright_ones() {
+    // a dark field against a bright hazy sky; the blur bleeds the sky's dark channel ~10 px into
+    // the field, which is where the blotches formed
+    let src = Rgb32f::from_fn(240, 160, |x, _| if x < 120 { [0.02, 0.03, 0.012] } else { [0.45, 0.5, 0.55] });
+    let mut s = DevelopSettings::default();
+    s.effects.dehaze = 80.0;
+    let r = render(&src, &SourceInfo::default(), &s, &RenderRequest::fit(240, 160)).image;
+    for ch in 0..3 {
+        let mut v: Vec<u8> = Vec::with_capacity(160 * 100);
+        for y in 0..160 {
+            for x in 0..100 {
+                v.push(r.get(x, y)[ch]);
+            }
+        }
+        v.sort_unstable();
+        let mid = v[v.len() / 2] as i32;
+        // a field rendered all black would pass the comparison below vacuously
+        assert!(mid > 2, "the dark field itself is crushed in ch {ch}: level {mid}");
+        for y in 0..160 {
+            for x in 0..120 {
+                let p = r.get(x, y)[ch] as i32;
+                assert!(p >= mid - 2, "crushed at {x},{y} ch {ch}: {p} vs field level {mid}");
+            }
+        }
+    }
+}
+
 #[test]
 fn resolution_independence_of_local_contrast() {
     // Clarity at two preview sizes should give similar results after downscaling.
@@ -255,12 +287,16 @@ fn drafts_keep_wide_planes_across_a_noise_reduction_change_and_full_renders_do_n
     let full = RenderRequest { quality: Quality::Full, ..draft };
     let mut s = typical_edits();
     s.effects.clarity = 60.0;
+    s.detail.sharpen_amount = 80.0;
     render_cached(&src, &info, &s, &draft, &cache);
     let clarity_plane = |c: &StageCache| c.entries.lock().unwrap().first().and_then(|e| e.planes.clarity.clone()).unwrap().1;
+    let sharpen_plane = |c: &StageCache| c.entries.lock().unwrap().first().and_then(|e| e.planes.sharpen.clone()).unwrap().1;
     let first = clarity_plane(&cache);
+    let first_sharpen = sharpen_plane(&cache);
     s.detail.nr_luminance = 50.0;
     render_cached(&src, &info, &s, &draft, &cache);
     assert!(Arc::ptr_eq(&first, &clarity_plane(&cache)), "a draft redid the clarity plane for a noise-reduction change");
+    assert!(!Arc::ptr_eq(&first_sharpen, &sharpen_plane(&cache)), "a draft reused the old sharpening plane after noise reduction changed");
     for v in [10.0, 45.0, 80.0] {
         s.detail.nr_luminance = v;
         s.detail.nr_color = v / 2.0;
@@ -806,5 +842,63 @@ fn sliver_crops_render_quickly_with_wide_stages_on() {
         let r = render(&src, &SourceInfo::default(), &s, &RenderRequest::fit(280, 180));
         assert!(t.elapsed().as_secs_f64() < 20.0, "{rect:?}: {:?}", t.elapsed());
         assert!(r.image.width >= 1 && r.image.height >= 1, "{rect:?}");
+    }
+}
+
+// Given a cached render with one process, a change to a process with another colour filter (Update
+// to Current Process, undo) renders like a fresh render, not the cached denoised image
+#[test]
+fn a_process_change_does_not_reuse_the_other_colour_filter() {
+    use crate::{StageCache, render_cached};
+    use lightcraft_develop::Process;
+    use std::sync::Arc;
+    let src = Arc::new(colour_noise_scene(128, 96, 128));
+    let info = SourceInfo::default();
+    let req = RenderRequest::fit(128, 96);
+    let cache = StageCache::default();
+    let mut old = DevelopSettings::default();
+    old.detail.nr_color = 25.0;
+    old.detail.nr_color_smoothness = 0.0;
+    old.process = Process::V2.version();
+    let current = DevelopSettings { process: Process::LATEST.version(), ..old.clone() };
+    let first = render_cached(&src, &info, &old, &req, &cache).image;
+    let fresh = render(&src, &info, &current, &req).image;
+    assert!(max_diff(&first, &fresh) > 0, "the two colour filters differ on this scene");
+    assert_eq!(render_cached(&src, &info, &current, &req, &cache).image, fresh, "process update");
+    assert_eq!(render_cached(&src, &info, &old, &req, &cache).image, first, "undo");
+}
+
+/// Flat grey with chroma noise: `quiet` columns on the left with little noise, the rest with much.
+pub(crate) fn colour_noise_scene(w: usize, h: usize, quiet: usize) -> Rgb32f {
+    let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+    let mut noise = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        ((seed >> 11) as f32 / (1u64 << 53) as f32 - 0.5) * 2.0
+    };
+    let mut img = Rgb32f::new(w, h);
+    for (i, p) in img.data.iter_mut().enumerate() {
+        let sigma = if i % w < quiet { 0.001 } else { 0.015 };
+        let y = 0.04f32;
+        let (r, b) = (y + noise() * sigma, y + noise() * sigma);
+        *p = [r, (y - 0.2627 * r - 0.0593 * b) / 0.6780, b];
+    }
+    img
+}
+
+/// A crop of no width used to give grain NaN coordinates (and NaN pixels); the render stays finite.
+#[test]
+fn zero_width_crop_with_grain_renders_finite_pixels() {
+    let mut s = DevelopSettings::default();
+    s.grain.amount = 60.0;
+    s.crop.geometry.rect = lightcraft_geom::Rect::new(0.5, 0.1, 0.5, 0.9);
+    let mut req = RenderRequest::fit(240, 240);
+    req.depth = crate::OutputDepth::F32Linear;
+    let r = render(&scene(), &SourceInfo::default(), &s, &req);
+    if let Some(d) = r.deep
+        && let crate::DeepSamples::F32(v) = d.samples
+    {
+        assert!(v.iter().all(|x| x.is_finite()), "non-finite sample in a zero-width crop with grain");
     }
 }
