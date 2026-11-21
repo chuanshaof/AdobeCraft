@@ -4,19 +4,19 @@ A single repository holding pinned copies of the seven [storytold](https://githu
 
 The goal is stability: each project is frozen at a known-good commit and only changes when it is deliberately updated. Upstream changes never arrive on their own.
 
-**Snapshot taken: 2026-10-24**
+**Snapshot taken: 2026-11-21**
 
 ## Pinned versions
 
 | Folder | Replaces | Upstream | Commit | Commit date |
 |---|---|---|---|---|
-| `photocraft/` | Photoshop | [storytold/photocraft](https://github.com/storytold/photocraft) | `1c3db2e5c` | 2026-10-23 |
-| `vectorcraft/` | Illustrator | [storytold/vectorcraft](https://github.com/storytold/vectorcraft) | `50d976e1e` | 2026-10-24 |
-| `filmcraft/` | Premiere | [storytold/filmcraft](https://github.com/storytold/filmcraft) | `fa550ce2d` | 2026-10-23 |
-| `lightcraft/` | Lightroom | [storytold/lightcraft](https://github.com/storytold/lightcraft) | `4ae308942` | 2026-10-23 |
-| `printcraft/` | Acrobat Pro | [storytold/printcraft](https://github.com/storytold/printcraft) | `86730ed14` | 2026-10-24 |
-| `effectcraft/` | After Effects | [storytold/effectcraft](https://github.com/storytold/effectcraft) | `eb5108786` | 2026-10-23 |
-| `designcraft/` | InDesign | [storytold/designcraft](https://github.com/storytold/designcraft) | `5449bc475` | 2026-10-24 |
+| `photocraft/` | Photoshop | [storytold/photocraft](https://github.com/storytold/photocraft) | `06afefff5` | 2026-11-21 |
+| `vectorcraft/` | Illustrator | [storytold/vectorcraft](https://github.com/storytold/vectorcraft) | `4c0edd884` | 2026-11-21 |
+| `filmcraft/` | Premiere | [storytold/filmcraft](https://github.com/storytold/filmcraft) | `960a66100` | 2026-11-20 |
+| `lightcraft/` | Lightroom | [storytold/lightcraft](https://github.com/storytold/lightcraft) | `be760ee52` | 2026-11-20 |
+| `printcraft/` | Acrobat Pro | [storytold/printcraft](https://github.com/storytold/printcraft) | `4f23ee1c1` | 2026-11-20 |
+| `effectcraft/` | After Effects | [storytold/effectcraft](https://github.com/storytold/effectcraft) | `aa623b757` | 2026-11-20 |
+| `designcraft/` | InDesign | [storytold/designcraft](https://github.com/storytold/designcraft) | `4000591c6` | 2026-11-20 |
 
 All are taken from each upstream's `main` branch.
 
