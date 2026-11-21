@@ -1,0 +1,929 @@
+//! Panels. Each panel reads engine state and acts only through `app.run(...)` (slider drags
+//! preview through the session's interaction so one drag is one undo step).
+//!
+//! Every icon panel has a body (`show_icon_panel`) and a panel (≡) menu (`panel_menu`).
+
+pub mod actions;
+pub mod align;
+pub mod appearance;
+pub mod artboards;
+pub mod asset_export;
+pub mod attributes;
+pub mod blend;
+pub mod brushes;
+pub mod character;
+pub mod color;
+pub mod color_guide;
+pub mod color_themes;
+pub mod color_wheel;
+pub mod css_properties;
+pub mod discover;
+pub mod doc_info;
+pub mod flattener_preview;
+pub mod glyphs;
+pub mod gradient;
+pub mod graphic_styles;
+pub mod history;
+pub mod image_trace;
+pub mod info;
+pub mod layers;
+pub mod learn;
+pub mod libraries;
+pub mod library_panel;
+pub mod links;
+pub mod magic_wand;
+pub(crate) mod memo;
+pub mod navigator;
+pub mod opentype;
+pub mod paragraph;
+pub mod pathfinder;
+pub mod pattern_options;
+pub mod preflight;
+pub mod properties;
+pub mod retype;
+pub mod script_console;
+pub mod separations;
+pub mod stroke;
+pub mod svg_interactivity;
+pub mod swatches;
+pub mod symbols;
+pub mod tabs;
+pub mod text_styles;
+pub mod three_d;
+pub mod transform;
+pub mod transparency;
+pub mod variables;
+
+use std::sync::Arc;
+
+use egui::{Rect, Sense, Ui, vec2};
+use serde_json::{Value, json};
+use vectorcraft_color::{BlendMode, Color, Paint};
+use vectorcraft_doc::{LiveCorners, Node, NodeId, NodeKind, StrokeLayer};
+use vectorcraft_engine::inspect::StrokeMixed;
+use vectorcraft_geom::shapes::CornerKind;
+
+use crate::theme::Tokens;
+use crate::widgets::{Live, dim_label};
+use crate::{VectorcraftApp, icons};
+
+/// The first selected node, as the `Arc` the document holds, if any. It does not change with later
+/// edits: read it again after one.
+pub fn first_selected(app: &VectorcraftApp) -> Option<Arc<Node>> {
+    let st = app.session.active()?;
+    st.selection.objects.first().and_then(|id| layers::node_arc(&st.doc, *id))
+}
+
+/// The radius the Live Corners of path `n` show in the panels: that of the corners the panels set
+/// (the Direct-Selected ones, else every corner), blank when they differ.
+pub(crate) fn corner_radius(app: &VectorcraftApp, n: &Node) -> Option<f64> {
+    corner_style(app, n).0
+}
+
+/// The radius and kind of the corners [`corner_radius`] reads, each None when they differ.
+pub(crate) fn corner_style(app: &VectorcraftApp, n: &Node) -> (Option<f64>, Option<CornerKind>) {
+    let partial = app.session.active().and_then(|d| d.selection.partial(n.id));
+    LiveCorners::of(n).map_or((None, None), |c| c.style(&c.picked(partial)))
+}
+
+/// The width of a panel's number fields: the Transform fields', two to a row beside the reference
+/// point, their labels and the W/H link, so every field in the panel is as wide (#696). Measured
+/// from the full row, before its widgets.
+pub(crate) fn field_width(ui: &Ui) -> f32 {
+    // The reference point and its gap, the four labels and the W/H link.
+    const AROUND: f32 = 37.0 + 70.0;
+    ((ui.available_width() - AROUND) / 2.0).clamp(60.0, 110.0)
+}
+
+/// The Corner Radius field of a live rectangle's properties: [`corner_radius`], which a new value
+/// sets on those corners. The link behind it is the `singleCornerRadius` preference: on, a Corner
+/// menu follows that sets the kind of all four corners; off, a row for each of the four corners
+/// follows, each with a radius field and a Corner menu that set its own corner.
+pub(crate) fn corner_radius_row(app: &mut VectorcraftApp, ui: &mut Ui, n: &Node, id: &str) {
+    let fw = field_width(ui);
+    let single = app.session.prefs.single_corner_radius;
+    ui.horizontal(|ui| {
+        dim_label(ui, tl!("Corner Radius:"));
+        if single {
+            corner_radius_field(app, ui, n, id, fw);
+        }
+        let tip = tl!("Single Corner Radius");
+        if crate::widgets::icon_button(ui, if single { "link" } else { "link-2-off" }, tip, single, 22.0).clicked() {
+            transform::set_pref(app, "singleCornerRadius", !single);
+        }
+    });
+    if single {
+        corner_kind_row(app, ui, n, id, fw);
+    } else {
+        corner_fields(app, ui, n, id, fw);
+    }
+}
+
+/// The Corner menu of a live rectangle whose corners share one radius field: the kind of all four
+/// corners, also while some of them are Direct-Selected, blank when they differ. A pick sets it on
+/// every corner of each selected live rectangle ([`set_rectangle_kinds`]).
+fn corner_kind_row(app: &mut VectorcraftApp, ui: &mut Ui, n: &Node, id: &str, width: f32) {
+    let Some(lc) = LiveCorners::of(n) else { return };
+    let current = lc.style(&lc.all()).1;
+    ui.horizontal(|ui| {
+        dim_label(ui, tl!("Corner:"));
+        if let Some(kind) = corner_kind_menu(ui, (id, "kind"), tl!("Corner:"), current, width) {
+            set_rectangle_kinds(app, kind, None);
+        }
+    });
+}
+
+/// Set `kind` on corner `corner` (every corner for None) of each selected live rectangle
+/// ([`set_rectangle_corners`]).
+fn set_rectangle_kinds(app: &mut VectorcraftApp, kind: CornerKind, corner: Option<usize>) {
+    set_rectangle_corners(app, json!({"kind": kind}), corner);
+}
+
+/// Run `object.setLiveShape` with `p` (a `kind` or `radius`) on corner `corner` (every corner for
+/// None) of each selected live rectangle, leaving other selected objects as they are: one undo
+/// step, or none when nothing changes.
+fn set_rectangle_corners(app: &mut VectorcraftApp, mut p: Value, corner: Option<usize>) {
+    p["corners"] = corner.map_or(json!([0, 1, 2, 3]), |k| json!([k]));
+    // The edit the tool computes on another thread comes first: the rectangles are the ones
+    // selected after it.
+    match app.session.finish_tool_edit() {
+        Ok(reqs) => crate::canvas::apply_requests(app, Ok(reqs)),
+        Err(e) => {
+            app.status(e.to_string());
+            return;
+        }
+    }
+    if app.session.active().is_none() {
+        return;
+    }
+    // The live rectangles of the selection when it runs, so an action that records it acts on the
+    // rectangles selected when it plays.
+    p["rectanglesOnly"] = json!(true);
+    if let Err(e) = app.run("object.setLiveShape", p) {
+        app.status(e);
+    }
+}
+
+/// A menu of the corner kinds, `width` wide, showing `current` (blank for None) and named `name`
+/// for screen readers. Returns the kind picked.
+fn corner_kind_menu(ui: &mut Ui, id: impl std::hash::Hash, name: &str, current: Option<CornerKind>, width: f32) -> Option<CornerKind> {
+    let names: Vec<&str> = CornerKind::ALL.iter().map(|k| crate::dialogs::corners::kind_label(*k)).collect();
+    let shown = current.map_or("", crate::dialogs::corners::kind_label);
+    crate::widgets::dropdown_names_named(ui, id, Some(name), shown, &names, width).and_then(|i| CornerKind::ALL.get(i).copied())
+}
+
+/// The corners of a live rectangle in the order their fields show, with their labels.
+fn rectangle_corners() -> [(usize, &'static str); 4] {
+    [(0, tl!("Top Left:")), (1, tl!("Top Right:")), (2, tl!("Bottom Right:")), (3, tl!("Bottom Left:"))]
+}
+
+/// One Corner Radius field and one Corner menu per corner of a live rectangle, each pair on its own
+/// row with the corner's label, the fields and menus in line; in a panel too narrow for that, each
+/// menu goes on the row under its field. A value typed or a kind picked is set on that corner
+/// alone, of each selected live rectangle ([`set_rectangle_corners`]).
+fn corner_fields(app: &mut VectorcraftApp, ui: &mut Ui, n: &Node, id: &str, width: f32) {
+    let Some(lc) = LiveCorners::of(n) else { return };
+    let unit = app.session.general_unit();
+    let widest = |names: &mut dyn Iterator<Item = &str>| names.map(|t| crate::widgets::dim_label_width(ui, t)).fold(0.0, f32::max);
+    let labels = widest(&mut rectangle_corners().into_iter().map(|(_, label)| label));
+    // The longest kind name, with the room the menu's button gives around it and its arrow.
+    let menu_width = width.max(widest(&mut CornerKind::ALL.into_iter().map(crate::dialogs::corners::kind_label)) + 26.0);
+    // The two gaps between the grid's three columns are 6 points each.
+    let in_line = labels + width + menu_width + 12.0 <= ui.available_width();
+    egui::Grid::new((id, "corners")).num_columns(if in_line { 3 } else { 2 }).spacing(vec2(6.0, 4.0)).show(ui, |ui| {
+        for (k, label) in rectangle_corners() {
+            dim_label(ui, label);
+            if let Some(v) = crate::widgets::num_field_named(ui, (id, "corner", k), Some(label), Some(lc.radius(k)), unit, width) {
+                // A negative radius typed in rounds nothing: the command takes 0 or more.
+                set_rectangle_corners(app, json!({"radius": v.max(0.0)}), Some(k));
+            }
+            if !in_line {
+                ui.end_row();
+                ui.label("");
+            }
+            if let Some(kind) = corner_kind_menu(ui, (id, "kind", k), label, Some(lc.kind(k)), menu_width) {
+                set_rectangle_kinds(app, kind, Some(k));
+            }
+            ui.end_row();
+        }
+    });
+}
+
+/// [`corner_radius_row`]'s field, `width` wide.
+pub(crate) fn corner_radius_field(app: &mut VectorcraftApp, ui: &mut Ui, n: &Node, id: impl std::hash::Hash + std::fmt::Debug, width: f32) {
+    if let Some(r) = crate::widgets::num_field(ui, id, corner_radius(app, n), app.session.general_unit(), width) {
+        app.run("object.setLiveShape", json!({"radius": r.max(0.0)})).ok();
+    }
+}
+
+/// Number of selected objects.
+pub(crate) fn selection_len(app: &VectorcraftApp) -> usize {
+    app.session.active().map(|d| d.selection.len()).unwrap_or(0)
+}
+
+pub fn show_icon_panel(app: &mut VectorcraftApp, ui: &mut Ui, id: &str) {
+    match id {
+        "swatches" => swatches::show(app, ui),
+        "color" => color::show(app, ui),
+        "colorGuide" => color_guide::show(app, ui),
+        "stroke" => stroke::show(app, ui),
+        "transparency" => transparency::show(app, ui),
+        "appearance" => appearance::show(app, ui),
+        "graphicStyles" => graphic_styles::show(app, ui),
+        "align" => align::show(app, ui),
+        "pathfinder" => pathfinder::show(app, ui),
+        blend::ID => blend::show(app, ui),
+        "transform" => transform::show(app, ui),
+        "history" => history::show(app, ui),
+        "actions" => actions::show(app, ui),
+        "info" => info::show(app, ui),
+        "separations" => separations::show(app, ui),
+        "artboards" => artboards::show(app, ui),
+        "gradient" => gradient::show(app, ui),
+        "character" => character::show(app, ui),
+        "paragraph" => paragraph::show(app, ui),
+        "glyphs" => glyphs::show(app, ui),
+        "navigator" => navigator::show(app, ui),
+        "brushes" => brushes::show(app, ui),
+        "symbols" => symbols::show(app, ui),
+        "patternOptions" => pattern_options::show(app, ui),
+        "imageTrace" => image_trace::show(app, ui),
+        "openType" => opentype::show(app, ui),
+        "docInfo" => doc_info::show(app, ui),
+        "charStyles" => text_styles::show(app, ui, text_styles::Kind::Char),
+        "paraStyles" => text_styles::show(app, ui, text_styles::Kind::Para),
+        "magicWand" => magic_wand::show(app, ui),
+        "tabs" => tabs::show(app, ui),
+        flattener_preview::ID => flattener_preview::show(app, ui),
+        "attributes" => attributes::show(app, ui),
+        svg_interactivity::ID => svg_interactivity::show(app, ui),
+        variables::ID => variables::show(app, ui),
+        "colorThemes" => color_themes::show(app, ui),
+        color_wheel::ID => color_wheel::show(app, ui),
+        links::ID => links::show(app, ui),
+        preflight::ID => preflight::show(app, ui),
+        asset_export::ID => asset_export::show(app, ui),
+        css_properties::ID => css_properties::show(app, ui),
+        three_d::ID => three_d::show(app, ui),
+        script_console::ID => script_console::show(app, ui),
+        learn::ID => learn::show(app, ui),
+        discover::ID => discover::show(app, ui),
+        retype::ID => retype::show(app, ui),
+        crate::addons::cleanup::ID => crate::addons::cleanup::show(app, ui),
+        crate::addons::color::ID => crate::addons::color::show(app, ui),
+        crate::addons::packaging::ID => crate::addons::packaging::show(app, ui),
+        crate::addons::packaging::preview::ID => crate::addons::packaging::preview::show(app, ui),
+        crate::addons::pathtools::ID => crate::addons::pathtools::show(app, ui),
+        crate::addons::pathtools::shape::ID => crate::addons::pathtools::shape::show(app, ui),
+        crate::addons::pen::ID => crate::addons::pen::show(app, ui),
+        crate::addons::units::ID => crate::addons::units::show(app, ui),
+        id if library_panel::parse(id).is_some() => library_panel::show(app, ui, id),
+        _ => {
+            dim_label(ui, tl!("This panel is on the roadmap (see the parity plan)."));
+        }
+    }
+}
+
+/// Items of a panel's (≡) menu. Unimplemented Illustrator items are listed disabled. False for a
+/// panel without items of its own.
+pub fn panel_menu_items(app: &mut VectorcraftApp, ui: &mut Ui, id: &str) -> bool {
+    match id {
+        "swatches" => swatches::menu(app, ui),
+        "color" => color::menu(app, ui),
+        "colorGuide" => color_guide::menu(app, ui),
+        "stroke" => stroke::menu(app, ui),
+        "transparency" => transparency::menu(app, ui),
+        "appearance" => appearance::menu(app, ui),
+        "graphicStyles" => graphic_styles::menu(app, ui),
+        "align" => align::menu(app, ui),
+        "pathfinder" => pathfinder::menu(app, ui),
+        "transform" => transform::menu(app, ui),
+        "history" => history::menu(app, ui),
+        "info" => info::menu(app, ui),
+        "separations" => separations::menu(app, ui),
+        "artboards" => artboards::menu(app, ui),
+        "gradient" => gradient::menu(app, ui),
+        "character" => character::menu(app, ui),
+        "paragraph" => paragraph::menu(app, ui),
+        "glyphs" => glyphs::menu(app, ui),
+        "navigator" => navigator::menu(app, ui),
+        "brushes" => brushes::menu(app, ui),
+        "symbols" => symbols::menu(app, ui),
+        "patternOptions" => pattern_options::menu(app, ui),
+        "imageTrace" => image_trace::menu(app, ui),
+        "openType" => opentype::menu(app, ui),
+        "docInfo" => doc_info::menu(app, ui),
+        "charStyles" => text_styles::menu(app, ui, text_styles::Kind::Char),
+        "paraStyles" => text_styles::menu(app, ui, text_styles::Kind::Para),
+        "magicWand" => magic_wand::menu(app, ui),
+        "tabs" => tabs::menu(app, ui),
+        "libraries" => libraries::menu(app, ui),
+        flattener_preview::ID => flattener_preview::menu(app, ui),
+        "attributes" => attributes::menu(app, ui),
+        svg_interactivity::ID => svg_interactivity::menu(app, ui),
+        "colorThemes" => color_themes::menu(app, ui),
+        color_wheel::ID => color_wheel::menu(app, ui),
+        "layers" => layers::menu(app, ui),
+        links::ID => links::menu(app, ui),
+        asset_export::ID => asset_export::menu(app, ui),
+        css_properties::ID => css_properties::menu(app, ui),
+        variables::ID => variables::menu(app, ui),
+        script_console::ID => script_console::menu(app, ui),
+        retype::ID => retype::menu(app, ui),
+        "actions" => actions::menu(app, ui),
+        crate::addons::packaging::ID => crate::addons::packaging::panel_menu(app, ui),
+        id if library_panel::parse(id).is_some() => library_panel::menu(app, ui, id),
+        _ => return false,
+    }
+    true
+}
+
+/// The ≡ button drawn into `rect` that opens a panel menu.
+pub(crate) fn menu_button(ui: &mut Ui, id: &str, rect: Rect) -> egui::Response {
+    let t = Tokens::get(ui.ctx());
+    let resp = ui.interact(rect, ui.scope_id().with(("panel-menu", id)), Sense::click());
+    icons::paint(ui, "menu", rect.shrink(1.0), if resp.hovered() { t.text_strong } else { t.text_dim });
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), tl!("Panel menu")));
+    resp.on_hover_text(tl!("Panel menu"))
+}
+
+/// The ≡ panel-menu button drawn into `rect` (the right end of a panel's title/tab strip).
+pub fn panel_menu(app: &mut VectorcraftApp, ui: &mut Ui, id: &str, rect: Rect) {
+    let resp = menu_button(ui, id, rect);
+    egui::Popup::menu(&resp).show(|ui| {
+        crate::widgets::menu_scroll(ui, |ui| {
+            crate::widgets::menu_min_width(ui, 220.0);
+            if panel_menu_items(app, ui, id) {
+                ui.separator();
+            }
+            // The panel floats out of the dock or goes back in, as dragging its tab does.
+            let (label, cmd) = if crate::panel_docking::floats(&app.ui, id) {
+                (tl!("Dock Panel"), "window.panel.dock")
+            } else {
+                (tl!("Float Panel"), "window.panel.float")
+            };
+            if crate::widgets::menu_item(ui, label, true, false)
+                && let Err(e) = app.run(cmd, json!({ "panel": id }))
+            {
+                app.ui.status = e;
+            }
+        });
+    });
+}
+
+pub fn libraries(app: &mut VectorcraftApp, ui: &mut Ui) {
+    libraries::show(app, ui);
+}
+
+// ---------- shared helpers ----------
+
+/// The paint command of the active proxy (Fill or Stroke), or of the inactive one.
+pub(crate) fn proxy_cmd(app: &VectorcraftApp, inactive: bool) -> &'static str {
+    if app.session.fill_active != inactive { "paint.setFill" } else { "paint.setStroke" }
+}
+
+/// The first selected node, borrowed (for per-frame reads that need no copy of it).
+fn first_node(app: &VectorcraftApp) -> Option<&Node> {
+    let st = app.session.active()?;
+    st.selection.objects.first().and_then(|id| st.doc.node(*id))
+}
+
+/// Is Alt held? A click on a colour then paints the inactive proxy.
+pub(crate) fn alt_held(ui: &Ui) -> bool {
+    ui.input(|i| i.modifiers.alt)
+}
+
+/// Apply a clicked colour, swatch or None (`params`: `{color}`, `{swatch}` or `{none}`) to the
+/// active proxy, or with Alt held to the inactive one, which stays behind.
+pub(crate) fn apply_click(app: &mut VectorcraftApp, ui: &Ui, mut params: Value) {
+    let alt = alt_held(ui);
+    params["focus"] = json!(!alt);
+    app.run(proxy_cmd(app, alt), params).ok();
+}
+
+/// Fill and stroke as the proxies show them ([`vectorcraft_engine::Session::proxy_paints`]: the
+/// Appearance panel's active item for the proxy of its kind, else the first selected object's, a
+/// group's first painted object's, else the defaults for new art).
+pub(crate) fn current_paints(app: &VectorcraftApp) -> (Paint, Paint) {
+    app.session.proxy_paints()
+}
+
+/// Whether the selected objects' fills and strokes differ (the proxies show "?"), cached per
+/// document revision, Appearance panel item and picked gradient mesh points (picking points
+/// changes no revision).
+pub(crate) fn mixed_paints(app: &VectorcraftApp, ctx: &egui::Context) -> (bool, bool) {
+    type Key = (u64, u64, Option<usize>, Vec<(NodeId, Vec<usize>)>, bool);
+    let Some(st) = app.session.active() else { return (false, false) };
+    // Whether the proxies show the Live Paint Bucket's colors too.
+    let key: Key = (st.uid, st.revision, app.session.appearance_item(), app.session.fill_mesh_points(), app.session.bucket_paints());
+    match pstate::<Option<(Key, (bool, bool))>>(ctx, "proxy-mixed") {
+        Some((k, mixed)) if k == key => mixed,
+        _ => {
+            let mixed = app.session.proxy_mixed();
+            set_pstate(ctx, "proxy-mixed", Some((key, mixed)));
+            mixed
+        }
+    }
+}
+
+/// The stroke the Stroke panel, Control bar and Properties show: while the Type tool edits text,
+/// the selected characters' stroke, else [`vectorcraft_engine::Session::shown_stroke`].
+pub(crate) fn current_stroke(app: &VectorcraftApp) -> Option<StrokeLayer> {
+    if character::text_editing(app).is_some() {
+        return character::text_style(app).map(|(c, _)| c.stroke_layer());
+    }
+    app.session.shown_stroke()
+}
+
+/// Which Stroke panel values the selection doesn't share and whether Align Stroke applies
+/// ([`vectorcraft_engine::DocState::stroke_mixed`]), cached per document revision. While the Type
+/// tool edits text, the selected characters' stroke shows as it is, and aligns to their glyphs.
+/// While the Live Paint Bucket is active, the panel shows the one stroke it paints with, as it does
+/// with nothing selected.
+pub(crate) fn stroke_mixed(app: &VectorcraftApp, ctx: &egui::Context) -> StrokeMixed {
+    if character::text_editing(app).is_some() {
+        return StrokeMixed { can_align: true, ..Default::default() };
+    }
+    if app.session.bucket_paints() {
+        return StrokeMixed { can_align: true, ..Default::default() };
+    }
+    let Some(st) = app.session.active() else { return StrokeMixed::default() };
+    let key = (st.uid, st.revision);
+    match pstate::<Option<((u64, u64), StrokeMixed)>>(ctx, "stroke-mixed") {
+        Some((k, mixed)) if k == key => mixed,
+        _ => {
+            let mixed = st.stroke_mixed();
+            set_pstate(ctx, "stroke-mixed", Some((key, mixed)));
+            mixed
+        }
+    }
+}
+
+/// Opacity and blend mode as the Transparency panel and Control bar show them: the Appearance
+/// panel's active item's, else the first picked gradient mesh point's opacity (which
+/// `transparency.set` changes then) with its object's blend mode, else the first selected object's.
+pub(crate) fn current_transparency(app: &VectorcraftApp) -> Option<(f32, BlendMode)> {
+    let n = first_node(app)?;
+    if let Some(it) = app.session.appearance_item().and_then(|i| n.appearance.items.get(i)) {
+        return Some((it.opacity(), it.blend()));
+    }
+    let picked = app.session.mesh_points_picked().and_then(|points| {
+        let (id, v) = points.first()?;
+        let d = &app.session.active()?.doc;
+        let m = match &d.node(*id)?.kind {
+            NodeKind::Mesh(m) => m,
+            _ => return None,
+        };
+        Some((m.points.get(*v.first()?)?.opacity, d.node(*id)?.blend))
+    });
+    Some(picked.unwrap_or((n.opacity, n.blend)))
+}
+
+/// Is the active proxy "?" (the selected objects' paints differ)?
+pub(crate) fn active_mixed(app: &VectorcraftApp, ctx: &egui::Context) -> bool {
+    let (f, s) = mixed_paints(app, ctx);
+    if app.session.fill_active { f } else { s }
+}
+
+/// The paint behind the active proxy.
+pub(crate) fn active_paint(app: &VectorcraftApp) -> Paint {
+    let (f, s) = current_paints(app);
+    if app.session.fill_active { f } else { s }
+}
+
+/// Draw the Fill/Stroke proxy and handle its clicks through commands.
+pub(crate) fn proxy(app: &mut VectorcraftApp, ui: &mut Ui, size: f32) {
+    let (f, s) = current_paints(app);
+    let mixed = mixed_paints(app, ui.ctx());
+    let c = crate::widgets::fill_stroke_proxy(ui, &f, &s, mixed, app.session.fill_active, size);
+    if (c.fill && !app.session.fill_active) || (c.stroke && app.session.fill_active) {
+        app.run("paint.toggleActive", json!({})).ok();
+    }
+    if c.swap {
+        app.run("paint.swap", json!({})).ok();
+    }
+    if c.default {
+        app.run("paint.default", json!({})).ok();
+    }
+    if let Some(stroke) = c.pick {
+        app.run("ui.colorPicker", json!({ "stroke": stroke })).ok();
+    }
+    if let Some(p) = c.dropped_fill {
+        app.run("paint.setFill", p).ok();
+    }
+    if let Some(p) = c.dropped_stroke {
+        app.run("paint.setStroke", p).ok();
+    }
+}
+
+/// The Fill (or `stroke`) chip of the Control bar and the Properties panel, `size` square (with a
+/// `chevron` after it): the proxy's paint, "?" when the selected objects' paints differ. A click
+/// brings that proxy forward and opens a popover with the Swatches panel; Shift-click (or the
+/// popover's toggle) shows the Color panel's mixer instead.
+pub(crate) fn paint_chip(app: &mut VectorcraftApp, ui: &mut Ui, stroke: bool, size: f32, chevron: bool) {
+    let (fill, stroke_paint) = current_paints(app);
+    let mixed = mixed_paints(app, ui.ctx());
+    let (paint, mixed) = if stroke { (stroke_paint, mixed.1) } else { (fill, mixed.0) };
+    let tip = if stroke {
+        tl!("Stroke: click for swatches, Shift-click for the color mixer")
+    } else {
+        tl!("Fill: click for swatches, Shift-click for the color mixer")
+    };
+    let resp = crate::widgets::chip_button_named(ui, size, chevron, tip, |ui, chip| {
+        crate::widgets::proxy_chip(ui, chip, &paint, mixed, stroke.then_some(size * 0.25));
+    });
+    if resp.clicked() {
+        app.run("paint.toggleActive", json!({ "fill": !stroke })).ok();
+        set_pstate(ui.ctx(), MIXER, ui.input(|i| i.modifiers.shift));
+    }
+    // A popover that keeps its own open state: the Swatches body opens menus of its own (Swatch
+    // Libraries, Show Swatch Kinds), which a remembered egui popup would close with them (#536).
+    crate::widgets::popover(&resp, resp.clicked(), |ui| paint_popover(app, ui));
+}
+
+/// The chip popovers' width (a narrow Swatches or Color panel).
+const POPOVER_WIDTH: f32 = 248.0;
+/// Panel state: the chip popovers show the Color panel's mixer instead of the swatches.
+const MIXER: &str = "paint-popover-mixer";
+
+/// The body of a Fill/Stroke chip popover: a Swatches / Color mixer toggle above that panel's body.
+fn paint_popover(app: &mut VectorcraftApp, ui: &mut Ui) {
+    ui.set_width(POPOVER_WIDTH);
+    let mixer: bool = pstate(ui.ctx(), MIXER);
+    ui.horizontal(|ui| {
+        for (icon, tip, m) in [("swatch-book", "Swatches", false), ("palette", "Color Mixer (Shift-click the chip)", true)] {
+            if crate::widgets::icon_button(ui, icon, tip, mixer == m, 22.0).clicked() {
+                set_pstate(ui.ctx(), MIXER, m);
+            }
+        }
+        // The mixer is the Color panel, so its menu comes along: the color modes (Grayscale,
+        // RGB, HSB, CMYK, Web Safe RGB), Invert, Complement and the rest (#4249).
+        if mixer {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (rect, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+                let resp = menu_button(ui, "color-mixer", rect);
+                egui::Popup::menu(&resp).show(|ui| {
+                    ui.set_min_width(200.0);
+                    color::menu(app, ui);
+                });
+            });
+        }
+    });
+    crate::widgets::divider(ui);
+    if mixer {
+        color::show(app, ui);
+    } else {
+        swatches::popover(app, ui);
+    }
+}
+
+/// Run `cmd` live: while dragging, preview on top of an interaction snapshot; on release, commit
+/// it as one undo step. Falls back to a plain run when no document is open.
+pub(crate) fn live_run(app: &mut VectorcraftApp, label: &str, cmd: &str, params: Value, phase: Live) {
+    match phase {
+        Live::Idle => {}
+        Live::Dragging | Live::Released => {
+            if app.begin_interaction(label).is_ok() {
+                if let Err(e) = app.session.preview(cmd, &params) {
+                    app.ui.status = e.to_string();
+                }
+                if phase == Live::Released
+                    && let Err(e) = app.session.commit_interaction()
+                {
+                    app.ui.status = e.to_string();
+                }
+                app.sync_views();
+            } else if phase == Live::Released {
+                app.run(cmd, params).ok();
+            }
+        }
+    }
+}
+
+/// Per-panel UI state kept in egui memory (not document state).
+pub(crate) fn pstate<T: Clone + Default + Send + Sync + 'static>(ctx: &egui::Context, key: &str) -> T {
+    ctx.data(|d| d.get_temp::<T>(egui::Id::unique(("panel-state", key)))).unwrap_or_default()
+}
+/// Store per-panel UI state in egui temp memory under the `panel-state` namespace.
+pub(crate) fn set_pstate<T: Clone + Send + Sync + 'static>(ctx: &egui::Context, key: &str, v: T) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::unique(("panel-state", key)), v));
+}
+
+/// `ui.panelView {panel, view?}`: set the view of the Swatches, Graphic Styles or Symbols panel
+/// (`panel`: swatches, graphicStyles or symbols), as the view items of its panel menu do; without
+/// `view`, answer the current one. An unknown panel or view is an error, and then nothing changes.
+/// → {panel, view}
+pub(crate) fn set_view(app: &mut VectorcraftApp, p: &Value) -> Result<Value, String> {
+    fn given<T: serde::de::DeserializeOwned>(p: &Value, err: &str) -> Result<Option<T>, String> {
+        match p.get("view") {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => serde_json::from_value(v.clone()).map(Some).map_err(|_| err.to_string()),
+        }
+    }
+    let ui = &mut app.ui;
+    let (panel, view) = match p.get("panel").and_then(Value::as_str) {
+        Some("swatches") => {
+            if let Some(v) = given(p, "`view` is smallThumb, mediumThumb, largeThumb, smallList or largeList")? {
+                ui.swatches_view = v;
+            }
+            ("swatches", json!(ui.swatches_view))
+        }
+        Some("graphicStyles") => {
+            if let Some(v) = given(p, "`view` is thumbnail, smallList or largeList")? {
+                ui.graphic_styles_view = v;
+            }
+            ("graphicStyles", json!(ui.graphic_styles_view))
+        }
+        Some("symbols") => {
+            if let Some(v) = given(p, "`view` is thumbnail, smallList or largeList")? {
+                ui.symbols_view = v;
+            }
+            ("symbols", json!(ui.symbols_view))
+        }
+        _ => return Err("`panel` is swatches, graphicStyles or symbols".to_string()),
+    };
+    Ok(json!({ "panel": panel, "view": view }))
+}
+
+/// Whether the panel whose state is `key` has the keyboard for its rows (Delete and Backspace
+/// remove its highlighted rows): it took it with a click on a row ([`set_row_keys`]) and kept it in
+/// every frame since, so it lapses when the panel isn't drawn.
+pub(crate) fn has_row_keys(ctx: &egui::Context, key: &str) -> bool {
+    pstate::<Option<u64>>(ctx, key).is_some_and(|pass| pass + 1 >= ctx.cumulative_pass_nr())
+}
+
+/// Take (`on`) or give up the keyboard for the rows of the panel whose state is `key`, for this
+/// frame and the next ([`has_row_keys`]).
+pub(crate) fn set_row_keys(ctx: &egui::Context, key: &str, on: bool) {
+    set_pstate(ctx, key, on.then(|| ctx.cumulative_pass_nr()));
+}
+
+/// Whether a plain Delete or Backspace belongs to a panel's rows this frame, the Layers or the
+/// Appearance panel's after a click on one of them, so [`crate::shortcuts::handle`] leaves it to the
+/// panel instead of running Edit › Clear on the selected art.
+pub(crate) fn rows_take_delete(ctx: &egui::Context) -> bool {
+    has_row_keys(ctx, layers::ROW_KEYS) || has_row_keys(ctx, appearance::ROW_KEYS)
+}
+
+/// How near a scrolled list's top or bottom edge a drag scrolls it ([`scroll_at_edges`]).
+const DRAG_SCROLL_EDGE: f32 = 28.0;
+
+/// The speed of that scrolling in points per second: at the band's inner side, and added to it at
+/// the list's edge.
+const DRAG_SCROLL_SPEED: (f32, f32) = (60.0, 280.0);
+
+/// The scrolling [`scroll_at_edges`] asks for, in points per second (positive shows earlier rows),
+/// with the pointer `depth` points below the top of a list view `view_height` points tall. Each
+/// band is [`DRAG_SCROLL_EDGE`] deep, or half the view in a view shorter than two bands, so the
+/// pointer is in one band at most and the middle of a short view scrolls neither way. A view with
+/// no height, or a value that isn't a number, gives 0.
+fn drag_scroll_speed(view_height: f32, depth: f32) -> f32 {
+    if !(view_height.is_finite() && view_height > 0.0) {
+        return 0.0;
+    }
+    let band = DRAG_SCROLL_EDGE.min(view_height / 2.0);
+    let (slow, more) = DRAG_SCROLL_SPEED;
+    let speed = |depth: f32| if (0.0..band).contains(&depth) { slow + more * (1.0 - depth / band) } else { 0.0 };
+    speed(depth) - speed(view_height - depth)
+}
+
+/// While something is dragged near the top or bottom edge of a scrolled list (`ui`: its contents),
+/// scroll that way, faster nearer the edge, and draw the next frame so a pointer held still keeps
+/// it scrolling. The pointer must be over the list's width. Each frame scrolls by the time it
+/// took (a stalled frame counts a tenth of a second at most), so the speed is the same at every
+/// frame rate.
+pub(crate) fn scroll_at_edges(ui: &mut Ui) {
+    let Some(pos) = ui.ctx().pointer_hover_pos() else { return };
+    let view = ui.clip_rect();
+    if !view.x_range().contains(pos.x) {
+        return;
+    }
+    let per_second = drag_scroll_speed(view.height(), pos.y - view.top());
+    if per_second != 0.0 {
+        let dt = ui.input(|i| i.stable_dt).min(0.1);
+        ui.scroll_with_delta_animation(vec2(0.0, per_second * dt), egui::style::ScrollAnimation::none());
+        ui.ctx().request_repaint();
+    }
+}
+
+/// [`crate::i18n::label_or_name`] in the UI language.
+pub(crate) fn label_or_name(s: &str, built_in: bool) -> &str {
+    crate::i18n::label_or_name(crate::i18n::current(), s, built_in)
+}
+
+/// Rows of chips (the Session's recent colors, which every paint command feeds), wrapped onto as
+/// many rows as the panel's width needs, under a "Recent Colors" header when `heading` is set;
+/// returns the one clicked, for the caller to apply. The chips sit in a group that, without the
+/// header, screen readers name "Recent Colors". A chip drags its color as a solid paint, which
+/// the Swatches panel makes a swatch of.
+pub(crate) fn recent_colors_row(app: &VectorcraftApp, ui: &mut Ui, heading: bool) -> Option<Color> {
+    let t = Tokens::get(ui.ctx());
+    if heading {
+        crate::widgets::subheader(ui, tl!("Recent Colors"));
+    }
+    let width = ui.available_width();
+    let colors = &app.session.recent_colors;
+    // Chips are 16 px on a 19 px pitch, inset 3 px, with 2 px kept clear of the right edge.
+    let per_row = (((width - 21.0) / 19.0).floor() as usize + 1).max(1);
+    let rows = colors.len().div_ceil(per_row).max(1);
+    let (r, _) = ui.allocate_exact_size(vec2(width, 3.0 + rows as f32 * 19.0), Sense::hover());
+    ui.painter().rect_stroke(r, 0.0, egui::Stroke::new(1.0, t.input_border), egui::StrokeKind::Inside);
+    // The chips go in a child `Ui` over the box, so screen readers find them inside its group;
+    // their ids stay under the caller's scope.
+    let scope = ui.scope_id();
+    let mut builder = egui::UiBuilder::new().max_rect(r).accessibility_role(egui::accesskit::Role::Group);
+    if !heading {
+        builder = builder.accessibility_label(tl!("Recent Colors"));
+    }
+    let ui = &mut ui.new_child(builder);
+    ui.ctx().accesskit_node_builder(ui.unique_id(), |node| {
+        node.set_bounds(egui::accesskit::Rect { x0: r.min.x.into(), y0: r.min.y.into(), x1: r.max.x.into(), y1: r.max.y.into() });
+    });
+    let mut chosen = None;
+    for (i, c) in colors.iter().enumerate() {
+        let (row, col) = (i / per_row, i % per_row);
+        let cell = Rect::from_min_size(r.min + vec2(3.0 + col as f32 * 19.0, 3.0 + row as f32 * 19.0), vec2(16.0, 16.0));
+        let resp = ui.interact(cell, scope.with(("recent", i)), Sense::click_and_drag());
+        crate::widgets::drag_source(ui, &resp, || crate::widgets::PanelDrag::paint(Paint::solid(*c)));
+        crate::widgets::swatch_tile(ui, cell, &Paint::solid(*c), false, resp.hovered());
+        if resp.on_hover_text(c.to_hex()).clicked() {
+            chosen = Some(*c);
+        }
+    }
+    chosen
+}
+
+/// A colour as command JSON, keeping its model.
+pub(crate) use vectorcraft_tools::params::color_json;
+
+/// Paint as command params (`{color}`, `{swatch, tint?}`, `{none}`, `{gradient}` (lossless) or
+/// `{pattern}`).
+pub(crate) fn paint_params(p: &Paint) -> Value {
+    match p {
+        Paint::None => json!({"none": true}),
+        Paint::Solid { swatch: Some(n), tint, .. } if *tint < 1.0 => json!({"swatch": n, "tint": tint * 100.0}),
+        Paint::Solid { swatch: Some(n), .. } => json!({"swatch": n}),
+        Paint::Solid { color, .. } => json!({"color": color_json(color)}),
+        Paint::Gradient(g) => json!({"gradient": vectorcraft_tools::params::gradient_params(g)}),
+        Paint::Pattern { pattern, .. } => json!({"pattern": pattern}),
+    }
+}
+
+/// [`paint_params`] for a swatch made from paint the app shows: a color and a gradient's stops
+/// and points keep their color models (`keepModel`), in a CMYK document too.
+pub(crate) fn swatch_paint_params(p: &Paint) -> Value {
+    let mut v = paint_params(p);
+    if matches!(p, Paint::Solid { swatch: None, .. } | Paint::Gradient(_)) {
+        v["keepModel"] = json!(true);
+    }
+    v
+}
+
+/// Egui colour of a document colour.
+pub(crate) fn c32(c: &Color) -> egui::Color32 {
+    let [r, g, b, _] = c.to_rgba8(1.0);
+    egui::Color32::from_rgb(r, g, b)
+}
+
+/// A labelled empty-state message used by list panels.
+pub(crate) fn empty_state(ui: &mut Ui, icon: &str, title: &str, body: &str) {
+    let t = Tokens::get(ui.ctx());
+    ui.add_space(12.0);
+    ui.vertical_centered(|ui| {
+        icons::icon(ui, icon, 28.0, t.text_disabled);
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(tl!(title)).size(12.5).color(t.text));
+        ui.label(egui::RichText::new(tl!(body)).size(11.5).color(t.text_dim));
+    });
+    ui.add_space(12.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dropping_a_proxy_paint_on_the_other_proxy_applies_it() {
+        use egui::{Event, Modifiers, PointerButton};
+        use vectorcraft_color::{Color, Paint};
+
+        use crate::widgets::PanelDrag;
+
+        let mut app = crate::VectorcraftApp::new(vectorcraft_engine::Session::new(), Default::default());
+        app.run("file.new", json!({"width": 200, "height": 200})).unwrap();
+        app.run("shape.rectangle", json!({"x": 10, "y": 10, "width": 40, "height": 40})).unwrap();
+        app.run("paint.setFill", json!({"color": "#ff0000"})).unwrap();
+        app.run("paint.setStroke", json!({"color": "#0000ff"})).unwrap();
+        let ctx = egui::Context::default();
+        let stroke_at = std::cell::Cell::new(egui::Pos2::ZERO);
+        let frame = |app: &mut crate::VectorcraftApp, events: Vec<Event>| {
+            let mut out = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                proxy(app, ui, 36.0);
+                if let Some(c) = ctx.read_response(ui.scope_id().with("stroke-proxy")).map(|r| r.rect.center()) {
+                    stroke_at.set(c);
+                }
+            });
+            out.textures_delta.clear();
+        };
+        frame(&mut app, vec![]);
+        let at = stroke_at.get();
+        let red = PanelDrag::paint(Paint::solid(Color::from_hex("#ff0000").unwrap()));
+        egui::DragAndDrop::set_payload(&ctx, red);
+        let release = Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE };
+        frame(&mut app, vec![Event::PointerMoved(at), release]);
+        let stroke = app.session.shown_stroke().unwrap();
+        assert_eq!(stroke.paint.color().map(|c| c.to_hex()), Some("#ff0000".into()), "{}", app.ui.status);
+        let st = app.session.active().unwrap();
+        let id = st.selection.objects[0];
+        assert_eq!(st.doc.node(id).unwrap().appearance.fill_paint().color().map(|c| c.to_hex()), Some("#ff0000".into()));
+        assert!(egui::DragAndDrop::payload::<PanelDrag>(&ctx).is_none());
+    }
+
+    #[test]
+    fn paint_params_roundtrip_shapes() {
+        assert_eq!(paint_params(&Paint::None), json!({"none": true}));
+        let p = paint_params(&Paint::solid(Color::cmyk(0.1, 0.2, 0.3, 0.4)));
+        assert!((p["color"]["k"].as_f64().unwrap() - 0.4).abs() < 1e-6);
+        let g = Paint::Gradient(Box::new(vectorcraft_color::GradientPaint::new(Default::default())));
+        let p = paint_params(&g);
+        assert_eq!(p["gradient"]["kind"], "linear");
+        assert_eq!(p["gradient"]["stops"].as_array().unwrap().len(), 2);
+        assert_eq!(paint_params(&vectorcraft_doc::pattern::pattern_paint("Dots")), json!({"pattern": "Dots"}));
+        assert_eq!(p["gradient"]["stops"][0]["midpoint"], json!(0.5));
+        let tint = Paint::Solid { color: Color::gray(0.5), swatch: Some("Ink".into()), tint: 0.5 };
+        assert_eq!(paint_params(&tint), json!({"swatch": "Ink", "tint": 50.0}), "a tint keeps its percentage");
+    }
+
+    #[test]
+    fn drag_scrolling_in_a_short_list_goes_toward_the_nearer_edge() {
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-3;
+        // A 40 pt view: each band is 20 pt deep, so the pointer is in one band at most.
+        for (depth, want) in [(5.0, 270.0), (15.0, 130.0), (20.0, 0.0), (25.0, -130.0), (35.0, -270.0)] {
+            let got = drag_scroll_speed(40.0, depth);
+            assert!(near(got, want), "40 pt view, pointer {depth} pt down: {got} pt/s, want {want}");
+        }
+        // Just outside a 20 pt view, the pointer does not scroll the list toward the far edge.
+        for depth in [-1.0, 21.0] {
+            assert_eq!(drag_scroll_speed(20.0, depth), 0.0, "20 pt view, pointer {depth} pt down");
+        }
+        // From 56 pt up, the bands stay 28 pt deep and the speeds are unchanged.
+        for (h, depth, want) in [(100.0, 5.0, 290.0), (100.0, 95.0, -290.0), (100.0, 50.0, 0.0), (56.0, 0.0, 340.0), (56.0, 27.0, 70.0)] {
+            let got = drag_scroll_speed(h, depth);
+            assert!(near(got, want), "{h} pt view, pointer {depth} pt down: {got} pt/s, want {want}");
+        }
+        for h in [0.0, -10.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(drag_scroll_speed(h, 5.0), 0.0, "view height {h}");
+        }
+        assert_eq!(drag_scroll_speed(40.0, f32::NAN), 0.0);
+    }
+}
+#[cfg(test)]
+mod tests_appearance;
+#[cfg(test)]
+mod tests_asset_export;
+#[cfg(test)]
+mod tests_blend;
+#[cfg(test)]
+mod tests_brush_libraries;
+#[cfg(test)]
+mod tests_color_wheel;
+#[cfg(test)]
+mod tests_color_wheel_box;
+#[cfg(test)]
+mod tests_color_wheel_document_colors;
+#[cfg(test)]
+mod tests_color_wheel_gamut;
+#[cfg(test)]
+mod tests_color_wheel_harmony;
+#[cfg(test)]
+mod tests_color_wheel_vision;
+#[cfg(test)]
+mod tests_constrain;
+#[cfg(test)]
+mod tests_css_properties;
+#[cfg(test)]
+mod tests_effectedit;
+#[cfg(test)]
+mod tests_fontsize;
+#[cfg(test)]
+mod tests_freeform;
+#[cfg(test)]
+mod tests_links;
+#[cfg(test)]
+mod tests_long_popups;
+#[cfg(test)]
+mod tests_maskview;
+#[cfg(test)]
+mod tests_script_console;
+#[cfg(test)]
+mod tests_stroke;
+#[cfg(test)]
+mod tests_strokedepth;
+#[cfg(test)]
+mod tests_strokeux;
+#[cfg(test)]
+mod tests_style_libraries;
+#[cfg(test)]
+mod tests_symbol_libraries;
+#[cfg(test)]
+mod tests_units;

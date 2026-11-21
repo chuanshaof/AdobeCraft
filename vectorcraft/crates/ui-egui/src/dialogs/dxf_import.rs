@@ -84,6 +84,24 @@ pub fn offer_place(app: &mut VectorcraftApp, p: &Value) -> bool {
     offer(app, &name, &bytes, path, Some(p))
 }
 
+/// The `dxf` options a drawing `file.place` params `p` name is placed with when Show Import Options
+/// is off: the choices confirmed last (fit, lineweights, centring, layers), the drawing at 1:1 in
+/// its own unit. `None` when `p` names no `.dxf` drawing or already gives `dxf` options.
+pub fn last_options(app: &VectorcraftApp, p: &Value) -> Option<Value> {
+    let named = p.get("path").or_else(|| p.get("name")).and_then(Value::as_str).map(fileio::extension);
+    if p.get("dxf").is_some() || named.as_deref() != Some("dxf") {
+        return None;
+    }
+    Some(remembered(app))
+}
+
+/// The `dxf` options of the choices confirmed last (fit, lineweights, centring, layers; `{}` when
+/// none was).
+pub fn remembered(app: &VectorcraftApp) -> Value {
+    let last = app.ui.dxf_import.as_object();
+    Value::Object(REMEMBERED.iter().filter_map(|k| last?.get(*k).filter(|v| v.is_boolean()).map(|v| (k.to_string(), v.clone()))).collect())
+}
+
 /// The `dxf` options of `document.open` and `file.place` the fields set.
 fn options(d: &Dialog) -> Value {
     let fit = d.bool("fit");
@@ -163,7 +181,7 @@ fn body(app: &mut VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) -> bool {
 fn preview(app: &mut VectorcraftApp, ctx: &egui::Context, d: &Dialog) -> Option<egui::TextureHandle> {
     let file = app.ui.dialog_file.clone()?;
     let layout = d.str("layout");
-    let key = egui::Id::new(("dxf-preview", file.token, layout.as_str()));
+    let key = egui::Id::unique(("dxf-preview", file.token, layout.as_str()));
     let o = vectorcraft_cad::ImportOptions { layout: Some(layout.clone()), fit: true, ..Default::default() };
     // A layout that can't be read shows an empty preview (and isn't read again).
     preview_texture(app, ctx, key, "dxf-preview", PREVIEW, || vectorcraft_cad::import(&file.bytes, &o).ok().map(|r| r.document))

@@ -49,6 +49,10 @@ pub(crate) struct Region {
     pub h: u16,
 }
 
+/// Groups drawn twice ([`Renderer::group_offscreen`]: blending with their backdrop) that may be
+/// nested in each other before deeper ones are drawn isolated, once.
+const MAX_TWICE_DRAWN: u32 = 4;
+
 impl Renderer {
     /// Draw a group's content with `draw` and composite it as `c` says. Blending content is drawn
     /// offscreen: over a copy of the backdrop when the group isn't isolated (possible only with
@@ -80,6 +84,7 @@ impl Renderer {
             if c.mask.is_some() || self.offscreen_fits(ctx, r, c.isolated) {
                 return self.group_offscreen(ctx, f, c, r, draw);
             }
+            self.stats.view_sized += 1;
         }
         if c.mask.is_some() {
             // Its backdrop out of reach (or not needed), a masked group starts from transparency.
@@ -110,6 +115,12 @@ impl Renderer {
 
     fn group_offscreen(&mut self, ctx: &mut RenderContext, f: &Frame, c: Composite, r: Region, draw: &mut Content) {
         let Composite { clip, blend, opacity, mask, isolated, .. } = c;
+        // A group that blends with its backdrop is drawn twice (over the backdrop, and alone for
+        // its coverage), and so is everything in it, so such groups nested in each other cost 2ⁿ.
+        // Past [`MAX_TWICE_DRAWN`] of them, a deeper one is drawn as an isolated group.
+        let twice = !isolated && blend != Blend::Normal;
+        let isolated = isolated || twice && self.twice_drawn >= MAX_TWICE_DRAWN;
+        let twice = twice && !isolated;
         if self.offscreen_live == 0 {
             self.offscreen_budget = OFFSCREEN_FRAMES * u64::from(ctx.width()) * u64::from(ctx.height());
         }
@@ -117,6 +128,7 @@ impl Renderer {
         self.offscreen_live = self.offscreen_live.saturating_add(cost);
         let sub = frame_over(f, r);
         let backdrop = (!isolated).then(|| self.flatten(ctx, r));
+        self.twice_drawn += u32::from(twice);
         let content = self.offscreen(r, &sub, backdrop.clone(), draw);
         let at = (r.x as f64, r.y as f64);
         let push = |ctx: &mut RenderContext, mode: BlendMode| {
@@ -162,6 +174,7 @@ impl Renderer {
             }
         }
         ctx.pop_layer();
+        self.twice_drawn -= u32::from(twice);
         self.offscreen_live = self.offscreen_live.saturating_sub(cost);
     }
 
@@ -271,9 +284,20 @@ impl Renderer {
         ctx.push_layer(None, Some(BlendMode::new(Mix::Normal, compose)), None, None, None);
         self.nested += 1;
         let shape = compose != Compose::Plus && !c.knockout_shape;
-        self.shape_of = if shape { Arc::as_ptr(c) as usize } else { 0 };
-        self.draw_arc(ctx, f, c);
-        self.shape_of = 0;
+        // A piece of a mesh-warped image knocks out its whole triangle, where its neighbors
+        // overlap it, at full coverage whatever the image's own alpha there.
+        if shape && let Some(outline) = c.knockout_outline() {
+            if let Some(region) = self.clip_of(outline) {
+                ctx.set_transform(f.view);
+                ctx.set_paint(f.ink.fixed([255, 255, 255, 255]));
+                ctx.set_fill_rule(fill_rule(region.1));
+                ctx.fill_path(&region.0);
+            }
+        } else {
+            self.shape_of = if shape { Arc::as_ptr(c) as usize } else { 0 };
+            self.draw_arc(ctx, f, c);
+            self.shape_of = 0;
+        }
         self.nested -= 1;
         ctx.pop_layer();
     }

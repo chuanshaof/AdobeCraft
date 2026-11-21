@@ -3,6 +3,7 @@
 
 use serde_json::{Value, json};
 use vectorcraft_doc::Unit;
+use vectorcraft_doc::color::Color;
 use vectorcraft_plugins::{Manifest, Param, ParamSpec};
 
 use crate::state::Dialog;
@@ -18,21 +19,25 @@ pub(super) fn field(ui: &mut egui::Ui, d: &mut Dialog, key: &str, label: &str) {
 
 /// [`field`] `width` points wide.
 pub(super) fn field_w(ui: &mut egui::Ui, d: &mut Dialog, key: &str, label: &str, width: f32) {
-    row_label(ui, label);
-    text(ui, d, key, width);
+    let row = row_label(ui, label);
+    // The value widget must be named by the real Label already drawn beside it (egui 0.37's
+    // kittest fails an unnamed input).
+    ui.label_inputs_by(row.id, |ui| text(ui, d, key, width));
     ui.end_row();
 }
 
-/// The label cell of a grid row.
-pub(super) fn row_label(ui: &mut egui::Ui, label: &str) {
+/// The label cell of a grid row (its `Response`, so the value can be named by it).
+pub(super) fn row_label(ui: &mut egui::Ui, label: &str) -> egui::Response {
     let t = Tokens::get(ui.ctx());
-    ui.label(egui::RichText::new(tl!(label)).color(t.text_dim));
+    ui.label(egui::RichText::new(tl!(label)).color(t.text_dim))
 }
 
 /// A labelled [`length`] field (one grid row).
 pub(super) fn length_field(ui: &mut egui::Ui, d: &mut Dialog, key: &str, label: &str, unit: Unit) {
-    row_label(ui, label);
-    length(ui, d, key, unit, FIELD_W);
+    let row = row_label(ui, label);
+    ui.label_inputs_by(row.id, |ui| {
+        length(ui, d, key, unit, FIELD_W);
+    });
     ui.end_row();
 }
 
@@ -40,8 +45,40 @@ pub(super) fn length_field(ui: &mut egui::Ui, d: &mut Dialog, key: &str, label: 
 /// "5 mm", wins), kept in points (a string with a unit, "12 pt", also reads). Returns true when it
 /// changed.
 pub(super) fn length(ui: &mut egui::Ui, d: &mut Dialog, key: &str, unit: Unit, width: f32) -> bool {
+    length_within(ui, d, key, unit, width, None)
+}
+
+/// [`length`] whose value is kept within `range` (points): a value typed outside it becomes the
+/// nearer end, so the field shows the distance the command applies (#4637).
+pub(crate) fn length_within(
+    ui: &mut egui::Ui,
+    d: &mut Dialog,
+    key: &str,
+    unit: Unit,
+    width: f32,
+    range: Option<std::ops::RangeInclusive<f64>>,
+) -> bool {
     let value = d.fields.contains_key(key).then(|| d.f64(key, 0.0));
-    let Some(v) = crate::widgets::num_field(ui, ("dlg-len", key), value, unit, width) else { return false };
+    let bounds = range.unwrap_or(crate::widgets::ANY);
+    let Some(v) = crate::widgets::num_field_within(ui, ("dlg-len", key), value, unit, width, bounds) else { return false };
+    d.fields.insert(key.into(), json!(v));
+    true
+}
+
+/// [`length_within`] for a value the selected objects may not share: with no value the field reads
+/// `empty` ("Mixed"), and typing a distance sets it.
+pub(crate) fn length_mixed(
+    ui: &mut egui::Ui,
+    d: &mut Dialog,
+    key: &str,
+    unit: Unit,
+    width: f32,
+    range: Option<std::ops::RangeInclusive<f64>>,
+    empty: &str,
+) -> bool {
+    let value = d.fields.contains_key(key).then(|| d.f64(key, 0.0));
+    let bounds = range.unwrap_or(crate::widgets::ANY);
+    let Some(v) = crate::widgets::num_field_within_empty(ui, ("dlg-len", key), value, empty, unit, width, bounds) else { return false };
     d.fields.insert(key.into(), json!(v));
     true
 }
@@ -74,7 +111,7 @@ fn lengths(kind: &str) -> &'static [&'static str] {
 /// number: fields that ↑/↓ step by one (Shift: ten) and that do math, as the distances do.
 fn suffix(kind: &str, key: &str) -> Option<&'static str> {
     match (kind, key) {
-        ("rotate" | "shear" | "reflect" | "move" | "lineSegment", "angle") => Some("°"),
+        ("rotate" | "shear" | "reflect" | "move" | "lineSegment", "angle") | ("shear", "axisAngle") => Some("°"),
         ("scale", "sx" | "sy") | ("spiral", "decay") => Some("%"),
         _ => None,
     }
@@ -83,7 +120,7 @@ fn suffix(kind: &str, key: &str) -> Option<&'static str> {
 /// The fields of the form dialogs ([`grid`]) that the dialog's own body draws, by dialog kind.
 fn own_rows(kind: &str) -> &'static [&'static str] {
     match kind {
-        "artboardOptions" => &["color", super::artboard_options::PIXEL_ASPECT],
+        "artboardOptions" => &["color", super::artboard_options::GUIDE_LABEL, super::artboard_options::PIXEL_ASPECT],
         // The grids' Reference Point is their 9-point locator.
         "rectangularGrid" | "polarGrid" => &["reference"],
         _ => &[],
@@ -101,6 +138,7 @@ fn order(kind: &str) -> &'static [&'static str] {
         "spiral" => &["radius", "decay", "segments"],
         "artboardOptions" => &["name", "width", "height"],
         "lineSegment" => &["length", "angle"],
+        "shear" => &["angle", "axis", "axisAngle"],
         _ => &[],
     }
 }
@@ -126,15 +164,67 @@ fn choices(kind: &str, key: &str) -> Vec<(&'static str, &'static str)> {
     match (kind, key) {
         ("offsetPath", "joins") => vec![("miter", tl!("Miter")), ("round", tl!("Round")), ("bevel", tl!("Bevel"))],
         ("average", "axis") => vec![axis("horizontal", "Horizontal"), axis("vertical", "Vertical"), axis("both", "Both")],
-        ("reflect", "axis") => vec![axis("horizontal", "Horizontal"), axis("vertical", "Vertical"), axis("angle", "Angle")],
-        ("shear", "axis") => vec![axis("horizontal", "Horizontal"), axis("vertical", "Vertical")],
+        ("reflect" | "shear", "axis") => vec![axis("horizontal", "Horizontal"), axis("vertical", "Vertical"), axis("angle", "Angle")],
         _ => vec![],
     }
 }
 
+/// The id of the colour swatch beside the field `key` (a test clicks it; [`colour_swatch`] draws it).
+pub(super) fn colour_swatch_id(key: &str) -> egui::Id {
+    egui::Id::unique(("fx-colour-swatch", key))
+}
+
+/// The colour swatch beside the colour field `key`, showing `colour`: a double-click asks for the
+/// Color Picker over this dialog, whose OK fills the field ([`super::color_picker::over_effect`]).
+/// Returns whether the picker was asked for.
+pub(super) fn colour_swatch(ui: &mut egui::Ui, key: &str, colour: Color) -> bool {
+    let t = Tokens::get(ui.ctx());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 18.0), egui::Sense::hover());
+    let resp = ui.interact(rect, colour_swatch_id(key), egui::Sense::click());
+    let [r, g, b, _] = colour.to_rgba8(1.0);
+    ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(r, g, b));
+    ui.painter().rect_stroke(rect, 2.0, egui::Stroke::new(1.0, t.input_border), egui::StrokeKind::Inside);
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.double_clicked()
+}
 /// A text field `width` wide bound to `d.fields[key]`. Returns true when it changed.
 pub(super) fn text(ui: &mut egui::Ui, d: &mut Dialog, key: &str, width: f32) -> bool {
     text_edit(ui, d, key, width).changed()
+}
+
+/// A parameter value that is a color object (`{"model": "cmyk", …}`, as Document Color Mode or an
+/// imported file stores an effect's color), read as a color. `None` for any other value.
+pub(super) fn color_object(v: &Value) -> Option<vectorcraft_doc::color::Color> {
+    v.is_object().then(|| serde_json::from_value(v.clone()).ok()).flatten()
+}
+
+/// [`text`] for a color parameter `key`: a color object ([`color_object`]) shows as its hex and
+/// stays as it is until the text is edited; any other value that isn't text shows dimmed.
+pub(super) fn color_text(ui: &mut egui::Ui, d: &mut Dialog, key: &str, width: f32) -> bool {
+    let Some(v) = d.fields.get(key).cloned() else { return text(ui, d, key, width) };
+    if let Some(c) = color_object(&v) {
+        d.fields.insert(key.into(), json!(c.to_hex()));
+        let changed = text(ui, d, key, width);
+        if !changed {
+            d.fields.insert(key.into(), v);
+        }
+        return changed;
+    }
+    if v.is_string() {
+        return text(ui, d, key, width);
+    }
+    crate::widgets::dim_label(ui, &v.to_string());
+    false
+}
+
+/// [`text`] for a row whose visible meaning is not the immediately preceding label widget
+/// (Export for Screens' Range field follows its radio buttons): screen readers name the field
+/// `name`, already translated. The pending label is still consumed, so it cannot name a later
+/// field.
+pub(super) fn text_named(ui: &mut egui::Ui, d: &mut Dialog, key: &str, name: &str, width: f32) -> bool {
+    text_edit_named(ui, d, key, name, width).changed()
 }
 
 /// [`text`] returning the field's response (focus, Enter).
@@ -142,13 +232,25 @@ pub(super) fn text_edit(ui: &mut egui::Ui, d: &mut Dialog, key: &str, width: f32
     text_edit_limited(ui, d, key, width, usize::MAX)
 }
 
+/// [`text_edit`] with an explicit translated name (see [`text_named`]).
+pub(super) fn text_edit_named(ui: &mut egui::Ui, d: &mut Dialog, key: &str, name: &str, width: f32) -> egui::Response {
+    text_edit_limited_name(ui, d, key, width, usize::MAX, Some(name))
+}
+
 /// [`text_edit`] that takes at most `max_chars` characters: typing and pasting stop at the limit,
 /// and a longer value already in the field is kept, with nothing added to it until it has fewer
 /// than `max_chars` characters.
 pub(super) fn text_edit_limited(ui: &mut egui::Ui, d: &mut Dialog, key: &str, width: f32, max_chars: usize) -> egui::Response {
+    text_edit_limited_name(ui, d, key, width, max_chars, None)
+}
+
+/// The text field shared by [`text_edit_limited`] and [`text_edit_named`]: `name` wins over the
+/// adjacent label, and either way the pending label is taken so it can't leak to a later field.
+fn text_edit_limited_name(ui: &mut egui::Ui, d: &mut Dialog, key: &str, width: f32, max_chars: usize, name: Option<&str>) -> egui::Response {
     let t = Tokens::get(ui.ctx());
+    let label = crate::widgets::take_previous_label(ui);
     let mut s = d.str(key);
-    let id = ui.id().with(("dlg-text", key));
+    let id = ui.scope_id().with(("dlg-text", key));
     crate::widgets::take_dialog_focus(ui, id, &s);
     let r = egui::Frame::NONE
         .fill(t.input)
@@ -157,18 +259,35 @@ pub(super) fn text_edit_limited(ui: &mut egui::Ui, d: &mut Dialog, key: &str, wi
         .inner_margin(egui::Margin::symmetric(6, 3))
         .show(ui, |ui| {
             crate::theme::strong_selected_text(ui);
-            ui.add(egui::TextEdit::singleline(&mut s).id(id).frame(egui::Frame::NONE).desired_width(width).char_limit(max_chars))
+            ui.add(
+                egui::TextEdit::singleline(&mut s)
+                    .id(id)
+                    .frame(egui::Frame::NONE)
+                    .align(egui::Align2::LEFT_CENTER)
+                    .desired_width(width)
+                    .char_limit(max_chars),
+            )
         });
     if r.inner.changed() {
         d.fields.insert(key.into(), Value::String(s));
     }
-    r.inner
+    match name {
+        Some(name) => r.inner.accessible_name(name),
+        None => crate::widgets::label_field(r.inner, label),
+    }
 }
 
 /// A text box `rows` lines tall and `width` wide bound to `d.fields[key]`. Enter adds a line (it
 /// doesn't press OK while the box has focus).
 pub(super) fn text_area(ui: &mut egui::Ui, d: &mut Dialog, key: &str, width: f32, rows: usize) -> egui::Response {
+    text_area_named(ui, d, key, None, width, rows)
+}
+
+/// [`text_area`] with an optional explicit translated name; the pending adjacent label is consumed
+/// either way.
+pub(super) fn text_area_named(ui: &mut egui::Ui, d: &mut Dialog, key: &str, name: Option<&str>, width: f32, rows: usize) -> egui::Response {
     let t = Tokens::get(ui.ctx());
+    let label = crate::widgets::take_previous_label(ui);
     let mut s = d.str(key);
     let r = egui::Frame::NONE
         .fill(t.input)
@@ -185,11 +304,14 @@ pub(super) fn text_area(ui: &mut egui::Ui, d: &mut Dialog, key: &str, width: f32
     if r.inner.has_focus() {
         ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
     }
-    r.inner
+    match name {
+        Some(name) => r.inner.accessible_name(name),
+        None => crate::widgets::label_field(r.inner, label),
+    }
 }
 
 /// A checkbox bound to `d.fields[key]` (its box shows while unchecked too).
-pub(super) fn check(ui: &mut egui::Ui, d: &mut Dialog, key: &str, label: &str) {
+pub(crate) fn check(ui: &mut egui::Ui, d: &mut Dialog, key: &str, label: &str) {
     let b = d.bool(key);
     if crate::widgets::check(ui, label, b, true) {
         d.fields.insert(key.into(), Value::Bool(!b));
@@ -198,7 +320,7 @@ pub(super) fn check(ui: &mut egui::Ui, d: &mut Dialog, key: &str, label: &str) {
 
 /// A dropdown row bound to the string `d.fields[key]`: `label` in a column `widths.0` wide, the
 /// dropdown `widths.1` wide; `options` are (value, label).
-pub(super) fn choice(ui: &mut egui::Ui, d: &mut Dialog, key: &str, label: &str, widths: (f32, f32), options: &[(&str, &str)]) {
+pub(crate) fn choice(ui: &mut egui::Ui, d: &mut Dialog, key: &str, label: &str, widths: (f32, f32), options: &[(&str, &str)]) {
     crate::widgets::label_row(ui, label, widths.0, |ui| dropdown(ui, d, key, widths.1, options, false));
 }
 
@@ -246,10 +368,20 @@ pub(super) fn grid_then(ui: &mut egui::Ui, d: &mut Dialog, unit: Unit, more: imp
             if lengths.contains(&k.as_str()) {
                 length_field(ui, d, &k, &humanized(&k), unit);
             } else if let Some(suffix) = suffix(&d.kind, &k) {
-                row_label(ui, &humanized(&k));
-                if let Some(v) = crate::widgets::plain_field(ui, ("dlg-num", &k), d.f64(&k, 0.0), suffix, 3, FIELD_W) {
-                    d.fields.insert(k, json!(v));
-                }
+                let label = match (d.kind.as_str(), k.as_str()) {
+                    ("shear", "axisAngle") => tl!("Axis Angle").into(),
+                    _ => humanized(&k),
+                };
+                // Shear's Axis Angle is the axis while the Angle axis is chosen, and keeps its value otherwise.
+                let enabled = d.kind != "shear" || k != "axisAngle" || d.str("axis") == "angle";
+                let row = row_label(ui, &label);
+                ui.label_inputs_by(row.id, |ui| {
+                    ui.add_enabled_ui(enabled, |ui| {
+                        if let Some(v) = crate::widgets::plain_field(ui, ("dlg-num", &k), d.f64(&k, 0.0), suffix, 3, FIELD_W) {
+                            d.fields.insert(k, json!(v));
+                        }
+                    });
+                });
                 ui.end_row();
             } else if let Some(ends) = skew_ends(&d.kind, &k) {
                 let max = vectorcraft_geom::shapes::GRID_SKEW_MAX;
@@ -269,8 +401,8 @@ pub(super) fn grid_then(ui: &mut egui::Ui, d: &mut Dialog, unit: Unit, more: imp
                 };
                 field(ui, d, &k, &label);
             } else {
-                row_label(ui, &humanized(&k));
-                dropdown(ui, d, &k, FIELD_W, &options, true);
+                let row = row_label(ui, &humanized(&k));
+                ui.label_inputs_by(row.id, |ui| dropdown(ui, d, &k, FIELD_W, &options, true));
                 ui.end_row();
             }
         }
@@ -279,17 +411,23 @@ pub(super) fn grid_then(ui: &mut egui::Ui, d: &mut Dialog, unit: Unit, more: imp
 }
 
 /// Command/effect parameters from the dialog fields (drop UI-only keys).
-pub(super) fn params(d: &Dialog) -> Value {
+pub(crate) fn params(d: &Dialog) -> Value {
     Value::Object(d.fields.iter().filter(|(k, _)| !k.starts_with("__") && k.as_str() != "preview").map(|(k, v)| (k.clone(), v.clone())).collect())
 }
 
 /// The (label, value) choices of a parameter that picks one of some values.
 pub(super) type Choices = &'static [(&'static str, &'static str)];
 
+/// Effects whose dialogs give their number fields spinner arrows (#5367, #5368): Drop Shadow's
+/// and the glows' Opacity, offsets and Blur, which are stepped more than typed.
+pub(super) fn has_spinners(effect: &str) -> bool {
+    matches!(effect, "stylize.dropShadow" | "stylize.outerGlow" | "stylize.innerGlow")
+}
+
 /// Generic editor for command/effect parameters: numbers, booleans, strings and colours; the
 /// parameters `is_length` names are distances shown and typed in `unit`, those `choices` gives
 /// choices for are dropdowns. Fields come in `rank` order (by name among equals). Returns true when
-/// a value changed.
+/// a value changed. The fields of [`has_spinners`]' effects carry spinner arrows.
 pub(super) fn param_fields(
     ui: &mut egui::Ui,
     d: &mut Dialog,
@@ -300,6 +438,8 @@ pub(super) fn param_fields(
 ) -> bool {
     let t = Tokens::get(ui.ctx());
     let mut changed = false;
+    let mut pick: Option<(String, Color)> = None;
+    let spinners = has_spinners(&d.str("__effect"));
     egui::Grid::new("fxgrid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
         let mut keys: Vec<(String, Value)> =
             d.fields.iter().filter(|(k, _)| !k.starts_with("__") && k.as_str() != "preview").map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -307,74 +447,151 @@ pub(super) fn param_fields(
         for (k, v) in keys {
             // A size's Relative / Absolute pair (Roughen, Zig Zag, Tweak) is its own label.
             let relative = k == "relative" && v.is_boolean();
-            ui.label(egui::RichText::new(if relative { String::new() } else { humanized(&k) }).color(t.text));
-            if let Some(cur) = crate::widgets::blend_param(&k, &v) {
-                if let Some(m) = crate::widgets::blend_param_dropdown(ui, ("fx-blend", &k), cur) {
-                    d.fields.insert(k, m);
-                    changed = true;
-                }
-                ui.end_row();
-                continue;
-            }
-            if is_length(&k) {
-                changed |= length(ui, d, &k, unit, 140.0);
-                ui.end_row();
-                continue;
-            }
-            if let Some(options) = choices(&k) {
-                let cur = v.as_str().unwrap_or_default();
-                let label = options.iter().find(|(_, value)| *value == cur).map_or(cur, |(l, _)| choice_label(l));
-                let labels: Vec<&str> = options.iter().map(|(l, _)| choice_label(l)).collect();
-                if let Some((_, value)) = crate::widgets::dropdown_names(ui, ("fx-choice", &k), label, &labels, 140.0).and_then(|i| options.get(i)) {
-                    d.fields.insert(k, json!(value));
-                    changed = true;
-                }
-                ui.end_row();
-                continue;
-            }
-            match v {
-                Value::Number(n) => {
-                    if let Some(x) = crate::widgets::plain_field(ui, ("fx-num", &k), n.as_f64().unwrap_or(0.0), "", 3, 140.0) {
-                        d.fields.insert(k, typed_number(x));
+            let row = ui.label(egui::RichText::new(if relative { String::new() } else { humanized(&k) }).color(t.text));
+            // The row's actual label node names every input beside it, including plain
+            // `TextEdit`s and the numeric field beside a slider (egui 0.37's strict a11y gate).
+            ui.label_inputs_by(row.id, |ui| {
+                if let Some(cur) = crate::widgets::blend_param(&k, &v) {
+                    if let Some(m) = crate::widgets::blend_param_dropdown(ui, ("fx-blend", &k), cur) {
+                        d.fields.insert(k.clone(), m);
                         changed = true;
                     }
+                    return;
                 }
-                Value::Bool(b) if relative => {
-                    ui.horizontal(|ui| {
-                        for (label, on) in [(tl!("Relative"), true), (tl!("Absolute"), false)] {
-                            if crate::widgets::radio(ui, label, b == on, true) && b != on {
-                                d.fields.insert(k.clone(), json!(on));
+                if is_length(&k) {
+                    // An effect's documented range keeps the field to the distance it applies.
+                    let range = vectorcraft_effects::length_range(&d.str("__effect"), &k);
+                    // A command's own range refuses a distance typed outside it.
+                    if let Some(bounds) = super::command::length_range(&d.str("__command"), &k) {
+                        let value = d.fields.contains_key(&k).then(|| d.f64(&k, 0.0));
+                        if let Some(x) = crate::widgets::num_field_refusing(ui, ("dlg-len", k.as_str()), value, unit, 140.0, bounds) {
+                            d.fields.insert(k.clone(), json!(x));
+                            changed = true;
+                        }
+                    } else if spinners {
+                        let bounds = range.unwrap_or(if k == "blur" { 0.0..=f64::INFINITY } else { crate::widgets::ANY });
+                        let value = d.fields.contains_key(&k).then(|| d.f64(&k, 0.0));
+                        if let Some(x) = crate::widgets::spin_length_within(ui, ("dlg-len", k.as_str()), value, unit, 140.0, bounds) {
+                            d.fields.insert(k.clone(), json!(x));
+                            changed = true;
+                        }
+                    } else {
+                        changed |= length_within(ui, d, &k, unit, 140.0, range);
+                    }
+                    return;
+                }
+                // A size in pixels of the raster effects resolution (Color Halftone's Max Radius)
+                // stays in pixels whatever the document's units, within its documented range.
+                if let Some(range) = vectorcraft_effects::raster_px_range(&d.str("__effect"), &k) {
+                    let x = v.as_f64().unwrap_or(*range.start());
+                    if let Some(x) = crate::widgets::range_field_named(ui, ("fx-px", &k), None, x, range, &unit_suffix("px"), 2, 140.0) {
+                        d.fields.insert(k.clone(), typed_number(x));
+                        changed = true;
+                    }
+                    return;
+                }
+                if let Some(options) = choices(&k) {
+                    let cur = v.as_str().unwrap_or_default();
+                    let label = options.iter().find(|(_, value)| *value == cur).map_or(cur, |(l, _)| choice_label(l));
+                    let labels: Vec<&str> = options.iter().map(|(l, _)| choice_label(l)).collect();
+                    if let Some((_, value)) =
+                        crate::widgets::dropdown_names(ui, ("fx-choice", &k), label, &labels, 140.0).and_then(|i| options.get(i))
+                    {
+                        d.fields.insert(k.clone(), json!(value));
+                        changed = true;
+                    }
+                    return;
+                }
+                match v {
+                    Value::Number(n) if spinners => {
+                        let range = if k == "opacity" { 0.0..=100.0 } else { crate::widgets::ANY };
+                        if let Some(x) = crate::widgets::spin_range(ui, ("fx-num", k.as_str()), n.as_f64(), range, "", 3, 140.0, 1.0) {
+                            d.fields.insert(k.clone(), typed_number(x));
+                            changed = true;
+                        }
+                    }
+                    Value::Number(n) => {
+                        // A resolution (Object › Rasterize's `ppi`) shows its unit in the UI language.
+                        let suffix = if k == "ppi" { crate::i18n::fill_once(tl!("{n} ppi"), &[("n", "")]) } else { String::new() };
+                        if let Some(x) = crate::widgets::plain_field(ui, ("fx-num", &k), n.as_f64().unwrap_or(0.0), &suffix, 3, 140.0) {
+                            d.fields.insert(k.clone(), typed_number(x));
+                            changed = true;
+                        }
+                    }
+                    Value::Bool(b) if relative => {
+                        ui.horizontal(|ui| {
+                            for (label, on) in [(tl!("Relative"), true), (tl!("Absolute"), false)] {
+                                if crate::widgets::radio(ui, label, b == on, true) && b != on {
+                                    d.fields.insert(k.clone(), json!(on));
+                                    changed = true;
+                                }
+                            }
+                        });
+                    }
+                    Value::Bool(b) => {
+                        if crate::widgets::check_box(ui, &humanized(&k), b, true) {
+                            d.fields.insert(k.clone(), json!(!b));
+                            changed = true;
+                        }
+                    }
+                    Value::String(mut s) if s.contains('\n') => {
+                        // Multi-line values (Graph Data CSV) get a text area.
+                        if ui.add(egui::TextEdit::multiline(&mut s).desired_width(260.0).desired_rows(8).font(egui::TextStyle::Monospace)).changed() {
+                            d.fields.insert(k.clone(), json!(s));
+                            changed = true;
+                        }
+                    }
+                    Value::String(mut s) => {
+                        // A hex colour (#rrggbb or #rgb) shows its swatch beside the field; the swatch's
+                        // double-click opens the Color Picker over this dialog.
+                        let mut colour = None;
+                        let mut ask = false;
+                        ui.horizontal(|ui| {
+                            if ui.add(egui::TextEdit::singleline(&mut s).align(egui::Align2::LEFT_CENTER).desired_width(140.0)).changed() {
+                                d.fields.insert(k.clone(), json!(s));
                                 changed = true;
                             }
+                            colour = crate::panels::color::parse_hex(&s);
+                            if let Some(c) = colour {
+                                ask = colour_swatch(ui, &k, c);
+                            }
+                        });
+                        if ask && let Some(c) = colour {
+                            pick = Some((k.clone(), c));
                         }
-                    });
-                }
-                Value::Bool(b) => {
-                    if crate::widgets::check_box(ui, &humanized(&k), b, true) {
-                        d.fields.insert(k, json!(!b));
-                        changed = true;
                     }
+                    // A color object shows as its hex; typing in the field stores the typed text.
+                    other => match color_object(&other) {
+                        Some(c) => {
+                            let mut s = c.to_hex();
+                            let mut colour = None;
+                            let mut ask = false;
+                            ui.horizontal(|ui| {
+                                if ui.add(egui::TextEdit::singleline(&mut s).desired_width(140.0)).changed() {
+                                    d.fields.insert(k.clone(), json!(s));
+                                    changed = true;
+                                }
+                                colour = crate::panels::color::parse_hex(&s);
+                                if let Some(c) = colour {
+                                    ask = colour_swatch(ui, &k, c);
+                                }
+                            });
+                            if ask && let Some(c) = colour {
+                                pick = Some((k.clone(), c));
+                            }
+                        }
+                        None => {
+                            ui.label(egui::RichText::new(other.to_string()).color(t.text_dim).size(11.0));
+                        }
+                    },
                 }
-                Value::String(mut s) if s.contains('\n') => {
-                    // Multi-line values (Graph Data CSV) get a text area.
-                    if ui.add(egui::TextEdit::multiline(&mut s).desired_width(260.0).desired_rows(8).font(egui::TextStyle::Monospace)).changed() {
-                        d.fields.insert(k, json!(s));
-                        changed = true;
-                    }
-                }
-                Value::String(mut s) => {
-                    if ui.add(egui::TextEdit::singleline(&mut s).desired_width(140.0)).changed() {
-                        d.fields.insert(k, json!(s));
-                        changed = true;
-                    }
-                }
-                other => {
-                    ui.label(egui::RichText::new(other.to_string()).color(t.text_dim).size(11.0));
-                }
-            }
+            });
             ui.end_row();
         }
     });
+    if let Some((key, colour)) = pick {
+        *d = super::color_picker::over_effect(d, &key, colour);
+    }
     changed
 }
 
@@ -403,7 +620,10 @@ fn typed_number(x: f64) -> Value {
 /// the rows then scroll ([`super::modal::scrolled_rows`]).
 pub(super) fn schema_fields(app: &mut crate::VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog, m: &Manifest) -> bool {
     let (changed, help) = schema_rows(ui, d, m);
-    if let Some(url) = help {
+    // The browser is another app: a click automation sent opens nothing.
+    if let Some(url) = help
+        && app.refuse_automation("the plug-in help button").is_ok()
+    {
         app.open_url(&url);
     }
     changed
@@ -462,16 +682,16 @@ fn param_row(ui: &mut egui::Ui, d: &mut Dialog, k: &str, p: &Param) -> (bool, Op
     let t = Tokens::get(ui.ctx());
     let label = param_label(k, p);
     let shown_label = ui.label(egui::RichText::new(&label).color(t.text));
-    if let Some(help) = &p.ui.help {
-        shown_label.on_hover_text(help);
-    }
+    let shown_label = if let Some(help) = &p.ui.help { shown_label.on_hover_text(help) } else { shown_label };
     let cur = d.fields.get(k).cloned().unwrap_or_else(|| p.spec.default_value());
     let unit = p.ui.unit.as_deref().unwrap_or_default();
     let suffix = unit_suffix(unit);
     let mut opened = None;
     let new = ui
         .horizontal(|ui| {
-            let (new, in_field) = value_field(ui, k, &label, &p.spec, &cur, &suffix);
+            // The row's painted label names every input in its value column (egui 0.37's strict
+            // accessibility gate), not only the first one.
+            let (new, in_field) = ui.label_inputs_by(shown_label.id, |ui| value_field(ui, k, &label, &p.spec, &cur, &suffix));
             if !in_field && !unit.is_empty() {
                 ui.label(egui::RichText::new(unit).color(t.text_dim));
             }
@@ -494,7 +714,7 @@ fn value_field(ui: &mut egui::Ui, k: &str, label: &str, spec: &ParamSpec, cur: &
     match spec {
         ParamSpec::Number { min, max, .. } => {
             let x = cur.as_f64().unwrap_or(*min);
-            (crate::widgets::range_field(ui, ("plugin-num", k), x, *min..=*max, suffix, 2, 100.0).map(|x| json!(x)), true)
+            (crate::widgets::range_field_named(ui, ("plugin-num", k), Some(label), x, *min..=*max, suffix, 2, 100.0).map(|x| json!(x)), true)
         }
         ParamSpec::Int { min, max, .. } => {
             let x = cur.as_i64().unwrap_or(*min).clamp(*min, *max);
@@ -502,12 +722,13 @@ fn value_field(ui: &mut egui::Ui, k: &str, label: &str, spec: &ParamSpec, cur: &
             // Past it, the number typed is read as an integer.
             const EXACT: i64 = 1 << 53;
             if -EXACT <= *min && *max <= EXACT {
-                let field = crate::widgets::range_field(ui, ("plugin-int", k), x as f64, *min as f64..=*max as f64, suffix, 0, 100.0);
+                let field =
+                    crate::widgets::range_field_named(ui, ("plugin-int", k), Some(label), x as f64, *min as f64..=*max as f64, suffix, 0, 100.0);
                 (field.map(|x| json!(x as i64)), true)
             } else {
                 let shown = x.to_string();
-                crate::widgets::take_dialog_focus(ui, ui.id().with(("plugin-int", k)), &shown);
-                let typed = crate::widgets::text_field(ui, ("plugin-int", k), Some(&shown), 100.0, 1);
+                crate::widgets::take_dialog_focus(ui, ui.scope_id().with(("plugin-int", k)), &shown);
+                let typed = crate::widgets::text_field_named(ui, ("plugin-int", k), Some(label), Some(&shown), 100.0, 1);
                 (typed.and_then(|text| text.parse::<i64>().ok()).map(|x| json!(x.clamp(*min, *max))), false)
             }
         }
@@ -517,18 +738,31 @@ fn value_field(ui: &mut egui::Ui, k: &str, label: &str, spec: &ParamSpec, cur: &
         }
         ParamSpec::Choice { options, .. } => {
             let labels: Vec<&str> = options.iter().map(String::as_str).collect();
-            let chosen = crate::widgets::dropdown_names(ui, ("plugin-choice", k), cur.as_str().unwrap_or_default(), &labels, 140.0);
+            let chosen =
+                crate::widgets::dropdown_names_named(ui, ("plugin-choice", k), Some(label), cur.as_str().unwrap_or_default(), &labels, 140.0);
             (chosen.and_then(|i| options.get(i)).map(|o| json!(o)), false)
         }
         ParamSpec::Text { max_length, .. } => {
-            let typed = crate::widgets::text_field(ui, ("plugin-text", k), cur.as_str(), 160.0, 1);
+            let typed = crate::widgets::text_field_named(ui, ("plugin-text", k), Some(label), cur.as_str(), 160.0, 1);
             (typed.map(|text| json!(text.chars().take(*max_length).collect::<String>())), false)
         }
         ParamSpec::NumberList { .. } => {
-            let typed = crate::widgets::text_field(ui, ("plugin-list", k), Some(&number_list_text(cur)), 160.0, 1);
+            let typed = crate::widgets::text_field_named(ui, ("plugin-list", k), Some(label), Some(&number_list_text(cur)), 160.0, 1);
             (typed.and_then(|text| read_number_list(&text, spec)), false)
         }
+        ParamSpec::Color { .. } => (plugin_color_button(ui, ("plugin-color", k), cur), false),
     }
+}
+
+/// A plug-in `color` parameter's button, showing `cur` (a color object or hex) and opening the color
+/// picker → the color picked, as the color object the plug-in gets: the picker's display sRGB in the
+/// working RGB space, so the color shows as it was picked whatever the working profile.
+pub(crate) fn plugin_color_button(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, cur: &Value) -> Option<Value> {
+    let [r, g, b, _] = vectorcraft_plugins::manifest::color_value(cur).unwrap_or_default().to_rgba8(1.0);
+    let mut rgb = [r, g, b];
+    let changed = ui.push_id(id, |ui| ui.color_edit_button_srgb(&mut rgb).changed()).inner;
+    let picked = || crate::screen_color::sampled(&vectorcraft_color::cms::active(), rgb.map(|v| f32::from(v) / 255.0));
+    changed.then(|| serde_json::to_value(picked()).unwrap_or_default())
 }
 
 /// A `numberList` value as its field shows it: "45, 135".
@@ -554,6 +788,12 @@ pub(crate) fn unit_suffix(unit: &str) -> String {
     if unit.is_empty() || unit.starts_with(['°', '%', '′', '″']) { unit.to_string() } else { format!(" {unit}") }
 }
 
+/// What a resolution field shows after its value in the interface language: the `{n} ppi` row
+/// without its number (" ppi", French " ppp").
+pub(crate) fn ppi_suffix() -> String {
+    crate::i18n::fill_once(tl!("{n} ppi"), &[("n", "")])
+}
+
 /// A number of a list as [`value_field`] shows it: at most 4 decimals, without trailing zeros.
 fn number_text(x: f64) -> String {
     let s = format!("{x:.4}");
@@ -574,12 +814,24 @@ pub(crate) fn humanize(k: &str) -> String {
         }
     }
     match s.as_str() {
+        "Ppi" => "Resolution:".into(),
         "Dx" => "Horizontal".into(),
         "Dy" => "Vertical".into(),
         "Sx" => "Horizontal %".into(),
         "Sy" => "Vertical %".into(),
         "Radius1" => "Radius 1".into(),
         "Radius2" => "Radius 2".into(),
+        "Dash1" => "Dash 1:".into(),
+        "Dash2" => "Dash 2:".into(),
+        "Dash3" => "Dash 3:".into(),
+        "Dash4" => "Dash 4:".into(),
+        "Dash5" => "Dash 5:".into(),
+        "Gap1" => "Gap 1:".into(),
+        "Gap2" => "Gap 2:".into(),
+        "Gap3" => "Gap 3:".into(),
+        "Gap4" => "Gap 4:".into(),
+        "Gap5" => "Gap 5:".into(),
+        "Align Corners" => "Align to Corners and Ends:".into(),
         "Max Radius" => "Max. Radius:".into(),
         "Blur Mode" => "Mode:".into(),
         "Channel1" => "Channel 1:".into(),
@@ -593,15 +845,24 @@ pub(crate) fn humanize(k: &str) -> String {
         "Create" => "Create New Fields by:".into(),
         "Height Width" => "Height/Width:".into(),
         "Traps With Process Color" => "Traps with Process Color:".into(),
+        "Cols" => "Columns:".into(),
+        "Flip Cols" => "Flip Columns:".into(),
+        "Each" => "One per Object:".into(),
         _ => format!("{s}:"),
     }
 }
 
-/// [`humanize`] translated where it is painted: the ":" stays outside the translated text.
+/// A style attribute as the style dialogs list it: the [`humanized`] key, then its value.
+pub(super) fn attribute_line(key: &str, value: &Value) -> String {
+    format!("{} {value}", humanized(key))
+}
+
+/// [`humanize`] translated where it is painted: the ":" stays outside the translated text and is
+/// written as the UI language writes a label's colon ([`crate::i18n::colon`]).
 pub(super) fn humanized(k: &str) -> String {
     let h = humanize(k);
     match h.strip_suffix(':') {
-        Some(base) => format!("{}:", tl!(base)),
+        Some(base) => crate::i18n::colon(tl!(base)),
         None => tl!(&h).to_string(),
     }
 }
@@ -656,7 +917,7 @@ pub(super) fn slider_field_named(
     let v = d.f64(key, 0.0).clamp(min, max);
     let shown = crate::widgets::SliderValue::field(v, range.clone(), suffix, 0);
     slider_rail_valued(ui, d, key, name, range, Some(shown), track);
-    if let Some(n) = crate::widgets::range_field(ui, ("dlg-field", key), v, min..=max, suffix, 0, 52.0).filter(|n| *n != v) {
+    if let Some(n) = crate::widgets::range_field_named(ui, ("dlg-field", key), Some(name), v, min..=max, suffix, 0, 52.0).filter(|n| *n != v) {
         d.fields.insert(key.into(), json!(n));
     }
 }
@@ -674,7 +935,8 @@ pub(super) fn slider_rail_named(
     range: std::ops::RangeInclusive<f64>,
     track: &dyn Fn(f32) -> egui::Color32,
 ) {
-    let shown = crate::widgets::SliderValue::number(d.f64(key, 0.0), range.clone());
+    // Whole numbers, as a drag sets them.
+    let shown = crate::widgets::SliderValue { decimals: Some(0), ..crate::widgets::SliderValue::number(d.f64(key, 0.0), range.clone()) };
     slider_rail_valued(ui, d, key, name, range, Some(shown), track);
 }
 
@@ -697,8 +959,9 @@ pub(super) fn slider_rail_valued(
     let units = shown.as_ref().map(|s| s.range.clone());
     let (dragged, _, keyed) =
         crate::widgets::color_slider_stepped(ui, ("dlg-slider", key), name, shown, ((v - min) / (max - min)) as f32, SLIDER_WIDTH, track);
-    let keyed =
-        keyed.zip(units).map(|(k, u)| if u == range { k } else { (min + (k - u.start()) / (u.end() - u.start()) * (max - min)).clamp(min, max) });
+    // Not clamped to the rail: a screen reader's set value can reach a number past it that the
+    // field holds.
+    let keyed = keyed.zip(units).map(|(k, u)| if u == range { k } else { min + (k - u.start()) / (u.end() - u.start()) * (max - min) });
     if let Some(n) = dragged.map(|x| (min + x as f64 * (max - min)).round()).or(keyed).filter(|n| *n != held) {
         d.fields.insert(key.into(), json!(n));
     }
@@ -713,10 +976,21 @@ pub(super) fn slider_ends(ui: &mut egui::Ui, label_w: f32, ends: (&str, &str)) {
     });
 }
 
+/// [`slider_ends`] under a rail `width` wide that starts at the left edge of the row, for a slider
+/// with its label on the line above.
+pub(super) fn slider_ends_below(ui: &mut egui::Ui, width: f32, ends: (&str, &str)) {
+    ui.horizontal(|ui| rail_ends_w(ui, width, ends));
+}
+
 /// The words of [`slider_ends`] under a rail that starts where the next widget does.
-fn rail_ends(ui: &mut egui::Ui, (left, right): (&str, &str)) {
+fn rail_ends(ui: &mut egui::Ui, ends: (&str, &str)) {
+    rail_ends_w(ui, SLIDER_WIDTH, ends);
+}
+
+/// [`rail_ends`] under a rail `width` wide.
+fn rail_ends_w(ui: &mut egui::Ui, width: f32, (left, right): (&str, &str)) {
     let t = Tokens::get(ui.ctx());
-    let (r, _) = ui.allocate_exact_size(egui::vec2(SLIDER_WIDTH, 14.0), egui::Sense::hover());
+    let (r, _) = ui.allocate_exact_size(egui::vec2(width, 14.0), egui::Sense::hover());
     let font = egui::FontId::proportional(11.0);
     ui.painter().text(r.left_center(), egui::Align2::LEFT_CENTER, left, font.clone(), t.text_dim);
     ui.painter().text(r.right_center(), egui::Align2::RIGHT_CENTER, right, font, t.text_dim);
@@ -725,16 +999,29 @@ fn rail_ends(ui: &mut egui::Ui, (left, right): (&str, &str)) {
 /// The field where [`preview`] keeps the parameters it last previewed.
 pub(super) const PREVIEWED: &str = "__previewed";
 
+/// The field holding why the dialog's command last refused its values, for the dialog to show.
+pub(super) const REFUSED: &str = "__refused";
+
+/// Keeps why the command refused the dialog's values in [`REFUSED`]: a refused value's message is
+/// written for the user, so it goes without the command's id that the error's text puts before it.
+pub(super) fn note_refusal(d: &mut Dialog, e: &vectorcraft_engine::EngineError) {
+    let why = match e {
+        vectorcraft_engine::EngineError::BadParams { msg, .. } => msg.clone(),
+        other => other.to_string(),
+    };
+    d.fields.insert(REFUSED.into(), json!(why));
+}
+
 /// The Preview checkbox of a dialog that previews `cmd` on the canvas: while it is on, `params` run
 /// again on the interaction's snapshot whenever they differ from the last preview (whether a widget
 /// or `ui.dialog.set` changed them); turning it off rolls back.
-pub(super) fn preview(app: &mut crate::VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog, label: &str, cmd: &str, params: Value) {
+pub(crate) fn preview(app: &mut crate::VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog, label: &str, cmd: &str, params: Value) {
     let _ = preview_result(app, ui, d, label, cmd, params);
 }
 
 /// As [`preview`], returning the command's result only when a new preview succeeds.
 /// A dialog can retain a small summary (such as point counts) in its private fields.
-pub(super) fn preview_result(
+pub(crate) fn preview_result(
     app: &mut crate::VectorcraftApp,
     ui: &mut egui::Ui,
     d: &mut Dialog,
@@ -742,15 +1029,30 @@ pub(super) fn preview_result(
     cmd: &str,
     params: Value,
 ) -> Option<Value> {
-    const LAST: &str = PREVIEWED;
     ui.add_space(8.0);
-    let mut on = d.bool("preview");
+    preview_check(ui, d);
+    preview_or_rollback(app, d, label, cmd, params)
+}
+
+/// The Preview checkbox (field `preview`), for a dialog that draws it in its button row
+/// (`DialogSpec::footer_left`) instead of through [`preview`].
+pub(crate) fn preview_check(ui: &mut egui::Ui, d: &mut Dialog) {
+    let on = d.bool("preview");
     if crate::widgets::check(ui, tl!("Preview"), on, true) {
-        on = !on;
-        d.fields.insert("preview".into(), json!(on));
+        d.fields.insert("preview".into(), json!(!on));
     }
-    if !on {
-        if d.fields.remove(LAST).is_some() {
+}
+
+/// [`preview`] without its checkbox, which the dialog draws itself ([`preview_check`]): the preview
+/// runs while the field is on and rolls back when it is off.
+pub(crate) fn preview_without_check(app: &mut crate::VectorcraftApp, d: &mut Dialog, label: &str, cmd: &str, params: Value) {
+    let _ = preview_or_rollback(app, d, label, cmd, params);
+}
+
+/// [`preview_now`] while Preview is on; off, it rolls the preview back.
+fn preview_or_rollback(app: &mut crate::VectorcraftApp, d: &mut Dialog, label: &str, cmd: &str, params: Value) -> Option<Value> {
+    if !d.bool("preview") {
+        if d.fields.remove(PREVIEWED).is_some() {
             let _ = app.session.cancel_interaction();
         }
         return None;
@@ -764,10 +1066,21 @@ pub(super) fn preview_result(
 pub(super) fn preview_now(app: &mut crate::VectorcraftApp, d: &mut Dialog, label: &str, cmd: &str, params: Value) -> Option<Value> {
     let mut result = None;
     if d.fields.get(PREVIEWED) != Some(&params) || !app.session.in_interaction() {
-        let _ = app.session.begin_interaction(label);
+        // A failure to begin (typing that can't be kept) shows, and nothing previews on the
+        // interaction still in progress.
+        if let Err(e) = app.begin_interaction(label) {
+            app.status(e);
+            return None;
+        }
         match app.session.preview(cmd, &params) {
-            Ok(r) => result = Some(r),
-            Err(e) => app.status(e.to_string()),
+            Ok(r) => {
+                d.fields.remove(REFUSED);
+                result = Some(r);
+            }
+            Err(e) => {
+                note_refusal(d, &e);
+                app.status(e.to_string());
+            }
         }
         d.fields.insert(PREVIEWED.into(), params);
     }
@@ -777,7 +1090,7 @@ pub(super) fn preview_now(app: &mut crate::VectorcraftApp, d: &mut Dialog, label
 /// OK of a dialog using [`preview`]: keep the previewed `cmd` as one undo step (or run it when no
 /// preview runs) and close; the command's warning shows in the status bar either way. On an error
 /// the dialog stays open.
-pub(super) fn commit_preview(app: &mut crate::VectorcraftApp, cmd: &str, params: Value) -> Result<Value, String> {
+pub(crate) fn commit_preview(app: &mut crate::VectorcraftApp, cmd: &str, params: Value) -> Result<Value, String> {
     let r = if app.session.in_interaction() {
         match app.session.preview(cmd, &params) {
             Ok(v) => {
@@ -823,8 +1136,9 @@ pub(super) fn bleed(ui: &mut egui::Ui, d: &mut Dialog, unit: vectorcraft_doc::Un
         ui.spacing_mut().item_spacing.x = 6.0;
         for (i, side) in ["Top", "Bottom", "Left", "Right"].into_iter().enumerate() {
             ui.vertical(|ui| {
-                ui.label(egui::RichText::new(tl!(side)).size(11.0).color(t.text_dim));
-                if let Some(v) = crate::widgets::num_field(ui, ("bleed", i), Some(b[i]), unit, width) {
+                let label = ui.label(egui::RichText::new(tl!(side)).size(11.0).color(t.text_dim));
+                let v = ui.label_inputs_by(label.id, |ui| crate::widgets::num_field(ui, ("bleed", i), Some(b[i]), unit, width));
+                if let Some(v) = v {
                     changed = Some((i, v.clamp(0.0, vectorcraft_doc::setup::MAX_BLEED)));
                 }
             });
@@ -852,10 +1166,11 @@ pub(super) fn bleed(ui: &mut egui::Ui, d: &mut Dialog, unit: vectorcraft_doc::Un
     }
 }
 
-/// A small grey caption above a field (New Document's details column).
-pub(super) fn caption(ui: &mut egui::Ui, text: &str) {
+/// A small grey caption above a field (New Document's details column) → its response, so the field
+/// can be named by it.
+pub(super) fn caption(ui: &mut egui::Ui, text: &str) -> egui::Response {
     let t = Tokens::get(ui.ctx());
-    ui.label(egui::RichText::new(tl!(text)).size(11.0).color(t.text_dim));
+    ui.label(egui::RichText::new(tl!(text)).size(11.0).color(t.text_dim))
 }
 
 #[cfg(test)]
@@ -870,6 +1185,27 @@ mod plugin_field_tests {
         assert_eq!([shown("mm"), shown("°"), shown("%"), shown("1/min"), shown("µm")], ["5 mm", "5°", "5%", "5 1/min", "5 µm"]);
     }
 
+    /// A resolution field's unit is the `{n} ppi` row without its number.
+    #[test]
+    fn the_ppi_unit_is_translated() {
+        assert_eq!(ppi_suffix(), " ppi");
+        crate::i18n::set_current(crate::i18n::Lang::from_code("fr").unwrap());
+        let fr = ppi_suffix();
+        crate::i18n::set_current(crate::i18n::Lang::EN);
+        assert_eq!(fr, " ppp");
+    }
+
+    /// [`ppi_suffix`] drops the number from the `{n} ppi` row, so every catalog writes the number
+    /// first and then a space before the unit.
+    #[test]
+    fn every_catalog_writes_the_ppi_unit_after_the_number() {
+        for lang in crate::i18n::Lang::all() {
+            let row = crate::i18n::tr(lang, "{n} ppi");
+            let unit = row.strip_prefix("{n}").unwrap_or_default();
+            assert!(unit.starts_with(char::is_whitespace) && !unit.trim().is_empty(), "{}: {row:?}", lang.code());
+        }
+    }
+
     #[test]
     fn number_lists_read_as_typed_within_their_limits() {
         let spec = ParamSpec::NumberList { min: 0.0, max: 360.0, default: vec![45.0], min_items: 1, max_items: 3 };
@@ -880,6 +1216,98 @@ mod plugin_field_tests {
             assert_eq!(read_number_list(bad, &spec), None, "{bad:?}");
         }
         assert_eq!(read_number_list("1", &ParamSpec::Bool { default: false }), None, "not a list");
+    }
+}
+
+#[cfg(test)]
+mod settled_typing_tests {
+    use super::*;
+    use vectorcraft_engine::{Session, ViewInfo};
+    use vectorcraft_tools::{PointerEvent, PointerKind};
+
+    /// An app with Real-time Drawing off and " world" typed after "Hello", not yet applied → the
+    /// type's id.
+    fn typing(app: &mut crate::VectorcraftApp) -> u64 {
+        app.run("file.new", json!({"width": 400, "height": 400})).unwrap();
+        app.run("prefs.set", json!({"key": "realTimeDrawing", "value": false})).unwrap();
+        let id = app.run("text.create", json!({"x": 100, "y": 100, "text": "Hello", "size": 20})).unwrap()["id"].as_u64().unwrap();
+        let v = ViewInfo::default();
+        app.session.select_tool("type", v).unwrap();
+        let b = app.session.active().unwrap().doc.bounds_of(&[vectorcraft_doc::NodeId(id)], false).unwrap();
+        for k in [PointerKind::Down, PointerKind::Up] {
+            app.session.pointer(&PointerEvent::new(k, b.x1 - 1.0, b.center().y), v).unwrap();
+        }
+        app.session.tool_text(" world", v).unwrap();
+        id
+    }
+
+    fn plain(app: &crate::VectorcraftApp, id: u64) -> String {
+        match &app.session.active().unwrap().doc.node(vectorcraft_doc::NodeId(id)).unwrap().kind {
+            vectorcraft_doc::NodeKind::Text(t) => t.plain_text(),
+            _ => panic!("not text"),
+        }
+    }
+
+    /// A dialog's preview while typing is in progress keeps the typing as its own step and starts
+    /// from it; the status bar shows the warning of the typing's preview that keeping it applied.
+    #[test]
+    fn a_dialog_preview_keeps_the_typing_and_shows_its_warning() {
+        let mut app = crate::VectorcraftApp::new(Session::new(), Default::default());
+        let id = typing(&mut app);
+        assert_eq!(plain(&app, id), "Hello", "the typing waits");
+        let steps = app.session.active().unwrap().history.undo.len();
+        let mut d = Dialog::new("test", json!({}));
+        assert!(preview_now(&mut app, &mut d, "Fill Color", "paint.setFill", json!({"color": "#00a000"})).is_some());
+        assert_eq!(plain(&app, id), "Hello world");
+        let st = app.session.active().unwrap();
+        assert_eq!(st.history.undo.len(), steps + 1, "the typing is a step of its own");
+        assert_eq!(st.interaction.as_ref().map(|it| it.label.as_str()), Some("Fill Color"));
+
+        // The typing's deferred preview warns that type is skipped (as Bloat does with type selected).
+        let mut app = crate::VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 400, "height": 400})).unwrap();
+        let rect = app.run("shape.rectangle", json!({"x": 100, "y": 100, "width": 200, "height": 200})).unwrap();
+        let text = app.run("text.create", json!({"x": 300, "y": 200, "text": "Hi"})).unwrap();
+        app.run("select.set", json!({"ids": [rect["id"], text["id"]]})).unwrap();
+        app.run("prefs.set", json!({"key": "realTimeDrawing", "value": false})).unwrap();
+        app.session.begin_interaction("Typing").unwrap();
+        let p = json!({"tool": "bloat", "points": [[290.0, 200.0]], "width": 200.0, "height": 200.0});
+        app.session.doc_mut().unwrap().interaction.as_mut().unwrap().preview = Some(("object.liquify".into(), p));
+        app.ui.status.clear();
+        let mut d = Dialog::new("test", json!({}));
+        assert!(preview_now(&mut app, &mut d, "Fill Color", "paint.setFill", json!({"color": "#00a000"})).is_some());
+        assert!(app.ui.status.contains("type"), "{:?}", app.ui.status);
+    }
+
+    /// The font menus end the typing session before their preview: the typing Real-time Drawing
+    /// off left unapplied is kept as a step of its own.
+    #[test]
+    fn ending_typing_for_the_font_menus_keeps_the_typing() {
+        let mut app = crate::VectorcraftApp::new(Session::new(), Default::default());
+        let id = typing(&mut app);
+        let steps = app.session.active().unwrap().history.undo.len();
+        crate::panels::character::end_typing(&mut app);
+        assert_eq!(plain(&app, id), "Hello world");
+        let st = app.session.active().unwrap();
+        assert_eq!(st.history.undo.len(), steps + 1);
+        assert!(st.interaction.is_none());
+        assert_ne!(app.session.tool_options().get("typing").and_then(Value::as_bool), Some(true), "the typing session is over");
+    }
+
+    /// A Character panel change keeps the typing first and acts on the characters the Type tool
+    /// selected in the typed text, not on a selection cut short to the text before the typing.
+    #[test]
+    fn a_character_change_acts_on_characters_selected_in_the_typing() {
+        let mut app = crate::VectorcraftApp::new(Session::new(), Default::default());
+        let id = typing(&mut app);
+        app.session.set_tool_option("select", &json!({"start": 6, "end": 11}));
+        crate::panels::character::range_style(&mut app, json!({"underline": true}));
+        assert_eq!(plain(&app, id), "Hello world");
+        let vectorcraft_doc::NodeKind::Text(t) = &app.session.active().unwrap().doc.node(vectorcraft_doc::NodeId(id)).unwrap().kind else {
+            panic!("not text")
+        };
+        let underlined: String = t.runs.iter().filter(|r| r.style.underline).map(|r| r.text.as_str()).collect();
+        assert_eq!(underlined, "world");
     }
 }
 
@@ -914,7 +1342,7 @@ mod selected_text_tests {
             let mut d = Dialog::new("test", json!({"name": "Artboard 1"}));
             let id = std::cell::Cell::new(egui::Id::NULL);
             let mut add = |ui: &mut egui::Ui| {
-                id.set(ui.id().with(("dlg-text", "name")));
+                id.set(ui.scope_id().with(("dlg-text", "name")));
                 text_edit(ui, &mut d, "name", 120.0);
             };
             frame(&ctx, 0.0, vec![], &mut add);

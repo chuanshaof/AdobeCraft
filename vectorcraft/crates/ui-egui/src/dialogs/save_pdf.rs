@@ -4,7 +4,13 @@
 //! The fields are the `document.exportPdf` options (sections are objects such as `compression`),
 //! plus `preset`, `range`, `path?` and UI-only `__` keys, so agents fill the dialog with
 //! `ui.dialog.set`. OK runs `document.exportPdf` through [`io::export_pdf`]; the Summary is
-//! `document.pdfSettings`. Save Preset… names the settings as a preset (`pdf.preset.save`).
+//! `document.pdfSettings`, and its Save Summary… writes it to a text file (`ui.pdfSummary.save`).
+//! Save Preset… names the settings as a preset (`pdf.preset.save`).
+//! Opened from Export As with Use Artboards off (`__artBounds`), the dialog has no Artboards
+//! section, and OK writes one page of the visible art's bounds through [`io::export`]; opened
+//! from Export Selection (`__selection` too), the page is the selection's crop. While Alt (Option
+//! on macOS) is held, Cancel reads Reset, which puts the options back to the chosen preset's
+//! settings and leaves the dialog open (`ui.dialogReset`).
 //!
 //! The same dialog edits a preset (kind `pdfPreset`, from Edit → PDF Presets): a `name` and
 //! `description` instead of the preset and artboards, and OK saves the preset.
@@ -13,8 +19,8 @@ use std::sync::LazyLock;
 
 use serde_json::{Map, Value, json};
 use vectorcraft_doc::Unit;
-use vectorcraft_engine::cmd::FlattenOptions;
 use vectorcraft_engine::cmd::fileio::{SaveMode, pdf};
+use vectorcraft_engine::cmd::{FlattenOptions, FlattenerPreset};
 use vectorcraft_pdf::{
     Changes, Choice, ColorConversion, Compatibility, Downsample, Encryption, ImageCodec, JpegQuality, MarkKind, MonoCodec, Overprint, PdfSettings,
     Printing, ProfileInclusion, Standard,
@@ -27,7 +33,26 @@ use crate::{VectorcraftApp, io, widgets};
 
 pub(super) const KIND: &str = "savePdf";
 
-pub(super) const SPEC: DialogSpec = DialogSpec { heading: |_| tl!("Save PDF").into(), body, confirm, ok: Some("Save PDF"), ..DialogSpec::FORM };
+pub(super) const SPEC: DialogSpec = DialogSpec {
+    heading: |_| tl!("Save PDF").into(),
+    body,
+    confirm,
+    ok: Some("Save PDF"),
+    inputs: |_| &["path", "flattener"],
+    reset: Some(reset),
+    ..DialogSpec::FORM
+};
+
+/// Custom Transparency Flattener Options, opened over Save PDF by Custom… beside Flattener preset.
+pub(super) const CUSTOM_KIND: &str = "pdfFlattenerOptions";
+
+pub(super) const CUSTOM_SPEC: DialogSpec = DialogSpec {
+    heading: |_| tl!("Custom Transparency Flattener Options").into(),
+    body: custom_body,
+    confirm: custom_confirm,
+    min_width: 420.0,
+    ..DialogSpec::FORM
+};
 
 /// The dialog kind of the preset editor (New / Edit in Edit → PDF Presets).
 pub(super) const PRESET_KIND: &str = "pdfPreset";
@@ -44,6 +69,9 @@ pub(super) const PRESET_SPEC: DialogSpec = DialogSpec {
 const EDITING: &str = "__editing";
 /// Save PDF's field holding the name typed for Save Preset… (present while that row shows).
 const SAVE_AS: &str = "__savePresetAs";
+/// Save PDF's field that is true when the page is the bounds of the visible art (Export As with
+/// Use Artboards off) instead of the artboards.
+const ART_BOUNDS: &str = "__artBounds";
 
 pub(super) const SECTIONS: [&str; 7] = ["General", "Compression", "Marks and Bleeds", "Output", "Advanced", "Security", "Summary"];
 
@@ -75,9 +103,27 @@ pub(super) const LIST_WIDTH: f32 = 150.0;
 pub(super) const TOP_LABEL_WIDTH: f32 = LIST_WIDTH + 26.0;
 
 /// Open the dialog with `params` (`document.exportPdf` options and `path?`) applied over their
-/// preset.
+/// preset. `useArtboards: false` makes the page the bounds of the visible art.
 pub fn open(app: &mut VectorcraftApp, params: &Value) -> Result<Value, String> {
+    let art_bounds = match params.get("useArtboards") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => !b,
+        Some(v) => return Err(format!("useArtboards must be true or false, not {v}")),
+    };
     let mut fields = settings_fields(app, params)?;
+    // The PDF settings keep no flattener options: those asked for go over the flattener preset.
+    match params.get("flattener") {
+        None | Some(Value::Null) => {}
+        Some(f @ Value::Object(o)) => {
+            let known = serde_json::to_value(FlattenOptions::default()).unwrap_or_default();
+            if let Some(k) = o.keys().find(|k| known.get(k.as_str()).is_none()) {
+                return Err(format!("flattener.{k} is not a flattener option"));
+            }
+            FlattenOptions::for_export(None, Some(f), &[]).map_err(|e| format!("flattener: {e}"))?;
+            fields.insert("flattener".into(), f.clone());
+        }
+        Some(v) => return Err(format!("flattener must be an object of flattener options, not {v}")),
+    }
     let s = |k: &str| params.get(k).and_then(Value::as_str);
     fields.insert("preset".into(), json!(s("preset").unwrap_or(pdf::DEFAULT_PRESET)));
     fields.insert("__presets".into(), json!(pdf::presets(&app.session)));
@@ -86,6 +132,9 @@ pub fn open(app: &mut VectorcraftApp, params: &Value) -> Result<Value, String> {
     fields.insert("range".into(), json!(s("range").unwrap_or("")));
     if let Some(path) = s("path") {
         fields.insert("path".into(), json!(path));
+    }
+    if art_bounds {
+        fields.insert(ART_BOUNDS.into(), json!(true));
     }
     app.ui.dialog = Some(Dialog { kind: KIND.into(), fields });
     Ok(Value::Null)
@@ -116,18 +165,43 @@ fn settings_fields(app: &VectorcraftApp, params: &Value) -> Result<Map<String, V
 /// The `document.exportPdf` params the dialog stands for.
 fn params(d: &Dialog) -> Value {
     let mut p = form::params(d);
-    if (d.bool("__allArtboards") || d.str("range").trim().is_empty())
-        && let Some(o) = p.as_object_mut()
-    {
-        o.remove("range");
+    let art = d.bool(ART_BOUNDS);
+    if let Some(o) = p.as_object_mut() {
+        if art || d.bool("__allArtboards") || d.str("range").trim().is_empty() {
+            o.remove("range");
+        }
+        if art {
+            o.insert("useArtboards".into(), json!(false));
+        }
     }
     p
 }
 
-/// Save PDF: write the file (a PDF copy, or the PDF a Save As / Save a Copy asked for, `__save`);
-/// the dialog stays open when that fails (bad range, cancelled save…). While Save Preset… asks for
-/// a name, OK (and Enter) saves the preset instead.
+/// The field that holds why the last Save PDF failed, shown in the dialog (the status bar sits
+/// behind it, #6861).
+const ERROR: &str = "__error";
+
+/// Save PDF: write the file (see [`write`]). When that fails the dialog stays open and says why,
+/// under its sections, as well as in the status bar the dialog covers.
 fn confirm(app: &mut VectorcraftApp, d: &Dialog) -> Result<Value, String> {
+    let r = write(app, d);
+    if let Some(open) = app.ui.dialog.as_mut().filter(|o| o.kind == d.kind) {
+        match &r {
+            Err(e) => {
+                open.fields.insert(ERROR.into(), json!(e));
+            }
+            Ok(_) => {
+                open.fields.remove(ERROR);
+            }
+        }
+    }
+    r
+}
+
+/// Write the file (a PDF copy, or the PDF a Save As / Save a Copy asked for, `__save`); the
+/// dialog stays open when that fails (bad range, cancelled save…). While Save Preset… asks for a
+/// name, OK (and Enter) saves the preset instead.
+fn write(app: &mut VectorcraftApp, d: &Dialog) -> Result<Value, String> {
     if d.fields.contains_key(SAVE_AS) {
         let mut d = d.clone();
         let r = save_preset(app, &mut d);
@@ -136,12 +210,24 @@ fn confirm(app: &mut VectorcraftApp, d: &Dialog) -> Result<Value, String> {
     }
     let r = match SaveMode::of(&d.str("__save")) {
         Some(mode) => io::save_pdf(app, mode, params(d)),
+        None if d.bool(ART_BOUNDS) => export_art(app, d),
         None => io::export_pdf(app, params(d)),
     };
-    if r.is_ok() {
+    // A question the write asked (replace the file the document was opened from?) stays open.
+    if r.is_ok() && app.ui.dialog.as_ref().is_some_and(|o| o.kind == KIND) {
         app.ui.dialog = None;
     }
     r
+}
+
+/// A page of the art's bounds (Export As with Use Artboards off), or of the selection's crop
+/// (Export Selection): written as Export As writes other formats ([`io::export`]), with the
+/// dialog's options and a saved preset written out.
+fn export_art(app: &mut VectorcraftApp, d: &Dialog) -> Result<Value, String> {
+    let mut p = params(d);
+    let path = p.as_object_mut().and_then(|o| o.remove("path")).and_then(|v| v.as_str().map(str::to_string));
+    let p = pdf::expand_preset(&app.session, "file.exportAs", &p).map_err(|e| e.to_string())?.into_owned();
+    io::export(app, Some("pdf"), path, &super::export_as::exported(d, p))
 }
 
 /// The settings as `pdf.preset.save` params (without the artboards and path).
@@ -256,11 +342,13 @@ pub(super) fn row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui
 pub(super) fn row_with(ui: &mut egui::Ui, label: &str, width: f32, add: impl FnOnce(&mut egui::Ui)) {
     let t = Tokens::get(ui.ctx());
     ui.horizontal(|ui| {
-        ui.allocate_ui_with_layout(egui::vec2(width, 24.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            ui.set_min_width(width);
-            ui.label(egui::RichText::new(label).color(t.text));
-        });
-        add(ui);
+        let label_id = ui
+            .allocate_ui_with_layout(egui::vec2(width, 24.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.set_min_width(width);
+                ui.label(egui::RichText::new(label).color(t.text)).id
+            })
+            .inner;
+        ui.label_inputs_by(label_id, add);
     });
 }
 
@@ -292,6 +380,19 @@ pub(super) fn pick<T: Choice>(ui: &mut egui::Ui, d: &mut Dialog, path: &str, wid
     true
 }
 
+/// [`pick`] with a first entry, `unset`, for a setting that isn't set: shown while the value at
+/// `path` isn't one of the choices, and stored as [`vectorcraft_pdf::UNSET_CHOICE`] when chosen.
+fn pick_or_unset<T: Choice>(ui: &mut egui::Ui, d: &mut Dialog, path: &str, width: f32, unset: &str) -> bool {
+    let current = choice_index::<T>(d, path).map_or(0, |i| i + 1);
+    let lang = crate::i18n::current();
+    let labels: Vec<&str> = std::iter::once(unset).chain(T::LABELS.iter().map(|label| choice_label(lang, path, label))).collect();
+    let label = labels.get(current).copied().unwrap_or(unset);
+    let Some(i) = widgets::dropdown_with(ui, path, label, &labels, width, |_| true) else { return false };
+    let id = i.checked_sub(1).and_then(|i| T::IDS.get(i)).copied().unwrap_or(vectorcraft_pdf::UNSET_CHOICE);
+    set(d, path, json!(id));
+    true
+}
+
 /// Printer mark styles use adjectives, separately from interface language names.
 pub(super) fn choice_label<'a>(lang: crate::i18n::Lang, path: &str, label: &'a str) -> &'a str {
     if path == "marks.kind" { crate::i18n::tr_ctx(lang, "mark-style", label) } else { crate::i18n::tr(lang, label) }
@@ -318,7 +419,7 @@ pub(super) fn length(ui: &mut egui::Ui, d: &mut Dialog, path: &str, unit: Unit, 
 
 pub(super) fn text(ui: &mut egui::Ui, d: &mut Dialog, path: &str, enabled: bool) {
     let mut s = get(d, path).as_str().unwrap_or_default().to_string();
-    if ui.add_enabled(enabled, egui::TextEdit::singleline(&mut s).desired_width(240.0)).changed() {
+    if ui.add_enabled(enabled, egui::TextEdit::singleline(&mut s).align(egui::Align2::LEFT_CENTER).desired_width(240.0)).changed() {
         set(d, path, json!(s));
     }
 }
@@ -353,7 +454,8 @@ fn body(app: &mut VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) -> bool {
         ui.vertical(|ui| {
             ui.set_width(500.0);
             ui.label(egui::RichText::new(tl!(section)).font(theme::semibold(14.0)).color(t.text_strong));
-            egui::ScrollArea::vertical().id_salt(("save-pdf", section)).max_height(360.0).auto_shrink([false, false]).show(ui, |ui| match section {
+            let list_h = super::modal::list_height(ui, 360.0);
+            egui::ScrollArea::vertical().id_salt(("save-pdf", section)).max_height(list_h).auto_shrink([false, false]).show(ui, |ui| match section {
                 "Compression" => compression(ui, d),
                 "Marks and Bleeds" => marks_and_bleeds(app, ui, d),
                 "Output" => output(ui, d),
@@ -362,6 +464,10 @@ fn body(app: &mut VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) -> bool {
                 "Summary" => summary(app, ui, d),
                 _ => general(ui, d, editor),
             });
+            if let Some(e) = d.fields.get(ERROR).and_then(Value::as_str) {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(crate::i18n::message(crate::i18n::current(), e)).color(t.error));
+            }
         });
     });
     false
@@ -397,7 +503,8 @@ pub(super) fn section_list(ui: &mut egui::Ui, d: &mut Dialog, sections: &[&str],
 
 /// What choosing `standard` changes: the compatibility, to its version unless it allows the one
 /// chosen, and off what files of a standard can't have (editing data, passwords; layers in PDF/X-1a
-/// and PDF/X-3).
+/// and PDF/X-3). In PDF/X-3 and PDF/X-4, Profile inclusion goes back to unset: the picker is
+/// disabled there, and `none` would write every CMYK color as DeviceCMYK.
 fn standard_chosen(d: &mut Dialog, standard: Standard) {
     if choice::<Compatibility>(d, "compatibility").is_some_and(|c| !standard.allows(c)) {
         set(d, "compatibility", json!(standard.version().id()));
@@ -410,6 +517,9 @@ fn standard_chosen(d: &mut Dialog, standard: Standard) {
     }
     if !standard.allows_layers() {
         set(d, "createLayers", json!(false));
+    }
+    if standard.is_pdfx() && !standard.cmyk_only() {
+        set(d, "output.profiles", json!(vectorcraft_pdf::UNSET_CHOICE));
     }
 }
 
@@ -449,6 +559,10 @@ fn preset_rows(app: &mut VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) {
                 d.fields.remove(SAVE_AS);
             }
         });
+        // `pdf.preset.save` keeps `flattenerPreset` but not `flattener`.
+        if d.fields.contains_key("flattener") {
+            note(ui, tl!("The PDF preset keeps the flattener preset but not the Custom… settings."));
+        }
     }
 }
 
@@ -456,11 +570,33 @@ fn preset_rows(app: &mut VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) {
 fn apply_preset(app: &mut VectorcraftApp, d: &mut Dialog, name: &str) {
     match settings_fields(app, &json!({ "preset": name })) {
         Ok(settings) => {
-            d.fields.extend(settings);
+            replace_settings(d, settings);
             d.fields.insert("preset".into(), json!(name));
         }
         Err(e) => app.status(e),
     }
+}
+
+/// The UI-only fields that stand for options: the Security section's password checkboxes.
+const OPTION_FLAGS: [&str; 2] = ["__requireOpenPassword", "__restrictPermissions"];
+
+/// Replace every option with `settings` (from [`settings_fields`]), the password checkboxes
+/// included, and let the bleed link follow the new values. The preset, the artboard choice, the
+/// path and the other UI-only fields (the section, the Save Preset name) stay.
+fn replace_settings(d: &mut Dialog, settings: Map<String, Value>) {
+    d.fields.retain(|k, _| {
+        matches!(k.as_str(), "preset" | "range" | "path") || (k.starts_with("__") && !OPTION_FLAGS.contains(&k.as_str()) && k != BLEED_LINKED)
+    });
+    d.fields.extend(settings);
+}
+
+/// Reset (Cancel with Alt or Option held): the options go back to the chosen preset's settings, as
+/// choosing that preset sets them, and the dialog stays open. A preset that can no longer be found
+/// (a saved one deleted while the dialog is open) is an error, and the dialog is left as it is.
+fn reset(app: &VectorcraftApp, d: &mut Dialog) -> Result<(), String> {
+    let settings = settings_fields(app, &json!({ "preset": d.str("preset") }))?;
+    replace_settings(d, settings);
+    Ok(())
 }
 
 /// General: the options, then the artboards (Save PDF) or the description (preset editor).
@@ -475,11 +611,20 @@ fn general(ui: &mut egui::Ui, d: &mut Dialog, editor: bool) {
     let layers = standard.allows_layers() && choice::<Compatibility>(d, "compatibility").unwrap_or_default().has_layers();
     flag(ui, d, "createLayers", tl!("Create PDF layers from layers and sublayers"), layers);
     flag(ui, d, "includeNonPrinting", tl!("Include non-printing layers"), true);
+    // PDF/X files and PDF 1.3 and 1.4 files always write long pages in points, and PDF/A files
+    // keep the `UserUnit`.
+    let compatibility = choice::<Compatibility>(d, "compatibility").unwrap_or_default();
+    let scales = standard == Standard::None && !matches!(compatibility, Compatibility::Pdf13 | Compatibility::Pdf14);
+    flag(ui, d, "longPagesInPoints", tl!("Write pages longer than 200 in at full size in points"), scales);
     if editor {
         heading(ui, tl!("Description"));
-        if let Some(text) = widgets::text_field(ui, "pdf-preset-description", Some(&d.str("description")), 460.0, 3) {
+        if let Some(text) = widgets::text_field_named(ui, "pdf-preset-description", Some(tl!("Description")), Some(&d.str("description")), 460.0, 3) {
             d.fields.insert("description".into(), json!(text));
         }
+        return;
+    }
+    // A page of the art's bounds has no artboards to choose.
+    if d.bool(ART_BOUNDS) {
         return;
     }
     heading(ui, tl!("Artboards"));
@@ -490,7 +635,10 @@ fn general(ui: &mut egui::Ui, d: &mut Dialog, editor: bool) {
             d.fields.insert("__allArtboards".into(), json!(all));
         }
         let mut range = d.str("range");
-        if ui.add_enabled(!all, egui::TextEdit::singleline(&mut range).desired_width(140.0).hint_text("1-3, 5")).changed() {
+        if ui
+            .add_enabled(!all, egui::TextEdit::singleline(&mut range).align(egui::Align2::LEFT_CENTER).desired_width(140.0).hint_text("1-3, 5"))
+            .changed()
+        {
             d.fields.insert("range".into(), json!(range));
         }
     });
@@ -503,9 +651,10 @@ fn image_rows(ui: &mut egui::Ui, d: &mut Dialog, key: &str, title: &str) {
     ui.horizontal(|ui| {
         pick::<Downsample>(ui, d, &format!("{base}.downsample"), 150.0, |_| true);
         ui.label(tl!("to"));
-        number(ui, d, &format!("{base}.ppi"), " ppi", on);
+        let ppi = super::ppi_suffix();
+        number(ui, d, &format!("{base}.ppi"), &ppi, on);
         ui.label(tl!("above"));
-        number(ui, d, &format!("{base}.abovePpi"), " ppi", on);
+        number(ui, d, &format!("{base}.abovePpi"), &ppi, on);
     });
     ui.horizontal(|ui| {
         ui.label(tl!("Compression:"));
@@ -569,23 +718,109 @@ pub(super) fn marks_and_bleeds(app: &VectorcraftApp, ui: &mut egui::Ui, d: &mut 
     flag(ui, d, "bleed.useDocument", tl!("Use document bleed settings"), true);
     // With the document's bleed the fields show it (Document Setup's `[top, bottom, left, right]`).
     let document = (get(d, "bleed.useDocument").as_bool() == Some(true)).then(|| app.session.active().map_or([0.0; 4], |s| s.doc.setup.bleed));
-    egui::Grid::new("pdf-bleed").num_columns(4).spacing([10.0, 6.0]).show(ui, |ui| {
-        for pair in [
-            [(0, "bleed.top", tl!("Top:")), (1, "bleed.bottom", tl!("Bottom:"))],
-            [(2, "bleed.left", tl!("Left:")), (3, "bleed.right", tl!("Right:"))],
-        ] {
-            for (i, p, label) in pair {
-                ui.label(label);
-                match document {
-                    Some(b) => {
-                        ui.add_enabled_ui(false, |ui| widgets::num_field(ui, p, b.get(i).copied(), unit, 80.0));
+    // Save PDF and the PDF preset editor link the four sides; Print's Marks and Bleed doesn't.
+    let pdf = d.kind == KIND || d.kind == PRESET_KIND;
+    ui.horizontal(|ui| {
+        egui::Grid::new("pdf-bleed").num_columns(4).spacing([10.0, 6.0]).show(ui, |ui| {
+            for pair in [
+                [(0, "bleed.top", tl!("Top:")), (1, "bleed.bottom", tl!("Bottom:"))],
+                [(2, "bleed.left", tl!("Left:")), (3, "bleed.right", tl!("Right:"))],
+            ] {
+                for (i, p, label) in pair {
+                    ui.label(label);
+                    match document {
+                        Some(b) => {
+                            ui.add_enabled_ui(false, |ui| widgets::num_field(ui, p, b.get(i).copied(), unit, 80.0));
+                        }
+                        None if pdf => {
+                            if let Some(x) = widgets::num_field(ui, p, get(d, p).as_f64(), unit, 80.0) {
+                                edit_bleed(d, i, x);
+                            }
+                        }
+                        None => length(ui, d, p, unit, true),
                     }
-                    None => length(ui, d, p, unit, true),
                 }
+                ui.end_row();
             }
-            ui.end_row();
+        });
+        if pdf {
+            let linked = bleed_linked(d);
+            let tip = if linked { tl!("Make the bleed values differ") } else { tl!("Make all bleed settings the same") };
+            // With the document's bleed the link is grayed out and keeps its state for the custom values.
+            let clicked = ui
+                .add_enabled_ui(document.is_none(), |ui| widgets::icon_button(ui, if linked { "link" } else { "link-2-off" }, tip, linked, 24.0))
+                .inner
+                .clicked();
+            if clicked {
+                link_bleed(d, !linked);
+            }
         }
     });
+}
+
+/// The custom bleed's sides in Save PDF and the PDF preset editor, `[top, bottom, left, right]`.
+const BLEED_SIDES: [&str; 4] = ["bleed.top", "bleed.bottom", "bleed.left", "bleed.right"];
+/// The field holding whether the link keeps the four custom bleed values the same. Without it,
+/// the sides are linked when they are equal (a preset's, or ones `ui.dialog.set` set).
+const BLEED_LINKED: &str = "__bleedLinked";
+
+/// Whether the custom bleed's sides are linked.
+fn bleed_linked(d: &Dialog) -> bool {
+    d.fields.get(BLEED_LINKED).and_then(Value::as_bool).unwrap_or_else(|| {
+        let top = get(d, BLEED_SIDES[0]).as_f64();
+        BLEED_SIDES[1..].iter().all(|p| get(d, p).as_f64() == top)
+    })
+}
+
+/// Link (every side takes the top's value) or unlink (the sides keep their values) the bleed.
+fn link_bleed(d: &mut Dialog, on: bool) {
+    d.fields.insert(BLEED_LINKED.into(), json!(on));
+    if on {
+        let top = get(d, BLEED_SIDES[0]).as_f64().unwrap_or(0.0);
+        for p in &BLEED_SIDES[1..] {
+            set(d, p, json!(top));
+        }
+    }
+}
+
+/// Side `side` of the custom bleed was edited to `value`: linked, every side takes it. The link
+/// keeps the state it had before the edit, so an unlinked edit that makes the sides equal leaves
+/// it off.
+fn edit_bleed(d: &mut Dialog, side: usize, value: f64) {
+    let linked = bleed_linked(d);
+    d.fields.insert(BLEED_LINKED.into(), json!(linked));
+    if linked {
+        for p in BLEED_SIDES {
+            set(d, p, json!(value));
+        }
+    } else if let Some(p) = BLEED_SIDES.get(side) {
+        set(d, p, json!(value));
+    }
+}
+
+/// `ui.dialog.set` set `field` of Save PDF or the PDF preset editor: `__bleedLinked` links or
+/// unlinks the bleed as its button does, and must be true or false; every write of `bleed`, the
+/// same values included, drops the link's state, so the link follows the values set. A flattener
+/// preset set there drops the Custom… options, as choosing it in the dropdown does.
+pub(super) fn field_set(d: &mut Dialog, field: &str) -> Result<(), String> {
+    match field {
+        BLEED_LINKED => match d.fields.get(BLEED_LINKED).cloned() {
+            Some(Value::Bool(on)) => {
+                link_bleed(d, on);
+                Ok(())
+            }
+            v => Err(format!("{BLEED_LINKED} must be true or false, not {}", v.unwrap_or(Value::Null))),
+        },
+        "bleed" => {
+            d.fields.remove(BLEED_LINKED);
+            Ok(())
+        }
+        "flattenerPreset" => {
+            d.fields.remove("flattener");
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// A dropdown of names such as colour profiles or flattener presets (`names`, the first one
@@ -618,11 +853,28 @@ fn output(ui: &mut egui::Ui, d: &mut Dialog) {
         .collect();
     row(ui, tl!("Destination:"), |ui| profile_pick(ui, d, "output.destination", &destinations, 2, converting));
     row(ui, tl!("Profile inclusion:"), |ui| {
-        // A standard decides whether colours are tagged.
-        ui.add_enabled_ui(standard == Standard::None, |ui| pick::<ProfileInclusion>(ui, d, "output.profiles", 300.0, |_| true));
+        // A standard decides whether colours are tagged. Not set, colors are untagged and gray and
+        // RGB images keep their profiles (shown as Default).
+        ui.add_enabled_ui(standard == Standard::None, |ui| pick_or_unset::<ProfileInclusion>(ui, d, "output.profiles", 300.0, tl!("Default")));
     });
     if standard.cmyk_only() {
         note(ui, tl!("PDF/X-1a files are CMYK: every colour is converted to the destination (blank: the output intent's CMYK profile), untagged."));
+    } else if standard.is_pdfx() {
+        note(
+            ui,
+            tl!(
+                "Files of this standard tag their colors with ICC profiles, except CMYK colors in the output intent's profile, which are written as DeviceCMYK."
+            ),
+        );
+        // A preset or the dialog's params can bring `none` with the standard; the picker can't change it.
+        if choice::<ProfileInclusion>(d, "output.profiles") == Some(ProfileInclusion::None) {
+            note(
+                ui,
+                tl!(
+                    "With Don't include profiles and a CMYK output intent, every CMYK color is written as DeviceCMYK unless it is converted to a CMYK destination of another profile."
+                ),
+            );
+        }
     } else if standard != Standard::None {
         note(ui, tl!("Files of this standard tag their colours with ICC profiles."));
     }
@@ -644,6 +896,103 @@ fn output(ui: &mut egui::Ui, d: &mut Dialog) {
     }
 }
 
+/// The name of the flattener preset Save PDF `d` flattens with: its `flattenerPreset` (High
+/// Resolution when empty), a built-in one named by id (`high`) as its name.
+fn flattener_name(d: &Dialog) -> String {
+    let name = get(d, "flattenerPreset").as_str().map(str::trim).filter(|n| !n.is_empty()).unwrap_or(pdf::DEFAULT_FLATTENER);
+    FlattenOptions::preset_label(&name.to_ascii_lowercase()).unwrap_or(name).to_string()
+}
+
+/// The flattener options Save PDF `d` flattens with: its preset, with the Custom… options over it.
+fn flattener(d: &Dialog, saved: &[FlattenerPreset]) -> Result<FlattenOptions, String> {
+    FlattenOptions::for_export(Some(&flattener_name(d)), d.fields.get("flattener"), saved)
+}
+
+/// The switches the PDF 1.3 writer sets itself, which Custom Transparency Flattener Options show
+/// but can't change: rasterized areas are always clipped to their regions and keep no alpha, and
+/// overprints are kept only with Overprint set to Preserve.
+const FIXED: [&str; 3] = ["clipComplexRegions", "preserveAlpha", "preserveOverprints"];
+
+/// `o` as the PDF 1.3 writer flattens with it (see [`FIXED`]), for Save PDF `parent`.
+fn as_written(o: &mut FlattenOptions, parent: &Dialog) {
+    o.clip_complex_regions = true;
+    o.preserve_alpha = false;
+    o.preserve_overprints &= choice::<Overprint>(parent, "advanced.overprint") != Some(Overprint::Discard);
+}
+
+/// Custom Transparency Flattener Options over Save PDF `parent`, on the options it flattens with
+/// (the default preset's while those are not valid).
+pub(super) fn over(parent: &Dialog, saved: &[FlattenerPreset]) -> Dialog {
+    let mut o = flattener(parent, saved).unwrap_or_else(|_| FlattenOptions::preset(pdf::DEFAULT_FLATTENER).unwrap_or_default());
+    let kept = o.preserve_overprints;
+    as_written(&mut o, parent);
+    let mut d = Dialog::new(CUSTOM_KIND, json!({}));
+    super::flatten::put_options(&mut d.fields, &o);
+    d.fields.insert(KEPT_OVERPRINTS.into(), json!(kept));
+    d.fields.insert(super::PARENT.into(), serde_json::to_value(parent).unwrap_or_default());
+    d
+}
+
+/// The `preserveOverprints` value of the options Custom Transparency Flattener Options opened on,
+/// before Overprint applies to it.
+const KEPT_OVERPRINTS: &str = "__keptOverprints";
+
+/// The options Custom Transparency Flattener Options `d` holds.
+fn custom_options(d: &Dialog) -> Result<FlattenOptions, String> {
+    FlattenOptions::from_params_with(&Value::Object(d.fields.clone()), &[])
+}
+
+/// The flattener options, with the switches of [`FIXED`] showing what the PDF 1.3 writer does.
+fn custom_body(_app: &mut VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) -> bool {
+    let current = custom_options(d);
+    // Values refused stay as entered, so that changing another option keeps them.
+    let (mut o, unread) = super::flatten::shown_options(&d.fields, &current);
+    if let Some(parent) = super::parent(d) {
+        as_written(&mut o, &parent);
+    }
+    super::flatten::fields_editor(ui, "pdf-flattener", &mut d.fields, &mut o, &unread, &FIXED);
+    if let Err(e) = &current {
+        ui.label(egui::RichText::new(e).color(Tokens::get(ui.ctx()).text_dim).size(11.5));
+    }
+    ui.add_space(8.0);
+    form::caption(ui, tl!("PDF 1.3 files clip rasterized areas to their regions, and Overprint sets whether overprints are kept."));
+    false
+}
+
+/// OK: Save PDF again, flattening with these options over its preset (High Resolution when a saved
+/// preset was deleted meanwhile). Options equal to the preset's leave the preset alone; bad options
+/// keep the dialog open.
+fn custom_confirm(app: &mut VectorcraftApp, d: &Dialog) -> Result<Value, String> {
+    let mut o = custom_options(d)?;
+    let mut parent = super::parent(d).ok_or("the dialog it was opened over is no longer open")?;
+    let kept = d
+        .fields
+        .get(KEPT_OVERPRINTS)
+        .and_then(Value::as_bool)
+        .or_else(|| flattener(&parent, &app.session.prefs.flattener_presets).ok().map(|before| before.preserve_overprints));
+    let base = match FlattenOptions::find_preset(&flattener_name(&parent), &app.session.prefs.flattener_presets) {
+        Some(base) => base,
+        None => {
+            set(&mut parent, "flattenerPreset", json!(""));
+            FlattenOptions::preset(pdf::DEFAULT_FLATTENER).unwrap_or_default()
+        }
+    };
+    // The writer sets the first two itself, so they take the preset's values: options that
+    // otherwise match the preset leave its name showing. The writer keeps overprints only where the
+    // options and Overprint both keep them, so the options keep the value they opened with, even
+    // when their preset was deleted, changed or made again under its name meanwhile.
+    o.clip_complex_regions = base.clip_complex_regions;
+    o.preserve_alpha = base.preserve_alpha;
+    o.preserve_overprints = kept.unwrap_or(o.preserve_overprints);
+    if o == base {
+        parent.fields.remove("flattener");
+    } else {
+        parent.fields.insert("flattener".into(), serde_json::to_value(&o).map_err(|e| e.to_string())?);
+    }
+    app.ui.dialog = Some(parent);
+    Ok(Value::Null)
+}
+
 fn advanced(app: &VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) {
     heading(ui, tl!("Fonts"));
     let outline = get(d, "advanced.outlineText").as_bool() == Some(true);
@@ -661,19 +1010,37 @@ fn advanced(app: &VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) {
         || choice::<Standard>(d, "standard").is_some_and(Standard::flattens);
     row(ui, tl!("Flattener preset:"), |ui| {
         let presets = app.session.flattener_presets();
-        let names: Vec<&str> = presets.iter().map(|p| p.name.as_str()).collect();
-        // The built-in presets come first (translated); the saved ones are names.
-        let builtins = names.len().saturating_sub(app.session.prefs.flattener_presets.len());
-        let name = get(d, "flattenerPreset").as_str().map(str::trim).filter(|n| !n.is_empty()).unwrap_or(pdf::DEFAULT_FLATTENER);
-        // A built-in preset named by id (`high`) shows as its name.
-        let current = FlattenOptions::preset_label(&name.to_ascii_lowercase()).unwrap_or(name).to_string();
+        let saved = &app.session.prefs.flattener_presets;
+        // [Custom] while Custom… options differ from the preset's.
+        let current = flattener(d, saved).ok();
+        // The preset as the list names it: the export finds a name in any case.
+        let name = flattener_name(d);
+        let name = presets.iter().find(|p| p.name.eq_ignore_ascii_case(name.trim())).map_or(name.as_str(), |p| p.name.as_str());
+        let mut custom = false;
         ui.add_enabled_ui(flat, |ui| {
-            if let Some(n) = super::mixed_dropdown(ui, "flattenerPreset", &current, &names, 200.0, |k| k < builtins).and_then(|i| names.get(i)) {
-                set(d, "flattenerPreset", json!(n));
+            if let Some(p) = super::flatten::preset_dropdown(ui, "flattenerPreset", &presets, name, current.as_ref(), 200.0) {
+                set(d, "flattenerPreset", json!(p.name));
+                d.fields.remove("flattener");
             }
+            // PDF presets keep no custom flattener options, so the preset editor has no Custom….
+            custom = d.kind == KIND && widgets::flat_button_fit(ui, tl!("Custom…"), 72.0).clicked();
         });
+        if custom {
+            *d = over(d, saved);
+        }
     });
-    if !flat {
+    if flat {
+        let name = get(d, "flattenerPreset").as_str().map(str::trim).filter(|n| !n.is_empty()).unwrap_or(pdf::DEFAULT_FLATTENER);
+        let preset_opts = FlattenOptions::for_export(Some(name), d.fields.get("flattener"), &app.session.prefs.flattener_presets).unwrap_or_default();
+        let line_ppi = preset_opts.line_art_ppi.round() as u32;
+        let grad_ppi = preset_opts.gradient_ppi.round() as u32;
+        note(
+            ui,
+            &crate::i18n::fmt(
+                tl!("Raster resolution: {line_ppi} ppi line art and text, {grad_ppi} ppi gradient and mesh"),
+                &[("line_ppi", &line_ppi.to_string()), ("grad_ppi", &grad_ppi.to_string())],
+            ),
+        );
         note(ui, tl!("PDF 1.3 files have no transparency: the preset flattens it."));
     }
 }
@@ -697,7 +1064,7 @@ fn password_check(ui: &mut egui::Ui, d: &mut Dialog, path: &str, flag: &str, lab
 
 fn password_field(ui: &mut egui::Ui, d: &mut Dialog, path: &str, enabled: bool) {
     let mut s = get(d, path).as_str().unwrap_or_default().to_string();
-    if ui.add_enabled(enabled, egui::TextEdit::singleline(&mut s).password(true).desired_width(200.0)).changed() {
+    if ui.add_enabled(enabled, egui::TextEdit::singleline(&mut s).password(true).align(egui::Align2::LEFT_CENTER).desired_width(200.0)).changed() {
         set(d, path, json!(s));
     }
 }
@@ -763,57 +1130,202 @@ pub(super) fn option_label(option: &str) -> String {
 }
 
 /// `document.pdfSettings` for the dialog with the document's warnings (an export in memory),
-/// cached until a field or the document changes.
+/// cached until a field, the document, the saved PDF or flattener presets, the loaded color
+/// profiles or the available fonts change.
 fn summary_of(app: &mut VectorcraftApp, ctx: &egui::Context, p: &Value) -> Result<Value, String> {
-    let revision = app.session.active().map_or(0, |s| s.revision);
-    let stamp = egui::Id::new((p.to_string(), revision));
-    let key = egui::Id::new("save-pdf-summary");
+    let (key, stamp) = summary_key(app, p);
     if let Some((s, v)) = ctx.data(|m| m.get_temp::<(egui::Id, Result<Value, String>)>(key))
         && s == stamp
     {
         return v;
     }
-    let mut q = p.clone();
-    q["includeDocument"] = json!(true);
-    let v = app.session.execute("document.pdfSettings", &q).map_err(|e| e.to_string());
+    let v = summary_settings(app, p);
     ctx.data_mut(|m| m.insert_temp(key, (stamp, v.clone())));
     v
 }
 
+/// Where [`summary_of`] keeps the Summary, and the stamp of what it was computed for: the params
+/// `p`, the active document and its revision, the saved PDF presets (which `preset` can name), the
+/// saved flattener presets (which `flattenerPreset` can name), the loaded color profiles (which
+/// `output.destination` and `output.outputIntent` can name) and the available fonts (which decide
+/// what is embedded or outlined).
+fn summary_key(app: &VectorcraftApp, p: &Value) -> (egui::Id, egui::Id) {
+    let document = app.session.active().map(|s| (s.uid, s.revision));
+    let prefs = &app.session.prefs;
+    let presets = serde_json::to_string(&(&prefs.pdf_presets, &prefs.flattener_presets)).unwrap_or_default();
+    let shared = (vectorcraft_color::cms::profiles_generation(), vectorcraft_text::FontDb::global().generation());
+    (egui::Id::unique("save-pdf-summary"), egui::Id::unique((p.to_string(), document, presets, shared)))
+}
+
+/// `document.pdfSettings` for the dialog's `document.exportPdf` params `p`, with the document's
+/// warnings (an export in memory).
+fn summary_settings(app: &mut VectorcraftApp, p: &Value) -> Result<Value, String> {
+    let mut q = p.clone();
+    q["includeDocument"] = json!(true);
+    app.session.execute("document.pdfSettings", &q).map_err(|e| e.to_string())
+}
+
+/// The `document.pdfSettings` params of the Summary: the dialog's export params, without the
+/// preset editor's own `name` and `description`, which are not PDF options.
+fn summary_params(d: &Dialog) -> Value {
+    let mut p = params(d);
+    if d.kind == PRESET_KIND
+        && let Some(o) = p.as_object_mut()
+    {
+        o.remove("name");
+        o.remove("description");
+    }
+    p
+}
+
 fn summary(app: &mut VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) {
     let t = Tokens::get(ui.ctx());
-    let v = match summary_of(app, ui.ctx(), &params(d)) {
+    let v = match summary_of(app, ui.ctx(), &summary_params(d)) {
         Ok(v) => v,
         Err(e) => {
             heading(ui, tl!("Error"));
-            ui.label(egui::RichText::new(format!("⚠ {e}")).color(t.text));
+            ui.label(egui::RichText::new(warning_line(crate::i18n::current(), &e)).color(t.text));
             return;
         }
     };
     heading(ui, tl!("Options"));
-    let mut changed: Vec<&Value> = v["changed"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
-    changed.sort_by_key(|c| section_of(c["option"].as_str().unwrap_or_default()));
+    let changed = changed_options(&v);
     if changed.is_empty() {
-        let base = if d.kind == PRESET_KIND { pdf::DEFAULT_PRESET } else { tl!("the preset") };
-        note(ui, &crate::i18n::fmt(tl!("Every option matches {base}."), &[("base", base)]));
+        note(ui, &unchanged_line(d));
     }
     option_rows(ui, changed, option_label);
     heading(ui, tl!("Warnings"));
     warning_rows(ui, v["warnings"].as_array().map(Vec::as_slice).unwrap_or_default());
+    ui.add_space(8.0);
+    if widgets::secondary_button(ui, tl!("Save Summary…")).clicked() {
+        // The text of the Summary drawn now: saving it does not compute the settings again.
+        let text = summary_text(d, &v);
+        if let Err(e) = crate::picks::in_dialog(app, d, move |app, d| save_summary_from_dialog(app, d, &text)) {
+            app.status(e);
+        }
+    }
+}
+
+/// The changed options of `document.pdfSettings`'s reply `v`, in the order of the sections.
+fn changed_options(v: &Value) -> Vec<&Value> {
+    let mut changed: Vec<&Value> = v["changed"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
+    changed.sort_by_key(|c| section_of(c["option"].as_str().unwrap_or_default()));
+    changed
+}
+
+/// The Summary's line when no option differs from the preset.
+fn unchanged_line(d: &Dialog) -> String {
+    let base = if d.kind == PRESET_KIND { pdf::DEFAULT_PRESET } else { tl!("the preset") };
+    crate::i18n::fmt(tl!("Every option matches {base}."), &[("base", base)])
+}
+
+/// The Summary of `document.pdfSettings`'s reply `v` as text, line for line as the section shows
+/// it in the interface language: Options and each changed option (or the line saying none
+/// changed), a blank line, then Warnings and each warning (or "None."). Lines end in LF, including
+/// line breaks inside an option's value.
+fn summary_text(d: &Dialog, v: &Value) -> String {
+    let lang = crate::i18n::current();
+    let mut lines = vec![tl!("Options").to_string()];
+    let changed = changed_options(v);
+    if changed.is_empty() {
+        lines.push(unchanged_line(d));
+    }
+    lines.extend(changed.into_iter().map(|c| option_line(c, option_label)));
+    lines.push(String::new());
+    lines.push(tl!("Warnings").to_string());
+    let warnings = v["warnings"].as_array().map(Vec::as_slice).unwrap_or_default();
+    if warnings.is_empty() {
+        lines.push(tl!("None.").to_string());
+    }
+    lines.extend(warnings.iter().map(|w| warning_line(lang, w.as_str().unwrap_or_default())));
+    let mut text = lines.join("\n").replace("\r\n", "\n").replace('\r', "\n");
+    text.push('\n');
+    text
+}
+
+/// The UI command that writes the Summary to a text file.
+pub(crate) const SAVE_SUMMARY: &str = "ui.pdfSummary.save";
+
+/// Is a dialog with the Summary open (Save PDF, or the preset editor)?
+pub(crate) fn summary_open(app: &VectorcraftApp) -> bool {
+    app.ui.dialog.as_ref().is_some_and(|d| d.kind == KIND || d.kind == PRESET_KIND)
+}
+
+/// `ui.pdfSummary.save {path}`: write the open Save PDF dialog's (or preset editor's) Summary as
+/// text to `path` (the web downloads it under the path's file name). The Summary the section last
+/// drew for the same fields, document, saved PDF and flattener presets, loaded color profiles
+/// and available fonts is used as it is; the settings are computed only when there is none. The dialog stays open and the document is not changed →
+/// `{path, bytes}`. A missing, empty or non-string `path` is an error that writes nothing.
+pub(crate) fn save_summary(app: &mut VectorcraftApp, p: &Value) -> Result<Value, String> {
+    let key = "path";
+    let path = match p.get(key) {
+        None | Some(Value::Null) => return Err("missing `path`".into()),
+        Some(Value::String(s)) if s.trim().is_empty() => return Err("path is empty".into()),
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(_) => return Err(format!("`{key}` must be a string")),
+    };
+    let d = app.ui.dialog.clone().filter(|_| summary_open(app)).ok_or("the Save PDF dialog is not open")?;
+    let p = summary_params(&d);
+    let v = match app.ui_ctx.clone() {
+        Some(ctx) => summary_of(app, &ctx, &p),
+        None => summary_settings(app, &p),
+    }?;
+    write_summary(app, path, &summary_text(&d, &v))
+}
+
+/// Save Summary…: the Summary's `text` to a file picked in a save panel (the web downloads it). A
+/// write that fails is told in a message over the dialog, which shows again when it closes; a
+/// canceled panel writes nothing.
+fn save_summary_from_dialog(app: &mut VectorcraftApp, d: &mut Dialog, text: &str) -> Result<(), String> {
+    let waiting = app.ui.told.len();
+    let r = write_summary(app, None, text);
+    // The message about a failed write: the open dialog when the panel answered after this frame,
+    // else waiting behind the dialog being drawn.
+    let told = app.ui.dialog.take_if(|t| t.kind == super::confirm::MESSAGE).or_else(|| {
+        (app.ui.told.len() > waiting && app.ui.told.last().is_some_and(|t| t.kind == super::confirm::MESSAGE)).then(|| app.ui.told.pop()).flatten()
+    });
+    if let Some(mut told) = told {
+        told.fields.insert(super::PARENT.into(), serde_json::to_value(&*d).unwrap_or_default());
+        *d = told;
+    }
+    match r {
+        Err(e) if e == "cancelled" => Ok(()),
+        r => r.map(|_| ()),
+    }
+}
+
+/// Write the Summary's `text` (UTF-8) to `path`, else to a picked `<document> PDF Summary.txt`
+/// next to the document → `{path, bytes}`.
+fn write_summary(app: &mut VectorcraftApp, path: Option<String>, text: &str) -> Result<Value, String> {
+    let title = app.session.active().map(|d| d.title()).unwrap_or_default();
+    let stem = std::path::Path::new(&title).file_stem().map_or_else(|| "Untitled".into(), |s| s.to_string_lossy().into_owned());
+    let path = io::write_named(app, path, &format!("{stem} PDF Summary.txt"), text.as_bytes())?;
+    app.status(format!("Saved {path}"));
+    Ok(json!({ "path": path, "bytes": text.len() }))
 }
 
 /// A Summary line per changed option (`{option, value}`), labelled by `label`.
 pub(super) fn option_rows<'a>(ui: &mut egui::Ui, changed: impl IntoIterator<Item = &'a Value>, label: impl Fn(&str) -> String) {
     let t = Tokens::get(ui.ctx());
     for c in changed {
-        let value = match &c["value"] {
-            Value::Bool(b) => if *b { tl!("On") } else { tl!("Off") }.to_string(),
-            Value::String(s) if c["option"] == "marks.kind" => choice_label(crate::i18n::current(), "marks.kind", s).to_string(),
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        };
-        ui.label(egui::RichText::new(format!("{}: {value}", label(c["option"].as_str().unwrap_or_default()))).color(t.text));
+        ui.label(egui::RichText::new(option_line(c, &label)).color(t.text));
     }
+}
+
+/// The displayed value of the changed option `c` (`{option, value}`).
+fn option_value(c: &Value) -> String {
+    match &c["value"] {
+        Value::Bool(b) => if *b { tl!("On") } else { tl!("Off") }.to_string(),
+        Value::String(s) if c["option"] == "marks.kind" => choice_label(crate::i18n::current(), "marks.kind", s).to_string(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// The Summary's line for the changed option `c` (`{option, value}`), labeled by `label`, with the
+/// colon the interface language writes.
+fn option_line(c: &Value, label: impl Fn(&str) -> String) -> String {
+    format!("{} {}", crate::i18n::colon(&label(c["option"].as_str().unwrap_or_default())), option_value(c))
 }
 
 /// The Summary's warnings ("None." without any).
@@ -823,334 +1335,14 @@ pub(super) fn warning_rows(ui: &mut egui::Ui, warnings: &[Value]) {
         note(ui, tl!("None."));
     }
     for w in warnings {
-        ui.label(egui::RichText::new(format!("⚠ {}", w.as_str().unwrap_or_default())).color(t.text));
+        ui.label(egui::RichText::new(warning_line(crate::i18n::current(), w.as_str().unwrap_or_default())).color(t.text));
     }
+}
+
+/// One of the Summary's warnings or errors, in `lang` as far as its catalog has it.
+pub(super) fn warning_line(lang: crate::i18n::Lang, w: &str) -> String {
+    format!("⚠ {}", crate::i18n::message(lang, w))
 }
 
 #[cfg(test)]
-mod tests {
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    use vectorcraft_engine::Session;
-
-    use super::*;
-    use crate::Services;
-
-    type Log = Rc<RefCell<Vec<(String, Vec<u8>)>>>;
-
-    /// The built-in presets are told from saved ones by name (only theirs are translated).
-    #[test]
-    fn built_in_presets_are_known_by_name() {
-        assert!(vectorcraft_pdf::builtin_presets().iter().all(|p| is_builtin_preset(&p.name)));
-        assert!(is_builtin_preset(pdf::DEFAULT_PRESET) && !is_builtin_preset("Default") && !is_builtin_preset("My Preset"));
-    }
-
-    /// An app with two artboards whose writer and URL opener record what they get.
-    fn app() -> (VectorcraftApp, Log, Log) {
-        let (written, opened) = (Log::default(), Log::default());
-        let (w, o) = (written.clone(), opened.clone());
-        let services = Services {
-            write: Some(Box::new(move |p: &str, b: &[u8]| {
-                w.borrow_mut().push((p.to_string(), b.to_vec()));
-                Ok(())
-            })),
-            open_url: Some(Box::new(move |u: &str| o.borrow_mut().push((u.to_string(), vec![])))),
-            ..Default::default()
-        };
-        let mut app = VectorcraftApp::new(Session::new(), services);
-        app.run("file.new", json!({"width": 120, "height": 90, "artboards": 3})).unwrap();
-        app.run("shape.rectangle", json!({"x": 10, "y": 10, "width": 50, "height": 40})).unwrap();
-        (app, written, opened)
-    }
-
-    /// One headless frame of the dialog layer.
-    fn frame(app: &mut VectorcraftApp) {
-        let ctx = egui::Context::default();
-        theme::install_fonts(&ctx);
-        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| super::super::show(app, ui.ctx()));
-        out.textures_delta.clear();
-    }
-
-    fn set_field(app: &mut VectorcraftApp, path: &str, v: Value) {
-        set(app.ui.dialog.as_mut().expect("dialog open"), path, v);
-    }
-
-    #[test]
-    fn every_section_draws() {
-        let (mut app, _, _) = app();
-        app.run("file.export.pdf", json!({})).unwrap();
-        assert_eq!(app.ui.dialog.as_ref().map(|d| d.kind.as_str()), Some(KIND));
-        assert_eq!(super::super::DialogKind::of(KIND), Some(super::super::DialogKind::SavePdf));
-        for s in SECTIONS {
-            set_field(&mut app, "__section", json!(s));
-            frame(&mut app);
-            assert!(app.ui.dialog.is_some(), "{s} closed the dialog");
-        }
-        // The Summary lists what changed and the warnings for options not applied yet (permissions
-        // without a password; thumbnails are embedded).
-        set_field(&mut app, "thumbnails", json!(true));
-        set_field(&mut app, "security.printing", json!("low"));
-        let p = params(app.ui.dialog.as_ref().unwrap());
-        let v = summary_of(&mut app, &egui::Context::default(), &p).unwrap();
-        let changed: Vec<&str> = v["changed"].as_array().unwrap().iter().map(|c| c["option"].as_str().unwrap()).collect();
-        assert_eq!(changed, ["security.printing", "thumbnails"]);
-        let warnings = v["warnings"].as_array().unwrap();
-        assert!(warnings.len() == 1 && warnings[0].as_str().unwrap().contains("permissions"), "{warnings:?}");
-    }
-
-    #[test]
-    fn confirm_runs_export_pdf_with_the_dialog_options() {
-        let (mut app, written, opened) = app();
-        app.run("ui.savePdfDialog", json!({"path": "/tmp/out.pdf", "compatibility": "1.5"})).unwrap();
-        set_field(&mut app, "__allArtboards", json!(false));
-        set_field(&mut app, "range", json!("1,3"));
-        set_field(&mut app, "compression.compressText", json!(false));
-        set_field(&mut app, "viewAfterSaving", json!(true));
-        let r = super::super::confirm(&mut app).unwrap();
-        assert!(app.ui.dialog.is_none(), "closes after saving");
-        assert_eq!(r["path"], "/tmp/out.pdf");
-        assert!(r.get("dataBase64").is_none());
-        let w = written.borrow();
-        assert_eq!(w.len(), 1);
-        assert_eq!(w[0].0, "/tmp/out.pdf");
-        assert!(w[0].1.starts_with(b"%PDF-1.5"), "compatibility reaches the writer");
-        assert_eq!(vectorcraft_pdf::import(&w[0].1).unwrap().artboards.len(), 2, "range 1,3");
-        assert!(!String::from_utf8_lossy(&w[0].1).contains("/FlateDecode"), "uncompressed content");
-        assert_eq!(opened.borrow().len(), 1, "View PDF after Saving opens the file once");
-        let url = &opened.borrow()[0].0;
-        assert!(url.starts_with("file:///") && url.ends_with("/tmp/out.pdf"), "the written file as a URL: {url}");
-        assert!(app.ui.status.starts_with("Saved /tmp/out.pdf"), "{}", app.ui.status);
-    }
-
-    #[test]
-    fn warnings_reach_the_status_and_errors_keep_the_dialog_open() {
-        let (mut app, written, opened) = app();
-        app.run("ui.savePdfDialog", json!({"path": "/tmp/w.pdf"})).unwrap();
-        set_field(&mut app, "security.printing", json!("low"));
-        super::super::confirm(&mut app).unwrap();
-        assert!(app.ui.status.contains("1 note(s)") && app.ui.status.contains("permissions"), "{}", app.ui.status);
-        assert!(opened.borrow().is_empty(), "not opened unless asked");
-        app.run("ui.savePdfDialog", json!({"path": "/tmp/bad.pdf"})).unwrap();
-        set_field(&mut app, "__allArtboards", json!(false));
-        set_field(&mut app, "range", json!("7"));
-        assert!(super::super::confirm(&mut app).is_err());
-        assert!(app.ui.dialog.is_some(), "a bad range keeps the dialog open");
-        assert_eq!(written.borrow().len(), 1);
-        // Without a path, bad options are refused before a save dialog asks for one.
-        let asked = Rc::new(RefCell::new(0));
-        let a = asked.clone();
-        app.services.pick_save = Some(Box::new(move |pick: &crate::FilePick| {
-            *a.borrow_mut() += 1;
-            Some(format!("/tmp/picked-{}", pick.name))
-        }));
-        app.run("ui.savePdfDialog", json!({"range": "7"})).unwrap();
-        assert!(super::super::confirm(&mut app).is_err());
-        assert_eq!(*asked.borrow(), 0, "no save dialog for a bad range");
-        set_field(&mut app, "range", json!("2"));
-        let r = super::super::confirm(&mut app).unwrap();
-        assert_eq!(*asked.borrow(), 1);
-        assert!(r["path"].as_str().is_some_and(|p| p.starts_with("/tmp/picked-") && p.ends_with(".pdf")), "{r}");
-        // Agents can export without the dialog.
-        let r = app.run("file.export.pdf", json!({"path": "/tmp/direct.pdf", "range": "2"})).unwrap();
-        assert_eq!(r["path"], "/tmp/direct.pdf");
-        assert!(r["warnings"].is_array());
-    }
-
-    /// A placed image whose pixel data can't be decoded is left out of the PDF, and the status bar
-    /// shows the note raster exports give.
-    #[test]
-    fn an_image_that_couldnt_be_decoded_is_named_in_the_status() {
-        let (mut app, written, _) = app();
-        // A PNG whose header reads (so it places at its size) but whose pixel data is cut short.
-        let mut cut = vec![];
-        image::RgbaImage::from_pixel(64, 32, image::Rgba([200, 30, 30, 255]))
-            .write_to(&mut std::io::Cursor::new(&mut cut), image::ImageFormat::Png)
-            .unwrap();
-        let idat = cut.windows(4).position(|w| w == b"IDAT").unwrap();
-        cut.truncate(idat + 8);
-        // The image is placed on the first artboard.
-        app.run("file.place", json!({"name": "cut.png", "dataBase64": vectorcraft_format::base64_encode(&cut), "at": [60, 50]})).unwrap();
-        app.run("ui.savePdfDialog", json!({"path": "/tmp/cut.pdf"})).unwrap();
-        super::super::confirm(&mut app).unwrap();
-        assert_eq!(app.ui.status, "Saved /tmp/cut.pdf with 1 note(s): an image couldn't be decoded and is missing from the picture");
-        assert_eq!(written.borrow().len(), 1);
-    }
-
-    #[test]
-    fn presets_reset_the_settings_and_fields_fall_back_to_defaults() {
-        let (mut app, _, _) = app();
-        app.run("ui.savePdfDialog", json!({"compatibility": "1.4", "marks": {"trim": true}})).unwrap();
-        let d = app.ui.dialog.as_mut().unwrap();
-        assert_eq!(get(d, "compatibility"), "1.4");
-        assert_eq!(get(d, "marks.weight"), 0.25, "the rest of a section keeps its defaults");
-        d.fields.remove("compression");
-        assert_eq!(get(d, "compression.color.ppi"), 300.0, "a field an agent dropped reads as its default");
-        let mut d = d.clone();
-        apply_preset(&mut app, &mut d, pdf::DEFAULT_PRESET);
-        assert_eq!(get(&d, "compatibility"), "1.7");
-        assert_eq!(get(&d, "marks.trim"), false);
-        assert!(app.run("ui.savePdfDialog", json!({"compatibility": "1.0"})).is_err(), "bad options are refused");
-    }
-
-    #[test]
-    fn marks_and_bleeds_reach_the_pdf() {
-        let (mut app, written, _) = app();
-        app.run("document.setup", json!({"bleed": 9})).unwrap();
-        let notes = app.run("layer.new", json!({})).unwrap()["id"].clone();
-        app.run("layer.setProps", json!({"id": notes, "printable": false})).unwrap();
-        app.run("shape.ellipse", json!({"x": 60, "y": 40, "width": 20, "height": 20})).unwrap();
-        app.run("ui.savePdfDialog", json!({"path": "/tmp/marks.pdf"})).unwrap();
-        set_field(&mut app, "__section", json!("Marks and Bleeds"));
-        set_field(&mut app, "bleed.useDocument", json!(true));
-        set_field(&mut app, "marks.trim", json!(true));
-        frame(&mut app);
-        set_field(&mut app, "__section", json!("General"));
-        set_field(&mut app, "includeNonPrinting", json!(true));
-        frame(&mut app);
-        let r = super::super::confirm(&mut app).unwrap();
-        assert_eq!(r["warnings"], json!([]), "marks and bleed are applied");
-        let bytes = &written.borrow()[0].1;
-        let page = &vectorcraft_pdf::info(bytes, None).unwrap().pages[0];
-        let trim = page.boxes.iter().find(|(b, _)| *b == vectorcraft_pdf::CropTo::Trim).unwrap().1;
-        assert_eq!((trim.width(), trim.x0), (120.0, 9.0 + 18.0 + 0.25), "the trim box is the artboard, inside the bleed and marks");
-        let mut ellipse = false;
-        vectorcraft_pdf::import(bytes).unwrap().walk(|n| {
-            let b = n.path_data().and_then(|p| p.bounds()).unwrap_or_default();
-            ellipse |= (b.width() - 20.0).abs() < 0.1 && (b.height() - 20.0).abs() < 0.1;
-        });
-        assert!(ellipse, "the non-printing layer is included");
-    }
-
-    #[test]
-    fn option_labels_read_well() {
-        assert_eq!(option_label("compression.color.abovePpi"), "Compression › Color › Above Ppi");
-        assert_eq!(option_label("compression.compressText"), "Compression › Compress Text");
-        assert_eq!(option_label("thumbnails"), "General › Thumbnails");
-        assert_eq!(option_label("bleed.top"), "Marks and Bleeds › Bleed › Top");
-        assert_eq!(section_of("bleed.top"), 2);
-        assert_eq!(SECTIONS[section_of("standard")], "General");
-    }
-
-    #[test]
-    fn confirming_preserves_passwords_supplied_when_opening_the_dialog() {
-        for (open, owner) in [("open", ""), ("", "owner"), ("open", "owner")] {
-            let (mut app, written, _) = app();
-            app.run(
-                "ui.savePdfDialog",
-                json!({"path": "/tmp/locked.pdf", "security": {"openPassword": open, "permissionsPassword": owner, "printing": "none"}}),
-            )
-            .unwrap();
-            // Drawing the Security and Summary sections must retain the live passwords.
-            for section in ["Security", "Summary"] {
-                set_field(&mut app, "__section", json!(section));
-                frame(&mut app);
-            }
-            let p = params(app.ui.dialog.as_ref().unwrap());
-            let summary = summary_of(&mut app, &egui::Context::default(), &p).unwrap();
-            assert!(!summary.to_string().contains("Password"), "summaries omit passwords");
-            let mut d = app.ui.dialog.clone().unwrap();
-            set(&mut d, SAVE_AS, json!("Protected"));
-            save_preset(&mut app, &mut d).unwrap();
-            let saved = &app.session.prefs.pdf_presets[0].settings.security;
-            assert!(saved.open_password.is_empty() && saved.permissions_password.is_empty(), "presets forget passwords");
-
-            super::super::confirm(&mut app).unwrap();
-            assert!(app.ui.dialog.is_none());
-            let written = written.borrow();
-            let bytes = &written[0].1;
-            assert!(String::from_utf8_lossy(bytes).contains("/Encrypt"));
-            if open.is_empty() {
-                assert_eq!(vectorcraft_pdf::info(bytes, None).unwrap().pages.len(), 3);
-            } else {
-                assert_eq!(vectorcraft_pdf::info(bytes, None).unwrap_err(), vectorcraft_pdf::PdfError::NeedsPassword);
-            }
-            assert_eq!(vectorcraft_pdf::info(bytes, Some("wrong")).unwrap_err(), vectorcraft_pdf::PdfError::WrongPassword);
-            for password in [open, owner].into_iter().filter(|p| !p.is_empty()) {
-                assert_eq!(vectorcraft_pdf::info(bytes, Some(password)).unwrap().pages.len(), 3);
-            }
-        }
-    }
-
-    #[test]
-    fn the_security_section_takes_passwords_that_presets_drop() {
-        let (mut app, _, _) = app();
-        app.run("ui.savePdfDialog", json!({})).unwrap();
-        set_field(&mut app, "__section", json!("Security"));
-        set_field(&mut app, OPEN_PASSWORD, json!("open"));
-        set_field(&mut app, PERMISSIONS_PASSWORD, json!("own"));
-        set_field(&mut app, "security.copy", json!(false));
-        frame(&mut app);
-        let p = params(app.ui.dialog.as_ref().unwrap());
-        assert_eq!((p["security"]["openPassword"].as_str(), p["security"]["permissionsPassword"].as_str()), (Some("open"), Some("own")));
-        assert_eq!(p["security"]["copy"], false);
-        // With a standard the section still draws (greyed); a preset brings its own security.
-        set_field(&mut app, "standard", json!(Standard::PdfA2b.id()));
-        frame(&mut app);
-        let mut d = app.ui.dialog.clone().unwrap();
-        apply_preset(&mut app, &mut d, pdf::DEFAULT_PRESET);
-        assert_eq!(get(&d, OPEN_PASSWORD), &Value::Null, "presets carry no passwords");
-        assert_eq!(get(&d, "security.copy"), true);
-    }
-
-    #[test]
-    fn choosing_a_pdfx_standard_sets_its_version_and_writes_the_standard() {
-        let (mut app, written, _) = app();
-        app.run("ui.savePdfDialog", json!({"path": "/tmp/x.pdf", "createLayers": true})).unwrap();
-        let d = app.ui.dialog.as_mut().unwrap();
-        set(d, "standard", json!(Standard::PdfX1a.id()));
-        standard_chosen(d, Standard::PdfX1a);
-        assert_eq!((get(d, "compatibility"), get(d, "createLayers"), get(d, "preserveEditing")), (&json!("1.3"), &json!(false), &json!(false)));
-        for s in SECTIONS {
-            set_field(&mut app, "__section", json!(s));
-            frame(&mut app);
-        }
-        super::super::confirm(&mut app).unwrap();
-        let pdf = String::from_utf8_lossy(&written.borrow()[0].1).into_owned();
-        assert!(pdf.starts_with("%PDF-1.3") && pdf.contains("/GTS_PDFXConformance(PDF/X-1a:2001)") && pdf.contains("/S/GTS_PDFX"));
-        // PDF/X-4 keeps layers and is PDF 1.6.
-        app.run("ui.savePdfDialog", json!({"compatibility": "2.0", "createLayers": true})).unwrap();
-        let d = app.ui.dialog.as_mut().unwrap();
-        set(d, "standard", json!(Standard::PdfX4.id()));
-        standard_chosen(d, Standard::PdfX4);
-        assert_eq!((get(d, "compatibility"), get(d, "createLayers")), (&json!("1.6"), &json!(true)));
-    }
-
-    #[test]
-    fn create_layers_writes_pdf_layers() {
-        let (mut app, written, _) = app();
-        app.run("layer.new", json!({"name": "Notes"})).unwrap();
-        app.run("shape.ellipse", json!({"x": 60, "y": 40, "width": 20, "height": 20})).unwrap();
-        app.run("ui.savePdfDialog", json!({"path": "/tmp/layers.pdf", "createLayers": true})).unwrap();
-        // The option is drawn greyed at PDF 1.4 (no PDF layers there), then live again.
-        for c in ["1.4", "1.7"] {
-            set_field(&mut app, "compatibility", json!(c));
-            frame(&mut app);
-        }
-        let r = super::super::confirm(&mut app).unwrap();
-        assert_eq!(r["warnings"], json!([]));
-        let back = vectorcraft_pdf::import(&written.borrow()[0].1).unwrap();
-        let names: Vec<_> = back.layers.iter().filter_map(|l| l.name.clone()).collect();
-        // The empty pages of the other artboards come in as page layers.
-        assert_eq!(names[..2], ["Layer 1", "Notes"]);
-    }
-
-    #[test]
-    fn pdf_1_3_takes_a_flattener_preset_in_advanced() {
-        let (mut app, written, _) = app();
-        app.run("ui.savePdfDialog", json!({"path": "/tmp/old.pdf", "compatibility": "1.3"})).unwrap();
-        for s in ["Advanced", "Security"] {
-            set_field(&mut app, "__section", json!(s));
-            frame(&mut app);
-        }
-        set_field(&mut app, "flattenerPreset", json!("Low Resolution"));
-        let p = params(app.ui.dialog.as_ref().unwrap());
-        assert_eq!((p["compatibility"].as_str(), p["flattenerPreset"].as_str()), (Some("1.3"), Some("Low Resolution")));
-        super::super::confirm(&mut app).unwrap();
-        assert!(written.borrow()[0].1.starts_with(b"%PDF-1.3"));
-        // A preset keeps the flattener preset.
-        app.run("pdf.preset.save", json!({"name": "Old", "compatibility": "1.3", "flattenerPreset": "Low Resolution"})).unwrap();
-        let saved = app.session.prefs.pdf_presets.iter().find(|p| p.name == "Old").unwrap();
-        assert_eq!((saved.settings.compatibility, saved.settings.flattener_preset.as_str()), (Compatibility::Pdf13, "Low Resolution"));
-    }
-}
+mod tests;

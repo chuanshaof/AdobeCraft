@@ -13,7 +13,17 @@ use super::{DialogSpec, form, run_and_close};
 use crate::VectorcraftApp;
 use crate::state::Dialog;
 
-pub(super) const SPEC: DialogSpec = DialogSpec { heading: |d| title(&d.kind).into(), body, confirm, preview: true, ..DialogSpec::FORM };
+pub(super) const SPEC: DialogSpec = DialogSpec { heading: |d| title(&d.kind).into(), body, confirm, preview: true, inputs, ..DialogSpec::FORM };
+
+/// The fields a transform dialog reads that it may not hold yet: Copy and the object options,
+/// Move's Distance and Angle, Scale's scale options, and the reference point of the others.
+fn inputs(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "move" => &["copy", "objects", "patterns", "distance", "angle"],
+        "scale" => &["copy", "objects", "patterns", "corners", "strokes", "origin"],
+        _ => &["copy", "objects", "patterns", "origin"],
+    }
+}
 
 fn title(kind: &str) -> &'static str {
     match kind {
@@ -76,12 +86,19 @@ fn clean(v: f64) -> f64 {
     (v * 1e6).round() / 1e6 + 0.0
 }
 
-/// The Move dialog's fields as it opens: Horizontal and Vertical are the offset moved last, and
-/// Copy, Transform Objects and Preview are as it was last confirmed with (Transform Patterns is
-/// General › Transform Pattern Tiles, which its OK sets).
+/// The Move dialog's fields as it opens: Horizontal and Vertical are the offset moved last, Distance
+/// and Angle are the same offset, and Copy, Transform Objects and Preview are as it was last
+/// confirmed with (Transform Patterns is General › Transform Pattern Tiles, which its OK sets).
 pub(crate) fn move_fields(app: &VectorcraftApp) -> Value {
     let (dx, dy) = last_move(app).unwrap_or_default();
-    let mut fields = json!({"dx": format!("{} pt", clean(dx)), "dy": format!("{} pt", clean(dy))});
+    let [dx, dy, distance, angle] = [dx, dy, dx.hypot(dy), (-dy).atan2(dx).to_degrees()].map(clean);
+    let mut fields = json!({
+        "dx": format!("{dx} pt"),
+        "dy": format!("{dy} pt"),
+        "distance": distance,
+        "angle": angle,
+        "__polar": [dx, dy, distance, angle],
+    });
     let kept = &app.ui.move_options;
     let kept_bool = |k: &str| kept.get(k).and_then(Value::as_bool);
     for k in ["copy", "objects", "preview"] {
@@ -149,7 +166,17 @@ fn scale_option(app: &VectorcraftApp, d: &Dialog, field: &str) -> bool {
 /// The Scale Corners and Scale Strokes & Effects checkboxes (fields `corners` and `strokes`),
 /// starting from the preferences.
 pub(super) fn scale_options(app: &VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog) {
-    for (field, _, label) in SCALE_OPTIONS {
+    scale_options_ordered(app, ui, d, false);
+}
+
+/// [`scale_options`], with `strokes_first` putting Scale Strokes & Effects above Scale Corners as
+/// Transform Each lists them.
+pub(super) fn scale_options_ordered(app: &VectorcraftApp, ui: &mut egui::Ui, d: &mut Dialog, strokes_first: bool) {
+    let mut options = SCALE_OPTIONS;
+    if strokes_first {
+        options.reverse();
+    }
+    for (field, _, label) in options {
         let on = scale_option(app, d, field);
         d.fields.insert(field.into(), Value::Bool(on));
         form::check(ui, d, field, tl!(label));
@@ -193,6 +220,7 @@ fn command(app: &VectorcraftApp, d: &Dialog) -> (&'static str, Value) {
         // The axis by name, or the angle it is at.
         "reflect" if d.str("axis") == "angle" => ("object.reflect", json!({"axis": d.f64("angle", 90.0)})),
         "reflect" => ("object.reflect", json!({"axis": d.fields.get("axis").cloned().unwrap_or(json!("vertical"))})),
+        "shear" if d.str("axis") == "angle" => ("object.shear", json!({"angle": d.f64("angle", 0.0), "axis": d.f64("axisAngle", 0.0)})),
         _ => ("object.shear", json!({"angle": d.f64("angle", 0.0), "axis": d.str("axis")})),
     };
     params["copy"] = json!(d.bool("copy"));
@@ -207,6 +235,12 @@ fn confirm(app: &mut VectorcraftApp, d: &Dialog) -> Result<Value, String> {
     if app.session.in_interaction() {
         app.session.cancel_interaction().map_err(|e| e.to_string())?;
     }
+    // A Distance and Angle set since the last frame set the offset Move runs with.
+    let mut d = d.clone();
+    if d.kind == "move" {
+        link_distance_and_angle(&mut d);
+    }
+    let d = &d;
     let (id, mut params) = command(app, d);
     if d.kind == "scale" {
         params = with_scale_options(app, d, params)?;
@@ -344,6 +378,54 @@ mod tests {
         }
     }
 
+    /// Shear's axis is Horizontal, Vertical or an angle: the Axis Angle field takes input only with
+    /// the Angle axis and keeps its value with the others, and OK sends that angle as the axis,
+    /// apart from the Shear Angle.
+    #[test]
+    fn shear_takes_an_axis_angle() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 300, "height": 300})).unwrap();
+        app.run("shape.rectangle", json!({"x": 100, "y": 100, "width": 60, "height": 20})).unwrap();
+        crate::menus::invoke(&mut app, "object.shear", json!({}));
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1100.0, 900.0)).build_ui_state(
+            move |ui, app: &mut VectorcraftApp| {
+                if !std::mem::replace(&mut fonts, true) {
+                    crate::theme::install_fonts(ui.ctx());
+                    return;
+                }
+                crate::dialogs::show(app, ui.ctx());
+            },
+            app,
+        );
+        h.run_steps(5);
+        let dimmed =
+            |h: &egui_kittest::Harness<'_, VectorcraftApp>| h.get_by_role_and_label(Role::TextInput, "Axis Angle").accesskit_node().is_disabled();
+        assert!(dimmed(&h), "Horizontal leaves the Axis Angle off");
+        // Along an axis at 90° the left and right sides slide, 45° moving the right one by the width;
+        // at 0° the top and bottom slide by the height. Each case is undone before the next.
+        for (axis, axis_angle, sent, size) in
+            [("angle", 90, json!(90.0), (60.0, 80.0)), ("angle", 0, json!(0.0), (80.0, 20.0)), ("vertical", 30, json!("vertical"), (60.0, 80.0))]
+        {
+            let d = h.state_mut().ui.dialog.as_mut().unwrap();
+            d.fields.extend([("axis".to_string(), json!(axis)), ("axisAngle".to_string(), json!(axis_angle)), ("angle".to_string(), json!(45))]);
+            h.run_steps(2);
+            assert_eq!(dimmed(&h), axis != "angle", "{axis}");
+            assert_eq!(h.state().ui.dialog.as_ref().unwrap().fields["axisAngle"], json!(axis_angle), "the field keeps its value");
+            crate::dialogs::confirm(h.state_mut()).unwrap();
+            let app = h.state();
+            let (cmd, p) = app.session.journal.last().unwrap();
+            assert_eq!((cmd.as_str(), &p["axis"], &p["angle"]), ("object.shear", &sent, &json!(45.0)), "{axis} {axis_angle}");
+            let b = app.session.doc().unwrap().doc.layers[0].children().unwrap()[0].geometric_bounds().unwrap();
+            assert_eq!((b.width().round(), b.height().round()), size, "{axis} {axis_angle}");
+            h.state_mut().run("edit.undo", json!({})).unwrap();
+            crate::menus::invoke(h.state_mut(), "object.shear", json!({}));
+            h.run_steps(2);
+        }
+    }
+
     /// #1915: Move's Distance and Angle follow Horizontal and Vertical, and they follow them back.
     /// The angle is counter-clockwise on the page and Vertical is down = +, so 90° moves up.
     #[test]
@@ -383,6 +465,39 @@ mod tests {
         assert_eq!((cmd.as_str(), &p["dx"], &p["dy"]), ("object.move", &json!(0.0), &json!(-10.0)));
         let b = app.session.doc().unwrap().doc.layers[0].children().unwrap()[0].geometric_bounds().unwrap();
         assert_eq!((b.x0, b.y0), (100.0, 90.0));
+    }
+
+    /// A Distance and Angle set before the dialog's first frame, or just before OK, move by that
+    /// offset (as `ui.dialog.set` then `ui.dialog.confirm` from a control client).
+    #[test]
+    fn move_takes_a_distance_and_an_angle_set_before_a_frame() {
+        let mut app = VectorcraftApp::new(Session::new(), Default::default());
+        app.run("file.new", json!({"width": 300, "height": 300})).unwrap();
+        app.run("shape.rectangle", json!({"x": 100, "y": 100, "width": 60, "height": 20})).unwrap();
+        let ctx = egui::Context::default();
+        crate::theme::install_fonts(&ctx);
+        let corner = |app: &VectorcraftApp| {
+            let b = app.session.doc().unwrap().doc.layers[0].children().unwrap()[0].geometric_bounds().unwrap();
+            (b.x0, b.y0)
+        };
+        // Up 10 pt with no frame, then right 20 pt (Move opens on the last offset) with one.
+        for (with_frame, distance, angle, want, corner_after) in
+            [(false, 10.0, 90.0, (0.0, -10.0), (100.0, 90.0)), (true, 20.0, 0.0, (20.0, 0.0), (120.0, 90.0))]
+        {
+            crate::menus::invoke(&mut app, "object.move", json!({}));
+            let d = app.ui.dialog.as_mut().unwrap();
+            d.fields.extend([("distance".to_string(), json!(distance)), ("angle".to_string(), json!(angle))]);
+            if with_frame {
+                let mut out = ctx.run_ui(egui::RawInput::default(), |ui| crate::dialogs::show(&mut app, ui.ctx()));
+                out.textures_delta.clear();
+                let d = app.ui.dialog.as_ref().unwrap();
+                assert_eq!(["distance", "angle"].map(|k| d.f64(k, f64::NAN)), [distance, angle], "the first frame keeps them");
+            }
+            crate::dialogs::confirm(&mut app).unwrap();
+            let (cmd, p) = app.session.journal.last().unwrap();
+            assert_eq!((cmd.as_str(), &p["dx"], &p["dy"]), ("object.move", &json!(want.0), &json!(want.1)), "with a frame: {with_frame}");
+            assert_eq!(corner(&app), corner_after);
+        }
     }
 
     /// Move opens on the offset of the last drag or Move, and with the checkboxes it was last

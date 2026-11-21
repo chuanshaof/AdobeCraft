@@ -1,0 +1,1451 @@
+//! File → Place in the app: the Place dialog, files dropped on the window, the loaded place
+//! cursor and the Control bar's image details.
+
+use std::sync::Arc;
+
+use egui::{Pos2, Shape, vec2};
+use serde_json::{Value, json};
+use vectorcraft_doc::NodeKind;
+use vectorcraft_engine::Session;
+use vectorcraft_testkit::pdf::{PdfPage, pdf};
+
+use crate::VectorcraftApp;
+use crate::canvas::Xf;
+use crate::place::{DropAt, DropTarget};
+use crate::tests_folder::Folder;
+
+/// A `w`×`h` red PNG declaring `ppi`.
+fn png(w: u32, h: u32, ppi: f64) -> Vec<u8> {
+    let mut out = vec![];
+    {
+        let __dyn: image::DynamicImage = (image::RgbaImage::from_pixel(w, h, image::Rgba([255, 0, 0, 255]))).into();
+        let (__w, __h) = (__dyn.width(), __dyn.height());
+        let (__layout, __sample, __raw) = match __dyn {
+            image::DynamicImage::ImageLuma8(b) => (craft_image_codecs::ChannelLayout::Gray, craft_image_codecs::SampleType::U8, b.into_raw()),
+            image::DynamicImage::ImageLumaA8(b) => (craft_image_codecs::ChannelLayout::GrayA, craft_image_codecs::SampleType::U8, b.into_raw()),
+            image::DynamicImage::ImageRgb8(b) => (craft_image_codecs::ChannelLayout::Rgb, craft_image_codecs::SampleType::U8, b.into_raw()),
+            image::DynamicImage::ImageRgba8(b) => (craft_image_codecs::ChannelLayout::Rgba, craft_image_codecs::SampleType::U8, b.into_raw()),
+            image::DynamicImage::ImageLuma16(b) => (
+                craft_image_codecs::ChannelLayout::Gray,
+                craft_image_codecs::SampleType::U16,
+                b.into_raw().into_iter().flat_map(|s| s.to_ne_bytes()).collect(),
+            ),
+            image::DynamicImage::ImageLumaA16(b) => (
+                craft_image_codecs::ChannelLayout::GrayA,
+                craft_image_codecs::SampleType::U16,
+                b.into_raw().into_iter().flat_map(|s| s.to_ne_bytes()).collect(),
+            ),
+            image::DynamicImage::ImageRgb16(b) => (
+                craft_image_codecs::ChannelLayout::Rgb,
+                craft_image_codecs::SampleType::U16,
+                b.into_raw().into_iter().flat_map(|s| s.to_ne_bytes()).collect(),
+            ),
+            image::DynamicImage::ImageRgba16(b) => (
+                craft_image_codecs::ChannelLayout::Rgba,
+                craft_image_codecs::SampleType::U16,
+                b.into_raw().into_iter().flat_map(|s| s.to_ne_bytes()).collect(),
+            ),
+            other => (craft_image_codecs::ChannelLayout::Rgba, craft_image_codecs::SampleType::U8, other.into_rgba8().into_raw()),
+        };
+        let __cimg = craft_image_codecs::Image::from_raw(__w, __h, __layout, __sample, __raw).unwrap();
+        craft_image_codecs::encode(&__cimg, craft_image_codecs::Format::Png, &craft_image_codecs::EncodeOptions::default())
+            .map(|__b| out.extend_from_slice(&__b))
+    }
+    .unwrap();
+    vectorcraft_engine::cmd::fileio::ppi::with_png_resolution(&out, (ppi, ppi))
+}
+
+/// An app reading files from disk, with a 400×300 document.
+fn app() -> VectorcraftApp {
+    let services = crate::Services { read: Some(Box::new(|p: &str| std::fs::read(p).map_err(|e| e.to_string()))), ..Default::default() };
+    let mut app = VectorcraftApp::new(Session::new(), services);
+    app.run("file.new", json!({"width": 400, "height": 300})).unwrap();
+    app
+}
+
+/// File → Place… with `path` chosen in the file picker.
+fn place_picked(app: &mut VectorcraftApp, path: &str) {
+    let path = path.to_string();
+    app.services.pick_open = Some(Box::new(move |_: &crate::FilePick| Some(path.clone())));
+    app.run("file.place", json!({})).unwrap();
+}
+
+#[derive(Debug)]
+struct Dropped(std::path::PathBuf);
+
+impl egui::DroppedFile for Dropped {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        std::fs::read(&self.0).map_err(|e| e.to_string())
+    }
+}
+
+#[derive(Debug)]
+struct MockDrop {
+    path: std::path::PathBuf,
+    bytes: Result<Vec<u8>, String>,
+}
+
+impl egui::DroppedFile for MockDrop {
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        self.bytes.clone()
+    }
+}
+
+/// One headless frame of the whole window (800×600) with `events` and `dropped` files.
+fn frame(app: &mut VectorcraftApp, ctx: &egui::Context, events: Vec<egui::Event>, dropped: &[&str], shift: bool) {
+    let files = dropped.iter().map(|p| Arc::new(Dropped(p.into())) as egui::DroppedFileHandle).collect();
+    frame_files(app, ctx, events, files, shift);
+}
+
+fn frame_files(app: &mut VectorcraftApp, ctx: &egui::Context, mut events: Vec<egui::Event>, dropped: Vec<egui::DroppedFileHandle>, shift: bool) {
+    events.push(egui::Event::ModifiersChanged(egui::Modifiers { shift, ..Default::default() }));
+    let raw = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))),
+        events,
+        dropped_files: dropped,
+        ..Default::default()
+    };
+    let mut out = ctx.run_ui(raw, |ui| {
+        app.logic(ui.ctx());
+        app.ui(ui);
+    });
+    out.textures_delta.clear();
+}
+
+fn selected_image(app: &VectorcraftApp) -> vectorcraft_doc::Node {
+    let st = app.session.active().unwrap();
+    let n = st.doc.node(st.selection.objects[0]).unwrap().clone();
+    assert!(matches!(n.kind, NodeKind::Image(_)), "{:?}", n.kind);
+    n
+}
+
+/// A tiny SVG document.
+const SVG: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" width="50" height="40"><path d="M5 5 L45 5 L30 30 Z"/></svg>"#;
+
+/// Two frames: fonts, then the canvas lays out → the canvas.
+fn laid_out(app: &mut VectorcraftApp, ctx: &egui::Context) -> egui::Rect {
+    frame(app, ctx, vec![], &[], false);
+    frame(app, ctx, vec![], &[], false);
+    app.canvas_rect.expect("the canvas is laid out")
+}
+
+/// Where the platform tells where files were dropped (the web), documents, pictures and text go
+/// as in Illustrator: placed at the pointer on the canvas, opened off it (the tab bar).
+#[test]
+fn a_drop_with_a_position_places_on_the_canvas_and_opens_off_it() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    let rect = laid_out(&mut app, &ctx);
+    let pos = rect.center() + vec2(60.0, -40.0);
+    let want = Xf::new(rect, app.view().unwrap()).to_doc(pos);
+    let uid = app.session.active().unwrap().uid;
+    for name in ["a.png", "a.svg", "a.ai", "a.vectorcraft"] {
+        assert_eq!(app.drop_target(name, Some(pos), true), DropTarget::Place(DropAt { doc: uid, reverts: 0, at: want, embed: true }), "{name}");
+        assert_eq!(app.drop_target(name, Some(Pos2::new(300.0, rect.top() - 10.0)), false), DropTarget::Open, "{name} on the tab bar");
+    }
+}
+
+/// Desktop drags carry no position (#472): a dropped document opens as a tab of its own, a
+/// picture or text is placed in the middle of the view.
+#[test]
+fn a_drop_without_a_position_opens_documents_and_places_pictures() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    laid_out(&mut app, &ctx);
+    let center = app.view().unwrap().center;
+    let uid = app.session.active().unwrap().uid;
+    for name in ["a.svg", "a.svgz", "a.pdf", "a.ai", "a.eps", "a.vectorcraft", "a.drawcraft", "a.vctemplate", "a.dxf", "a.emf"] {
+        assert_eq!(app.drop_target(name, None, false), DropTarget::Open, "{name}");
+    }
+    for name in ["a.png", "a.jpg", "a.tiff", "a.webp", "a.txt"] {
+        assert_eq!(app.drop_target(name, None, false), DropTarget::Place(DropAt { doc: uid, reverts: 0, at: center, embed: false }), "{name}");
+    }
+}
+
+/// Swatch libraries and color books, graphic style libraries, Libraries panel files, presets,
+/// plug-ins and scripts open as File → Open opens them, dropped with or without a position, on the
+/// canvas too.
+#[test]
+fn libraries_presets_and_plugins_open_wherever_they_are_dropped() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    let rect = laid_out(&mut app, &ctx);
+    let on_canvas = rect.center() + vec2(60.0, -40.0);
+    let libraries = ["a.vcswatches", "a.gpl", "a.ase", "a.acb", "a.vcstyles", "a.vclibrary"];
+    let presets_and_plugins =
+        ["a.vcflattener", "a.vcpdfpresets", "a.vcprintpresets", "a.vcperspective", "a.vcexportpresets", "a.wasm", "a.jsx", "a.jsxinc", "a.jsxbin"];
+    for name in libraries.into_iter().chain(presets_and_plugins) {
+        assert_eq!(app.drop_target(name, None, false), DropTarget::Open, "{name}");
+        assert_eq!(app.drop_target(name, Some(on_canvas), true), DropTarget::Open, "{name} on the canvas");
+    }
+}
+
+/// A swatch library dropped on the window while a document is open loads in the library panel,
+/// as File → Open loads it.
+#[test]
+fn a_dropped_swatch_library_opens_in_the_library_panel() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    laid_out(&mut app, &ctx);
+    let dir = Folder::new("ui-place-swatches");
+    let gpl = dir.file("dropped.gpl", b"GIMP Palette\nName: Dropped\n#\n255   0   0\tRed\n  0 128 255\tSky\n");
+    frame(&mut app, &ctx, vec![], &[&gpl], false);
+    let id = format!("loaded/{gpl}");
+    assert_eq!(crate::panels::library_panel::last_open(&app.ui).map(|o| o.id.as_str()), Some(id.as_str()), "{}", app.ui.status);
+    let lib = app.session.execute("swatch.library.get", &json!({"library": id})).unwrap();
+    let names: Vec<&str> = lib["swatches"].as_array().unwrap().iter().filter_map(|w| w["name"].as_str()).collect();
+    assert_eq!((lib["name"].as_str(), names), (Some("Dropped"), vec!["Red", "Sky"]));
+    assert_eq!((app.session.documents().len(), images(&app, 0)), (1, 0), "neither opened as a document nor placed");
+    assert_eq!(app.ui.recent_files.first(), Some(&gpl), "added to Open Recent Files as File → Open adds it");
+}
+
+/// A script dropped on the window while a document is open shows its check, as File → Open shows
+/// it, and the document is left as it was.
+#[test]
+fn a_dropped_script_shows_its_check() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    laid_out(&mut app, &ctx);
+    let dir = Folder::new("ui-place-script");
+    let path = dir.file("dropped.jsx", b"#target acme\napp.executeMenuCommand('acmecopyall');\n");
+    frame(&mut app, &ctx, vec![], &[&path], false);
+    let d = app.ui.dialog.as_ref().expect("the check is shown");
+    assert_eq!(d.kind, crate::dialogs::script_check::KIND, "{}", app.ui.status);
+    assert_eq!(
+        (d.fields["report"]["name"].as_str(), d.fields["report"]["needs"].clone()),
+        (Some("dropped.jsx"), json!(["language", "menuCommands"]))
+    );
+    assert_eq!((app.session.documents().len(), images(&app, 0)), (1, 0), "neither opened as a document nor placed");
+}
+
+/// A Libraries panel file dropped on the window while a document is open is added to the
+/// Libraries panel as a new library, as File → Open adds it.
+#[test]
+fn a_dropped_libraries_panel_file_is_added_as_a_new_library() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    laid_out(&mut app, &ctx);
+    let file = json!({"name": "Dropped", "colors": [{"name": "Red", "color": {"model": "rgb", "r": 1, "g": 0, "b": 0}}]});
+    let dir = Folder::new("ui-place-library");
+    let path = dir.file("dropped.vclibrary", file.to_string().as_bytes());
+    frame(&mut app, &ctx, vec![], &[&path], false);
+    assert_eq!(app.ui.status, "Imported library Dropped");
+    let lib = app.session.execute("library.get", &json!({})).unwrap();
+    let colors: Vec<&str> = lib["colors"].as_array().unwrap().iter().filter_map(|c| c["name"].as_str()).collect();
+    assert_eq!((lib["name"].as_str(), colors), (Some("Dropped"), vec!["Red"]));
+    assert_eq!((app.session.documents().len(), images(&app, 0)), (1, 0), "neither opened as a document nor placed");
+}
+
+/// A shortcut set dropped on the window while a document is open opens Import Shortcut Set, as
+/// File → Open opens it: from its path (desktop) and from its bytes dropped on the canvas (web).
+#[test]
+fn a_dropped_shortcut_set_opens_import_shortcut_set() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    let rect = laid_out(&mut app, &ctx);
+    let set = "/Menus {\n /Acme\\ Undo { /Modifiers 11 /Key 902 }\n}\n";
+    let dir = Folder::new("ui-place-shortcuts");
+    let path = dir.file("dropped.kys", set.as_bytes());
+    frame(&mut app, &ctx, vec![], &[&path], false);
+    let kind = |app: &VectorcraftApp| app.ui.dialog.as_ref().map(|d| d.kind.clone());
+    assert_eq!(kind(&app).as_deref(), Some(crate::dialogs::shortcut_import::KIND), "{}", app.ui.status);
+    app.ui.dialog = None;
+    let target = app.drop_target("sent.kys", Some(rect.center()), false);
+    assert_eq!(target, DropTarget::Open);
+    crate::place::drop_files(&mut app, vec![(target, ("sent.kys".into(), None, set.as_bytes().to_vec()))]);
+    assert_eq!(kind(&app).as_deref(), Some(crate::dialogs::shortcut_import::KIND), "{}", app.ui.status);
+    assert_eq!((app.session.documents().len(), images(&app, 0)), (1, 0), "neither opened as a document nor placed");
+}
+
+#[test]
+fn a_dropped_png_is_placed_in_the_middle_of_the_view() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    laid_out(&mut app, &ctx);
+    let dir = Folder::new("ui-place-png");
+    let path = dir.file("drop.png", &png(20, 10, 72.0));
+    // Where egui last saw the pointer is stale during a desktop drag: it doesn't count.
+    frame(&mut app, &ctx, vec![egui::Event::PointerMoved(Pos2::new(5.0, 5.0))], &[&path], false);
+    let n = selected_image(&app);
+    let want = app.view().unwrap().center;
+    let c = n.geometric_bounds().unwrap().center();
+    assert!((c.x - want.x).abs() < 1e-6 && (c.y - want.y).abs() < 1e-6, "{c:?} vs {want:?}");
+    assert!(matches!(&n.kind, NodeKind::Image(im) if im.link.as_ref().map(|l| l.path.as_str()) == Some(path.as_str())), "linked by default");
+    assert_eq!(app.session.documents().len(), 1, "placed, not opened");
+    // Shift embeds.
+    frame(&mut app, &ctx, vec![], &[&path], true);
+    assert!(matches!(&selected_image(&app).kind, NodeKind::Image(im) if im.link.is_none()));
+}
+
+/// #472: a document dropped on the window opens as a new tab, not into the open document; the
+/// pictures dropped with it are placed in the document that was open, before it opens.
+#[test]
+fn a_dropped_document_opens_as_a_tab_of_its_own() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    laid_out(&mut app, &ctx);
+    let dir = Folder::new("ui-place-tab");
+    let svg = dir.file("dropped.svg", SVG.as_bytes());
+    let pic = dir.file("with-it.png", &png(8, 8, 72.0));
+    frame(&mut app, &ctx, vec![], &[&svg, &pic], false);
+    assert_eq!(app.session.documents().len(), 2, "opened, not placed");
+    assert_eq!(app.session.active_index(), Some(1), "the document opened is shown");
+    assert_eq!(app.session.active().unwrap().path.as_deref(), Some(svg.as_str()));
+    assert_eq!((images(&app, 0), images(&app, 1)), (1, 0), "the picture is placed in the document that was open");
+    assert_eq!(app.ui.recent_files.first(), Some(&svg));
+}
+
+#[test]
+fn a_native_svg_drop_uses_file_open_even_with_a_path_only_handle() {
+    let dir = Folder::new("ui-place-path-only");
+    let path = dir.file("path-only.svg", SVG.as_bytes());
+    let mut dropped = app();
+    let ctx = egui::Context::default();
+    laid_out(&mut dropped, &ctx);
+    let handle = Arc::new(MockDrop { path: path.clone().into(), bytes: Err("only a path".into()) }) as egui::DroppedFileHandle;
+    frame_files(&mut dropped, &ctx, vec![], vec![handle], false);
+
+    let mut opened = app();
+    opened.run("file.open", json!({ "path": path })).unwrap();
+    let anchors = |app: &VectorcraftApp| {
+        let mut count = 0;
+        app.session.active().unwrap().doc.walk(|n| {
+            if let NodeKind::Path { path, .. } = &n.kind {
+                count += path.anchors().count();
+            }
+        });
+        count
+    };
+    assert_eq!(anchors(&dropped), anchors(&opened), "same editable SVG anchors as File > Open");
+    assert!(anchors(&dropped) >= 3, "the imported path has editable anchors");
+    assert_eq!(dropped.session.active().unwrap().path, opened.session.active().unwrap().path);
+    assert_eq!(dropped.session.active().unwrap().selection.objects.len(), opened.session.active().unwrap().selection.objects.len());
+    assert_eq!(dropped.ui.recent_files, opened.ui.recent_files);
+}
+
+#[test]
+fn an_svg_drop_without_a_path_is_detected_from_its_bytes() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    laid_out(&mut app, &ctx);
+    let svg = Arc::new(MockDrop { path: Default::default(), bytes: Ok(SVG.as_bytes().to_vec()) }) as egui::DroppedFileHandle;
+    frame_files(&mut app, &ctx, vec![], vec![svg], false);
+    assert_eq!(app.session.documents().len(), 2, "SVG bytes open as a document, not placed art");
+    assert!(app.session.active().unwrap().path.is_none(), "no filesystem path was supplied");
+
+    frame(&mut app, &ctx, vec![], &[], false);
+    let image = Arc::new(MockDrop { path: Default::default(), bytes: Ok(png(6, 6, 72.0)) }) as egui::DroppedFileHandle;
+    frame_files(&mut app, &ctx, vec![], vec![image], false);
+    assert_eq!(app.session.documents().len(), 2, "an image is placed, not opened");
+    assert_eq!(images(&app, 1), 1);
+}
+
+#[test]
+fn multiple_svg_drops_open_individually() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    laid_out(&mut app, &ctx);
+    let dir = Folder::new("ui-place-several-svg");
+    let a = dir.file("first.svg", SVG.as_bytes());
+    let b = dir.file("second.svg", SVG.as_bytes());
+    frame(&mut app, &ctx, vec![], &[&a, &b], false);
+    assert_eq!(app.session.documents().len(), 3);
+    assert_eq!(app.session.active().unwrap().path.as_deref(), Some(b.as_str()));
+    assert_eq!(&app.ui.recent_files[..2], &[b, a]);
+}
+
+#[test]
+fn unsupported_and_unreadable_drops_leave_the_document_open() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    laid_out(&mut app, &ctx);
+    let dir = Folder::new("ui-place-unreadable");
+    let invalid = dir.file("not-art.xyz", b"not an image or document");
+    frame(&mut app, &ctx, vec![], &[&invalid], false);
+    assert!(app.ui.status.contains("Couldn't place not-art.xyz"), "{}", app.ui.status);
+
+    let invalid_svg = dir.file("broken.svg", b"<svg");
+    frame(&mut app, &ctx, vec![], &[&invalid_svg], false);
+    assert!(app.ui.status.contains("Couldn't open broken.svg"), "{}", app.ui.status);
+
+    let missing = dir.file("unreadable.svg", SVG.as_bytes());
+    std::fs::remove_file(&missing).unwrap();
+    frame(&mut app, &ctx, vec![], &[&missing], false);
+    assert!(app.ui.status.contains("Couldn't open unreadable.svg"), "{}", app.ui.status);
+    assert_eq!(app.session.documents().len(), 1);
+    assert!(app.ui.recent_files.is_empty(), "failed drops don't enter Open Recent");
+}
+
+#[test]
+fn files_dropped_with_no_document_open_open_and_are_recent() {
+    let mut app = VectorcraftApp::new(Session::new(), Default::default());
+    let ctx = egui::Context::default();
+    let dir = Folder::new("ui-place-no-document");
+    let path = dir.file("open-me.png", &png(8, 8, 72.0));
+    frame(&mut app, &ctx, vec![], &[], false);
+    frame(&mut app, &ctx, vec![], &[&path], false);
+    assert_eq!(app.session.documents().len(), 1, "no document: the drop opens");
+    assert_eq!(app.ui.recent_files.first(), Some(&path));
+}
+
+/// The images in open document `i`.
+fn images(app: &VectorcraftApp, i: usize) -> usize {
+    let mut n = 0;
+    app.session.documents()[i].doc.walk(|node| n += usize::from(matches!(node.kind, NodeKind::Image(_))));
+    n
+}
+
+/// The web reads dropped files asynchronously (#359): a file that arrives after another document
+/// became active still lands where it was dropped, and is dropped itself when that document closed.
+#[test]
+fn a_file_read_after_another_document_became_active_lands_where_it_was_dropped() {
+    let mut app = app();
+    let inbox = crate::place::PlaceInbox::default();
+    app.services.place_inbox = Some(inbox.clone());
+    let ctx = egui::Context::default();
+    frame(&mut app, &ctx, vec![], &[], false);
+    frame(&mut app, &ctx, vec![], &[], false);
+    let rect = app.canvas_rect.expect("the canvas is laid out");
+    let pos = rect.center() + vec2(60.0, -40.0);
+    let drop_on_active = |app: &VectorcraftApp| match app.drop_target("late.png", Some(pos), false) {
+        DropTarget::Place(d) => d,
+        t => panic!("{t:?}"),
+    };
+    let arrive =
+        |name: &str, drop| inbox.lock().unwrap().push(crate::place::PlaceArrival { name: name.into(), bytes: png(20, 10, 72.0), drop: Some(drop) });
+    // Dropped on A; another document opens while the file is read.
+    let on_a = drop_on_active(&app);
+    let want = Xf::new(rect, app.view().unwrap()).to_doc(pos);
+    app.run("file.new", json!({"width": 600, "height": 500})).unwrap();
+    assert_eq!(app.session.active_index(), Some(1));
+    arrive("late.png", on_a);
+    frame(&mut app, &ctx, vec![], &[], false);
+    assert_eq!(app.session.active_index(), Some(0), "the document it was dropped on is active again");
+    assert_eq!((images(&app, 0), images(&app, 1)), (1, 0));
+    let c = selected_image(&app).geometric_bounds().unwrap().center();
+    assert!((c.x - want.x).abs() < 1e-6 && (c.y - want.y).abs() < 1e-6, "where it was dropped: {c:?} vs {want:?}");
+    // Dropped on B, which closes before the file arrives: nothing is placed.
+    app.run("document.activate", json!({"index": 1})).unwrap();
+    let on_b = drop_on_active(&app);
+    app.run("file.close", json!({})).unwrap();
+    assert_eq!(app.session.documents().len(), 1);
+    arrive("orphan.png", on_b);
+    frame(&mut app, &ctx, vec![], &[], false);
+    assert_eq!(images(&app, 0), 1, "not placed in the document left open");
+    assert!(app.ui.status.contains("orphan.png") && app.ui.status.contains("closed"), "{}", app.ui.status);
+}
+
+#[test]
+fn the_place_dialog_lists_the_files_and_loads_the_cursor_with_several() {
+    let mut app = app();
+    let dir = Folder::new("ui-place-dialog");
+    let a = dir.file("a.png", &png(300, 150, 300.0));
+    let b = dir.file("b.png", &png(10, 10, 72.0));
+    app.run("file.place", json!({"paths": [a, b]})).unwrap();
+    let d = app.ui.dialog.as_ref().expect("the Place dialog");
+    assert_eq!(d.kind, crate::dialogs::place::KIND);
+    assert!(d.bool("link") && !d.bool("__replace"), "Link on; Replace needs one file and one selected object");
+    assert_eq!(d.fields["__info"][0], "300 × 150 px, 300 ppi, RGB (72 pt × 36 pt)");
+    let text = crate::tests_labels::painted_text(&mut app, |app, ui| crate::dialogs::show(app, ui.ctx()));
+    for label in ["Place", "a.png", "b.png", "Link", "Template", "Replace", "Cancel"] {
+        assert!(text.contains(label), "{label} in {text}");
+    }
+    crate::dialogs::confirm(&mut app).unwrap();
+    assert!(app.ui.dialog.is_none());
+    assert_eq!(app.session.tool_id(), "place");
+    assert_eq!(app.session.tool_options()["count"], 2);
+    // The cursor carries the current file's thumbnail and the number of files.
+    let ctx = egui::Context::default();
+    crate::theme::install_fonts(&ctx);
+    let mut shapes = vec![];
+    for _ in 0..2 {
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| crate::place::paint_cursor(&mut app, ui.ctx(), ui.painter(), Pos2::new(50.0, 50.0)));
+        out.textures_delta.clear();
+        shapes = out.shapes;
+    }
+    let mut text = String::new();
+    let mut textured = false;
+    for s in shapes {
+        match s.shape {
+            Shape::Text(t) => text.push_str(t.galley.text()),
+            Shape::Mesh(m) => textured |= m.texture_id != egui::TextureId::default(),
+            _ => {}
+        }
+    }
+    assert!(textured, "the thumbnail");
+    assert_eq!(text, "2", "the badge");
+}
+
+#[test]
+fn one_file_places_centred_in_the_view_and_replace_swaps_the_selection() {
+    let mut app = app();
+    app.view_mut().unwrap().center = vectorcraft_geom::Point::new(120.0, 80.0);
+    let dir = Folder::new("ui-place-replace");
+    place_picked(&mut app, &dir.file("one.png", &png(300, 150, 300.0)));
+    let d = app.ui.dialog.as_ref().expect("the Place dialog");
+    assert_eq!(d.kind, crate::dialogs::place::KIND);
+    assert!(d.bool("link") && !d.bool("__replace"), "Link on; Replace needs one selected object");
+    assert_eq!(d.fields["__info"][0], "300 × 150 px, 300 ppi, RGB (72 pt × 36 pt)");
+    let text = crate::tests_labels::painted_text(&mut app, |app, ui| crate::dialogs::show(app, ui.ctx()));
+    for label in ["Place", "one.png", "Link", "Template", "Replace", "Cancel"] {
+        assert!(text.contains(label), "{label} in {text}");
+    }
+    crate::dialogs::confirm(&mut app).unwrap();
+    assert!(app.ui.dialog.is_none());
+    let first = selected_image(&app);
+    assert_eq!(first.geometric_bounds().unwrap().center(), vectorcraft_geom::Point::new(120.0, 80.0), "centred in the view");
+    // With one object selected, Replace applies.
+    place_picked(&mut app, &dir.file("two.png", &png(40, 40, 144.0)));
+    assert!(app.ui.dialog.as_ref().unwrap().bool("__replace"));
+    app.ui.dialog.as_mut().unwrap().fields.insert("replace".into(), json!(true));
+    app.ui.dialog.as_mut().unwrap().fields.insert("link".into(), json!(false));
+    crate::dialogs::confirm(&mut app).unwrap();
+    let second = selected_image(&app);
+    assert_eq!(second.name.as_deref(), Some("two.png"));
+    assert_eq!(app.session.active().unwrap().doc.layers[0].children().unwrap().len(), 1, "replaced");
+    assert!(!app.ui.place_link, "Link is remembered");
+}
+
+#[test]
+fn the_control_bar_shows_the_image_file_link_colour_mode_and_ppi() {
+    let mut app = app();
+    let dir = Folder::new("ui-place-control-bar");
+    let path = dir.file("photo.png", &png(30, 30, 300.0));
+    app.run("file.place", json!({"path": path})).unwrap();
+    let text = crate::tests_labels::painted_text(&mut app, crate::chrome::control_bar);
+    for s in ["Linked File", "photo.png", "RGB   PPI: 300"] {
+        assert!(text.contains(s), "{s} in {text}");
+    }
+    let v: Value = app.run("file.place", json!({"path": path, "link": false})).unwrap();
+    assert_eq!(v["linked"], false);
+    let text = crate::tests_labels::painted_text(&mut app, crate::chrome::control_bar);
+    assert!(text.contains("Embedded"), "{text}");
+}
+
+/// The Control bar's label is read from the first selected object each frame, so it follows an
+/// edit, Undo, a switch to another document and back, and a selection change.
+#[test]
+fn the_control_bar_label_follows_edits_undo_documents_and_selection() {
+    let mut app = app();
+    let dir = Folder::new("ui-place-label");
+    let path = dir.file("label.png", &png(30, 30, 72.0));
+    app.run("file.place", json!({"path": path})).unwrap();
+    let text = |app: &mut VectorcraftApp| crate::tests_labels::painted_text(app, crate::chrome::control_bar);
+    assert!(text(&mut app).contains("Linked File"));
+    app.run("links.embed", json!({})).unwrap();
+    let embedded = text(&mut app);
+    assert!(embedded.contains("Embedded") && !embedded.contains("Linked File"), "{embedded}");
+    app.run("edit.undo", json!({})).unwrap();
+    assert!(text(&mut app).contains("Linked File"));
+    app.run("file.new", json!({"width": 100, "height": 100})).unwrap();
+    assert!(!text(&mut app).contains("Linked File"), "the new document has nothing selected");
+    app.session.set_active(0);
+    assert!(text(&mut app).contains("Linked File"));
+    app.run("shape.rectangle", json!({"x": 10, "y": 10, "width": 40, "height": 30})).unwrap();
+    let rect = text(&mut app);
+    assert!(!rect.contains("Linked File") && !rect.contains("Embedded"), "{rect}");
+}
+
+/// Click the Control bar's `label`.
+fn click_label(app: &mut VectorcraftApp, ctx: &egui::Context, label: &str) {
+    use crate::tests_removeanchors::{at, click_control, control_frame};
+    let p = at(&control_frame(app, ctx, vec![]), label);
+    click_control(app, ctx, p);
+}
+
+/// The Control bar's file name opens the link menu: Replace… puts the picked file in the image's
+/// place (an embedded image becomes linked) with the new file's own aspect ratio, fitted inside the
+/// old bounds; Placement Options… opens its dialog.
+#[test]
+fn the_control_bars_file_name_relinks_the_image() {
+    use crate::tests_removeanchors::{click_control, control_frame};
+    // Menu items are drawn after the space a check mark takes.
+    let item = |app: &mut VectorcraftApp, ctx: &egui::Context, label: &str| {
+        let texts = control_frame(app, ctx, vec![]);
+        texts.iter().find(|(t, _)| t.trim() == label).map(|(_, r)| r.center()).unwrap_or_else(|| panic!("no `{label}` in {texts:?}"))
+    };
+    let mut app = app();
+    let data = vectorcraft_format::base64_encode(&png(30, 30, 72.0));
+    app.run("file.place", json!({"name": "red.png", "dataBase64": data, "link": false})).unwrap();
+    let before = selected_image(&app).geometric_bounds().unwrap();
+    let ctx = egui::Context::default();
+    crate::theme::install_fonts(&ctx);
+    click_label(&mut app, &ctx, "red.png");
+    for s in ["Replace…", "Go To Link", "Edit Original", "Update Link", "Placement Options…"] {
+        item(&mut app, &ctx, s);
+    }
+    let dir = Folder::new("ui-place-relink");
+    let other = dir.file("blue.png", &png(60, 30, 72.0));
+    let picked = other.clone();
+    app.services.pick_open = Some(Box::new(move |_: &crate::FilePick| Some(picked.clone())));
+    let p = item(&mut app, &ctx, "Replace…");
+    click_control(&mut app, &ctx, p);
+    let image = selected_image(&app);
+    let NodeKind::Image(im) = &image.kind else { panic!("an image") };
+    assert!(im.link.as_ref().is_some_and(|l| l.name() == "blue.png"), "relinked to the picked file");
+    let after = image.geometric_bounds().unwrap();
+    assert!((after.width() - before.width()).abs() < 1e-6 && (after.height() - before.height() / 2.0).abs() < 1e-6, "2:1, fitted: {after:?}");
+    assert!((after.center() - before.center()).hypot() < 1e-6, "centred where the old image was");
+    click_label(&mut app, &ctx, "blue.png");
+    let p = item(&mut app, &ctx, "Placement Options…");
+    click_control(&mut app, &ctx, p);
+    assert!(app.ui.dialog.is_some(), "Placement Options opens");
+}
+
+#[test]
+fn the_control_bar_and_properties_trace_a_selected_image() {
+    use crate::panels::image_trace::{TRACE_BUTTON_W, selected_trace};
+    let selected_preset = |app: &VectorcraftApp| selected_trace(app).map(|t| t.0);
+    use crate::tests_removeanchors::{at, click_control, control_frame, has, properties_frame};
+    let mut app = app();
+    let data = vectorcraft_format::base64_encode(&png(30, 30, 72.0));
+    app.run("file.place", json!({"name": "red.png", "dataBase64": data, "link": false})).unwrap();
+    let ctx = egui::Context::default();
+    crate::theme::install_fonts(&ctx);
+    let bar = control_frame(&mut app, &ctx, vec![]);
+    for s in ["Embedded", "Unembed…", "Image Trace", "Mask", "Crop Image", "Opacity:"] {
+        assert!(has(&bar, s), "{s}");
+    }
+    assert!(!has(&bar, "Stroke:"), "an image has no Fill and Stroke in the Control bar");
+    let props = properties_frame(&mut app, 260.0);
+    for s in ["Unembed…", "Image Trace", "Mask", "Crop Image"] {
+        assert!(has(&props, s), "Properties: {s}");
+    }
+    // The button's arrow lists the presets; choosing one traces the image with it.
+    click_control(&mut app, &ctx, at(&bar, "Image Trace") + vec2(TRACE_BUTTON_W / 2.0, 0.0));
+    click_label(&mut app, &ctx, "6 Colors");
+    assert_eq!(selected_preset(&app).as_deref(), Some("6 Colors"));
+    // The button itself traces with the Default preset.
+    app.run("edit.undo", json!({})).unwrap();
+    click_label(&mut app, &ctx, "Image Trace");
+    assert_eq!(selected_preset(&app).as_deref(), Some("Default"));
+    // An Image Trace object: its preset (another traces it again), view, the panel and Expand.
+    let bar = control_frame(&mut app, &ctx, vec![]);
+    for s in ["Image Tracing", "Preset:", "Default", "View:", "Tracing Result", "Expand"] {
+        assert!(has(&bar, s), "{s}");
+    }
+    let props = properties_frame(&mut app, 260.0);
+    assert!(has(&props, "Release") && has(&props, "View:"));
+    // Another view redraws it without tracing again.
+    let traced = app.session.active().unwrap().selection.objects.clone();
+    click_control(&mut app, &ctx, at(&bar, "Tracing Result"));
+    click_label(&mut app, &ctx, "Outlines with Source Image");
+    assert_eq!(selected_trace(&app).map(|t| t.1), Some(vectorcraft_doc::TraceView::OutlinesWithSource));
+    assert_eq!(app.session.active().unwrap().selection.objects, traced, "the same object");
+    let bar = control_frame(&mut app, &ctx, vec![]);
+    click_control(&mut app, &ctx, at(&bar, "Default"));
+    click_label(&mut app, &ctx, "3 Colors");
+    assert_eq!(selected_preset(&app).as_deref(), Some("3 Colors"));
+    click_label(&mut app, &ctx, "Expand");
+    let st = app.session.active().unwrap();
+    let g = st.doc.node(st.selection.objects[0]).unwrap();
+    assert!(selected_trace(&app).is_none() && g.children().unwrap().iter().all(|c| !matches!(c.kind, NodeKind::Image(_))), "expanded");
+}
+
+/// With the Control bar's Image Options group off, a selected image or Image Trace object shows
+/// neither its own controls nor Fill and Stroke in their place; its label and Opacity stay.
+#[test]
+fn the_image_options_group_holds_the_image_and_trace_controls() {
+    use crate::tests_removeanchors::{control_frame, has};
+    let mut app = app();
+    let data = vectorcraft_format::base64_encode(&png(30, 30, 72.0));
+    app.run("file.place", json!({"name": "red.png", "dataBase64": data, "link": false})).unwrap();
+    let ctx = egui::Context::default();
+    crate::theme::install_fonts(&ctx);
+    let set = |app: &mut VectorcraftApp, on: bool| app.run("window.control.options", json!({"group": "imageOptions", "visible": on})).unwrap();
+    set(&mut app, false);
+    let bar = control_frame(&mut app, &ctx, vec![]);
+    for s in ["Unembed…", "Image Trace", "Crop Image", "Stroke:"] {
+        assert!(!has(&bar, s), "{s}: {bar:?}");
+    }
+    assert!(has(&bar, "Embedded") && has(&bar, "Opacity:"), "{bar:?}");
+    set(&mut app, true);
+    click_label(&mut app, &ctx, "Image Trace");
+    assert!(has(&control_frame(&mut app, &ctx, vec![]), "Expand"), "traced");
+    set(&mut app, false);
+    let bar = control_frame(&mut app, &ctx, vec![]);
+    for s in ["Preset:", "Expand", "Stroke:"] {
+        assert!(!has(&bar, s), "{s}: {bar:?}");
+    }
+    assert!(has(&bar, "Image Tracing") && has(&bar, "Opacity:"), "{bar:?}");
+}
+
+#[test]
+fn the_control_bars_mask_clips_the_image_and_selects_the_clipping_path() {
+    let mut app = app();
+    let data = vectorcraft_format::base64_encode(&png(30, 30, 72.0));
+    let img = app.run("file.place", json!({"name": "red.png", "dataBase64": data, "link": false})).unwrap()["ids"][0].as_u64().unwrap();
+    let ctx = egui::Context::default();
+    crate::theme::install_fonts(&ctx);
+    click_label(&mut app, &ctx, "Mask");
+    let st = app.session.active().unwrap();
+    let group = &st.doc.layers[0].children().unwrap()[0];
+    assert!(matches!(group.kind, NodeKind::Group { clip: true, .. }));
+    let ids: Vec<u64> = group.children().unwrap().iter().map(|c| c.id.0).collect();
+    assert_eq!((ids[1], st.selection.objects.iter().map(|i| i.0).collect::<Vec<_>>()), (img, vec![ids[0]]));
+}
+
+#[test]
+fn a_vectorcraft_document_places_linked_and_edit_original_opens_it() {
+    let mut app = app();
+    // A one-artboard document with a rectangle.
+    let mut src = Session::new();
+    src.execute("file.new", &json!({"width": 100, "height": 50})).unwrap();
+    src.execute("shape.rectangle", &json!({"x": 0, "y": 0, "width": 100, "height": 50})).unwrap();
+    let bytes = vectorcraft_format::save_file(&src.active().unwrap().doc);
+    let dir = Folder::new("ui-place-document");
+    let path = dir.file("badge.vectorcraft", &bytes);
+    place_picked(&mut app, &path);
+    let d = app.ui.dialog.as_ref().expect("the Place dialog");
+    assert!(d.bool("link") && d.bool("__documents") && !d.bool("__others"), "Link on, for a document");
+    // Link's tooltip says what it does for a document.
+    assert!(crate::dialogs::place::link_tip(d).contains("editable copy"));
+    crate::dialogs::confirm(&mut app).unwrap();
+    let st = app.session.active().unwrap();
+    let id = st.selection.objects[0];
+    let vectorcraft_doc::NodeKind::PlacedDocument(p) = &st.doc.node(id).unwrap().kind else { panic!("not a placed document") };
+    assert_eq!(p.link.path, path);
+    // Edit Original opens the document in a new tab.
+    let tabs = app.session.documents().len();
+    app.run("links.editOriginal", json!({})).unwrap();
+    assert_eq!(app.session.documents().len(), tabs + 1);
+    assert_eq!(app.session.active().unwrap().path.as_deref(), Some(path.as_str()));
+    // A PNG keeps the image tooltip; a PNG and a document, both.
+    let pic = dir.file("pic.png", &png(10, 10, 72.0));
+    place_picked(&mut app, &pic);
+    let d = app.ui.dialog.as_ref().unwrap();
+    assert!(!d.bool("__documents") && crate::dialogs::place::link_tip(d).contains("image file"));
+    app.ui.dialog = None;
+    let both = vec![pic.clone(), path.clone()];
+    app.services.pick_open_multi = Some(Box::new(move || both.clone()));
+    app.run("file.place", json!({})).unwrap();
+    let d = app.ui.dialog.as_ref().unwrap();
+    assert!(crate::dialogs::place::link_tip(d).contains("VectorCraft documents"));
+}
+
+#[test]
+fn the_place_dialog_links_a_pdf_page_and_embeds_it_with_link_off() {
+    let mut app = app();
+    let mut src = Session::new();
+    src.execute("file.new", &json!({"width": 100, "height": 50})).unwrap();
+    src.execute("shape.rectangle", &json!({"x": 0, "y": 0, "width": 100, "height": 50})).unwrap();
+    let pdf = src.execute("document.serialize", &json!({"format": "pdf", "preserveEditing": false})).unwrap();
+    let dir = Folder::new("ui-place-pdf");
+    let path = dir.file("flyer.pdf", &vectorcraft_format::base64_decode(pdf["dataBase64"].as_str().unwrap()).unwrap());
+    // Link on (the default): one locked object, linked to the file.
+    place_picked(&mut app, &path);
+    let d = app.ui.dialog.as_ref().expect("the Place dialog");
+    assert!(d.bool("link") && d.bool("__documents") && !d.bool("__others"), "Link places it as one locked object");
+    assert!(crate::dialogs::place::link_tip(d).contains("locked object"));
+    crate::dialogs::confirm(&mut app).unwrap();
+    let st = app.session.active().unwrap();
+    let vectorcraft_doc::NodeKind::PlacedDocument(p) = &st.doc.node(st.selection.objects[0]).unwrap().kind else { panic!("not a placed document") };
+    assert_eq!(p.link.path, path);
+    // Link off: the page's art is embedded.
+    place_picked(&mut app, &path);
+    app.ui.dialog.as_mut().unwrap().fields.insert("link".into(), json!(false));
+    crate::dialogs::confirm(&mut app).unwrap();
+    let st = app.session.active().unwrap();
+    assert_eq!(st.doc.node(st.selection.objects[0]).unwrap().kind_label(), "Clip Group");
+}
+
+#[test]
+fn the_place_dialog_offers_a_postscript_ai_and_an_eps_file_as_a_locked_object() {
+    let mut app = app();
+    let ps = b"%!PS-Adobe-3.0\n%%BoundingBox: 0 0 100 100\n%%EndComments\n1 0 0 setrgbcolor 10 10 50 50 rectfill\nshowpage\n%%EOF\n";
+    let dir = Folder::new("ui-place-postscript");
+    for name in ["legacy.ai", "legacy.eps", "legacy.ps"] {
+        let path = dir.file(name, ps);
+        // With Link, file.place places a .ai saved without PDF compatibility, an EPS file and a
+        // PostScript file as one locked placed document.
+        let r = app.session.execute("file.place", &json!({"path": path, "link": true})).unwrap();
+        assert_eq!(r["linked"], json!(true), "{name}: {r}");
+        let st = app.session.active().unwrap();
+        assert!(matches!(st.doc.node(st.selection.objects[0]).unwrap().kind, NodeKind::PlacedDocument(_)), "{name}");
+        // So Link's tooltip promises one locked object for it.
+        place_picked(&mut app, &path);
+        let d = app.ui.dialog.as_ref().expect("the Place dialog");
+        assert!(d.bool("__documents") && !d.bool("__others"), "{name}: {:?}", d.fields);
+        assert!(crate::dialogs::place::link_tip(d).contains("locked object"), "{name}");
+        app.ui.dialog = None;
+    }
+    // Where the platform reads part of a file, only the file's start is read to tell.
+    let asked = std::rc::Rc::new(std::cell::Cell::new(0));
+    let seen = asked.clone();
+    app.services.read_head = Some(Box::new(move |p: &str, max: usize| {
+        seen.set(max);
+        std::fs::read(p).map(|b| b[..b.len().min(max)].to_vec()).map_err(|e| e.to_string())
+    }));
+    place_picked(&mut app, &dir.file("headed.eps", ps));
+    assert!(app.ui.dialog.as_ref().expect("the Place dialog").bool("__documents"));
+    assert_eq!(asked.get(), vectorcraft_engine::cmd::place::DCS_HEAD_BYTES + 1);
+    app.ui.dialog = None;
+    // A DCS file is placed as a linked image, from its start alone too: past the start the
+    // PostScript goes on longer than what is read.
+    let mut dcs = b"%!PS-Adobe-2.0 EPSF-1.2\n%%BoundingBox: 0 0 20 10\n%%CyanPlate: pic.C\n%%EndComments\n".to_vec();
+    dcs.resize(vectorcraft_engine::cmd::place::DCS_HEAD_BYTES + 100, b'\n');
+    // The same PostScript behind a binary EPS header (no preview).
+    let mut binary = vec![0xC5, 0xD0, 0xD3, 0xC6];
+    binary.extend(30u32.to_le_bytes());
+    binary.extend((dcs.len() as u32).to_le_bytes());
+    binary.resize(30, 0);
+    binary.extend(&dcs);
+    let files = [("plates.eps", &dcs, true), ("plates.ai", &dcs, true), ("binary.eps", &binary, true), ("binary.eps", &binary, false)];
+    for (name, bytes, head) in files {
+        if !head {
+            app.services.read_head = None;
+        }
+        place_picked(&mut app, &dir.file(name, bytes));
+        let d = app.ui.dialog.as_ref().expect("the Place dialog");
+        assert!(!d.bool("__documents") && d.bool("__others"), "{name}, head {head}: {:?}", d.fields);
+        app.ui.dialog = None;
+    }
+    // A file named .eps that isn't PostScript gets the tooltip for other files.
+    let path = dir.file("notes.eps", b"not PostScript");
+    place_picked(&mut app, &path);
+    let d = app.ui.dialog.as_ref().expect("the Place dialog");
+    assert!(!d.bool("__documents") && d.bool("__others"), "{:?}", d.fields);
+}
+
+/// Tool key `key` as the Control bar's Apply (Enter) and Cancel (Escape) send it.
+fn tool_key(app: &mut VectorcraftApp, key: vectorcraft_tools::ToolKey) {
+    let view = app.view_info();
+    let r = app.session.tool_key(key, vectorcraft_tools::Mods::default(), view);
+    crate::canvas::apply_requests(app, r);
+}
+
+/// #734: Crop Image shows a crop box on the image instead of cropping to the artboard at once (an
+/// image inside the artboard had nothing to cut); Apply crops to the box in one undo step, Cancel
+/// leaves the image whole, and both go back to the Selection tool.
+/// Holding Escape with the place cursor loaded discards one file for the press. The repeats discard
+/// no more and run no command bound to Escape.
+#[test]
+fn holding_escape_with_the_place_cursor_loaded_discards_one_file() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    crate::theme::install_fonts(&ctx);
+    app.run("shortcuts.set", json!({"id": "select.none", "shortcut": "Escape", "force": true})).unwrap();
+    let id = app.run("shape.rectangle", json!({"x": 10, "y": 10, "width": 20, "height": 20})).unwrap()["id"].clone();
+    app.run("select.set", json!({"ids": [id]})).unwrap();
+    let dir = Folder::new("ui-place-held-escape");
+    let paths: Vec<String> = ["held-a.png", "held-b.png", "held-c.png"].iter().map(|name| dir.file(name, &png(10, 10, 72.0))).collect();
+    app.run("file.place", json!({"paths": paths})).unwrap();
+    crate::dialogs::confirm(&mut app).unwrap();
+    assert_eq!(app.session.tool_options()["count"], 3);
+    let selected = app.session.active().unwrap().selection.objects.clone();
+    assert!(!selected.is_empty());
+    let key = |pressed| egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed, repeat: false, modifiers: Default::default() };
+    frame(&mut app, &ctx, vec![], &[], false);
+    for repeat in 0..4 {
+        frame(&mut app, &ctx, vec![key(true)], &[], false);
+        assert_eq!(app.session.tool_options()["count"], 2, "repeat {repeat}: one file is discarded");
+        assert_eq!(app.session.active().unwrap().selection.objects, selected, "repeat {repeat}: no command ran");
+    }
+    frame(&mut app, &ctx, vec![key(false)], &[], false);
+    frame(&mut app, &ctx, vec![key(true)], &[], false);
+    assert_eq!(app.session.tool_options()["count"], 1, "a new press discards the next file");
+}
+
+/// A command bound to Shift+Escape keeps repeating with the place cursor loaded, and no file is
+/// discarded.
+#[test]
+fn holding_a_chord_bound_to_a_command_repeats_it_with_the_place_cursor_loaded() {
+    let mut app = app();
+    let ctx = egui::Context::default();
+    crate::theme::install_fonts(&ctx);
+    app.run("shortcuts.set", json!({"id": "view.zoomIn", "shortcut": "Shift+Escape", "force": true})).unwrap();
+    let dir = Folder::new("ui-place-held-chord");
+    let paths: Vec<String> = ["chord-a.png", "chord-b.png"].iter().map(|name| dir.file(name, &png(10, 10, 72.0))).collect();
+    app.run("file.place", json!({"paths": paths})).unwrap();
+    crate::dialogs::confirm(&mut app).unwrap();
+    let modifiers = egui::Modifiers::SHIFT;
+    let press = egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers };
+    frame(&mut app, &ctx, vec![], &[], false);
+    let mut zoom = app.view().unwrap().zoom;
+    for repeat in 0..3 {
+        frame(&mut app, &ctx, vec![press.clone()], &[], true);
+        assert!(app.view().unwrap().zoom > zoom, "repeat {repeat}: the command runs");
+        assert_eq!(app.session.tool_options()["count"], 2, "repeat {repeat}: no file is discarded");
+        zoom = app.view().unwrap().zoom;
+    }
+}
+
+#[test]
+fn crop_image_shows_a_box_that_apply_crops_to() {
+    use vectorcraft_tools::ToolKey;
+    let mut app = app();
+    let dir = Folder::new("ui-place-crop");
+    place_picked(&mut app, &dir.file("crop.png", &png(100, 50, 72.0)));
+    app.ui.dialog.as_mut().unwrap().fields.insert("link".into(), json!(false));
+    crate::dialogs::confirm(&mut app).unwrap();
+    let whole = selected_image(&app).geometric_bounds().unwrap();
+    assert!(crate::menus::enabled(&app, "ui.cropImage"));
+    app.run("ui.cropImage", json!({})).unwrap();
+    assert_eq!(app.session.tool_id(), "cropImage");
+    tool_key(&mut app, ToolKey::Escape);
+    assert_eq!(app.session.tool_id(), "selection");
+    assert_eq!(selected_image(&app).geometric_bounds(), Some(whole), "Cancel leaves it whole");
+    // The box set to the image's left half, as the Control bar's fields set it, then Apply.
+    app.run("ui.cropImage", json!({})).unwrap();
+    app.run("tool.setOption", json!({"key": "rect", "value": [whole.x0, whole.y0, whole.width() / 2.0, whole.height()]})).unwrap();
+    tool_key(&mut app, ToolKey::Enter);
+    assert_eq!(app.session.tool_id(), "selection");
+    let b = selected_image(&app).geometric_bounds().unwrap();
+    assert!(
+        (b.x0 - whole.x0).abs() < 1e-6 && (b.width() - whole.width() / 2.0).abs() < 1e-6 && (b.height() - whole.height()).abs() < 1e-6,
+        "{b:?} of {whole:?}"
+    );
+    app.run("edit.undo", json!({})).unwrap();
+    assert_eq!(selected_image(&app).geometric_bounds(), Some(whole), "one undo step");
+    // Without an image selected there's nothing to crop.
+    app.run("select.none", json!({})).unwrap();
+    assert!(!crate::menus::enabled(&app, "ui.cropImage") && app.run("ui.cropImage", json!({})).is_err());
+}
+
+/// Crop Image's Apply and Object › Rasterize say in the status bar when the image couldn't be
+/// decoded, as raster exports do.
+#[test]
+fn crop_and_rasterize_say_in_the_status_bar_when_an_image_could_not_be_decoded() {
+    const WARNING: &str = "an image couldn't be decoded and is missing from the picture";
+    // A PNG whose header reads but whose pixel data is cut short.
+    let mut app = app();
+    vectorcraft_testkit::fixtures::place_cut_png(&mut app.session, &png(100, 50, 72.0), json!({}));
+    let whole = selected_image(&app).geometric_bounds().unwrap();
+    app.run("ui.cropImage", json!({})).unwrap();
+    app.run("tool.setOption", json!({"key": "rect", "value": [whole.x0, whole.y0, whole.width() / 2.0, whole.height()]})).unwrap();
+    app.status("");
+    tool_key(&mut app, vectorcraft_tools::ToolKey::Enter);
+    assert_eq!(app.ui.status, WARNING, "Crop Image's Apply");
+    // Undo puts the image back as placed; then Rasterize runs on it.
+    app.run("edit.undo", json!({})).unwrap();
+    app.status("");
+    app.run("object.rasterize", json!({"ppi": 72})).unwrap();
+    assert_eq!(app.ui.status, WARNING, "Rasterize");
+}
+
+/// One headless frame of the whole window at `time` → how long the app asked to wait before the
+/// next one.
+fn frame_at(app: &mut VectorcraftApp, ctx: &egui::Context, time: f64) -> std::time::Duration {
+    // The app's background work (the link-watch look) runs on host time; drive it with this test's
+    // simulated seconds rather than the real monotonic clock, as the window loop would.
+    app.now_override = Some(time);
+    let raw = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0))), time: Some(time), ..Default::default() };
+    let mut out = ctx.run_ui(raw, |ui| {
+        app.logic(ui.ctx());
+        app.ui(ui);
+    });
+    out.textures_delta.clear();
+    out.viewport_output.get(&egui::ViewportId::ROOT).map_or(std::time::Duration::MAX, |v| v.repaint_delay)
+}
+
+/// The window sits idle for `secs` from `*time` (a frame now, then only the frames the app asks
+/// for) or until `done` → whether it was.
+fn idle(app: &mut VectorcraftApp, ctx: &egui::Context, time: &mut f64, secs: f64, done: &dyn Fn(&VectorcraftApp) -> bool) -> bool {
+    let end = *time + secs;
+    loop {
+        let wait = frame_at(app, ctx, *time);
+        if done(app) {
+            return true;
+        }
+        let next = *time + wait.as_secs_f64().max(1.0 / 60.0);
+        if next > end {
+            *time = end;
+            return false;
+        }
+        // The look runs on a worker thread, in real time: the clock waits for it to finish, else a
+        // busy machine's slow look outlasts the simulated seconds and the test fails at random.
+        if app.session.link_scan.is_some() {
+            app.session.wait_link_scan();
+            continue;
+        }
+        *time = next;
+    }
+}
+
+/// A file placed into a document whose last look found no links, then changed by another app
+/// while the window sits idle in the background, follows Update Links: Automatically: the app
+/// wakes itself to see the new link before the change, so the change isn't taken for the file as
+/// first seen.
+/// The text of the one selected type object.
+fn selected_text(app: &VectorcraftApp) -> String {
+    let st = app.session.active().unwrap();
+    let NodeKind::Text(t) = &st.doc.node(st.selection.objects[0]).unwrap().kind else { panic!("not type") };
+    t.plain_text()
+}
+
+/// The kind of the open dialog, if any.
+fn dialog_kind(app: &VectorcraftApp) -> Option<&str> {
+    app.ui.dialog.as_ref().map(|d| d.kind.as_str())
+}
+
+const NOTES: &[u8] = b"one\r\ntwo\r\n\r\nthree\r\n";
+
+/// A DXF drawing of one 100 × 50 line.
+const LINE_DXF: &[u8] = b"0\nSECTION\n2\nENTITIES\n0\nLINE\n8\n0\n10\n0\n20\n0\n11\n100\n21\n50\n0\nENDSEC\n0\nEOF\n";
+
+#[test]
+fn show_import_options_is_a_place_option_saved_with_the_preferences() {
+    let mut app = app();
+    let dir = Folder::new("ui-place-show-import-options");
+    let notes = dir.file("notes.txt", NOTES);
+    app.run("file.place", json!({"paths": [notes]})).unwrap();
+    let d = app.ui.dialog.as_ref().expect("the Place dialog");
+    assert!(d.bool("showImportOptions"), "on by default");
+    let text = crate::tests_labels::painted_text(&mut app, |app, ui| crate::dialogs::show(app, ui.ctx()));
+    assert!(text.contains("Show Import Options"), "{text}");
+    // On: the text file asks for its import options first.
+    crate::dialogs::confirm(&mut app).unwrap();
+    assert_eq!(dialog_kind(&app), Some(crate::dialogs::text_import::KIND));
+    app.ui.dialog = None;
+    // Off: it is placed at once, and the next Place dialog starts off.
+    app.run("file.place", json!({"paths": [notes]})).unwrap();
+    app.ui.dialog.as_mut().unwrap().fields.insert("showImportOptions".into(), json!(false));
+    crate::dialogs::confirm(&mut app).unwrap();
+    assert_eq!(dialog_kind(&app), None);
+    assert!(selected_text(&app).contains("three"));
+    assert!(!app.ui.place_import_options);
+    app.run("file.place", json!({"paths": [notes]})).unwrap();
+    assert!(!app.ui.dialog.as_ref().unwrap().bool("showImportOptions"), "remembered");
+    // `showImportOptions` given with `paths` sets the dialog's checkbox.
+    app.run("file.place", json!({"paths": [notes], "showImportOptions": true})).unwrap();
+    assert!(app.ui.dialog.as_ref().unwrap().bool("showImportOptions"));
+    // Saved with the preferences; older preferences without it start on.
+    let saved = serde_json::to_value(&app.ui).unwrap();
+    assert_eq!(saved["place_import_options"], false);
+    let old: crate::UiState = serde_json::from_value(json!({"place_link": false})).unwrap();
+    assert!(old.place_import_options && old.text_import.is_null());
+}
+
+#[test]
+fn with_show_import_options_off_a_file_takes_the_options_confirmed_last() {
+    let mut app = app();
+    let b64 = vectorcraft_format::base64_encode;
+    // Nothing confirmed yet: file.place's defaults.
+    app.run("file.place", json!({"name": "a.txt", "dataBase64": b64(NOTES), "showImportOptions": false})).unwrap();
+    assert_eq!(dialog_kind(&app), None);
+    let plain = selected_text(&app);
+    // Text Import Options remembers what it confirmed, and the next text file starts from it.
+    app.run("file.place", json!({"name": "b.txt", "dataBase64": b64(NOTES)})).unwrap();
+    assert_eq!(dialog_kind(&app), Some(crate::dialogs::text_import::KIND));
+    for k in ["removeLineReturns", "removeParagraphReturns", "replaceSpaces"] {
+        app.ui.dialog.as_mut().unwrap().fields.insert(k.into(), json!(true));
+    }
+    app.ui.dialog.as_mut().unwrap().fields.insert("spaces".into(), json!(4));
+    crate::dialogs::confirm(&mut app).unwrap();
+    assert_eq!(selected_text(&app), "one two\nthree");
+    assert_ne!(plain, "one two\nthree");
+    app.run("file.place", json!({"name": "c.txt", "dataBase64": b64(NOTES)})).unwrap();
+    let d = app.ui.dialog.as_ref().unwrap();
+    assert!(d.bool("removeLineReturns") && d.bool("replaceSpaces"));
+    assert_eq!(d.f64("spaces", 0.0), 4.0);
+    app.ui.dialog = None;
+    app.run("file.place", json!({"name": "d.txt", "dataBase64": b64(NOTES), "showImportOptions": false})).unwrap();
+    assert_eq!((dialog_kind(&app), selected_text(&app).as_str()), (None, "one two\nthree"));
+    // A DXF drawing: placed without asking, with the fit chosen last.
+    let width = |app: &VectorcraftApp| {
+        let st = app.session.active().unwrap();
+        st.doc.node(st.selection.objects[0]).unwrap().geometric_bounds().unwrap().width()
+    };
+    app.run("file.place", json!({"name": "line.dxf", "dataBase64": b64(LINE_DXF), "showImportOptions": false})).unwrap();
+    assert_eq!(dialog_kind(&app), None);
+    let unfitted = width(&app);
+    app.ui.dxf_import = json!({"fit": true});
+    app.run("file.place", json!({"name": "line.dxf", "dataBase64": b64(LINE_DXF), "showImportOptions": false})).unwrap();
+    assert_eq!(dialog_kind(&app), None);
+    assert!(width(&app) > unfitted + 1.0, "fitted: {} vs {unfitted}", width(&app));
+    app.run("file.place", json!({"name": "line.dxf", "dataBase64": b64(LINE_DXF)})).unwrap();
+    assert_eq!(dialog_kind(&app), Some(crate::dialogs::dxf_import::KIND), "on: it asks");
+    app.ui.dialog = None;
+    // A PDF with several pages: its first page, without asking.
+    let pages = [PdfPage::new(100.0, 100.0, "0 g 0 0 10 10 re f"), PdfPage::new(300.0, 100.0, "1 0 0 rg 0 0 30 30 re f")];
+    let two = pdf(&pages, None);
+    app.run("file.place", json!({"name": "two.pdf", "dataBase64": b64(&two), "showImportOptions": false})).unwrap();
+    assert_eq!(dialog_kind(&app), None);
+    assert!((width(&app) - 100.0).abs() < 0.01, "page 1: {}", width(&app));
+    // An encrypted PDF still asks for its password, and then places its first page.
+    let locked = pdf(&pages, Some("pw"));
+    app.run("file.place", json!({"name": "locked.pdf", "dataBase64": b64(&locked), "showImportOptions": false})).unwrap();
+    assert_eq!(app.ui.dialog.as_ref().map(|d| d.bool("__locked")), Some(true));
+    app.ui.dialog.as_mut().unwrap().fields.insert("password".into(), json!("pw"));
+    crate::dialogs::confirm(&mut app).unwrap();
+    assert_eq!(dialog_kind(&app), None, "no page to pick");
+    assert!((width(&app) - 100.0).abs() < 0.01, "page 1: {}", width(&app));
+    // Given `page`, it asks for the password and places that page.
+    app.run("file.place", json!({"name": "locked.pdf", "dataBase64": b64(&locked), "page": 2, "showImportOptions": false})).unwrap();
+    app.ui.dialog.as_mut().unwrap().fields.insert("password".into(), json!("pw"));
+    crate::dialogs::confirm(&mut app).unwrap();
+    assert!((width(&app) - 300.0).abs() < 0.01, "page 2: {}", width(&app));
+    // A page past the last one is refused once the file is unlocked, not placed as another page.
+    app.run("file.place", json!({"name": "locked.pdf", "dataBase64": b64(&locked), "page": 9, "showImportOptions": false})).unwrap();
+    app.ui.dialog.as_mut().unwrap().fields.insert("password".into(), json!("pw"));
+    assert!(crate::dialogs::confirm(&mut app).is_err());
+    app.ui.dialog = None;
+    // A value that is not true or false is refused, and nothing is placed.
+    let before = app.session.active().unwrap().history.undo.len();
+    for bad in [json!("no"), json!(0)] {
+        let e = app.run("file.place", json!({"name": "e.txt", "dataBase64": b64(NOTES), "showImportOptions": bad})).unwrap_err();
+        assert!(e.contains("`showImportOptions` must be true or false"), "{e}");
+    }
+    assert_eq!((dialog_kind(&app), app.session.active().unwrap().history.undo.len()), (None, before));
+}
+
+#[test]
+fn the_place_cursors_files_ask_for_their_import_options_when_show_import_options_is_on() {
+    let mut app = app();
+    let dir = Folder::new("ui-place-cursor-import-options");
+    let a = dir.file("a.png", &png(10, 10, 72.0));
+    let notes = dir.file("notes.txt", NOTES);
+    let click = json!({"path": notes, "rect": [10, 10, 200, 100]});
+    // On: a click on the text file asks for its import options, and OK places it in the rect.
+    app.run("file.place", json!({"paths": [a, notes]})).unwrap();
+    crate::dialogs::confirm(&mut app).unwrap();
+    assert_eq!(app.session.tool_options()["count"], 2);
+    crate::place::place_from_cursor(&mut app, &click);
+    assert_eq!(dialog_kind(&app), Some(crate::dialogs::text_import::KIND));
+    assert_eq!(app.ui.dialog.as_ref().unwrap().fields["__params"]["rect"], json!([10, 10, 200, 100]));
+    crate::dialogs::confirm(&mut app).unwrap();
+    assert!(selected_text(&app).contains("three"));
+    // A click on a PDF places the page chosen at its own size, centered where the click put the
+    // first page; a drag keeps its box.
+    let pages = [PdfPage::new(100.0, 100.0, "0 g 0 0 10 10 re f"), PdfPage::new(300.0, 100.0, "1 0 0 rg 0 0 30 30 re f")];
+    let two = dir.file("two.pdf", &pdf(&pages, None));
+    app.run("file.place", json!({"paths": [a, two]})).unwrap();
+    app.ui.dialog.as_mut().unwrap().fields.insert("link".into(), json!(false));
+    crate::dialogs::confirm(&mut app).unwrap();
+    crate::place::place_from_cursor(&mut app, &json!({"path": two, "link": false, "rect": [10, 10, 100, 100]}));
+    assert_eq!(dialog_kind(&app), Some("importPdf"));
+    assert_eq!(app.ui.dialog.as_ref().unwrap().fields["__place"], json!({"link": false, "at": [60.0, 60.0]}));
+    app.ui.dialog.as_mut().unwrap().fields.insert("page".into(), json!(2));
+    crate::dialogs::confirm(&mut app).unwrap();
+    let st = app.session.active().unwrap();
+    let b = st.doc.node(st.selection.objects[0]).unwrap().geometric_bounds().unwrap();
+    assert_eq!((b.width().round(), b.center()), (300.0, vectorcraft_geom::Point::new(60.0, 60.0)));
+    crate::place::place_from_cursor(&mut app, &json!({"path": two, "link": false, "rect": [10, 10, 50, 50]}));
+    assert_eq!(app.ui.dialog.as_ref().unwrap().fields["__place"]["rect"], json!([10, 10, 50, 50]));
+    app.ui.dialog = None;
+    // Off: the cursor's files are placed at once, with the options confirmed last.
+    app.run("file.place", json!({"paths": [a, notes]})).unwrap();
+    app.ui.dialog.as_mut().unwrap().fields.insert("showImportOptions".into(), json!(false));
+    crate::dialogs::confirm(&mut app).unwrap();
+    assert_eq!(app.session.tool_options()["count"], 2);
+    crate::place::place_from_cursor(&mut app, &click);
+    assert_eq!(dialog_kind(&app), None);
+    assert!(selected_text(&app).contains("three"));
+    // A cursor loaded by file.place.queue places at once, as before.
+    app.run("file.place", json!({"paths": [a, notes]})).unwrap();
+    crate::dialogs::confirm(&mut app).unwrap();
+    app.run("file.place.queue", json!({"paths": [a, notes]})).unwrap();
+    crate::place::place_from_cursor(&mut app, &click);
+    assert_eq!(dialog_kind(&app), None);
+}
+
+/// A Shift-click of the place cursor asks for the current file's import options however the
+/// cursor was loaded; a file without import options, and a Shift-drag, place as before.
+#[test]
+fn a_shift_click_of_the_place_cursor_asks_for_the_files_import_options() {
+    let mut app = app();
+    let dir = Folder::new("ui-place-cursor-shift-click");
+    let a = dir.file("a.png", &png(10, 10, 72.0));
+    let notes = dir.file("notes.txt", NOTES);
+    let line = dir.file("line.dxf", LINE_DXF);
+    let shift = vectorcraft_tools::Mods { shift: true, ..Default::default() };
+    // A press at (10, 10) released at (`to`, 10) with `mods`, placed as the canvas places it.
+    let gesture = |app: &mut VectorcraftApp, mods: vectorcraft_tools::Mods, to: f64| {
+        use vectorcraft_tools::{PointerEvent, PointerKind};
+        let view = app.view_info();
+        for (kind, x) in [(PointerKind::Down, 10.0), (PointerKind::Drag, to), (PointerKind::Up, to)] {
+            for r in app.session.pointer(&PointerEvent::new(kind, x, 10.0).with_mods(mods), view).unwrap() {
+                if let vectorcraft_engine::UiRequest::Place(p) = r {
+                    crate::place::place_from_cursor(app, &p);
+                }
+            }
+        }
+    };
+    let count = |app: &VectorcraftApp| app.session.tool_options()["count"].as_u64();
+    let load = |app: &mut VectorcraftApp, paths: Value, show: bool| {
+        app.run("file.place", json!({ "paths": paths })).unwrap();
+        app.ui.dialog.as_mut().unwrap().fields.insert("showImportOptions".into(), json!(show));
+        crate::dialogs::confirm(app).unwrap();
+    };
+    // Show Import Options off: a Shift-click on a text file opens Text Import Options, whose OK
+    // places it.
+    load(&mut app, json!([notes, line, a]), false);
+    assert_eq!(count(&app), Some(3));
+    gesture(&mut app, shift, 10.0);
+    assert_eq!(dialog_kind(&app), Some(crate::dialogs::text_import::KIND));
+    crate::dialogs::confirm(&mut app).unwrap();
+    assert_eq!(dialog_kind(&app), None);
+    assert!(selected_text(&app).contains("three"));
+    assert_eq!(count(&app), Some(2), "the cursor goes on to the next file");
+    // A DXF drawing opens DXF Import Options.
+    gesture(&mut app, shift, 10.0);
+    assert_eq!(dialog_kind(&app), Some(crate::dialogs::dxf_import::KIND));
+    app.ui.dialog = None;
+    // A PNG image has no import options: it is placed.
+    let placed = images(&app, 0);
+    gesture(&mut app, shift, 10.0);
+    assert_eq!((dialog_kind(&app), images(&app, 0)), (None, placed + 1));
+    // Show Import Options on: one dialog, not two.
+    load(&mut app, json!([notes, a]), true);
+    gesture(&mut app, shift, 10.0);
+    assert_eq!(dialog_kind(&app), Some(crate::dialogs::text_import::KIND));
+    crate::dialogs::confirm(&mut app).unwrap();
+    assert_eq!(dialog_kind(&app), None);
+    // Off, a Shift-drag places at once, as a drag does.
+    load(&mut app, json!([notes, a]), false);
+    gesture(&mut app, shift, 200.0);
+    assert_eq!(dialog_kind(&app), None);
+    assert!(selected_text(&app).contains("three"));
+    // A plain click places at once.
+    let placed = images(&app, 0);
+    gesture(&mut app, vectorcraft_tools::Mods::default(), 10.0);
+    assert_eq!((dialog_kind(&app), images(&app, 0)), (None, placed + 1));
+    // A cursor loaded by file.place.queue with a `page`: the Shift-click still asks for the page.
+    let pages = [PdfPage::new(100.0, 100.0, "0 g 0 0 10 10 re f"), PdfPage::new(300.0, 100.0, "1 0 0 rg 0 0 30 30 re f")];
+    let two = dir.file("two.pdf", &pdf(&pages, None));
+    app.run("file.place.queue", json!({"paths": [two], "link": false, "page": 2})).unwrap();
+    gesture(&mut app, shift, 10.0);
+    assert_eq!(dialog_kind(&app), Some("importPdf"));
+    app.ui.dialog = None;
+    // A one-page PDF opens no dialog, and is placed with the options the cursor was loaded with.
+    let one = dir.file("one.pdf", &pdf(&pages[..1], None));
+    app.run("file.place.queue", json!({"paths": [one], "link": false, "crop": "bounding"})).unwrap();
+    gesture(&mut app, shift, 10.0);
+    assert_eq!(dialog_kind(&app), None);
+    let st = app.session.active().unwrap();
+    let b = st.doc.node(st.selection.objects[0]).unwrap().geometric_bounds().unwrap();
+    assert!((b.width() - 10.0).abs() < 0.01, "the bounding box: {}", b.width());
+}
+
+/// An encrypted PDF in the place cursor asks for its password when clicked, with Show Import
+/// Options on or off, and the password's OK places it where the click put it.
+#[test]
+fn an_encrypted_pdf_in_the_place_cursor_asks_for_its_password_when_clicked() {
+    let mut app = app();
+    let dir = Folder::new("ui-place-cursor-encrypted-pdf");
+    let a = dir.file("a.png", &png(10, 10, 72.0));
+    let pages = [PdfPage::new(100.0, 100.0, "0 g 0 0 10 10 re f"), PdfPage::new(300.0, 100.0, "1 0 0 rg 0 0 30 30 re f")];
+    let locked = dir.file("locked.pdf", &pdf(&pages, Some("pw")));
+    // The click gives the box of the size the cursor holds it at, a letter page.
+    let click = json!({"path": locked, "link": false, "rect": [10, 10, 612, 792]});
+    let center = vectorcraft_geom::Point::new(316.0, 406.0);
+    let placed = |app: &VectorcraftApp| {
+        let st = app.session.active().unwrap();
+        let b = st.doc.node(st.selection.objects[0]).unwrap().geometric_bounds().unwrap();
+        (b.width().round(), b.center())
+    };
+    for show in [false, true] {
+        app.run("file.place", json!({"paths": [a, locked]})).unwrap();
+        let d = app.ui.dialog.as_mut().unwrap();
+        d.fields.insert("showImportOptions".into(), json!(show));
+        d.fields.insert("link".into(), json!(false));
+        crate::dialogs::confirm(&mut app).unwrap();
+        assert_eq!(app.session.tool_options()["count"], 2, "kept in the cursor");
+        crate::place::place_from_cursor(&mut app, &click);
+        let d = app.ui.dialog.as_mut().expect("the password dialog");
+        assert!(d.bool("__locked"));
+        assert_eq!(d.fields["__place"], json!({"link": false, "at": [316.0, 406.0]}));
+        d.fields.insert("password".into(), json!("pw"));
+        crate::dialogs::confirm(&mut app).unwrap();
+        if show {
+            // Unlocked, it asks for the page.
+            assert_eq!(dialog_kind(&app), Some("importPdf"));
+            crate::dialogs::confirm(&mut app).unwrap();
+        }
+        assert_eq!((dialog_kind(&app), placed(&app)), (None, (100.0, center)), "Show Import Options {show}");
+    }
+    // A cursor loaded by file.place.queue asks too, also with a `page`, which it then places.
+    app.run("file.place.queue", json!({"paths": [a, locked], "link": false, "page": 2})).unwrap();
+    crate::place::place_from_cursor(&mut app, &json!({"path": locked, "link": false, "page": 2, "rect": [10, 10, 612, 792]}));
+    let d = app.ui.dialog.as_mut().expect("the password dialog");
+    assert!(d.bool("__locked"));
+    d.fields.insert("password".into(), json!("pw"));
+    crate::dialogs::confirm(&mut app).unwrap();
+    assert_eq!((dialog_kind(&app), placed(&app).0), (None, 300.0), "page 2");
+    // File › Place of it with a `page` and Show Import Options on asks for the password too.
+    crate::place::run_for_user(&mut app, &json!({"path": locked, "link": false, "page": 1})).unwrap();
+    assert!(app.ui.dialog.as_ref().is_some_and(|d| d.bool("__locked")));
+    app.ui.dialog = None;
+    // An encrypted PDF whose name has no PDF extension is still left out of the cursor.
+    let misnamed = dir.file("locked.dat", &pdf(&pages, Some("pw")));
+    let r = app.run("file.place.queue", json!({"paths": [a, misnamed]})).unwrap();
+    assert_eq!((&r["count"], &r["skipped"][0]["name"]), (&json!(1), &json!("locked.dat")), "{r}");
+}
+
+/// A cursor loaded again after the Place dialog loaded it with Show Import Options on (a queue set
+/// on the Place tool) places its files at once.
+#[test]
+fn a_place_cursor_loaded_again_no_longer_asks_for_import_options() {
+    let mut app = app();
+    let dir = Folder::new("ui-place-cursor-reloaded");
+    let a = dir.file("a.png", &png(10, 10, 72.0));
+    let notes = dir.file("notes.txt", NOTES);
+    app.run("file.place", json!({"paths": [a, notes]})).unwrap();
+    crate::dialogs::confirm(&mut app).unwrap();
+    let entries: Vec<Value> = [(&a, "a.png"), (&notes, "notes.txt")]
+        .iter()
+        .map(|(path, name)| json!({"params": {"path": path}, "name": name, "width": 190, "height": 90}))
+        .collect();
+    assert_eq!(app.session.tool_id(), "place");
+    app.run("tool.setOption", json!({"values": {"queue": {"entries": entries}}})).unwrap();
+    crate::place::place_from_cursor(&mut app, &json!({"path": notes, "rect": [10, 10, 190, 90]}));
+    assert_eq!(dialog_kind(&app), None);
+    assert!(selected_text(&app).contains("three"));
+}
+
+/// The import options a click of a cursor loaded within automation roots asks for place within
+/// those roots when OK is pressed, by the person at the keyboard too: a file outside them is not
+/// read. One inside them is placed.
+#[test]
+fn the_import_options_a_place_cursor_asks_for_place_within_its_roots() {
+    use vectorcraft_engine::file_access::{AutomationRoots, confine, unconfined};
+    let mut app = app();
+    let dir = Folder::new("ui-place-cursor-ask-roots");
+    std::fs::create_dir_all(dir.join("in")).unwrap();
+    let a = dir.file("in/a.png", &png(10, 10, 72.0));
+    let notes = dir.file("in/notes.txt", NOTES);
+    let pages = [PdfPage::new(100.0, 100.0, "0 g 0 0 10 10 re f"), PdfPage::new(300.0, 100.0, "1 0 0 rg 0 0 30 30 re f")];
+    let two = dir.file("in/two.pdf", &pdf(&pages, None));
+    let outside_notes = dir.file("outside.txt", NOTES);
+    let outside_pdf = dir.file("outside.pdf", &pdf(&pages, None));
+    let roots = AutomationRoots::new(&[&dir.join("in")], &[]).unwrap();
+    confine(roots.as_ref(), || {
+        app.run("file.place", json!({"paths": [a, notes, two]})).unwrap();
+        app.ui.dialog.as_mut().unwrap().fields.insert("link".into(), json!(false));
+        crate::dialogs::confirm(&mut app).unwrap();
+    });
+    assert_eq!(app.session.tool_options()["count"], 3);
+    let undo = |app: &VectorcraftApp| app.session.active().unwrap().history.undo.len();
+    let before = undo(&app);
+    // The text file's OK, its params naming a file outside the roots: nothing is placed.
+    unconfined(|| crate::place::place_from_cursor(&mut app, &json!({"path": notes, "rect": [10, 10, 200, 100]})));
+    assert_eq!(dialog_kind(&app), Some(crate::dialogs::text_import::KIND));
+    app.ui.dialog.as_mut().unwrap().fields.get_mut("__params").unwrap()["path"] = json!(outside_notes);
+    let _ = unconfined(|| crate::dialogs::confirm(&mut app));
+    assert_eq!(undo(&app), before, "the text file outside the roots");
+    // The PDF's OK, its file outside the roots: nothing is placed.
+    unconfined(|| crate::place::place_from_cursor(&mut app, &json!({"path": two, "link": false, "rect": [10, 10, 100, 100]})));
+    assert_eq!(dialog_kind(&app), Some("importPdf"));
+    app.ui.dialog.as_mut().unwrap().fields.insert("path".into(), json!(outside_pdf));
+    let _ = unconfined(|| crate::dialogs::confirm(&mut app));
+    assert_eq!(undo(&app), before, "the PDF outside the roots");
+    app.ui.dialog = None;
+    // A caller with roots of its own confirms within those: the file in the cursor's roots but
+    // outside the caller's is not placed.
+    std::fs::create_dir_all(dir.join("b")).unwrap();
+    let narrower = AutomationRoots::new(&[&dir.join("b")], &[]).unwrap();
+    unconfined(|| crate::place::place_from_cursor(&mut app, &json!({"path": notes, "rect": [10, 10, 200, 100]})));
+    let _ = confine(narrower.as_ref(), || crate::dialogs::confirm(&mut app));
+    assert_eq!(undo(&app), before, "outside the caller's roots");
+    // The text file inside the roots is placed.
+    unconfined(|| crate::place::place_from_cursor(&mut app, &json!({"path": notes, "rect": [10, 10, 200, 100]})));
+    assert_eq!(dialog_kind(&app), Some(crate::dialogs::text_import::KIND));
+    unconfined(|| crate::dialogs::confirm(&mut app)).unwrap();
+    assert!(selected_text(&app).contains("three"));
+    // Once the cursor is loaded again, the earlier click's import options place nothing.
+    let after = undo(&app);
+    unconfined(|| crate::place::place_from_cursor(&mut app, &json!({"path": notes, "rect": [10, 10, 200, 100]})));
+    assert_eq!(dialog_kind(&app), Some(crate::dialogs::text_import::KIND));
+    app.run("file.place.queue", json!({"paths": [a]})).unwrap();
+    assert!(unconfined(|| crate::dialogs::confirm(&mut app)).is_err());
+    assert_eq!(undo(&app), after);
+    // So do those of a click before a queue set on the Place tool.
+    confine(roots.as_ref(), || {
+        app.run("file.place", json!({"paths": [a, notes]})).unwrap();
+        crate::dialogs::confirm(&mut app).unwrap();
+    });
+    unconfined(|| crate::place::place_from_cursor(&mut app, &json!({"path": notes, "rect": [10, 10, 200, 100]})));
+    assert_eq!(dialog_kind(&app), Some(crate::dialogs::text_import::KIND));
+    let entry = json!({"params": {"path": a}, "name": "a.png", "width": 10, "height": 10});
+    app.run("tool.setOption", json!({"values": {"queue": {"entries": [entry]}}})).unwrap();
+    let saved = app.ui.dialog.clone();
+    assert!(unconfined(|| crate::dialogs::confirm(&mut app)).is_err());
+    assert_eq!(undo(&app), after);
+    // Also when confirmed by a caller with roots that hold the file.
+    app.ui.dialog = saved;
+    assert!(confine(roots.as_ref(), || crate::dialogs::confirm(&mut app)).is_err());
+    assert_eq!(undo(&app), after);
+}
+
+#[test]
+fn a_file_placed_while_idle_follows_its_changes() {
+    let mut app = app();
+    // Every frame renders on this thread, however long it takes: a frame finished by the render
+    // worker during the idle frames asks for a repaint.
+    app.canvas.worker_started = true;
+    app.run("prefs.set", json!({"key": "updateLinks", "value": "automatically"})).unwrap();
+    let ctx = egui::Context::default();
+    let mut time = 0.0;
+    idle(&mut app, &ctx, &mut time, 3.0, &|_| false);
+    // A look finds the new document without links: no wakes of its own for it.
+    assert_eq!(frame_at(&mut app, &ctx, time), std::time::Duration::MAX, "{:?}", ctx.repaint_causes());
+    // Half a second later, before the next look is due, a file is placed. The place itself is a
+    // frame (as any command); then nothing happens for 3 s.
+    time += 0.5;
+    let dir = Folder::new("ui-place-idle-watch");
+    let path = dir.file("idle-watch.png", &png(40, 30, 72.0));
+    app.run("file.place", json!({"path": path})).unwrap();
+    let id = app.session.active().unwrap().selection.objects[0];
+    idle(&mut app, &ctx, &mut time, 3.0, &|_| false);
+    let stamp = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let changed = png(60, 30, 72.0);
+    std::fs::write(&path, &changed).unwrap();
+    // The rewritten file is dated 2 s later, however fast it was written.
+    let later = std::fs::FileTimes::new().set_modified(stamp + std::time::Duration::from_secs(2));
+    std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_times(later).unwrap();
+    let hash = vectorcraft_doc::links::hash_bytes(&changed);
+    let updated = |app: &VectorcraftApp| {
+        let st = app.session.active().unwrap();
+        matches!(&st.doc.node(id).unwrap().kind, NodeKind::Image(im) if im.link.as_ref().and_then(|l| l.hash.as_deref()) == Some(hash.as_str()))
+    };
+    assert!(idle(&mut app, &ctx, &mut time, 10.0, &updated), "the changed file was never read again");
+}
+
+/// A look whose worker ended without stamps is cleared: the app stops asking for a frame every
+/// 100 ms, and the next look, on schedule, reads a changed file again.
+#[test]
+fn a_look_whose_worker_stopped_does_not_stop_later_looks() {
+    let mut app = app();
+    // Every frame renders on this thread: a frame finished by the render worker asks for a repaint.
+    app.canvas.worker_started = true;
+    app.run("prefs.set", json!({"key": "updateLinks", "value": "automatically"})).unwrap();
+    let dir = Folder::new("ui-place-stopped-watch");
+    let path = dir.file("stopped-watch.png", &png(40, 30, 72.0));
+    app.run("file.place", json!({"path": path})).unwrap();
+    let id = app.session.active().unwrap().selection.objects[0];
+    let ctx = egui::Context::default();
+    let mut time = 0.0;
+    idle(&mut app, &ctx, &mut time, 3.0, &|_| false);
+    // A look that is due starts in this frame and is applied in the next one, at the same time.
+    time += 3.0;
+    frame_at(&mut app, &ctx, time);
+    app.session.wait_link_scan();
+    frame_at(&mut app, &ctx, time);
+    assert!(app.session.link_scan.is_none());
+    let scan = vectorcraft_engine::link_watch::LinkScan::default();
+    scan.2.store(true, std::sync::atomic::Ordering::SeqCst);
+    app.session.link_scan = Some(scan);
+    // Half a second later, before the next look is due.
+    time += 0.5;
+    let wait = frame_at(&mut app, &ctx, time);
+    assert!(app.session.link_scan.is_none(), "the look ended");
+    assert!(wait > std::time::Duration::from_millis(100), "{wait:?}: {:?}", ctx.repaint_causes());
+    let stamp = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let changed = png(60, 30, 72.0);
+    std::fs::write(&path, &changed).unwrap();
+    // The rewritten file is dated 2 s later, however fast it was written.
+    let later = std::fs::FileTimes::new().set_modified(stamp + std::time::Duration::from_secs(2));
+    std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_times(later).unwrap();
+    let hash = vectorcraft_doc::links::hash_bytes(&changed);
+    let updated = |app: &VectorcraftApp| {
+        let st = app.session.active().unwrap();
+        matches!(&st.doc.node(id).unwrap().kind, NodeKind::Image(im) if im.link.as_ref().and_then(|l| l.hash.as_deref()) == Some(hash.as_str()))
+    };
+    assert!(idle(&mut app, &ctx, &mut time, 10.0, &updated), "the changed file was never read again");
+}

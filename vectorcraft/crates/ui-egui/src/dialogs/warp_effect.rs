@@ -1,7 +1,7 @@
 //! Effect > Warp controls. The style remains an effect ID; Envelope Warp has a different schema.
 use egui::{Pos2, Rect, Stroke, vec2};
 use serde_json::{Map, Value, json};
-use vectorcraft_effects::{WARP_STYLES, WarpStyle, warp_point};
+use vectorcraft_effects::{WARP_STYLES, WarpNet, WarpStyle};
 
 use super::form;
 use crate::state::Dialog;
@@ -38,6 +38,8 @@ fn shown(label: &str) -> String {
 fn style_preview(ui: &mut egui::Ui, suffix: &str) {
     let (rect, _) = ui.allocate_exact_size(vec2(30.0, 22.0), egui::Sense::hover());
     let Some(style) = WarpStyle::from_id(suffix) else { return };
+    // The map new warps take, on a box 0.55 times as high as it is wide.
+    let net = WarpNet::new(style, 0.45, 0.0, 0.0, 2.0, 1.1, false);
     let mut lines = vec![];
     let mut bounds = Rect::NOTHING;
     for vertical in [false, true] {
@@ -46,8 +48,8 @@ fn style_preview(ui: &mut egui::Ui, suffix: &str) {
                 .map(|i| {
                     let along = -1.0 + f64::from(i) / 8.0;
                     let (x, y) = if vertical { (fixed, along) } else { (along, fixed) };
-                    let (x, y) = warp_point(style, 0.45, 0.0, 0.0, 0.55, x, y);
-                    let p = Pos2::new(x as f32, y as f32);
+                    let q = net.at((x + 1.0) / 2.0, (y + 1.0) / 2.0);
+                    let p = Pos2::new(q.x as f32, q.y as f32);
                     bounds.extend_with(p);
                     p
                 })
@@ -71,7 +73,7 @@ pub(super) fn body(ui: &mut egui::Ui, d: &mut Dialog) {
     let current = WARP_STYLES.iter().find(|(style, _)| *style == suffix).map_or_else(|| suffix.to_string(), |(_, label)| shown(label));
     widgets::label_row(ui, tl!("Style:"), LABEL_W, |ui| {
         style_preview(ui, suffix);
-        if let Some((style, label)) = widgets::combo(ui, "warp-style", &current, 170.0, false, |ui| {
+        if let Some((style, label)) = widgets::combo(ui, "warp-style", &current, 170.0, |ui| {
             let mut chosen = None;
             for (style, label) in WARP_STYLES {
                 ui.horizontal(|ui| {

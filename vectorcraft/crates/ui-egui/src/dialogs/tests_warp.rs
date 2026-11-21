@@ -380,6 +380,50 @@ fn warp_options_slider_drag_previews_exact_parameter_and_cancel_restores() {
     assert!(app.ui.dialog.is_none() && !app.session.in_interaction());
 }
 
+/// The edit the Warp dialog test makes: the Bend field, the style, or none.
+fn make_warp_edit(app: &mut VectorcraftApp, ctx: &egui::Context, edit: &str) {
+    match edit {
+        "bend" => {
+            click_number(app, ctx, "Bend:");
+            frame(app, ctx, replace_number("25%"));
+            // Blur via the existing orientation choice; it stays Horizontal.
+            click_text(app, ctx, "Horizontal");
+        }
+        "style" => {
+            click_text(app, ctx, "Arc");
+            click_text(app, ctx, "Arc Lower");
+        }
+        _ => {}
+    }
+}
+
+/// OK or Cancel was clicked: the document, the history and Redo as each leaves them.
+fn finish_warp_dialog(
+    app: &mut VectorcraftApp,
+    accept: bool,
+    (before, expected): (&std::sync::Arc<vectorcraft_doc::Document>, &std::sync::Arc<vectorcraft_doc::Document>),
+    (undo, redo): (usize, usize),
+) {
+    let state = app.session.doc().unwrap();
+    if accept {
+        // Whole-document equality also checks both targets, sibling effects and
+        // the first visible / second hidden Warp. Existing OK history stays one step.
+        assert_eq!(state.doc.as_ref(), expected.as_ref());
+        assert_eq!(state.history.undo.len(), undo + 1);
+        app.run("edit.undo", json!({})).unwrap();
+        assert_eq!(app.session.doc().unwrap().doc.as_ref(), before.as_ref());
+        assert!(!app.session.doc().unwrap().is_dirty());
+        app.run("edit.redo", json!({})).unwrap();
+        assert_eq!(app.session.doc().unwrap().doc.as_ref(), expected.as_ref());
+    } else {
+        assert_eq!(state.doc.as_ref(), before.as_ref());
+        assert_eq!((state.history.undo.len(), state.history.redo.len()), (undo, redo));
+        assert!(!state.is_dirty());
+        app.run("edit.redo", json!({})).unwrap();
+        assert_ne!(app.session.doc().unwrap().doc.as_ref(), before.as_ref(), "Cancel keeps the original Redo usable");
+    }
+}
+
 #[test]
 fn warp_options_mixed_styles_change_only_after_explicit_style_choice() {
     for item in [Value::Null, json!(1)] {
@@ -423,19 +467,7 @@ fn warp_options_mixed_styles_change_only_after_explicit_style_choice() {
                 click_text(&mut app, &ctx, "Edit");
                 settle(&mut app, &ctx);
                 assert_eq!(app.session.doc().unwrap().doc, before, "opening must not broadcast the first target's style");
-                match edit {
-                    "bend" => {
-                        click_number(&mut app, &ctx, "Bend:");
-                        frame(&mut app, &ctx, replace_number("25%"));
-                        // Blur via the existing orientation choice; it stays Horizontal.
-                        click_text(&mut app, &ctx, "Horizontal");
-                    }
-                    "style" => {
-                        click_text(&mut app, &ctx, "Arc");
-                        click_text(&mut app, &ctx, "Arc Lower");
-                    }
-                    _ => {}
-                }
+                make_warp_edit(&mut app, &ctx, edit);
                 assert_eq!(app.session.doc().unwrap().doc, expected, "edit={edit}, item={item}");
                 assert_eq!(app.session.doc().unwrap().history.undo.len(), undo);
                 click_text(&mut app, &ctx, "Preview");
@@ -449,23 +481,7 @@ fn warp_options_mixed_styles_change_only_after_explicit_style_choice() {
                 let state = app.session.doc().unwrap();
                 assert_eq!(state.selection, selection);
                 assert_eq!(app.last_effect, last_effect);
-                if accept {
-                    // Whole-document equality also checks both targets, sibling effects and
-                    // the first visible / second hidden Warp. Existing OK history stays one step.
-                    assert_eq!(state.doc, expected);
-                    assert_eq!(state.history.undo.len(), undo + 1);
-                    app.run("edit.undo", json!({})).unwrap();
-                    assert_eq!(app.session.doc().unwrap().doc, before);
-                    assert!(!app.session.doc().unwrap().is_dirty());
-                    app.run("edit.redo", json!({})).unwrap();
-                    assert_eq!(app.session.doc().unwrap().doc, expected);
-                } else {
-                    assert_eq!(state.doc, before);
-                    assert_eq!((state.history.undo.len(), state.history.redo.len()), (undo, redo));
-                    assert!(!state.is_dirty());
-                    app.run("edit.redo", json!({})).unwrap();
-                    assert_ne!(app.session.doc().unwrap().doc, before, "Cancel keeps the original Redo usable");
-                }
+                finish_warp_dialog(&mut app, accept, (&before, &expected), (undo, redo));
             }
         }
     }
@@ -506,9 +522,9 @@ fn tab_to_warp_control(app: &mut VectorcraftApp, ctx: &egui::Context, label: &st
         if !events.iter().any(|event| {
             let egui::output::OutputEvent::FocusGained(info) = event else { return false };
             info.enabled
-                && match info.typ {
-                    egui::WidgetType::ComboBox => info.current_text_value.as_deref() == Some(label),
-                    egui::WidgetType::Button => info.label.as_deref() == Some(label),
+                && match info.role {
+                    egui::Role::ComboBox => info.current_text_value.as_deref() == Some(label),
+                    egui::Role::Button => info.label.as_deref() == Some(label),
                     _ => false,
                 }
         }) {
@@ -523,6 +539,18 @@ fn tab_to_warp_control(app: &mut VectorcraftApp, ctx: &egui::Context, label: &st
         }
     }
     panic!("Tab traversal did not focus {label}");
+}
+
+/// With Preview on the Style choice shows on the art in an interaction; off, the document is as it was.
+fn check_style_preview(app: &VectorcraftApp, preview: bool, id: NodeId, before: &std::sync::Arc<vectorcraft_doc::Document>) {
+    let state = app.session.doc().unwrap();
+    if preview {
+        assert_eq!(state.doc.node(id).unwrap().appearance.effects[0].id, "warp.arcLower");
+        assert!(app.session.in_interaction());
+    } else {
+        assert_eq!(state.doc.as_ref(), before.as_ref());
+        assert!(!state.is_dirty() && !app.session.in_interaction());
+    }
 }
 
 #[test]
@@ -555,10 +583,10 @@ fn warp_options_style_keyboard_enter_does_not_accept_dialog() {
         assert_ne!(ctx.memory(|m| m.focused()), Some(style_id));
         warp_key(&mut app, &ctx, egui::Key::Tab, egui::Modifiers::SHIFT);
         assert_eq!(ctx.memory(|m| m.focused()), Some(style_id));
-        assert!(!egui::ComboBox::is_open(&ctx, style_id));
+        assert!(!craft_ui::ComboBox::is_open(&ctx, style_id));
         warp_key(&mut app, &ctx, egui::Key::Enter, egui::Modifiers::NONE);
         assert!(app.ui.dialog.is_some(), "WARP_STYLE_ENTER_OPEN: opening Style must not accept Warp Options");
-        assert!(egui::ComboBox::is_open(&ctx, style_id));
+        assert!(craft_ui::ComboBox::is_open(&ctx, style_id));
         assert_eq!(app.ui.dialog.as_ref().unwrap().str("__effect"), "warp.arc");
         assert_eq!(entries(&app.session.doc().unwrap().history.undo), undo);
         assert_eq!(entries(&app.session.doc().unwrap().history.redo), redo);
@@ -567,7 +595,7 @@ fn warp_options_style_keyboard_enter_does_not_accept_dialog() {
         tab_to_warp_control(&mut app, &ctx, "Arc Lower", egui::Modifiers::NONE);
         warp_key(&mut app, &ctx, egui::Key::Enter, egui::Modifiers::NONE);
         assert!(app.ui.dialog.is_some(), "WARP_STYLE_ENTER_CHOICE: choosing Style must not accept Warp Options");
-        assert!(!egui::ComboBox::is_open(&ctx, style_id));
+        assert!(!craft_ui::ComboBox::is_open(&ctx, style_id));
         assert_eq!(app.ui.dialog.as_ref().unwrap().str("__effect"), "warp.arcLower");
         assert!(app.ui.dialog.as_ref().unwrap().bool("__warp_style_changed"));
         let state = app.session.doc().unwrap();
@@ -575,13 +603,7 @@ fn warp_options_style_keyboard_enter_does_not_accept_dialog() {
         assert_eq!(entries(&state.history.undo), undo);
         assert_eq!(entries(&state.history.redo), redo);
         assert_eq!(app.last_effect, last_effect);
-        if preview {
-            assert_eq!(state.doc.node(id).unwrap().appearance.effects[0].id, "warp.arcLower");
-            assert!(app.session.in_interaction());
-        } else {
-            assert_eq!(state.doc, before);
-            assert!(!state.is_dirty() && !app.session.in_interaction());
-        }
+        check_style_preview(&app, preview, id, &before);
         click_text(&mut app, &ctx, "Cancel");
         let state = app.session.doc().unwrap();
         assert_eq!(state.doc, before);
@@ -593,4 +615,34 @@ fn warp_options_style_keyboard_enter_does_not_accept_dialog() {
         app.run("edit.redo", json!({})).unwrap();
         assert_eq!(app.session.doc().unwrap().doc, moved);
     }
+}
+
+/// Warp Options editing the Warps of two objects, one new and one saved without a map version,
+/// changes the Bend of both and keeps each one's own `version`.
+#[test]
+fn warp_options_edit_keeps_each_targets_map_version() {
+    let (mut app, first) = app();
+    app.run("effect.apply", json!({"effect": "warp.arc"})).unwrap();
+    let second = NodeId(app.run("shape.rectangle", json!({"x": 230, "y": 60, "width": 120, "height": 80})).unwrap()["id"].as_u64().unwrap());
+    app.run("effect.apply", json!({"effect": "warp.arc"})).unwrap();
+    // As a file saved before the version existed gives it.
+    let doc = std::sync::Arc::make_mut(&mut app.session.doc_mut().unwrap().doc);
+    if let Some(Value::Object(p)) = doc.node_mut(second).and_then(|n| n.appearance.effects.first_mut()).map(|e| &mut e.params) {
+        p.remove("version");
+    }
+    app.run("select.set", json!({"ids": [first.0, second.0]})).unwrap();
+    app.run("effect.dialog", json!({"effect": "warp.arc"})).unwrap();
+    assert_eq!(app.ui.dialog.as_ref().unwrap().kind, effect::EXISTS);
+    let ctx = context();
+    settle(&mut app, &ctx);
+    click_text(&mut app, &ctx, "Edit");
+    settle(&mut app, &ctx);
+    make_warp_edit(&mut app, &ctx, "bend");
+    click_text(&mut app, &ctx, "OK");
+    assert!(app.ui.dialog.is_none());
+    let doc = app.session.doc().unwrap().doc.clone();
+    let params = |id: NodeId| doc.node(id).unwrap().appearance.effects[0].params.clone();
+    assert_eq!((&params(first)["bend"], &params(first)["version"]), (&json!(25.0), &json!(vectorcraft_doc::live::WARP_NET)));
+    assert_eq!(params(second)["bend"], json!(25.0));
+    assert!(params(second).get("version").is_none(), "{:?}", params(second));
 }

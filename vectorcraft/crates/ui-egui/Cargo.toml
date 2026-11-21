@@ -21,6 +21,7 @@ interface-fonts = []
 
 [dependencies]
 craft-ui = { workspace = true }
+craft-keymap = { workspace = true, features = ["egui"] }
 vectorcraft-geom = { workspace = true }
 vectorcraft-color = { workspace = true }
 vectorcraft-doc = { workspace = true }
@@ -37,14 +38,26 @@ vectorcraft-pdf = { workspace = true }
 vectorcraft-cad = { workspace = true }
 vectorcraft-eps = { workspace = true }
 vectorcraft-format = { workspace = true }
-egui = { workspace = true, features = ["bytemuck"] }
+egui = { workspace = true, features = ["bytemuck", "default_fonts", "monochrome_emoji_fonts"] }
 # With egui's `bytemuck`: copies rendered rasters into egui images whole (`canvas::color_image`).
-bytemuck = "1"
+# `default_fonts`: egui 0.37 makes its bundled faces opt-in, and a dependency's dev-features do not
+# reach our tests; `theme::install_fonts` starts from `FontDefinitions::default()`, which is empty
+# without them (production would lay out tofu, and the no-interface-fonts tests would bind nothing).
+bytemuck = { version = "1", features = ["extern_crate_alloc"] }
 egui_extras = { workspace = true }
 image = { workspace = true }
+craft-image-codecs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
+
+# Floating panels open in OS windows of their own on the desktop; on the web they stay in the page.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+craft-ui = { workspace = true, features = ["native-windows"] }
+craft-update = { workspace = true }
+# The local date and time the status bar's Date and Time readout shows (`chrono::Local`). Already in
+# Cargo.lock with the time-zone crates `clock` uses.
+chrono = { workspace = true, features = ["clock"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # `now_ms` (src/lib.rs) reads the page's `performance.now()` with this crate in the web build. It is
@@ -59,6 +72,7 @@ rustix = { workspace = true, features = ["std", "process"] }
 
 [dev-dependencies]
 egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
+vectorcraft-apischema = { workspace = true }
 vectorcraft-testkit = { workspace = true }
 # A variable font built in code (no font file is committed).
 vectorcraft-text = { workspace = true, features = ["test-fonts"] }
