@@ -114,8 +114,8 @@ fn fxm_sprite(at: u32, x: f32, y: f32) -> FxmShade {
             cov = min(0.12 * select(0.0, 1.0, d <= 1.0) + ring * 0.8 + hl, 1.0);
         }
         case 5u: {
-            let sn = sin(data[at + 8u]);
-            let cs = cos(data[at + 8u]);
+            let sn = sin_p(data[at + 8u]);
+            let cs = cos_p(data[at + 8u]);
             let ux = (dx * cs + dy * sn) / r;
             let uy = (-dx * sn + dy * cs) / r;
             let d = sqrt(ux * ux + uy * uy);
@@ -125,25 +125,46 @@ fn fxm_sprite(at: u32, x: f32, y: f32) -> FxmShade {
             cov = min(core + stx + sty, 1.0);
         }
         case 6u: {
-            let sn = sin(data[at + 8u]);
-            let cs = cos(data[at + 8u]);
+            let sn = sin_p(data[at + 8u]);
+            let cs = cos_p(data[at + 8u]);
             let ux = dx * cs + dy * sn;
             let uy = -dx * sn + dy * cs;
             let e = r * 0.75;
             cov = fxm_aa(e - abs(ux)) * fxm_aa(e - abs(uy));
         }
         case 7u: {
-            let sn = sin(data[at + 8u]);
-            let cs = cos(data[at + 8u]);
+            let sn = sin_p(data[at + 8u]);
+            let cs = cos_p(data[at + 8u]);
             let ux = dx * cs + dy * sn;
             let uy = -dx * sn + dy * cs;
             let e = r * 0.5;
             var m = 3.4e38;
             for (var k = 0; k < 3; k++) {
                 let a = 1.5707964 + f32(k) * 6.2831855 / 3.0;
-                m = min(m, e - (ux * cos(a) + uy * sin(a)));
+                m = min(m, e - (ux * cos_p(a) + uy * sin_p(a)));
             }
             cov = fxm_aa(m);
+        }
+        // sim::Shape::Ball (CC Ball Action's Shading): the sphere's light and shine scaled by
+        // |shade| (data[at + 9]), lit from the lower right when shade < 0.
+        case 9u: {
+            let d = sqrt(dx * dx + dy * dy);
+            let cv = fxm_aa(r - d);
+            if (cv <= 0.0) {
+                return fxm_none();
+            }
+            let shade = data[at + 9u];
+            let nx = dx / r;
+            let ny = dy / r;
+            let nz = sqrt(max(1.0 - nx * nx - ny * ny, 0.0));
+            let m = select(1.0, -1.0, shade < 0.0);
+            let diff = max(nx * (-0.48 * m) + ny * (-0.58 * m) + nz * 0.66, 0.0);
+            let rz = 2.0 * diff * nz - 0.66;
+            let st = abs(shade);
+            let spec = powz(max(rz, 0.0), 20.0) * 0.6 * st;
+            let k = max(1.0 - st * 0.8 * (1.0 - diff), 0.0);
+            rgb = rgb * k + spec;
+            cov = cv;
         }
         default: {
             let lx = data[at + 9u];
@@ -165,7 +186,8 @@ fn fxm_sprite(at: u32, x: f32, y: f32) -> FxmShade {
     return FxmShade(true, vec4<f32>(rgb * a, a));
 }
 
-// CC Bubbles' bubble (sim::bubbles). u[1].y = metal, u[1].z = shading type.
+// CC Bubbles' bubble (sim::bubbles). u[1].y = metal, u[1].z = shading type, f[0] = the layer
+// rectangle's first and last pixel centres (x0, y0, x1, y1), which refraction samples stay within.
 fn fxm_bubble(at: u32, x: f32, y: f32) -> FxmShade {
     let qx = data[at + 1u];
     let qy = data[at + 2u];
@@ -180,7 +202,9 @@ fn fxm_bubble(at: u32, x: f32, y: f32) -> FxmShade {
     }
     let k = select(-0.7, 1.6, P.u[1].y != 0u);
     let nz = sqrt(max(1.0 - d2, 0.0));
-    let s = fxm_unpremul(sample_bilinear(src, data[at + 4u] + dx * qr * k, data[at + 5u] + dy * qr * k));
+    let sx = min(max(data[at + 4u] + dx * qr * k, P.f[0].x), P.f[0].z);
+    let sy = min(max(data[at + 5u] + dy * qr * k, P.f[0].y), P.f[0].w);
+    let s = fxm_unpremul(sample_bilinear_clamped(src, sx, sy));
     var c = s.xyz;
     if (s.w <= 0.0) {
         c = vec3<f32>(0.6, 0.7, 0.8);
@@ -428,8 +452,8 @@ fn fxm_ripples(x: f32, y: f32) -> f32 {
         let r = data[i * 4u + 2u];
         let u = (d - r) / P.f[0].y;
         if (abs(u) < 1.0) {
-            let env = 0.5 + 0.5 * cos(u * 3.1415927);
-            v += data[i * 4u + 3u] * env * cos((d - r) / P.f[0].x * 6.2831855);
+            let env = 0.5 + 0.5 * cos_p(u * 3.1415927);
+            v += data[i * 4u + 3u] * env * cos_p((d - r) / P.f[0].x * 6.2831855);
         }
     }
     return v;

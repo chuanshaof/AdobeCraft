@@ -16,6 +16,7 @@ export ROOT
 # (`cargo xtask version` prints the same thing; awk avoids compiling xtask here.)
 workspace_version() {
   awk '
+    { sub(/\r$/, "") }
     /^\[/ { in_pkg = ($0 == "[workspace.package]") ; next }
     in_pkg && $1 == "version" { gsub(/[" ]/, "", $3); print $3; exit }
   ' "$ROOT/Cargo.toml"
@@ -49,7 +50,7 @@ warn() {
 # Copy licence and readme files that exist into a package directory.
 copy_docs() {
   local dest="$1" f
-  for f in README.md LICENSE LICENSE-MIT LICENSE-APACHE COPYRIGHT; do
+  for f in README.md LICENSE LICENSE-MIT LICENSE-APACHE COPYRIGHT NOTICE; do
     if [[ -f "$ROOT/$f" ]]; then cp "$ROOT/$f" "$dest/"; fi
   done
   return

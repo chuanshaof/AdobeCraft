@@ -1,0 +1,299 @@
+use super::cdl::{Cdl, parse_cdl_xml};
+use super::{Arc, Lut, parse_cube};
+use crate::file_cache::{self, Registered};
+
+// ---------------------------------------------------------------- LUT files
+
+/// A loaded transform file.
+#[derive(Clone, Debug)]
+pub enum FileXform {
+    /// A lattice/1D LUT with an optional per-channel piecewise-linear shaper (cineSpace pre-LUT).
+    Lut { lut: Lut, shaper: Option<[Vec<(f32, f32)>; 3]> },
+    /// CDL corrections by id (in file order).
+    Cdl(Vec<(String, Cdl)>),
+    /// A matrix with offset (Sony Imageworks `.spimtx`), as a MatrixTransform's.
+    Matrix { m: [f64; 16], offset: [f64; 4] },
+}
+
+/// Parse a Sony Imageworks `.spimtx` matrix: three rows of four numbers, three matrix columns
+/// and an offset in 16-bit code values (÷ 65535).
+pub fn parse_spimtx(text: &str) -> Option<FileXform> {
+    let value = craft_cms::sony_lut::parse_spimtx(text)?;
+    Some(FileXform::Matrix { m: value.matrix, offset: value.offset })
+}
+
+/// Parse a Sony Imageworks `.spi1d` 1D LUT: `From <min> <max>`, `Length <n>`, `Components
+/// <1 | 3>`, then `{` the values `}`.
+pub fn parse_spi1d(text: &str) -> Option<Lut> {
+    let table = craft_cms::spi1d::parse(text)?;
+    Some(Lut { n1: table.values.len(), d1: table.values, n3: 0, d3: vec![], dmin: [table.domain[0]; 3], dmax: [table.domain[1]; 3] })
+}
+
+/// Parse a Sony Imageworks `.spi3d` lattice: `SPILUT 1.0`, `3 3`, the sizes, then one
+/// `r g b  R G B` line per lattice point (indices, then the colour).
+pub fn parse_spi3d(text: &str) -> Option<Lut> {
+    let value = craft_cms::sony_lut::parse_spi3d(text)?;
+    Some(Lut { n1: 0, d1: vec![], n3: value.size, d3: value.values, dmin: [0.0; 3], dmax: [1.0; 3] })
+}
+
+/// Parse an Autodesk `.3dl` lattice (integers, blue fastest; an optional input-mesh line).
+pub fn parse_3dl(text: &str) -> Option<Lut> {
+    parse_3dl_limited(text, MAX_LATTICE)
+}
+
+/// [`parse_3dl`] with the largest accepted lattice side as a parameter, so tests can reach it.
+pub(super) fn parse_3dl_limited(text: &str, max_side: usize) -> Option<Lut> {
+    let mut mesh: Option<Vec<f64>> = None;
+    let mut rows: Vec<[f64; 3]> = vec![];
+    let mut out_bits: Option<u32> = None;
+    for line in text.lines() {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with('#') || l.starts_with('<') {
+            continue;
+        }
+        if l.starts_with(|c: char| c.is_ascii_alphabetic()) {
+            // "Mesh <in bits> <out bits>" (Lustre header); other keywords are ignored.
+            let t: Vec<&str> = l.split_whitespace().take(3).collect();
+            if t[0].eq_ignore_ascii_case("mesh") && t.len() >= 3 {
+                out_bits = t[2].parse().ok();
+            }
+            continue;
+        }
+        let v: Vec<f64> = l.split_whitespace().filter_map(|t| t.parse().ok()).take(max_side.max(3).saturating_add(1)).collect();
+        if v.len() > 3 && mesh.is_none() && rows.is_empty() {
+            // The mesh length is the lattice side: refuse one no lattice reader accepts (#3830).
+            if v.len() > max_side {
+                return None;
+            }
+            mesh = Some(v);
+        } else if v.len() == 3 {
+            // One spare row while no mesh is known: a 3-entry mesh reads as a data row until the
+            // count tells them apart below.
+            if rows.len() >= max_side.saturating_pow(3).saturating_add(usize::from(mesh.is_none())) {
+                return None;
+            }
+            rows.push([v[0], v[1], v[2]]);
+        } else {
+            return None;
+        }
+    }
+    // A 3-entry input mesh (3³ lattice) looks like a data row: 28 rows are a mesh and 27.
+    if mesh.is_none() && rows.len() == 28 {
+        mesh = Some(rows.remove(0).to_vec());
+    }
+    let n = match &mesh {
+        Some(m) => m.len(),
+        None => (rows.len() as f64).cbrt().round() as usize,
+    };
+    if !(2..=max_side).contains(&n) || n.checked_pow(3) != Some(rows.len()) {
+        return None;
+    }
+    let maxv = rows.iter().flat_map(|r| r.iter()).fold(0.0f64, |m, &v| m.max(v));
+    let out_max = match out_bits {
+        Some(b) if b > 0 && b < 32 => (1u64 << b) as f64 - 1.0,
+        _ => [255.0, 1023.0, 4095.0, 65535.0].into_iter().find(|&m| maxv <= m).unwrap_or(maxv.max(1.0)),
+    };
+    // .3dl rows: red slowest, blue fastest. Our lattice is red fastest.
+    let mut d3 = vec![[0.0f32; 3]; n * n * n];
+    for (k, r) in rows.iter().enumerate() {
+        let (ri, gi, bi) = (k / (n * n), (k / n) % n, k % n);
+        d3[ri + gi * n + bi * n * n] = r.map(|v| (v / out_max) as f32);
+    }
+    Some(Lut { n1: 0, d1: vec![], n3: n, d3, dmin: [0.0; 3], dmax: [1.0; 3] })
+}
+
+/// Largest lattice side the lattice readers accept (`.spi3d`, `.csp`, `.3dl`).
+const MAX_LATTICE: usize = 129;
+/// Most entries of a 1D table (interpolated by index, so capped like the lattices: 2²⁴).
+const MAX_1D: usize = 1 << 24;
+
+/// Parse a cineSpace `.csp` LUT (1D or 3D, with its three pre-LUT shapers).
+pub fn parse_csp(text: &str) -> Option<(Lut, [Vec<(f32, f32)>; 3])> {
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    if !lines.next()?.starts_with("CSPLUTV100") {
+        return None;
+    }
+    let kind = lines.next()?;
+    let mut lines = lines.peekable();
+    if lines.peek().is_some_and(|l| l.starts_with("BEGIN METADATA")) {
+        for l in lines.by_ref() {
+            if l.starts_with("END METADATA") {
+                break;
+            }
+        }
+    }
+    let nums = |l: &str| -> Option<Vec<f32>> { l.split_whitespace().map(|t| t.parse().ok()).collect() };
+    let mut shaper: [Vec<(f32, f32)>; 3] = Default::default();
+    for ch in shaper.iter_mut() {
+        let n: usize = lines.next()?.parse().ok()?;
+        let ins = nums(lines.next()?)?;
+        let outs = nums(lines.next()?)?;
+        if ins.len() != n || outs.len() != n || n < 2 {
+            return None;
+        }
+        *ch = ins.into_iter().zip(outs).collect();
+    }
+    if kind.starts_with("3D") {
+        let sz = nums(lines.next()?)?;
+        if sz.len() != 3 || sz[0] != sz[1] || sz[1] != sz[2] {
+            return None;
+        }
+        // The size comes from the file: an integer lattice size the other lattice readers accept
+        // (2..=129), checked before anything is allocated. Rows are read before they are stored,
+        // so a short file never reserves the table it claims.
+        let n = sz[0];
+        if n.fract() != 0.0 || !(2.0..=MAX_LATTICE as f32).contains(&n) {
+            return None;
+        }
+        let n = n as usize;
+        let mut d3 = Vec::new();
+        for _ in 0..n * n * n {
+            let v = nums(lines.next()?)?;
+            if v.len() != 3 {
+                return None;
+            }
+            d3.push([v[0], v[1], v[2]]);
+        }
+        Some((Lut { n1: 0, d1: vec![], n3: n, d3, dmin: [0.0; 3], dmax: [1.0; 3] }, shaper))
+    } else {
+        let n: usize = lines.next()?.parse().ok()?;
+        if !(2..=MAX_1D).contains(&n) {
+            return None;
+        }
+        let mut d1 = Vec::new();
+        for _ in 0..n {
+            let v = nums(lines.next()?)?;
+            if v.len() != 3 {
+                return None;
+            }
+            d1.push([v[0], v[1], v[2]]);
+        }
+        Some((Lut { n1: n, d1, n3: 0, d3: vec![], dmin: [0.0; 3], dmax: [1.0; 3] }, shaper))
+    }
+}
+
+fn shape(curve: &[(f32, f32)], x: f32) -> f32 {
+    if curve.len() < 2 {
+        return x;
+    }
+    let i = curve.partition_point(|p| p.0 < x).clamp(1, curve.len() - 1);
+    let (a, b) = (curve[i - 1], curve[i]);
+    let t = ((x - a.0) / (b.0 - a.0).max(1e-12)).clamp(0.0, 1.0);
+    a.1 + (b.1 - a.1) * t
+}
+
+fn shape_inv(curve: &[(f32, f32)], y: f32) -> f32 {
+    let flipped: Vec<(f32, f32)> = curve.iter().map(|&(a, b)| (b, a)).collect();
+    shape(&flipped, y)
+}
+
+/// Parse transform text by its format (detected from `ext` or the content).
+pub fn parse_file(text: &str, ext: &str) -> Option<FileXform> {
+    let ext = ext.to_ascii_lowercase();
+    if ext == "cc" || ext == "ccc" || ext == "cdl" || text.contains("<ColorCorrection") {
+        let v = parse_cdl_xml(text);
+        return (!v.is_empty()).then_some(FileXform::Cdl(v));
+    }
+    if ext == "csp" || text.trim_start().starts_with("CSPLUTV100") {
+        return parse_csp(text).map(|(lut, s)| FileXform::Lut { lut, shaper: Some(s) });
+    }
+    if ext == "spimtx" {
+        return parse_spimtx(text);
+    }
+    if ext == "spi1d" || text.trim_start().starts_with("Version") {
+        return parse_spi1d(text).map(|lut| FileXform::Lut { lut, shaper: None });
+    }
+    if ext == "spi3d" || text.trim_start().starts_with("SPILUT") {
+        return parse_spi3d(text).map(|lut| FileXform::Lut { lut, shaper: None });
+    }
+    if ext == "cube" || text.contains("LUT_3D_SIZE") || text.contains("LUT_1D_SIZE") {
+        return parse_cube(text).map(|lut| FileXform::Lut { lut, shaper: None });
+    }
+    parse_3dl(text).map(|lut| FileXform::Lut { lut, shaper: None })
+}
+
+/// [`load_file`]'s cache, by parameter text (bounded like [`crate::load_lut`]'s).
+static FILES: Registered<Option<Arc<FileXform>>> = Registered::new(64, 512 << 20);
+
+/// The files the transform cached for `src` was read from.
+pub(crate) fn cached_files(src: &str) -> Option<Vec<String>> {
+    file_cache::lock(FILES.get()).files(src)
+}
+
+/// Load (and cache) a transform from a file path or inline content. A file is stamped (one
+/// `metadata` call) on every load and read again once its size or modification time moved (see
+/// [`crate::file_cache`]); inline content is its own content.
+pub fn load_file(src: &str) -> Option<Arc<FileXform>> {
+    let src_t = src.trim();
+    if src_t.is_empty() {
+        return None;
+    }
+    file_cache::cached(FILES.get(), src, || {
+        let parsed = if src.contains('\n') {
+            parse_file(src, "")
+        } else {
+            let ext = std::path::Path::new(src_t).extension().and_then(std::ffi::OsStr::to_str).unwrap_or("");
+            file_cache::read(src_t).ok().and_then(|t| parse_file(&t, ext))
+        }
+        .map(Arc::new);
+        let bytes = match parsed.as_deref() {
+            Some(FileXform::Lut { lut, shaper }) => crate::utility::lut_bytes(lut)
+                .saturating_add(shaper.as_ref().map_or(0, |s| s.iter().map(Vec::len).sum::<usize>().saturating_mul(std::mem::size_of::<(f32, f32)>()))),
+            Some(FileXform::Cdl(c)) => c.len().saturating_mul(std::mem::size_of::<(String, Cdl)>()),
+            Some(FileXform::Matrix { .. }) | None => 0,
+        };
+        (parsed, bytes)
+    })
+}
+
+impl FileXform {
+    pub fn apply(&self, c: [f32; 3], interp: u32, inverse: bool, ccc_id: &str) -> [f32; 3] {
+        match self {
+            FileXform::Cdl(list) => {
+                let cdl = list.iter().find(|(id, _)| !ccc_id.is_empty() && id == ccc_id).or(list.first()).map(|(_, c)| *c).unwrap_or_default();
+                let c64 = c.map(|v| v as f64);
+                let o = if inverse { cdl.invert(c64, true) } else { cdl.apply(c64, true) };
+                o.map(|v| v as f32)
+            }
+            FileXform::Matrix { m, offset } => crate::ocio_config::matrix_apply(m, offset, c.map(|v| v as f64), inverse).map(|v| v as f32),
+            FileXform::Lut { lut, shaper } => {
+                let fwd = |c: [f32; 3]| {
+                    let c = match shaper {
+                        Some(s) => [shape(&s[0], c[0]), shape(&s[1], c[1]), shape(&s[2], c[2])],
+                        None => c,
+                    };
+                    lut.apply_interp(c, interp)
+                };
+                if !inverse {
+                    return fwd(c);
+                }
+                if lut.n3 == 0 {
+                    // 1D: invert each channel exactly through the (monotone) tables.
+                    let mut x = c;
+                    if lut.n1 > 1 {
+                        x = [0, 1, 2].map(|i| {
+                            let curve: Vec<(f32, f32)> =
+                                (0..lut.n1).map(|k| (lut.d1[k][i], lut.dmin[i] + (lut.dmax[i] - lut.dmin[i]) * k as f32 / (lut.n1 - 1) as f32)).collect();
+                            shape(&curve, c[i])
+                        });
+                    }
+                    if let Some(s) = shaper {
+                        x = [shape_inv(&s[0], x[0]), shape_inv(&s[1], x[1]), shape_inv(&s[2], x[2])];
+                    }
+                    return x;
+                }
+                // 3D: damped fixed-point (Newton with an identity Jacobian) from the target.
+                let mut x = c;
+                for _ in 0..40 {
+                    let y = fwd(x);
+                    let e = [c[0] - y[0], c[1] - y[1], c[2] - y[2]];
+                    if e.iter().all(|v| v.abs() < 1e-6) {
+                        break;
+                    }
+                    x = [x[0] + e[0], x[1] + e[1], x[2] + e[2]];
+                }
+                x
+            }
+        }
+    }
+}

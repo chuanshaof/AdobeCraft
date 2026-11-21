@@ -1,0 +1,1353 @@
+//! Composition viewer parity: snapping maths, channel / exposure display transforms, snapshots,
+//! guides, the shape Pen, vertex add / delete / convert, motion-path key and tangent edits and
+//! the Graph Editor transform box. Every edit undoes.
+
+use effectcraft_keyframe::Value as KV;
+use effectcraft_project::LayerId;
+use effectcraft_time::Tick;
+use serde_json::json;
+
+use crate::Session;
+use crate::viewer::{
+    Channel, DisplayPass, FrameEncoding, PRI_COMP, PRI_GRID, PRI_GUIDE, PRI_LAYER, PRI_VERTEX, PassCurve, SnapKind, SnapSource, SnapTarget, snap,
+};
+
+fn comp() -> Session {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Main", "width": 640, "height": 360, "frameRate": 30, "duration": 10})).unwrap();
+    s
+}
+
+fn layer(s: &Session, id: u64) -> effectcraft_project::Layer {
+    s.active_comp().unwrap().layer(LayerId(id)).unwrap().clone()
+}
+
+// ---------------------------------------------------------------- snapping
+
+#[test]
+fn snap_picks_nearest_target_within_tolerance() {
+    let t = [SnapTarget::point([100.0, 100.0], PRI_LAYER, SnapSource::Comp), SnapTarget::point([108.0, 100.0], PRI_LAYER, SnapSource::Comp)];
+    let s = snap(&[[103.0, 101.0]], &t, 10.0).unwrap();
+    assert_eq!(s.delta, [-3.0, -1.0]);
+    assert_eq!(s.at, [100.0, 100.0]);
+    // Out of tolerance: nothing.
+    assert!(snap(&[[130.0, 100.0]], &t, 10.0).is_none());
+    // Of several sources, the one nearest a target snaps.
+    let s = snap(&[[0.0, 0.0], [107.0, 100.0]], &t, 10.0).unwrap();
+    assert_eq!(s.delta, [1.0, 0.0]);
+}
+
+#[test]
+fn snap_lines_snap_axes_independently_and_priority_breaks_ties() {
+    let t = [
+        SnapTarget::vline(50.0, PRI_GRID, SnapSource::Grid),
+        SnapTarget::vline(54.0, PRI_GUIDE, SnapSource::Guide),
+        SnapTarget::hline(20.0, PRI_GRID, SnapSource::Grid),
+    ];
+    // x snaps to the nearest vertical line (equal distance: the guide wins over the grid), y to
+    // the horizontal one.
+    let s = snap(&[[52.0, 23.0]], &t, 5.0).unwrap();
+    assert_eq!(s.delta, [2.0, -3.0]);
+    assert_eq!(s.hits.len(), 2);
+    assert_eq!(s.hits[0].source, SnapSource::Guide);
+    assert_eq!(s.at, [54.0, 20.0]);
+    // A point at the same distance as a line beats it (it snaps both axes).
+    let t2 = [SnapTarget::vline(10.0, PRI_GUIDE, SnapSource::Guide), SnapTarget::point([10.0, 12.0], PRI_VERTEX, SnapSource::Vertex(LayerId(1)))];
+    let s = snap(&[[12.0, 12.0]], &t2, 5.0).unwrap();
+    assert_eq!(s.hits[0].kind, SnapKind::Point);
+    assert_eq!(s.delta, [-2.0, 0.0]);
+    // Equal point distances: lower priority value (vertex) wins over a layer feature.
+    let t3 =
+        [SnapTarget::point([0.0, 3.0], PRI_LAYER, SnapSource::Layer(LayerId(2))), SnapTarget::point([3.0, 0.0], PRI_VERTEX, SnapSource::Vertex(LayerId(3)))];
+    assert_eq!(snap(&[[0.0, 0.0]], &t3, 5.0).unwrap().hits[0].source, SnapSource::Vertex(LayerId(3)));
+}
+
+/// #2855: an edge midpoint lies on its edge line, so one line nearer than the point must not win
+/// and leave the other axis free. Two lines do win when together they are nearer.
+#[test]
+fn snap_point_beats_one_line_and_loses_only_to_two_nearer_lines() {
+    let src = SnapSource::Layer(LayerId(1));
+    let mid = SnapTarget::point([100.0, 50.0], PRI_LAYER, src);
+    let top = SnapTarget::hline(50.0, PRI_LAYER, src);
+    // The line alone is nearer (1 against √10), and the point still snaps both axes.
+    let s = snap(&[[103.0, 51.0]], &[top, mid], 5.0).unwrap();
+    assert_eq!(s.at, [100.0, 50.0]);
+    assert_eq!(s.delta, [-3.0, -1.0]);
+    assert_eq!(s.hits, [mid]);
+    // Lines through the point itself tie with it: the point.
+    let centre = SnapTarget::vline(100.0, PRI_LAYER, src);
+    assert_eq!(snap(&[[103.0, 51.0]], &[top, centre, mid], 5.0).unwrap().hits, [mid]);
+    // Two lines together nearer than the point: both snap.
+    let far = SnapTarget::point([101.0, 55.0], PRI_LAYER, src);
+    let v = SnapTarget::vline(102.0, PRI_GUIDE, SnapSource::Guide);
+    let h = SnapTarget::hline(52.0, PRI_GUIDE, SnapSource::Guide);
+    let s = snap(&[[103.0, 51.0]], &[v, h, far], 5.0).unwrap();
+    assert_eq!(s.at, [102.0, 52.0]);
+    assert_eq!(s.hits, [v, h]);
+}
+
+/// #2681: a pair of lines, one of them through the point (the layer's own edge line), beats the
+/// point only when it is clearly nearer (by `POINT_BIAS` of the tolerance, 2 of 8 here); a pair
+/// only a little nearer leaves the feature on the point.
+#[test]
+fn a_line_pair_through_a_point_beats_it_only_by_a_clear_margin() {
+    use crate::viewer::POINT_BIAS;
+    assert_eq!(8.0 * POINT_BIAS, 2.0);
+    let src = SnapSource::Layer(LayerId(1));
+    let edge = SnapTarget::vline(100.0, PRI_LAYER, src);
+    let row = SnapTarget::hline(51.5, PRI_COMP, SnapSource::Comp);
+    // The point is 5 away; the pair (3 and ½) about 3.04, under 2 nearer: the point.
+    let pt = SnapTarget::point([100.0, 47.0], PRI_LAYER, src);
+    let s = snap(&[[103.0, 51.0]], &[edge, row, pt], 8.0).unwrap();
+    assert_eq!(s.hits, [pt]);
+    assert_eq!(s.at, [100.0, 47.0]);
+    // The point about 6.7 away, the same pair more than 2 nearer: the pair.
+    let far = SnapTarget::point([100.0, 45.0], PRI_LAYER, src);
+    let s = snap(&[[103.0, 51.0]], &[edge, row, far], 8.0).unwrap();
+    assert_eq!(s.hits, [edge, row]);
+    assert_eq!(s.at, [100.0, 51.5]);
+}
+
+/// #2681: two guides crossing 1 px beside a layer's point are reachable right next to it: a pair
+/// of lines that both miss the point gets no margin, only the nearer one wins.
+#[test]
+fn a_guide_intersection_beside_a_point_stays_reachable() {
+    let src = SnapSource::Layer(LayerId(1));
+    let pt = SnapTarget::point([100.0, 50.0], PRI_LAYER, src);
+    let own = [SnapTarget::vline(100.0, PRI_LAYER, src), SnapTarget::hline(50.0, PRI_LAYER, src)];
+    let guides = [SnapTarget::vline(101.0, PRI_GUIDE, SnapSource::Guide), SnapTarget::hline(51.0, PRI_GUIDE, SnapSource::Guide)];
+    let t = [own[0], own[1], guides[0], guides[1], pt];
+    // Nearer the intersection (about 0.71) than the point (about 2.12): the intersection.
+    let s = snap(&[[101.5, 51.5]], &t, 8.0).unwrap();
+    assert_eq!(s.at, [101.0, 51.0]);
+    assert_eq!(s.hits, guides);
+    // Nearer the point: the point.
+    let s = snap(&[[100.3, 50.3]], &t, 8.0).unwrap();
+    assert_eq!(s.hits, [pt]);
+}
+
+/// #2855: an unrotated layer's centre lines follow its edges' span rule, reach the outer comp
+/// through a collapsed precomp layer, and a rotated layer keeps its points only.
+#[test]
+fn layer_centre_lines_follow_the_edges() {
+    use crate::viewer::{SnapFeatures, SnapOptions, targets};
+    let mut s = comp();
+    // A 100×50 solid moved off the comp's centre lines: x 70–170, y 55–105, centre (120, 80).
+    let a = s.execute("layer.newSolid", json!({"color": "#ff0000", "width": 100, "height": 50})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("prop.set", json!({"layer": a, "path": "transform/position", "value": [120, 80, 0]})).unwrap();
+    let cid = s.active_comp_id().unwrap();
+    let at = |s: &Session, f: SnapFeatures| {
+        let comp = s.project.comp(cid).unwrap().clone();
+        let ctx = effectcraft_render::EvalCtx::new(&s.project, cid, &comp, Tick::ZERO);
+        targets(&ctx, &[], SnapOptions { layers: true, features: f, guides: false, grid: false, grid_spacing: 0.0 })
+    };
+    let lines = |t: &[SnapTarget], l: LayerId| {
+        let of = |kind: SnapKind, i: usize, c: f64| t.iter().find(|t| t.kind == kind && t.source == SnapSource::Layer(l) && t.pos[i] == c).map(|t| t.span);
+        (of(SnapKind::VLine, 0, 120.0), of(SnapKind::HLine, 1, 80.0))
+    };
+    assert_eq!(lines(&at(&s, SnapFeatures::default()), LayerId(a)), (Some(None), Some(None)));
+    let off = SnapFeatures { edges_extended: false, ..Default::default() };
+    assert_eq!(lines(&at(&s, off), LayerId(a)), (Some(Some([55.0, 105.0])), Some(Some([70.0, 170.0]))));
+    // Through a collapsed precomp layer (it fills the comp, unmoved, so the numbers stay).
+    s.execute("layer.precompose", json!({"layers": [a], "name": "Inner"})).unwrap();
+    let pre = s.active_comp().unwrap().layers[0].id;
+    s.execute("layer.setSwitch", json!({"layers": [pre.0], "switch": "collapse", "value": true})).unwrap();
+    assert_eq!(lines(&at(&s, off), pre), (Some(Some([55.0, 105.0])), Some(Some([70.0, 170.0]))));
+    // Rotated: no lines at all.
+    s.execute("prop.set", json!({"layer": pre.0, "path": "transform/rotation", "value": 30})).unwrap();
+    assert_eq!(lines(&at(&s, off), pre), (None, None));
+}
+
+/// #2681: two Ellipse-tool circles, one moved so its left point meets the other's right point.
+/// The point must land exactly on the other circle's point at 100 % as at 200 % and 400 %, on
+/// HiDPI displays too. The tolerance is the viewer's (8 screen points over the zoom in points per
+/// comp pixel), so at 100 % it reaches the comp's centre row 6 px below the circles and a guide
+/// 3 px below them. Neither may pull the circle off the point: the other circle's own edge line
+/// and row pass through its point, so a pair of lines made with that row or guide is only a
+/// little nearer than the point (the row or guide a few pixels nearer on y), and a point wins
+/// unless a pair is clearly nearer (`POINT_BIAS`). Before #2855 one nearer line was enough, and
+/// even after it any pair nearer by a hair; zoomed in the row and guide were out of reach, so
+/// the snap looked right there and not at 100 %.
+#[test]
+fn circles_snap_point_to_point_at_every_zoom() {
+    circles_snap_point_to_point(false);
+}
+
+/// #2681 with the circles converted to Bezier paths (Convert To Bezier Path): the dragged path
+/// point lands on the other circle's path point (a vertex target) the same way.
+#[test]
+fn bezier_circles_snap_path_point_to_path_point_at_every_zoom() {
+    circles_snap_point_to_point(true);
+}
+
+/// The #2681 drops: parametric circles (their edge midpoints snap) or, with `bezier`, the same
+/// circles as Bezier paths (their path points snap).
+fn circles_snap_point_to_point(bezier: bool) {
+    use crate::viewer::{SnapOptions, layer_features, layer_vertices, targets};
+    let mut s = comp();
+    // Circle A: 100 px, centred at (200, 174), its right point at (250, 174); the comp's centre
+    // row is y = 180, a horizontal guide at y = 177.
+    s.execute("view.addGuide", json!({"orientation": "horizontal", "position": 177})).unwrap();
+    let a = s.execute("shape.newShape", json!({"kind": "ellipse", "size": [100, 100], "position": [200, 174]})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("edit.deselectAll", json!({})).unwrap();
+    let b = s.execute("shape.newShape", json!({"kind": "ellipse", "size": [100, 100], "position": [400, 300]})).unwrap()["layer"].as_u64().unwrap();
+    assert_ne!(a, b, "two shape layers");
+    if bezier {
+        for l in [a, b] {
+            /// Returns the uid of the first ellipse group in the tree, searching depth first.
+            fn ellipse(g: &effectcraft_project::PropGroup) -> Option<u64> {
+                if g.match_id == "ellipse" {
+                    return Some(g.uid);
+                }
+                g.groups().find_map(ellipse)
+            }
+            let uid = ellipse(layer(&s, l).props.sub("contents").unwrap()).unwrap();
+            s.state.selected_props = vec![(LayerId(l), uid)];
+            s.execute("path.convertToBezier", json!({})).unwrap();
+        }
+    }
+    let cid = s.active_comp_id().unwrap();
+    // The circle's right (`right`) or left point: an edge midpoint of its box (features:
+    // corners, edge midpoints top, right, bottom, left, centre, anchor point), or a path point.
+    let point = |s: &Session, id: u64, right: bool| {
+        let comp = s.project.comp(cid).unwrap().clone();
+        let ctx = effectcraft_render::EvalCtx::new(&s.project, cid, &comp, Tick::ZERO);
+        let l = comp.layer(LayerId(id)).unwrap();
+        if !bezier {
+            return layer_features(&ctx, l)[if right { 5 } else { 7 }];
+        }
+        let v = layer_vertices(&ctx, l);
+        assert!(v.len() >= 4, "a Bezier circle: {v:?}");
+        let x = |p: &&[f64; 2]| p[0];
+        *(if right { v.iter().max_by(|p, q| x(p).total_cmp(&x(q))) } else { v.iter().min_by(|p, q| x(p).total_cmp(&x(q))) }).unwrap()
+    };
+    let near = |p: [f64; 2], q: [f64; 2], e: f64| (p[0] - q[0]).abs() < e && (p[1] - q[1]).abs() < e;
+    let right_of_a = point(&s, a, true);
+    assert!(near(right_of_a, [250.0, 174.0], 1e-6), "{right_of_a:?}");
+    let left_of_b = point(&s, b, false);
+    assert!(near(left_of_b, [350.0, 300.0], 1e-6), "{left_of_b:?}");
+    let to_left = [left_of_b[0] - 400.0, left_of_b[1] - 300.0];
+    let source = if bezier { SnapSource::Vertex(LayerId(a)) } else { SnapSource::Layer(LayerId(a)) };
+    // B's left point dropped right of and below A's right point (screen points): just off it,
+    // and nearer the comp's centre row (at 100 %) than A's own row. With and without snapping to
+    // the guide.
+    for (dx, dy) in [(3.0, 1.0), (3.0, 3.5)] {
+        for guides in [false, true] {
+            for ppp in [1.0, 1.25, 1.5] {
+                for magnification in [1.0, 2.0, 4.0] {
+                    let case = format!("bezier {bezier}, drop ({dx}, {dy}) pt, guides {guides}, {magnification}x, ppp {ppp}");
+                    // The viewer's zoom (points per comp pixel) and snap tolerance (`SNAP_PX / zoom`).
+                    let zoom: f64 = magnification / ppp;
+                    let tol = 8.0 / zoom;
+                    let want = [right_of_a[0] + dx / zoom, right_of_a[1] + dy / zoom];
+                    s.execute("prop.set", json!({"layer": b, "path": "transform/position", "value": [want[0] - to_left[0], want[1] - to_left[1], 0]})).unwrap();
+                    let src = point(&s, b, false);
+                    assert!(near(src, want, 1e-9), "{case}: {src:?} {want:?}");
+                    let comp = s.project.comp(cid).unwrap().clone();
+                    let ctx = effectcraft_render::EvalCtx::new(&s.project, cid, &comp, Tick::ZERO);
+                    let t = targets(&ctx, &[LayerId(b)], SnapOptions { layers: true, guides, ..Default::default() });
+                    let hit = snap(&[src], &t, tol).unwrap_or_else(|| panic!("{case}: nothing snapped"));
+                    assert!(near(hit.at, right_of_a, 1e-9), "{case}: B's left point lands at {:?}, not on A's right point {right_of_a:?}", hit.at);
+                    assert_eq!(hit.hits.len(), 1, "{case}: one point, not two lines: {:?}", hit.hits);
+                    assert_eq!(hit.hits[0].kind, SnapKind::Point, "{case}");
+                    assert_eq!(hit.hits[0].source, source, "{case}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn snap_targets_cover_layers_comp_guides_and_grid() {
+    let mut s = comp();
+    let a = s.execute("layer.newSolid", json!({"color": "#ff0000", "width": 100, "height": 50})).unwrap()["layer"].as_u64().unwrap();
+    let b = s.execute("layer.newSolid", json!({"color": "#00ff00", "width": 40, "height": 40})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("view.addGuide", json!({"orientation": "vertical", "position": 77})).unwrap();
+    let cid = s.active_comp_id().unwrap();
+    let comp = s.project.comp(cid).unwrap().clone();
+    let ctx = effectcraft_render::EvalCtx::new(&s.project, cid, &comp, Tick::ZERO);
+    let opts = crate::viewer::SnapOptions { layers: true, features: Default::default(), guides: true, grid: true, grid_spacing: 100.0 };
+    let t = crate::viewer::targets(&ctx, &[LayerId(b)], opts);
+    // Layer a's corner (270, 155) is a target; layer b (dragged) is not.
+    assert!(t.iter().any(|x| x.source == SnapSource::Layer(LayerId(a)) && x.kind == SnapKind::Point && x.pos == [270.0, 155.0]));
+    assert!(!t.iter().any(|x| x.source == SnapSource::Layer(LayerId(b))));
+    assert!(t.iter().any(|x| x.source == SnapSource::Guide && x.pos[0] == 77.0));
+    assert!(t.iter().any(|x| x.source == SnapSource::Grid && x.kind == SnapKind::HLine && x.pos[1] == 300.0));
+    assert!(t.iter().any(|x| x.source == SnapSource::Comp && x.kind == SnapKind::Point && x.pos == [320.0, 180.0]));
+    // Dragging a corner near layer a's corner lands on it (edges snap x and y).
+    let hit = snap(&[[272.0, 157.0]], &t, 6.0).unwrap();
+    assert_eq!(hit.at, [270.0, 155.0]);
+    assert_eq!(hit.delta, [-2.0, -2.0]);
+}
+
+/// Tools bar ▸ Snapping options (#253): Snap Edges Extended off keeps a layer's edges to its
+/// extent, every feature of a layer snaps, hidden layers are no targets, and with Snapping off
+/// only guides and the grid are left.
+#[test]
+fn snapping_options_pick_the_targets() {
+    use crate::viewer::{SnapFeatures, SnapOptions, layer_features, targets};
+    let mut s = comp();
+    // A 100×50 solid at the comp centre: x 270–370, y 155–205.
+    let a = s.execute("layer.newSolid", json!({"color": "#ff0000", "width": 100, "height": 50})).unwrap()["layer"].as_u64().unwrap();
+    let hidden = s.execute("layer.newSolid", json!({"color": "#00ff00", "width": 40, "height": 40})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("prop.set", json!({"layer": hidden, "path": "transform/position", "value": [50, 50, 0]})).unwrap();
+    s.execute("layer.setSwitch", json!({"layers": [hidden], "switch": "video", "value": false})).unwrap();
+    s.execute("view.addGuide", json!({"orientation": "vertical", "position": 77})).unwrap();
+    let cid = s.active_comp_id().unwrap();
+    let comp = s.project.comp(cid).unwrap().clone();
+    let ctx = effectcraft_render::EvalCtx::new(&s.project, cid, &comp, Tick::ZERO);
+    let opts = |features: SnapFeatures| SnapOptions { layers: true, features, guides: false, grid: false, grid_spacing: 0.0 };
+    let all = targets(&ctx, &[], opts(SnapFeatures::default()));
+    assert!(!all.iter().any(|t| t.source == SnapSource::Layer(LayerId(hidden))), "hidden layers are no targets");
+    // Extended: a point far below layer a snaps to its left edge's line.
+    assert_eq!(snap(&[[268.0, 340.0]], &all, 4.0).unwrap().at, [270.0, 340.0]);
+    // Not extended: only along the edge.
+    let own = targets(&ctx, &[], opts(SnapFeatures { edges_extended: false, ..Default::default() }));
+    assert!(snap(&[[268.0, 340.0]], &own, 4.0).is_none_or(|h| h.hits.iter().all(|t| t.source != SnapSource::Layer(LayerId(a)))));
+    assert_eq!(snap(&[[268.0, 190.0]], &own, 4.0).unwrap().at, [270.0, 190.0]);
+    // Corners, edge midpoints and the centre of a are targets.
+    for p in [[270.0, 155.0], [320.0, 155.0], [320.0, 180.0]] {
+        assert!(all.iter().any(|t| t.source == SnapSource::Layer(LayerId(a)) && t.pos == p), "{p:?}");
+    }
+    // The dragged layer's features: corners, edge midpoints, centre and anchor point.
+    let l = comp.layer(LayerId(a)).unwrap();
+    let f = layer_features(&ctx, l);
+    assert_eq!(f[..4], [[270.0, 155.0], [370.0, 155.0], [370.0, 205.0], [270.0, 205.0]]);
+    assert_eq!(f.len(), 10, "{f:?}");
+    // Snapping off: guides only.
+    let guides = targets(&ctx, &[], SnapOptions { layers: false, guides: true, ..opts(SnapFeatures::default()) });
+    assert!(!guides.is_empty() && guides.iter().all(|t| t.source == SnapSource::Guide));
+}
+
+/// Snap to Features in Collapsed Compositions and Text Layers: the layers inside a collapsed
+/// precomp layer are targets (highlighting the precomp layer), only while the option is on and
+/// the precomp layer collapses transformations.
+#[test]
+fn collapsed_precomp_features_snap() {
+    use crate::viewer::{SnapFeatures, SnapOptions, targets};
+    let mut s = comp();
+    // A 40×20 solid at (100, 50) in a 640×360 precomp.
+    let inner = s.execute("layer.newSolid", json!({"color": "#ff0000", "width": 40, "height": 20})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("prop.set", json!({"layer": inner, "path": "transform/position", "value": [100, 50, 0]})).unwrap();
+    s.execute("layer.precompose", json!({"layers": [inner], "name": "Inner"})).unwrap();
+    let pre = s.active_comp().unwrap().layers[0].id;
+    // Moved by (10, 20) in the outer comp: the inner solid's corner (80, 40) lands at (90, 60).
+    s.execute("prop.set", json!({"layer": pre.0, "path": "transform/position", "value": [330, 200, 0]})).unwrap();
+    let cid = s.active_comp_id().unwrap();
+    let at = |s: &Session, f: SnapFeatures| {
+        let comp = s.project.comp(cid).unwrap().clone();
+        let ctx = effectcraft_render::EvalCtx::new(&s.project, cid, &comp, Tick::ZERO);
+        targets(&ctx, &[], SnapOptions { layers: true, features: f, guides: false, grid: false, grid_spacing: 0.0 })
+    };
+    let corner = |t: &[crate::viewer::SnapTarget]| t.iter().any(|t| t.kind == SnapKind::Point && t.pos == [90.0, 60.0] && t.source == SnapSource::Layer(pre));
+    assert!(!corner(&at(&s, SnapFeatures::default())), "not collapsed");
+    s.execute("layer.setSwitch", json!({"layers": [pre.0], "switch": "collapse", "value": true})).unwrap();
+    let on = at(&s, SnapFeatures::default());
+    assert!(corner(&on), "collapsed");
+    assert_eq!(snap(&[[93.0, 63.0]], &on, 5.0).unwrap().at, [90.0, 60.0]);
+    assert!(!corner(&at(&s, SnapFeatures { collapsed_features: false, ..Default::default() })), "option off");
+}
+
+#[test]
+fn snapping_options_command_sets_and_toggles() {
+    let mut s = comp();
+    assert_eq!(s.state.snap_features, crate::viewer::SnapFeatures { edges_extended: true, collapsed_features: true });
+    let r = s.execute("view.snappingOptions", json!({"edgesExtended": false})).unwrap();
+    assert_eq!(r, json!({"edgesExtended": false, "collapsedFeatures": true}));
+    s.execute("view.snappingOptions", json!({"toggle": "collapsedFeatures"})).unwrap();
+    assert!(!s.state.snap_features.collapsed_features);
+    s.execute("view.snappingOptions", json!({"toggle": "collapsedFeatures"})).unwrap();
+    assert!(s.state.snap_features.collapsed_features);
+    // The per-feature toggles are gone, as in After Effects' menu.
+    for k in ["nope", "corners", "anchorPoints", "paths"] {
+        assert!(s.execute("view.snappingOptions", json!({"toggle": k})).is_err(), "{k}");
+    }
+}
+
+// ---------------------------------------------------------------- channels, exposure, snapshot
+
+/// The display pass on 8-bit frames (sRGB, no HDR step): Show Channel and exposure.
+fn display_rgba8(px: [u8; 4], channel: Channel, colorized: bool, stops: f32) -> [u8; 4] {
+    let encoding = FrameEncoding { curve: PassCurve::Srgb, hdr: effectcraft_project::HdrMode::Clip };
+    let mut v = [px];
+    DisplayPass::new(channel, colorized, stops, encoding, None).apply_rgba8(&mut v);
+    v[0]
+}
+
+#[test]
+fn channel_and_exposure_pixel_transforms() {
+    // Premultiplied: straight (200, 100, 50) at 50% alpha.
+    let px = [100u8, 50, 25, 128];
+    let run = |c: Channel, col: bool, stops: f32| display_rgba8(px, c, col, stops);
+    assert_eq!(run(Channel::Rgb, false, 0.0), px);
+    assert_eq!(run(Channel::Red, false, 0.0), [100, 100, 100, 255]);
+    assert_eq!(run(Channel::Green, true, 0.0), [0, 50, 0, 255]);
+    assert_eq!(run(Channel::Blue, false, 0.0), [25, 25, 25, 255]);
+    assert_eq!(run(Channel::Alpha, false, 0.0), [128, 128, 128, 255]);
+    let st = run(Channel::RgbStraight, false, 0.0);
+    assert!((st[0] as i32 - 199).abs() <= 1 && (st[1] as i32 - 100).abs() <= 1 && st[3] == 255, "{st:?}");
+    // +1 stop doubles linear light: sRGB 50% gray → about 69%; -1 stop darkens; 0 is identity.
+    let g = display_rgba8([128, 128, 128, 255], Channel::Rgb, false, 1.0);
+    assert!((174..=178).contains(&g[0]), "{g:?}");
+    let g = display_rgba8([128, 128, 128, 255], Channel::Rgb, false, -1.0);
+    assert!((92..=96).contains(&g[0]), "{g:?}");
+    for v in 0..=255u8 {
+        assert_eq!(display_rgba8([v, v, v, 255], Channel::Rgb, false, 0.0), [v, v, v, 255]);
+    }
+    // Exposure applies to a single channel too, and keeps alpha untouched in RGB.
+    assert!(run(Channel::Red, false, 1.0)[0] > 100);
+    assert_eq!(run(Channel::Rgb, false, 2.0)[3], 128);
+}
+
+#[test]
+fn channel_exposure_and_fast_preview_commands() {
+    let mut s = comp();
+    s.execute("view.channel", json!({"channel": "alpha"})).unwrap();
+    assert_eq!(s.state.viewer.channel, Channel::Alpha);
+    s.execute("view.channel", json!({"channel": "alpha", "toggle": true})).unwrap();
+    assert_eq!(s.state.viewer.channel, Channel::Rgb);
+    s.execute("view.channel", json!({"channel": "RGB Straight", "colorized": true})).unwrap();
+    assert_eq!(s.state.viewer.channel, Channel::RgbStraight);
+    assert!(s.state.viewer.colorized);
+    s.execute("view.exposure", json!({"stops": 1.5})).unwrap();
+    s.execute("view.exposure", json!({"delta": -0.5})).unwrap();
+    assert_eq!(s.state.viewer.exposure, 1.0);
+    s.execute("view.resetExposure", json!({})).unwrap();
+    assert_eq!(s.state.viewer.exposure, 0.0);
+    s.execute("view.fastPreviewMode", json!({"mode": "fastDraft"})).unwrap();
+    assert_eq!(s.state.viewer.fast_previews, crate::commands::viewer_cmds::FastPreviews::FastDraft);
+    assert!(s.execute("view.fastPreviewMode", json!({"mode": "nope"})).is_err());
+    let was = s.state.snapping;
+    s.execute("view.snapping", json!({})).unwrap();
+    assert_eq!(s.state.snapping, !was);
+}
+
+#[test]
+fn snapshot_store_and_restore() {
+    let mut s = comp();
+    assert!(!s.is_enabled("view.showSnapshot"));
+    s.execute("layer.newSolid", json!({"color": "#ff0000", "width": 640, "height": 360})).unwrap();
+    let r = s.execute("view.takeSnapshot", json!({"scale": 0.25})).unwrap();
+    assert_eq!((r["width"].as_u64(), r["height"].as_u64()), (Some(160), Some(90)));
+    // The project changes; the snapshot keeps the old frame.
+    s.execute("layer.newSolid", json!({"color": "#0000ff", "width": 640, "height": 360})).unwrap();
+    let snap = s.snapshot.clone().unwrap();
+    assert_eq!(snap.image.get(10, 10), [1.0, 0.0, 0.0, 1.0]);
+    let now = s.render(s.active_comp_id().unwrap(), Tick::ZERO, effectcraft_render::RenderOpts { scale: 0.25, ..Default::default() });
+    assert_eq!(now.get(10, 10), [0.0, 0.0, 1.0, 1.0]);
+    s.execute("view.showSnapshot", json!({"value": true})).unwrap();
+    assert!(s.state.viewer.show_snapshot);
+    let (w, h, rgba) = crate::commands::viewer_cmds::snapshot_rgba8(&s).unwrap();
+    assert_eq!((w, h), (160, 90));
+    assert_eq!(&rgba[0..4], &[255, 0, 0, 255]);
+    s.execute("edit.purge", json!({"what": "snapshot"})).unwrap();
+    assert!(s.snapshot.is_none() && !s.state.viewer.show_snapshot);
+}
+
+#[test]
+fn guides_move_and_remove_with_undo() {
+    let mut s = comp();
+    s.execute("view.addGuide", json!({"orientation": "horizontal", "position": 40})).unwrap();
+    s.execute("view.moveGuide", json!({"index": 0, "position": 90, "merge": "g"})).unwrap();
+    s.execute("view.moveGuide", json!({"index": 0, "position": 95, "merge": "g"})).unwrap();
+    assert_eq!(s.active_comp().unwrap().guides[0].position, 95.0);
+    s.undo();
+    assert_eq!(s.active_comp().unwrap().guides[0].position, 40.0);
+    s.execute("view.removeGuide", json!({"index": 0})).unwrap();
+    assert!(s.active_comp().unwrap().guides.is_empty());
+    assert!(s.execute("view.removeGuide", json!({"index": 0})).is_err());
+    s.undo();
+    assert_eq!(s.active_comp().unwrap().guides.len(), 1);
+}
+
+#[test]
+fn region_of_interest_renders_and_crops() {
+    let mut s = comp();
+    s.execute("layer.newSolid", json!({"color": "#ff8000", "width": 200, "height": 100})).unwrap();
+    s.execute("view.setRegionOfInterest", json!({"rect": [200, 100, 240, 160]})).unwrap();
+    let cid = s.active_comp_id().unwrap();
+    let full = s.render(cid, Tick::ZERO, Default::default());
+    let roi = s.render(cid, Tick::ZERO, effectcraft_render::RenderOpts { roi: s.state.region_of_interest, ..Default::default() });
+    assert_eq!((roi.width, roi.height), (240, 160));
+    for (x, y) in [(0, 0), (30, 50), (239, 159), (119, 79)] {
+        assert_eq!(roi.get(x, y), full.get(x + 200, y + 100));
+    }
+    s.execute("comp.cropToRegionOfInterest", json!({})).unwrap();
+    let c = s.active_comp().unwrap();
+    assert_eq!((c.width, c.height), (240, 160));
+    let cropped = s.render(cid, Tick::ZERO, Default::default());
+    assert_eq!(cropped.get(30, 50), roi.get(30, 50));
+    assert_eq!(cropped.get(30, 50)[3], 1.0);
+}
+
+// ---------------------------------------------------------------- shape pen and vertices
+
+fn shape_path(s: &Session, lid: u64, uid: u64) -> effectcraft_keyframe::ShapePath {
+    let l = layer(s, lid);
+    l.props.find_group(uid).unwrap().get("path").unwrap().value.as_path().unwrap().clone()
+}
+
+#[test]
+fn toggle_closed_respects_path_and_vertex_selection() {
+    let mut s = comp();
+    let a = s.execute("shape.newPath", json!({"vertices": [[0, 0], [100, 0], [100, 100]], "closed": true})).unwrap();
+    let lid = a["layer"].as_u64().unwrap();
+    let a = a["path"].as_u64().unwrap();
+    let b = s.execute("shape.newPath", json!({"layer": lid, "vertices": [[10, 10], [90, 10], [90, 90]], "closed": true})).unwrap()["path"].as_u64().unwrap();
+    let leaf = layer(&s, lid).props.find_group(a).unwrap().get("path").unwrap().uid;
+    s.state.selected_vertices.clear();
+    s.state.selected_props = vec![(LayerId(lid), leaf)];
+    s.execute("path.toggleClosed", json!({})).unwrap();
+    assert!(!shape_path(&s, lid, a).closed);
+    assert!(shape_path(&s, lid, b).closed, "an unselected sibling stays closed");
+    s.state.selected_props = vec![(LayerId(lid), b)];
+    s.state.selected_vertices = vec![crate::VertexRef { layer: LayerId(lid), mask: a, index: 1 }];
+    s.execute("path.toggleClosed", json!({})).unwrap();
+    assert!(shape_path(&s, lid, a).closed, "selected points and properties both describe target paths");
+    assert!(shape_path(&s, lid, b).closed);
+    s.state.selected_vertices.clear();
+    s.state.selected_props = vec![(LayerId(lid), a), (LayerId(lid), leaf), (LayerId(lid), b)];
+    let r = s.execute("path.toggleClosed", json!({})).unwrap();
+    assert_eq!(r["paths"], json!(2));
+    assert!(!shape_path(&s, lid, a).closed);
+    assert!(!shape_path(&s, lid, b).closed);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(shape_path(&s, lid, a).closed);
+    assert!(shape_path(&s, lid, b).closed, "all paths undo in one step");
+    s.execute("mask.setClosed", json!({"layer": lid, "mask": a, "closed": false})).unwrap();
+    assert_eq!(crate::menus::checked(&s, "path.toggleClosed", &json!({})), Some(false), "a mixed selection is unchecked");
+    s.execute("path.toggleClosed", json!({})).unwrap();
+    assert!(shape_path(&s, lid, a).closed);
+    assert!(shape_path(&s, lid, b).closed, "a mixed selection closes all paths");
+    s.state.selected_props.clear();
+    s.execute("path.toggleClosed", json!({})).unwrap();
+    assert!(!shape_path(&s, lid, a).closed);
+    assert!(!shape_path(&s, lid, b).closed, "layer selection addresses all editable paths");
+}
+
+#[test]
+fn toggle_closed_combines_property_and_shape_group_selections() {
+    let mut s = comp();
+    let a = s.execute("shape.newPath", json!({"vertices": [[0, 0], [100, 0], [100, 100]], "closed": true})).unwrap();
+    let (lid, a_path) = (a["layer"].as_u64().unwrap(), a["path"].as_u64().unwrap());
+    let b = s.execute("shape.newPath", json!({"layer": lid, "vertices": [[10, 10], [90, 10], [90, 90]], "closed": true})).unwrap();
+    let (b_path, b_group) = (b["path"].as_u64().unwrap(), b["group"].as_u64().unwrap());
+    let c_path =
+        s.execute("shape.newPath", json!({"layer": lid, "vertices": [[20, 20], [80, 20], [80, 80]], "closed": true})).unwrap()["path"].as_u64().unwrap();
+    s.execute("prop.select", json!({"layer": lid, "prop": a_path})).unwrap();
+    s.execute("prop.select", json!({"layer": lid, "prop": b_group, "add": true})).unwrap();
+    assert!(s.state.selected_vertices.iter().all(|v| v.mask == a_path), "only the selected path group implies selected vertices");
+    assert!(!s.state.selected_vertices.is_empty());
+    assert!(s.state.selected_props.contains(&(LayerId(lid), b_group)));
+    let result = s.execute("path.toggleClosed", json!({})).unwrap();
+    assert_eq!(result["paths"], json!(2));
+    assert!(!shape_path(&s, lid, a_path).closed);
+    assert!(!shape_path(&s, lid, b_path).closed, "the added shape group is included alongside implied vertices");
+    assert!(shape_path(&s, lid, c_path).closed, "unselected sibling stays unchanged");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(shape_path(&s, lid, a_path).closed);
+    assert!(shape_path(&s, lid, b_path).closed, "both selected paths undo together");
+    assert!(shape_path(&s, lid, c_path).closed);
+}
+
+#[test]
+fn toggle_closed_ignores_selections_retained_on_other_layers() {
+    let mut s = comp();
+    let a = s.execute("shape.newPath", json!({"vertices": [[0, 0], [100, 0], [100, 100]], "closed": true})).unwrap();
+    let (a_layer, a_path) = (a["layer"].as_u64().unwrap(), a["path"].as_u64().unwrap());
+    let b_layer = s.execute("layer.newShape", json!({"kind": "none"})).unwrap()["layer"].as_u64().unwrap();
+    assert!(s.state.selected_vertices.iter().any(|v| v.layer == LayerId(a_layer)), "insertion retains old vertices");
+    assert!(!s.is_enabled("path.toggleClosed"));
+    assert!(s.execute("path.toggleClosed", json!({})).is_err());
+    assert!(shape_path(&s, a_layer, a_path).closed);
+
+    let b_path =
+        s.execute("shape.newPath", json!({"layer": b_layer, "vertices": [[0, 0], [50, 0], [50, 50]], "closed": true})).unwrap()["path"].as_u64().unwrap();
+    s.execute("prop.select", json!({"layer": b_layer, "prop": b_path})).unwrap();
+    s.execute("layer.selectNext", json!({})).unwrap();
+    assert_eq!(s.state.selected_layers, vec![LayerId(a_layer)]);
+    assert!(s.state.selected_vertices.iter().any(|v| v.layer == LayerId(b_layer)), "navigation retains old vertices");
+    assert!(s.state.selected_props.contains(&(LayerId(b_layer), b_path)));
+    assert_eq!(crate::menus::checked(&s, "path.toggleClosed", &json!({})), Some(true));
+    s.execute("path.toggleClosed", json!({})).unwrap();
+    assert!(!shape_path(&s, a_layer, a_path).closed);
+    assert!(shape_path(&s, b_layer, b_path).closed, "the deselected layer stays unchanged");
+    s.execute("layer.selectPrevious", json!({})).unwrap();
+    assert_eq!(s.state.selected_layers, vec![LayerId(b_layer)]);
+    s.execute("prop.select", json!({"layer": b_layer, "path": "transform/position"})).unwrap();
+    assert_eq!(crate::menus::checked(&s, "path.toggleClosed", &json!({})), Some(true), "a non-path property falls back to the layer's paths");
+    s.execute("path.toggleClosed", json!({})).unwrap();
+    assert!(!shape_path(&s, b_layer, b_path).closed);
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute("layer.selectNext", json!({})).unwrap();
+    s.execute("path.toggleClosed", json!({})).unwrap();
+    assert!(shape_path(&s, a_layer, a_path).closed, "a property retained on another layer cannot block this layer");
+    assert!(shape_path(&s, b_layer, b_path).closed);
+}
+
+#[test]
+fn toggle_closed_falls_back_from_stale_selection_and_rejects_locked_or_pathless_layers() {
+    let mut s = comp();
+    let r = s.execute("shape.newPath", json!({"vertices": [[0, 0], [100, 0], [100, 100]], "closed": true})).unwrap();
+    let (lid, uid) = (r["layer"].as_u64().unwrap(), r["path"].as_u64().unwrap());
+    let before = s.project.clone();
+    s.state.selected_vertices.clear();
+    s.state.selected_props = vec![(LayerId(lid), u64::MAX)];
+    s.execute("path.toggleClosed", json!({})).unwrap();
+    assert!(!shape_path(&s, lid, uid).closed, "a stale property selection falls back to the layer's paths");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(s.project.same_content(&before));
+    s.state.selected_props.clear();
+    s.state.selected_vertices = vec![crate::VertexRef { layer: LayerId(lid), mask: uid, index: usize::MAX }];
+    s.execute("path.toggleClosed", json!({})).unwrap();
+    assert!(!shape_path(&s, lid, uid).closed, "a stale vertex selection falls back to the layer's paths");
+    s.execute("edit.undo", json!({})).unwrap();
+    s.state.selected_vertices.clear();
+    let cid = s.active_comp_id().unwrap();
+    std::sync::Arc::make_mut(&mut s.project).comp_mut(cid).unwrap().layer_mut(LayerId(lid)).unwrap().switches.locked = true;
+    assert!(!s.is_enabled("path.toggleClosed"));
+    assert!(s.execute("path.toggleClosed", json!({})).is_err());
+    assert!(shape_path(&s, lid, uid).closed);
+    s.execute("layer.newShape", json!({"kind": "rect"})).unwrap();
+    s.state.selected_props.clear();
+    assert!(!s.is_enabled("path.toggleClosed"));
+    assert!(s.execute("path.toggleClosed", json!({})).is_err());
+}
+
+#[test]
+fn toggle_closed_handles_masks_and_preserves_explicit_set_closed() {
+    let mut s = comp();
+    let lid = s.execute("layer.newSolid", json!({})).unwrap()["layer"].as_u64().unwrap();
+    let uid = s.execute("mask.new", json!({"layer": lid, "vertices": [[0, 0], [100, 0], [100, 100]], "closed": true})).unwrap()["mask"].as_u64().unwrap();
+    let path = |s: &Session| layer(s, lid).props.find_group(uid).unwrap().get("path").unwrap().value.as_path().unwrap().clone();
+    let original = path(&s);
+    let other = s.execute("mask.new", json!({"layer": lid, "vertices": [[10, 10], [90, 10], [90, 90]], "closed": true})).unwrap()["mask"].as_u64().unwrap();
+    let other_closed = |s: &Session| layer(s, lid).props.find_group(other).unwrap().get("path").unwrap().value.as_path().unwrap().closed;
+    let feather = layer(&s, lid).props.find_group(uid).unwrap().get("feather").unwrap().uid;
+    s.state.selected_vertices.clear();
+    s.state.selected_props = vec![(LayerId(lid), feather)];
+    s.execute("path.toggleClosed", json!({})).unwrap();
+    assert!(!path(&s).closed, "selecting Mask Feather selects its mask");
+    assert!(other_closed(&s), "an unselected mask stays closed");
+    assert!(layer(&s, lid).props.find_group(uid).unwrap().get("path").unwrap().keys.is_empty(), "a static path gains no keyframe");
+    s.state.selected_props = vec![(LayerId(lid), uid)];
+    s.execute("mask.setClosed", json!({"layer": lid, "mask": uid})).unwrap();
+    assert_eq!(path(&s), original, "explicit API still defaults to closed");
+    s.execute("mask.setClosed", json!({"layer": lid, "mask": uid, "closed": false})).unwrap();
+    assert!(!path(&s).closed);
+    s.execute("path.toggleClosed", json!({})).unwrap();
+    assert_eq!(path(&s), original);
+    let cid = s.active_comp_id().unwrap();
+    let g = std::sync::Arc::make_mut(&mut s.project).comp_mut(cid).unwrap().layer_mut(LayerId(lid)).unwrap().props.find_group_mut(uid).unwrap();
+    if let effectcraft_project::GroupKind::Mask { locked, .. } = &mut g.kind {
+        *locked = true;
+    }
+    assert!(!s.is_enabled("path.toggleClosed"));
+    assert!(s.execute("path.toggleClosed", json!({})).is_err());
+    assert_eq!(path(&s), original);
+    assert!(other_closed(&s), "a selected locked mask does not fall back to its unlocked siblings");
+}
+
+#[test]
+fn toggle_closed_recomputes_roto_bezier_tangents() {
+    let mut s = comp();
+    let lid = s.execute("layer.newSolid", json!({})).unwrap()["layer"].as_u64().unwrap();
+    let uid =
+        s.execute("mask.new", json!({"layer": lid, "vertices": [[0, 0], [100, 0], [100, 100], [0, 100]], "closed": true})).unwrap()["mask"].as_u64().unwrap();
+    s.execute("path.rotoBezier", json!({"layer": lid, "value": true})).unwrap();
+    let path = |s: &Session| layer(s, lid).props.find_group(uid).unwrap().get("path").unwrap().value.as_path().unwrap().clone();
+    let closed = path(&s);
+    assert_ne!(closed.out_tangents[0], [0.0; 2], "a closed RotoBezier path has tangents at every vertex");
+    s.state.selected_props = vec![(LayerId(lid), uid)];
+    s.execute("path.toggleClosed", json!({})).unwrap();
+    let open = path(&s);
+    assert!(!open.closed);
+    assert_eq!((open.in_tangents[0], open.out_tangents[3]), ([0.0; 2], [0.0; 2]), "open ends lose their automatic tangents");
+    assert_ne!(open.out_tangents[1], [0.0; 2]);
+    s.execute("path.toggleClosed", json!({})).unwrap();
+    assert_eq!(path(&s), closed, "reclosing restores the closed RotoBezier tangents");
+}
+
+#[test]
+fn toggle_closed_fits_short_tangent_lists() {
+    let mut s = comp();
+    let lid = s.execute("layer.newSolid", json!({})).unwrap()["layer"].as_u64().unwrap();
+    let uid = s.execute("mask.new", json!({"layer": lid, "vertices": [[0, 0], [100, 0], [100, 100]], "closed": true})).unwrap()["mask"].as_u64().unwrap();
+    let cid = s.active_comp_id().unwrap();
+    let layer_mut = std::sync::Arc::make_mut(&mut s.project).comp_mut(cid).unwrap().layer_mut(LayerId(lid)).unwrap();
+    let prop = layer_mut.props.find_group_mut(uid).unwrap().get_mut("path").unwrap();
+    let KV::Path(path) = &mut prop.value else { panic!("not a path") };
+    // A file can store fewer tangents than vertices (#1250).
+    path.in_tangents.clear();
+    path.out_tangents.truncate(1);
+    s.state.selected_props = vec![(LayerId(lid), uid)];
+    s.execute("path.toggleClosed", json!({})).unwrap();
+    let path = layer(&s, lid).props.find_group(uid).unwrap().get("path").unwrap().value.as_path().unwrap().clone();
+    assert!(!path.closed);
+    assert_eq!((path.in_tangents.len(), path.out_tangents.len()), (3, 3));
+}
+
+#[test]
+fn toggle_closed_edits_layer_time_and_roundtrips() {
+    use effectcraft_keyframe::Keyframe;
+    let mut s = comp();
+    let r = s.execute("shape.newPath", json!({"vertices": [[0, 0], [100, 0], [100, 100]], "closed": true})).unwrap();
+    let (lid, uid) = (r["layer"].as_u64().unwrap(), r["path"].as_u64().unwrap());
+    let cid = s.active_comp_id().unwrap();
+    let original = shape_path(&s, lid, uid);
+    let second = Tick::from_seconds_f64(1.0);
+    let layer = std::sync::Arc::make_mut(&mut s.project).comp_mut(cid).unwrap().layer_mut(LayerId(lid)).unwrap();
+    layer.start_time = second;
+    layer.stretch = 200.0;
+    let prop = layer.props.find_group_mut(uid).unwrap().get_mut("path").unwrap();
+    prop.keys = vec![Keyframe::new(Tick::ZERO, KV::Path(original.clone())), Keyframe::new(second, KV::Path(original.clone()))];
+    let keys = prop.keys.clone();
+    s.execute("time.set", json!({"time": 3.0})).unwrap();
+    s.execute("path.toggleClosed", json!({})).unwrap();
+    let prop = s.project.comp(cid).unwrap().layer(LayerId(lid)).unwrap().props.find_group(uid).unwrap().get("path").unwrap();
+    assert_eq!(prop.keys.len(), 2);
+    assert_eq!(prop.keys[0], keys[0], "the other keyframe is untouched");
+    let mut opened = original;
+    opened.closed = false;
+    assert_eq!(prop.value_at(second), KV::Path(opened.clone()));
+    assert!(prop.value_at(Tick::from_seconds_f64(0.5)).as_path().unwrap().closed, "the earlier segment keeps its closedness");
+    let bytes = serde_json::to_vec(&*s.project).unwrap();
+    let restored: effectcraft_project::Project = serde_json::from_slice(&bytes).unwrap();
+    let prop = restored.comp(cid).unwrap().layer(LayerId(lid)).unwrap().props.find_group(uid).unwrap().get("path").unwrap();
+    assert_eq!(prop.value_at(second), KV::Path(opened));
+    s.execute("time.set", json!({"time": 2.0})).unwrap();
+    assert_eq!(crate::menus::checked(&s, "path.toggleClosed", &json!({})), Some(true));
+    s.execute("time.set", json!({"time": 3.0})).unwrap();
+    assert_eq!(crate::menus::checked(&s, "path.toggleClosed", &json!({})), Some(false));
+}
+
+#[test]
+fn toggle_closed_rejects_excessive_group_nesting_without_an_edit() {
+    use effectcraft_project::build::{self, Ids};
+    let mut s = comp();
+    let r = s.execute("shape.newPath", json!({"vertices": [[0, 0], [100, 0], [100, 100]], "closed": true})).unwrap();
+    let lid = LayerId(r["layer"].as_u64().unwrap());
+    let cid = s.active_comp_id().unwrap();
+    let project = std::sync::Arc::make_mut(&mut s.project);
+    let mut next = project.next_id;
+    let contents = project.comp_mut(cid).unwrap().layer_mut(lid).unwrap().props.sub_mut("contents").unwrap();
+    let node = contents.children.first_mut().unwrap();
+    let mut nested = node.as_group().unwrap().clone();
+    for _ in 0..130 {
+        nested = build::shape_group(&mut Ids(&mut next), "Nested", vec![nested]);
+    }
+    *node = effectcraft_project::Node::Group(nested);
+    project.next_id = next;
+    let before = s.project.clone();
+    assert!(!s.is_enabled("path.toggleClosed"));
+    assert!(s.execute("path.toggleClosed", json!({})).is_err());
+    assert!(s.project.same_content(&before));
+}
+
+#[test]
+fn shape_pen_builds_shape_group_and_renders() {
+    let mut s = comp();
+    // Nothing selected: a new shape layer; vertices in comp space.
+    let r = s
+        .execute("shape.newPath", json!({"vertices": [[100, 100], [300, 100], [300, 250], [100, 250]], "closed": true, "fill": [0, 1, 0], "strokeWidth": 0}))
+        .unwrap();
+    let (lid, group, path) = (r["layer"].as_u64().unwrap(), r["group"].as_u64().unwrap(), r["path"].as_u64().unwrap());
+    let l = layer(&s, lid);
+    assert!(matches!(l.source, effectcraft_project::LayerSource::Shape));
+    let g = l.props.find_group(group).unwrap();
+    assert_eq!(g.name, "Shape 1");
+    let items: Vec<&str> = g.sub("contents").unwrap().groups().map(|x| x.match_id.as_str()).collect();
+    assert_eq!(items, vec!["path", "fill"]);
+    assert_eq!(g.sub("contents").unwrap().groups().next().unwrap().name, "Path 1");
+    // Layer space: the layer sits at the comp centre.
+    assert_eq!(shape_path(&s, lid, path).vertices[0], [100.0 - 320.0, 100.0 - 180.0]);
+    let img = s.render(s.active_comp_id().unwrap(), Tick::ZERO, Default::default());
+    assert_eq!(img.get(200, 170), [0.0, 1.0, 0.0, 1.0]);
+    assert_eq!(img.get(50, 50)[3], 0.0);
+    // With the shape layer selected the Pen adds a second group (with a stroke) to it.
+    let r2 = s.execute("shape.newPath", json!({"vertices": [[0, 0], [10, 10]], "space": "layer", "strokeWidth": 2})).unwrap();
+    assert_eq!(r2["layer"].as_u64(), Some(lid));
+    let l = layer(&s, lid);
+    let names: Vec<String> = l.props.sub("contents").unwrap().groups().map(|g| g.name.clone()).collect();
+    assert_eq!(names, vec!["Shape 2", "Shape 1"]);
+    let g2 = l.props.find_group(r2["group"].as_u64().unwrap()).unwrap();
+    let items: Vec<&str> = g2.sub("contents").unwrap().groups().map(|x| x.match_id.as_str()).collect();
+    assert_eq!(items, vec!["path", "stroke", "fill"]);
+    s.undo();
+    assert_eq!(layer(&s, lid).props.sub("contents").unwrap().groups().count(), 1);
+    // Not a shape layer → error.
+    let sol = s.execute("layer.newSolid", json!({"color": "#ffffff"})).unwrap()["layer"].as_u64().unwrap();
+    assert!(s.execute("shape.newPath", json!({"layer": sol, "vertices": [[0, 0]]})).is_err());
+}
+
+/// The shape tools draw into the selected shape layer's Contents as a new group, as After
+/// Effects does, and a new shape layer only with none selected (#227).
+#[test]
+fn shape_tools_draw_into_the_selected_shape_layer() {
+    let mut s = comp();
+    // Nothing selected: a new shape layer centred on the shape.
+    let r = s.execute("shape.newShape", json!({"kind": "rect", "size": [100, 60], "position": [200, 100], "fill": [1, 0, 0]})).unwrap();
+    let lid = r["layer"].as_u64().unwrap();
+    let l = layer(&s, lid);
+    assert_eq!(l.name, "Shape Layer 1");
+    assert_eq!(l.props.prop("transform/position").unwrap().value.components()[..2], [200.0, 100.0]);
+    // Selected (and scaled 200%): the next shape goes on top of its Contents, in layer space.
+    s.execute("prop.set", json!({"layer": lid, "path": "transform/scale", "value": [200, 200, 100]})).unwrap();
+    let n = s.active_comp().unwrap().layers.len();
+    let r = s.execute("shape.newShape", json!({"kind": "ellipse", "size": [40, 20], "position": [300, 160]})).unwrap();
+    assert_eq!(r["layer"].as_u64(), Some(lid));
+    assert_eq!(s.active_comp().unwrap().layers.len(), n, "no new layer");
+    let l = layer(&s, lid);
+    let contents = l.props.sub("contents").unwrap();
+    let names: Vec<&str> = contents.groups().map(|g| g.name.as_str()).collect();
+    assert_eq!(names, ["Ellipse 1", "Rectangle 1"]);
+    let g = l.props.find_group(r["group"].as_u64().unwrap()).unwrap();
+    assert_eq!(g.sub("transform").unwrap().get("position").unwrap().value.components(), [50.0, 30.0]);
+    assert_eq!(g.sub("contents").unwrap().groups().next().unwrap().get("size").unwrap().value.components(), [20.0, 10.0]);
+    // A second rectangle is "Rectangle 2"; it renders where it was drawn.
+    s.execute("shape.newShape", json!({"kind": "rect", "size": [40, 40], "position": [500, 300], "fill": [0, 1, 0]})).unwrap();
+    let names: Vec<String> = layer(&s, lid).props.sub("contents").unwrap().groups().map(|g| g.name.clone()).collect();
+    assert_eq!(names, ["Rectangle 2", "Ellipse 1", "Rectangle 1"]);
+    let img = s.render(s.active_comp_id().unwrap(), Tick::ZERO, Default::default());
+    assert_eq!(img.get(500, 300), [0.0, 1.0, 0.0, 1.0]);
+    // Each shape is one undo step.
+    s.undo();
+    s.undo();
+    assert_eq!(layer(&s, lid).props.sub("contents").unwrap().groups().count(), 1);
+    // A locked shape layer isn't drawn into; a solid is refused when named.
+    s.execute("layer.setSwitch", json!({"layers": [lid], "switch": "locked", "value": true})).unwrap();
+    s.state.selected_layers = vec![LayerId(lid)];
+    let r = s.execute("shape.newShape", json!({"kind": "star"})).unwrap();
+    assert_ne!(r["layer"].as_u64(), Some(lid));
+    let sol = s.execute("layer.newSolid", json!({"color": "#ffffff"})).unwrap()["layer"].as_u64().unwrap();
+    assert!(s.execute("shape.newShape", json!({"layer": sol})).is_err());
+    assert!(s.execute("shape.newShape", json!({"kind": "blob"})).is_err());
+}
+
+/// The Tools bar's Fill / Stroke Options (None, Solid Color, Linear and Radial Gradient, blend
+/// mode, opacity) and Stroke Width paint new shapes and Pen paths; a command's own paint
+/// parameters win (#227).
+#[test]
+fn shape_tool_options_paint_new_shapes() {
+    use crate::commands::shape_tool::ShapeTool;
+    let mut s = comp();
+    let o = s.execute("shape.toolOptions", json!({})).unwrap();
+    assert_eq!((o["createsMask"].clone(), o["fill"]["kind"].clone(), o["strokeWidth"].clone()), (json!(false), json!("solid"), json!(0.0)));
+    // A radial gradient fill at 50% in Multiply and a red 4 px stroke.
+    let o = s
+        .execute("shape.toolOptions", json!({"fillType": "Radial Gradient", "fillBlend": "multiply", "fillOpacity": 50, "stroke": [1, 0, 0], "strokeWidth": 4}))
+        .unwrap();
+    assert_eq!(o["fill"]["kind"], json!("radial"));
+    let r = s.execute("shape.newShape", json!({"kind": "ellipse", "size": [100, 60]})).unwrap();
+    let lid = r["layer"].as_u64().unwrap();
+    let items = |s: &Session, g: u64| layer(s, lid).props.find_group(g).unwrap().sub("contents").unwrap().clone();
+    let g = items(&s, r["group"].as_u64().unwrap());
+    assert_eq!(g.groups().map(|x| x.match_id.as_str()).collect::<Vec<_>>(), ["ellipse", "stroke", "gfill"]);
+    let at = |g: &effectcraft_project::PropGroup, item: &str, prop: &str| g.groups().find(|x| x.match_id == item).unwrap().get(prop).unwrap().value.clone();
+    let multiply = effectcraft_color::BlendMode::ALL.iter().position(|m| *m == effectcraft_color::BlendMode::Multiply).unwrap() as u32;
+    assert_eq!(at(&g, "gfill", "type"), KV::Enum(1));
+    assert_eq!(at(&g, "gfill", "blend"), KV::Enum(multiply));
+    assert_eq!(at(&g, "gfill", "opacity").as_f64(), 50.0);
+    assert_eq!(at(&g, "gfill", "end").components(), [50.0, 0.0], "out from the centre");
+    assert_eq!(at(&g, "stroke", "color").components(), [1.0, 0.0, 0.0, 1.0]);
+    assert_eq!(at(&g, "stroke", "width").as_f64(), 4.0);
+    // No fill and a linear gradient stroke, across a Pen path's points.
+    s.execute("shape.toolOptions", json!({"fill": false, "strokeType": "linear"})).unwrap();
+    let r = s.execute("shape.newPath", json!({"layer": lid, "vertices": [[10, 20], [110, 40]], "space": "layer"})).unwrap();
+    let g = items(&s, r["group"].as_u64().unwrap());
+    assert_eq!(g.groups().map(|x| x.match_id.as_str()).collect::<Vec<_>>(), ["path", "gstroke"]);
+    assert_eq!((at(&g, "gstroke", "start").components(), at(&g, "gstroke", "end").components()), (vec![10.0, 30.0], vec![110.0, 30.0]));
+    // A command's own paint wins over the Tools bar's.
+    let r = s.execute("shape.newShape", json!({"kind": "rect", "fill": "#00ff00", "strokeWidth": 0})).unwrap();
+    let g = items(&s, r["group"].as_u64().unwrap());
+    assert_eq!(g.groups().map(|x| x.match_id.as_str()).collect::<Vec<_>>(), ["rect", "fill"]);
+    assert_eq!(at(&g, "fill", "color").components(), [0.0, 1.0, 0.0, 1.0]);
+    // Bad values are errors that leave the options as they were; reset restores the defaults.
+    let before = s.state.shape_tool.clone();
+    for bad in [json!({"fillType": "plaid"}), json!({"strokeBlend": "nope"}), json!({"fill": true}), json!({"strokeWidth": "wide"})] {
+        assert!(s.execute("shape.toolOptions", bad.clone()).is_err(), "{bad}");
+    }
+    assert_eq!(s.state.shape_tool, before);
+    s.execute("shape.toolOptions", json!({"reset": true, "createsMask": true})).unwrap();
+    assert_eq!(s.state.shape_tool, ShapeTool { creates_mask: true, ..ShapeTool::default() });
+}
+
+/// Tool Creates Mask: every shape tool draws its mask (#227).
+#[test]
+fn masks_of_every_shape_tool_kind() {
+    let mut s = comp();
+    let sol = s.execute("layer.newSolid", json!({"color": "#ffffff"})).unwrap()["layer"].as_u64().unwrap();
+    for (kind, n) in [("rect", 4), ("ellipse", 4), ("rounded", 8), ("polygon", 5), ("star", 10)] {
+        let m = s.execute("layer.addMask", json!({"layer": sol, "shape": kind, "rect": [100, 100, 80, 80]})).unwrap()["mask"].as_u64().unwrap();
+        let path = layer(&s, sol).props.find_group(m).unwrap().get("path").unwrap().value.as_path().unwrap().clone();
+        assert!(path.closed, "{kind}");
+        assert!(if kind == "rounded" { path.vertices.len() >= n } else { path.vertices.len() == n }, "{kind}: {}", path.vertices.len());
+        assert!(path.vertices.iter().all(|v| (100.0..=180.0).contains(&v[0]) && (100.0..=180.0).contains(&v[1])), "{kind}: inside the box");
+    }
+    assert!(s.execute("layer.addMask", json!({"layer": sol, "shape": "blob"})).is_err());
+}
+
+#[test]
+fn vertex_add_delete_convert_on_shape_paths_and_masks_undo() {
+    let mut s = comp();
+    let r = s.execute("shape.newPath", json!({"vertices": [[0, 0], [100, 0], [100, 100]], "space": "layer"})).unwrap();
+    let (lid, path) = (r["layer"].as_u64().unwrap(), r["path"].as_u64().unwrap());
+    // Pen continues the path: add a vertex, move it, close.
+    s.execute("mask.addVertex", json!({"layer": lid, "mask": path, "point": [0, 100]})).unwrap();
+    s.execute("mask.setClosed", json!({"layer": lid, "mask": path, "closed": true})).unwrap();
+    let sp = shape_path(&s, lid, path);
+    assert_eq!(sp.vertices.len(), 4);
+    assert!(sp.closed);
+    // Add Vertex on segment 0 at t=0.5 keeps the line and inserts its midpoint.
+    let i = s.execute("mask.insertVertex", json!({"layer": lid, "mask": path, "segment": 0})).unwrap();
+    assert_eq!(i.as_u64(), Some(1));
+    assert_eq!(shape_path(&s, lid, path).vertices[1], [50.0, 0.0]);
+    // Convert Vertex: corner → smooth → corner.
+    let c = s.execute("mask.convertVertex", json!({"layer": lid, "mask": path, "index": 2})).unwrap();
+    assert_eq!(c["smooth"], json!(true));
+    let sp = shape_path(&s, lid, path);
+    // Neighbours (50,0) and (100,100): tangent along them, a sixth of the way.
+    assert_eq!(sp.out_tangents[2], [50.0 / 6.0, 100.0 / 6.0]);
+    assert_eq!(sp.in_tangents[2], [-50.0 / 6.0, -100.0 / 6.0]);
+    s.execute("mask.convertVertex", json!({"layer": lid, "mask": path, "index": 2})).unwrap();
+    assert_eq!(shape_path(&s, lid, path).out_tangents[2], [0.0, 0.0]);
+    s.undo();
+    assert_ne!(shape_path(&s, lid, path).out_tangents[2], [0.0, 0.0]);
+    // Delete Vertex (selection-based).
+    s.execute("mask.selectVertices", json!({"vertices": [{"layer": lid, "mask": path, "index": 1}]})).unwrap();
+    s.execute("mask.deleteVertices", json!({})).unwrap();
+    assert_eq!(shape_path(&s, lid, path).vertices.len(), 4);
+    s.undo();
+    assert_eq!(shape_path(&s, lid, path).vertices.len(), 5);
+    // Free transform of the whole shape path (scale 200% about the bbox centre).
+    s.execute("mask.selectVertices", json!({"vertices": []})).unwrap();
+    s.execute("path.freeTransform", json!({"layer": lid, "mask": path, "scale": 200})).unwrap();
+    assert_eq!(shape_path(&s, lid, path).vertices[0], [-50.0, -50.0]);
+    // Masks work through the same commands.
+    let sol = s.execute("layer.newSolid", json!({"color": "#ffffff"})).unwrap()["layer"].as_u64().unwrap();
+    let m = s.execute("mask.new", json!({"layer": sol, "vertices": [[0, 0], [100, 0], [100, 100]], "closed": true})).unwrap()["mask"].as_u64().unwrap();
+    s.execute("mask.insertVertex", json!({"layer": sol, "mask": m, "segment": 2, "t": 0.5})).unwrap();
+    let l = layer(&s, sol);
+    let mp = l.masks().unwrap().find_group(m).unwrap().get("path").unwrap().value.as_path().unwrap().clone();
+    assert_eq!(mp.vertices.len(), 4);
+    assert_eq!(mp.vertices[3], [50.0, 50.0]);
+}
+
+#[test]
+fn split_segment_keeps_curve_shape() {
+    use effectcraft_keyframe::ShapePath;
+    let mut sp = ShapePath {
+        vertices: vec![[0.0, 0.0], [100.0, 0.0]],
+        in_tangents: vec![[0.0; 2], [0.0, -50.0]],
+        out_tangents: vec![[30.0, 60.0], [0.0; 2]],
+        closed: false,
+        feather: Vec::new(),
+    };
+    let seg = |sp: &ShapePath, i: usize, t: f64| {
+        let (a, d) = (sp.vertices[i], sp.vertices[i + 1]);
+        let b = [a[0] + sp.out_tangents[i][0], a[1] + sp.out_tangents[i][1]];
+        let c = [d[0] + sp.in_tangents[i + 1][0], d[1] + sp.in_tangents[i + 1][1]];
+        let u = 1.0 - t;
+        let f = |k: usize| u * u * u * a[k] + 3.0 * u * u * t * b[k] + 3.0 * u * t * t * c[k] + t * t * t * d[k];
+        [f(0), f(1)]
+    };
+    let before: Vec<[f64; 2]> = (0..=2000).map(|i| seg(&sp, 0, i as f64 / 2000.0)).collect();
+    crate::commands::split_segment_for_tests(&mut sp, 0, 0.3);
+    assert_eq!(sp.vertices.len(), 3);
+    for i in 0..2 {
+        for j in 0..=50 {
+            let p = seg(&sp, i, j as f64 / 50.0);
+            let d = before.iter().map(|q| ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt()).fold(f64::MAX, f64::min);
+            assert!(d < 0.2, "{p:?} {d}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------- motion paths and graph box
+
+fn animated_position(s: &mut Session) -> u64 {
+    let lid = s.execute("layer.newSolid", json!({"color": "#ffffff", "width": 50, "height": 50})).unwrap()["layer"].as_u64().unwrap();
+    for (t, v) in [(0.0, [100.0, 100.0]), (1.0, [300.0, 100.0]), (2.0, [300.0, 300.0])] {
+        s.execute("prop.addKey", json!({"layer": lid, "path": "transform/position", "time": t, "value": [v[0], v[1], 0.0]})).unwrap();
+    }
+    lid
+}
+
+#[test]
+fn motion_path_key_drag_edits_value_and_tangents() {
+    let mut s = comp();
+    let lid = animated_position(&mut s);
+    // Dragging the middle key's dot sets that key's value (merged drag = one undo step).
+    s.execute("keys.set", json!({"layer": lid, "path": "transform/position", "time": 1.0, "value": [310, 120, 0], "merge": "mp"})).unwrap();
+    s.execute("keys.set", json!({"layer": lid, "path": "transform/position", "time": 1.0, "value": [320, 140, 0], "merge": "mp"})).unwrap();
+    let pos = |s: &Session| layer(s, lid).props.prop("transform/position").unwrap().clone();
+    assert_eq!(pos(&s).keys[1].value, KV::Vec3([320.0, 140.0, 0.0]));
+    assert_eq!(pos(&s).keys[0].value, KV::Vec3([100.0, 100.0, 0.0]));
+    // Tangent drag: out handle set, in mirrored, no longer auto.
+    s.execute("keys.setSpatialTangents", json!({"layer": lid, "path": "transform/position", "time": 1.0, "out": [40, 0], "merge": "tg"})).unwrap();
+    let k = pos(&s).keys[1].clone();
+    assert_eq!(k.spatial_out, [40.0, 0.0, 0.0]);
+    assert_eq!(k.spatial_in, [-40.0, 0.0, 0.0]);
+    assert!(!k.spatial_auto);
+    // The motion path passes through the key and bulges along the tangent.
+    let mid = pos(&s).value_at(Tick::from_seconds_f64(1.0)).as_vec3();
+    assert_eq!([mid[0], mid[1]], [320.0, 140.0]);
+    // Alt-drag (break): only the in handle changes.
+    s.execute("keys.setSpatialTangents", json!({"layer": lid, "path": "transform/position", "time": 1.0, "in": [0, -30], "break": true})).unwrap();
+    let k = pos(&s).keys[1].clone();
+    assert_eq!((k.spatial_in, k.spatial_out), ([0.0, -30.0, 0.0], [40.0, 0.0, 0.0]));
+    s.undo();
+    s.undo();
+    assert!(pos(&s).keys[1].spatial_auto);
+    s.undo();
+    assert_eq!(pos(&s).keys[1].value, KV::Vec3([300.0, 100.0, 0.0]));
+}
+
+#[test]
+fn graph_transform_box_scales_key_times_and_values() {
+    let mut s = comp();
+    let lid = s.execute("layer.newSolid", json!({"color": "#ffffff"})).unwrap()["layer"].as_u64().unwrap();
+    for (t, v) in [(0.0, 0.0), (1.0, 50.0), (2.0, 100.0)] {
+        s.execute("prop.addKey", json!({"layer": lid, "path": "transform/opacity", "time": t, "value": v})).unwrap();
+    }
+    let uid = layer(&s, lid).props.prop("transform/opacity").unwrap().uid;
+    let keys: Vec<_> = [0.0, 1.0, 2.0].iter().map(|t| json!({"layer": lid, "prop": uid, "time": t})).collect();
+    s.execute("keys.select", json!({"keys": keys})).unwrap();
+    // Time: scale 2× about 0 s; value: scale 0.5 about 100.
+    s.execute("keys.transform", json!({"timeScale": 2.0, "timeAnchor": 0.0, "valueScale": 0.5, "valueAnchor": 100.0})).unwrap();
+    let p = layer(&s, lid).props.prop("transform/opacity").unwrap().clone();
+    let got: Vec<(f64, f64)> = p.keys.iter().map(|k| (k.time.seconds(), k.value.as_f64())).collect();
+    assert_eq!(got, vec![(0.0, 50.0), (2.0, 75.0), (4.0, 100.0)]);
+    assert_eq!(s.state.selected_keys.len(), 3);
+    // Alt-drag of the last key in the timeline: scale the group about the first key; times
+    // land on frames.
+    s.execute("keys.transform", json!({"timeScale": 0.501, "timeAnchor": 0.0})).unwrap();
+    let p = layer(&s, lid).props.prop("transform/opacity").unwrap().clone();
+    let got: Vec<f64> = p.keys.iter().map(|k| k.time.seconds()).collect();
+    assert_eq!(got, vec![0.0, 1.0, 2.0]);
+    s.undo();
+    s.undo();
+    let p = layer(&s, lid).props.prop("transform/opacity").unwrap().clone();
+    assert_eq!(p.keys.iter().map(|k| k.time.seconds()).collect::<Vec<_>>(), vec![0.0, 1.0, 2.0]);
+    assert_eq!(p.keys[1].value.as_f64(), 50.0);
+    assert!(s.execute("keys.transform", json!({"timeScale": 0})).is_err());
+}
+
+// ---------------------------------------------------------------- resolution
+
+#[test]
+fn each_comp_keeps_its_resolution_outside_the_undo_history_and_in_the_file() {
+    use effectcraft_project::Resolution;
+    let mut s = comp();
+    let a = s.active_comp_id().unwrap();
+    s.execute("layer.newSolid", json!({"name": "S", "color": "#ff0000", "width": 10, "height": 10})).unwrap();
+    let path = std::env::temp_dir().join(format!("ec-resolution-{}.ecproj", std::process::id()));
+    s.execute("file.saveAs", json!({"path": path.to_string_lossy()})).unwrap();
+    assert_eq!(s.active_comp().unwrap().resolution, Resolution::Auto);
+    let (steps, pixels) = (s.history.undo.len(), s.active_comp_arc().unwrap());
+    let r = s.execute_checked("view.res.half", json!({})).unwrap();
+    assert_eq!((r["resolution"].clone(), r["factor"].clone()), (json!("Half"), json!(2)));
+    // No undo step, but the project is modified (it's saved with it).
+    assert_eq!(s.history.undo.len(), steps);
+    assert!(s.is_dirty());
+    assert!(s.active_comp().unwrap().same_pixels(&pixels));
+    // Another comp has its own; switching back shows comp A's again.
+    s.execute("comp.new", json!({"name": "B", "width": 320, "height": 180, "frameRate": 30, "duration": 5})).unwrap();
+    let b = s.active_comp_id().unwrap();
+    assert_ne!(a, b);
+    assert_eq!(s.active_comp().unwrap().resolution, Resolution::Auto);
+    s.execute_checked("view.res.custom", json!({"factor": 6})).unwrap();
+    s.open_comp(a);
+    assert_eq!(s.active_comp().unwrap().resolution, Resolution::Half);
+    assert_eq!(s.execute("comp.info", json!({})).unwrap()["resolution"], json!("Half"));
+    assert_eq!(crate::menus::checked(&s, "view.res.half", &json!({})), Some(true));
+    assert_eq!(crate::menus::checked(&s, "view.res.full", &json!({})), Some(false));
+    // Undo and redo restore the comps, not their resolutions.
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(s.project.comp(b).is_none(), "undid New Composition");
+    assert_eq!(s.project.comp(a).unwrap().resolution, Resolution::Half);
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(s.project.comp(b).unwrap().resolution, Resolution::Custom(6));
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(s.active_comp().unwrap().layers.is_empty(), "undid the solid");
+    assert_eq!(s.project.comp(a).unwrap().resolution, Resolution::Half);
+    s.execute("edit.redo", json!({})).unwrap();
+    s.execute("edit.redo", json!({})).unwrap();
+    // The comp's explicit `comp` parameter; the same value again changes nothing.
+    s.execute_checked("view.res.quarter", json!({"comp": b.0})).unwrap();
+    let rev = s.revision;
+    s.execute_checked("view.res.quarter", json!({"comp": b.0})).unwrap();
+    assert_eq!(s.revision, rev);
+    // Saved with the project and read back.
+    s.execute("file.save", json!({})).unwrap();
+    assert!(!s.is_dirty());
+    let mut o = Session::default();
+    o.execute("file.open", json!({"path": path.to_string_lossy()})).unwrap();
+    assert_eq!(o.project.comp(a).unwrap().resolution, Resolution::Half);
+    assert_eq!(o.project.comp(b).unwrap().resolution, Resolution::Quarter);
+    let _ = std::fs::remove_file(path);
+    // Custom without a factor asks the frontend (the Custom Resolution dialog).
+    s.drain_events();
+    s.execute_checked("view.res.custom", json!({})).unwrap();
+    assert!(s.drain_events().iter().any(|e| matches!(e, crate::Event::Frontend { command, .. } if command == "view.res.custom")));
+    assert!(s.execute_checked("view.res.custom", json!({"factor": "big"})).is_err());
+    s.execute_checked("view.res.auto", json!({})).unwrap();
+    assert_eq!(s.active_comp().unwrap().resolution, Resolution::Auto);
+}
+
+/// #1685: changing Type updates the property tree in the same undo step, including when
+/// addressed by uid (as in the UI) rather than by path (scripts/control channel).
+#[test]
+fn polystar_type_switch_updates_inner_controls_and_undoes() {
+    let mut s = comp();
+    let lid = s.execute("layer.newShape", json!({"kind": "polygon"})).unwrap()["layer"].as_u64().unwrap();
+    let group = |s: &Session| layer(s, lid).props.group("contents/group/contents/star").unwrap().clone();
+    let polygon = group(&s);
+    let type_uid = polygon.get("type").unwrap().uid;
+    assert!(polygon.get("innerRadius").is_none());
+    s.execute("prop.set", json!({"layer": lid, "prop": type_uid, "value": 0})).unwrap();
+    let star = group(&s);
+    assert_eq!(star.get("innerRadius").unwrap().value, KV::Scalar(50.0));
+    assert_eq!(star.get("innerRoundness").unwrap().value, KV::Scalar(0.0));
+    assert_eq!(star.get("innerRadius").unwrap().ui, effectcraft_project::ParamUi::Pixels);
+    assert_eq!(star.get("innerRoundness").unwrap().ui, effectcraft_project::ParamUi::Percent);
+    let names: Vec<_> = star.children.iter().filter_map(|n| n.as_prop()).map(|p| p.match_id.as_str()).collect();
+    assert_eq!(names, ["direction", "type", "points", "position", "rotation", "innerRadius", "outerRadius", "innerRoundness", "outerRoundness"]);
+    assert_eq!(star.get("outerRadius"), polygon.get("outerRadius"));
+    assert!(s.undo());
+    assert_eq!(group(&s), polygon);
+    assert!(s.redo());
+    assert_eq!(group(&s), star);
+    // Reapplying the same Type must not reset custom inner values or allocate new ids.
+    s.execute("prop.set", json!({"layer": lid, "path": "contents/group/contents/star/innerRadius", "value": 37})).unwrap();
+    let before = group(&s);
+    let next = s.project.next_id;
+    s.execute("prop.set", json!({"layer": lid, "path": "contents/group/contents/star/type", "value": 0})).unwrap();
+    assert_eq!(group(&s), before);
+    assert_eq!(s.project.next_id, next);
+    let inner_uid = before.get("innerRadius").unwrap().uid;
+    s.state.selected_props = vec![(LayerId(lid), inner_uid)];
+    s.state.selected_keys = vec![crate::KeyRef { layer: LayerId(lid), prop: inner_uid, time: Tick::ZERO }];
+    s.execute("prop.set", json!({"layer": lid, "path": "contents/group/contents/star/type", "value": 1})).unwrap();
+    assert_eq!(group(&s).get("type").unwrap().value, KV::Enum(1));
+    assert!(group(&s).get("innerRadius").is_none());
+    assert!(group(&s).get("innerRoundness").is_none());
+    assert!(s.state.selected_props.is_empty());
+    assert!(s.state.selected_keys.is_empty());
+    assert!(s.undo());
+    assert_eq!(group(&s), before, "undo restores the original inner values and ids");
+    assert!(s.redo());
+    assert!(group(&s).get("innerRadius").is_none());
+    s.execute("prop.set", json!({"layer": lid, "prop": type_uid, "value": 0})).unwrap();
+    assert_eq!(group(&s).get("innerRadius").unwrap().value, KV::Scalar(50.0));
+}
+
+#[test]
+fn polystar_animated_type_keeps_the_inner_controls_needed_by_other_frames() {
+    let mut s = comp();
+    let lid = s.execute("layer.newShape", json!({"kind": "star"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("prop.set", json!({"layer": lid, "path": "contents/group/contents/star/innerRadius", "value": 27})).unwrap();
+    s.execute("prop.toggleAnimation", json!({"layer": lid, "path": "contents/group/contents/star/type", "value": true})).unwrap();
+    s.execute("prop.set", json!({"layer": lid, "path": "contents/group/contents/star/type", "time": 1, "value": 1})).unwrap();
+    let star = layer(&s, lid).props.group("contents/group/contents/star").unwrap().clone();
+    assert_eq!(star.get("type").unwrap().value_at(Tick::ZERO), KV::Enum(0));
+    assert_eq!(star.get("type").unwrap().value_at(Tick::from_seconds_f64(1.0)), KV::Enum(1));
+    assert_eq!(star.get("innerRadius").unwrap().value, KV::Scalar(27.0));
+}
+
+#[test]
+fn polystar_expression_routes_synchronize_controls_in_the_same_undo_step() {
+    for explicit in [false, true] {
+        let mut s = comp();
+        let lid = s.execute("layer.newShape", json!({"kind": "polygon"})).unwrap()["layer"].as_u64().unwrap();
+        let group = |s: &Session| layer(s, lid).props.group("contents/group/contents/star").unwrap().clone();
+        let before = group(&s);
+        let uid = before.get("type").unwrap().uid;
+        s.state.selected_props = vec![(LayerId(lid), uid)];
+        let params = if explicit { json!({"layer": lid, "prop": uid, "expression": "1"}) } else { json!({"expression": "1"}) };
+        s.execute("prop.setExpression", params).unwrap();
+        let animated = group(&s);
+        assert!(animated.get("innerRadius").is_some() && animated.get("innerRoundness").is_some());
+        assert!(s.undo());
+        assert_eq!(group(&s), before);
+        assert!(s.redo());
+        assert_eq!(group(&s), animated);
+        let inner = animated.get("innerRadius").unwrap().uid;
+        s.state.selected_props = vec![(LayerId(lid), inner)];
+        s.execute("prop.setExpression", json!({"layer": lid, "prop": uid, "expression": ""})).unwrap();
+        assert!(group(&s).get("innerRadius").is_none());
+        assert!(s.state.selected_props.is_empty());
+        assert!(s.undo());
+        assert_eq!(group(&s), animated);
+        assert!(s.redo());
+        assert!(group(&s).get("innerRadius").is_none());
+    }
+}
+
+#[test]
+fn polystar_animation_menu_adds_inner_controls_and_undoes() {
+    let mut s = comp();
+    let lid = s.execute("layer.newShape", json!({"kind": "polygon"})).unwrap()["layer"].as_u64().unwrap();
+    let group = |s: &Session| layer(s, lid).props.group("contents/group/contents/star").unwrap().clone();
+    let before = group(&s);
+    s.state.selected_props = vec![(LayerId(lid), before.get("type").unwrap().uid)];
+    s.execute("anim.addKeyframe", json!({})).unwrap();
+    let animated = group(&s);
+    assert_eq!(animated.get("type").unwrap().keys.len(), 1);
+    assert!(animated.get("innerRadius").is_some() && animated.get("innerRoundness").is_some());
+    assert!(s.undo());
+    assert_eq!(group(&s), before);
+    assert!(s.redo());
+    assert_eq!(group(&s), animated);
+}
+
+#[test]
+fn deleting_the_last_polystar_type_key_removes_stale_controls_and_selection() {
+    for command in ["keys.delete", "edit.clear"] {
+        let mut s = comp();
+        let lid = s.execute("layer.newShape", json!({"kind": "polygon"})).unwrap()["layer"].as_u64().unwrap();
+        let group = |s: &Session| layer(s, lid).props.group("contents/group/contents/star").unwrap().clone();
+        let type_uid = group(&s).get("type").unwrap().uid;
+        s.execute("prop.addKey", json!({"layer": lid, "prop": type_uid, "time": 0, "value": 1})).unwrap();
+        let animated = group(&s);
+        let inner = animated.get("innerRadius").unwrap().uid;
+        s.state.selected_props = vec![(LayerId(lid), inner)];
+        s.state.selected_keys = vec![crate::KeyRef { layer: LayerId(lid), prop: type_uid, time: Tick::ZERO }];
+        s.execute(command, json!({})).unwrap();
+        let polygon = group(&s);
+        assert!(polygon.get("innerRadius").is_none() && polygon.get("innerRoundness").is_none());
+        assert!(s.state.selected_props.is_empty() && s.state.selected_keys.is_empty());
+        assert!(s.undo());
+        assert_eq!(group(&s), animated);
+        assert!(s.redo());
+        assert_eq!(group(&s), polygon);
+    }
+}
+
+#[test]
+fn polystar_sync_cleans_the_edited_compositions_parked_selection() {
+    let mut s = comp();
+    let first = s.active_comp_id().unwrap();
+    let lid = s.execute("layer.newShape", json!({"kind": "polygon"})).unwrap()["layer"].as_u64().unwrap();
+    let path = "contents/group/contents/star";
+    let type_uid = layer(&s, lid).props.group(path).unwrap().get("type").unwrap().uid;
+    s.execute("prop.addKey", json!({"layer": lid, "prop": type_uid, "time": 0, "value": 1})).unwrap();
+    let before = layer(&s, lid).props.group(path).unwrap().clone();
+    let inner = before.get("innerRadius").unwrap().uid;
+    s.state.selected_props = vec![(LayerId(lid), inner)];
+    s.state.selected_keys = vec![crate::KeyRef { layer: LayerId(lid), prop: inner, time: Tick::ZERO }];
+    s.execute("comp.new", json!({"width": 100, "height": 100, "duration": 2})).unwrap();
+    let second = s.active_comp_id().unwrap();
+    let other = s.execute("layer.newSolid", json!({})).unwrap()["layer"].as_u64().unwrap();
+    let other_prop = layer(&s, other).props.prop("transform/rotation").unwrap().uid;
+    s.execute("prop.addKey", json!({"layer": other, "prop": other_prop, "time": 0, "value": 15})).unwrap();
+    s.state.selected_props = vec![(LayerId(other), other_prop)];
+    s.state.selected_keys = vec![crate::KeyRef { layer: LayerId(other), prop: other_prop, time: Tick::ZERO }];
+    let live = (s.state.selected_props.clone(), s.state.selected_keys.clone());
+    s.execute("prop.toggleAnimation", json!({"comp": first.0, "layer": lid, "prop": type_uid, "value": false})).unwrap();
+    assert_eq!(s.active_comp_id(), Some(second));
+    assert_eq!((s.state.selected_props.clone(), s.state.selected_keys.clone()), live);
+    let parked = s.state.comp_selections.get(&first).unwrap();
+    assert!(parked.props.is_empty() && parked.keys.is_empty(), "the inactive composition must not keep removed control references");
+    let after = s.project.comp(first).unwrap().layer(LayerId(lid)).unwrap().props.group(path).unwrap().clone();
+    assert!(after.get("innerRadius").is_none());
+    assert!(s.undo());
+    assert_eq!(s.project.comp(first).unwrap().layer(LayerId(lid)).unwrap().props.group(path).unwrap(), &before);
+    assert!(s.redo());
+    assert_eq!(s.project.comp(first).unwrap().layer(LayerId(lid)).unwrap().props.group(path).unwrap(), &after);
+}
+
+#[test]
+fn polystar_multi_property_expression_clear_resolves_targets_before_removing_controls() {
+    let mut s = comp();
+    let lid = s.execute("layer.newShape", json!({"kind": "polygon"})).unwrap()["layer"].as_u64().unwrap();
+    let group = |s: &Session| layer(s, lid).props.group("contents/group/contents/star").unwrap().clone();
+    let type_uid = group(&s).get("type").unwrap().uid;
+    s.execute("prop.setExpression", json!({"layer": lid, "prop": type_uid, "expression": "1"})).unwrap();
+    let inner = group(&s).get("innerRadius").unwrap().uid;
+    s.execute("prop.setExpression", json!({"layer": lid, "prop": inner, "expression": "37"})).unwrap();
+    let before = group(&s);
+    s.state.selected_props = vec![(LayerId(lid), type_uid), (LayerId(lid), inner)];
+    assert_eq!(s.execute("prop.setExpression", json!({"expression": ""})).unwrap(), json!([null, null]));
+    let after = group(&s);
+    assert!(after.get("type").unwrap().expr.is_none());
+    assert!(after.get("innerRadius").is_none());
+    assert_eq!(s.state.selected_props, vec![(LayerId(lid), type_uid)]);
+    assert!(s.undo());
+    assert_eq!(group(&s), before);
+    assert!(s.redo());
+    assert_eq!(group(&s), after);
+}
+
+/// Undo must discard removed controls before their UIDs can name newly allocated properties.
+#[test]
+fn polystar_undo_sanitizes_live_and_parked_property_selections_before_uid_reuse() {
+    for parked in [false, true] {
+        let mut s = comp();
+        let cid = s.active_comp_id().unwrap();
+        let lid = s.execute("layer.newShape", json!({"kind": "polygon"})).unwrap()["layer"].as_u64().unwrap();
+        let polygon = layer(&s, lid).props.group("contents/group/contents/star").unwrap().clone();
+        let type_uid = polygon.get("type").unwrap().uid;
+        s.execute("comp.new", json!({"width": 100, "height": 100, "duration": 2})).unwrap();
+        let other = s.active_comp_id().unwrap();
+        s.activate_comp(cid);
+        s.state.selected_props = vec![(LayerId(lid), type_uid)];
+        s.execute("anim.addKeyframe", json!({})).unwrap();
+        let inner = layer(&s, lid).props.group("contents/group/contents/star").unwrap().get("innerRadius").unwrap().uid;
+        let valid = vec![(LayerId(lid), type_uid), (LayerId(lid), polygon.uid)];
+        s.state.selected_props = valid.iter().copied().chain([(LayerId(lid), inner)]).collect();
+        s.state.selected_keys = vec![crate::KeyRef { layer: LayerId(lid), prop: inner, time: Tick::ZERO }];
+        if parked {
+            s.activate_comp(other);
+        }
+        assert!(s.undo());
+        let (props, keys) = if parked {
+            let selection = s.state.comp_selections.get(&cid).unwrap();
+            (&selection.props, &selection.keys)
+        } else {
+            (&s.state.selected_props, &s.state.selected_keys)
+        };
+        assert_eq!(props, &valid, "remove stale leaves while preserving property and group selections");
+        assert!(keys.is_empty());
+        s.activate_comp(cid);
+        s.execute("prop.separateDimensions", json!({"layer": lid, "value": true})).unwrap();
+        let position_z = layer(&s, lid).props.prop("transform/positionZ").unwrap().clone();
+        assert_eq!(position_z.uid, inner, "the removed control's UID was actually reused");
+        s.execute("prop.setExpression", json!({"expression": "1"})).unwrap();
+        assert_eq!(layer(&s, lid).props.prop("transform/positionZ").unwrap(), &position_z, "the reused UID must not become an implicit expression target");
+    }
+}
+
+/// #3229: a drag Shift keeps to one axis snaps only that axis. A point a few pixels off the axis
+/// lines the feature up with it (along x: its x) without taking it off the axis, as a line
+/// through the point would; lines along the drag are left out, and the point reaches only `tol`
+/// off the axis. Unconstrained (`snap`) the same point takes both coordinates, the feature leaving
+/// the axis.
+#[test]
+fn a_shift_drag_snaps_only_along_its_axis() {
+    use crate::viewer::snap_along;
+    let src = SnapSource::Layer(LayerId(1));
+    let corner = SnapTarget::point([450.0, 150.0], PRI_LAYER, src);
+    let row = SnapTarget::hline(151.0, PRI_GUIDE, SnapSource::Guide);
+    let column = SnapTarget::vline(449.0, PRI_GUIDE, SnapSource::Guide);
+    let feature = [[448.0, 153.0]];
+    assert_eq!(snap(&feature, &[corner, row], 8.0).unwrap().at, [450.0, 150.0]);
+    // Along x: x onto the corner's, y kept (the nearer row does not pull it either).
+    let s = snap_along(&feature, &[corner, row], 8.0, true).unwrap();
+    assert_eq!(s.delta, [2.0, 0.0]);
+    assert_eq!(s.at, [450.0, 153.0]);
+    // The point, and the line from it to the feature (the feedback).
+    assert_eq!(s.hits, [corner, SnapTarget::vline(450.0, PRI_LAYER, src).within(Some([150.0, 153.0]))]);
+    // Along y: y onto the corner's, x kept (the column is left out).
+    let s = snap_along(&feature, &[corner, column], 8.0, false).unwrap();
+    assert_eq!(s.delta, [0.0, -3.0]);
+    assert_eq!(s.at, [448.0, 150.0]);
+    assert_eq!(s.hits, [corner, SnapTarget::hline(150.0, PRI_LAYER, src).within(Some([450.0, 448.0]))]);
+    // A line across the drag still snaps; a nearer one wins over the point.
+    let s = snap_along(&feature, &[corner, column], 8.0, true).unwrap();
+    assert_eq!(s.at, [449.0, 153.0]);
+    assert_eq!(s.hits, [column]);
+    // The point reaches only the tolerance off the axis.
+    assert_eq!(snap_along(&[[448.0, 170.0]], &[corner], 8.0, true), None);
+}

@@ -1,0 +1,477 @@
+//! GPU 3D Channel family vs the CPU effects (the oracle): direct on a buffer (full and half
+//! resolution, padded offsets, aux channels at 1× and 2× the layer resolution) and composited
+//! at 8 and 32 bpc from footage that carries auxiliary channels.
+
+use std::sync::Arc;
+
+use effectcraft_effects::{EffectEnv, EffectHost, LayerPixels};
+use effectcraft_keyframe::Value;
+use effectcraft_project::{BitDepth, Footage, ItemId};
+use effectcraft_raster::channels3d::{BACKGROUND_DEPTH, crypto_float, crypto_hash};
+use effectcraft_raster::{AuxChannels, Image};
+use effectcraft_render::{Backend, FootageSource, RenderOpts, Renderer};
+use effectcraft_time::Tick;
+
+use crate::tests::{Pattern, Scene, c, check, diff, gpu, n, opts, pattern, set, tolerance};
+
+pub(crate) struct AuxHost(pub(crate) Arc<AuxChannels>);
+
+impl EffectHost for AuxHost {
+    fn layer(&self, _: u64, _: bool) -> Option<LayerPixels> {
+        None
+    }
+    fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+        None
+    }
+    fn aux(&self) -> Option<Arc<AuxChannels>> {
+        Some(self.0.clone())
+    }
+}
+
+const NAMES: [&str; 5] = ["alpha", "beta", "gamma", "delta", "epsilon"];
+
+/// Aux channels for a `w`×`h` layer at `scale` aux pixels per layer pixel: a depth ramp with a
+/// background corner, object / material ID blocks, coverage, UVs, normals, background RGB, raw
+/// RGB and a two-rank Cryptomatte layer with a manifest.
+pub(crate) fn aux_scene(w: u32, h: u32, scale: f64) -> AuxChannels {
+    let (aw, ah) = ((w as f64 * scale) as u32, (h as f64 * scale) as u32);
+    let mut a = AuxChannels::new(aw, ah, scale);
+    let n = (aw * ah) as usize;
+    let mut ch: Vec<(String, Vec<f32>)> = [
+        "Z",
+        "ObjectID",
+        "MaterialID",
+        "Coverage",
+        "UV.U",
+        "UV.V",
+        "N.X",
+        "N.Y",
+        "N.Z",
+        "BG.R",
+        "BG.G",
+        "BG.B",
+        "R",
+        "G",
+        "B",
+        "CryptoObject00.R",
+        "CryptoObject00.G",
+        "CryptoObject00.B",
+        "CryptoObject00.A",
+    ]
+    .iter()
+    .map(|s| (s.to_string(), vec![0.0; n]))
+    .collect();
+    let hashes: Vec<u32> = NAMES.iter().map(|s| crypto_hash(s)).collect();
+    for y in 0..ah {
+        for x in 0..aw {
+            let i = (y * aw + x) as usize;
+            let (u, v) = (x as f32 / aw as f32, y as f32 / ah as f32);
+            let bg = u > 0.8 && v < 0.25;
+            let obj = ((x as f64 / scale) as u32 / 11 + (y as f64 / scale) as u32 / 9 * 3) % 5;
+            let vals = [
+                if bg { BACKGROUND_DEPTH } else { 50.0 + 900.0 * u + 300.0 * (v * 7.0).sin() },
+                if bg { 0.0 } else { obj as f32 + 1.0 },
+                ((obj * 7) % 3) as f32,
+                0.5 + 0.5 * (u * 9.0).sin(),
+                u,
+                v,
+                (u - 0.5) * 1.6,
+                (0.5 - v) * 1.4,
+                0.7,
+                0.2 + 0.6 * v,
+                0.4,
+                0.9 - 0.5 * u,
+                u * 1.8,
+                v * 0.7,
+                0.3 + u * v * 2.5,
+                crypto_float(hashes[obj as usize]),
+                0.7,
+                crypto_float(hashes[(obj as usize + 1) % 5]),
+                0.3,
+            ];
+            for (k, val) in vals.iter().enumerate() {
+                ch[k].1[i] = *val;
+            }
+        }
+    }
+    a.channels = ch;
+    a.manifests = vec![("CryptoObject".into(), NAMES.iter().zip(&hashes).map(|(n, h)| (n.to_string(), *h)).collect())];
+    a
+}
+
+/// The effect alone on a buffer with aux channels (`allow` = fraction of pixels that may
+/// differ by more than 1e-3).
+pub(crate) fn direct(id: &str, vals: &[(&str, Value)], allow: f64) {
+    let Some(g) = gpu() else { return };
+    let spec = effectcraft_effects::find(id).unwrap();
+    let size = [70.0, 44.0];
+    let mut params =
+        effectcraft_effects::Params { values: spec.params.iter().map(|ps| (ps.id.to_string(), effectcraft_effects::default_value(ps, size))).collect() };
+    for (k, v) in vals {
+        params.values.insert(k.to_string(), v.clone());
+    }
+    for aux_scale in [1.0, 2.0] {
+        let host = AuxHost(Arc::new(aux_scene(70, 44, aux_scale)));
+        for (scale, offset) in [(1.0, [0.0, 0.0]), (0.5, [0.0, 0.0]), (1.0, [3.0, 2.0])] {
+            let (w, h) = ((size[0] * scale) as u32, (size[1] * scale) as u32);
+            let mut img = pattern(7, w + 2 * offset[0] as u32, h + 2 * offset[1] as u32);
+            if offset[0] > 0.0 {
+                // A padded buffer: transparent margins.
+                for (i, px) in img.data.iter_mut().enumerate() {
+                    let (x, y) = (i as u32 % img.width, i as u32 / img.width);
+                    if x < offset[0] as u32 || y < offset[1] as u32 || x >= w + offset[0] as u32 || y >= h + offset[1] as u32 {
+                        *px = [0.0; 4];
+                    }
+                }
+            }
+            let buf = effectcraft_effects::Buf { img, offset, scale };
+            let ctx = || effectcraft_effects::EffectCtx {
+                params: &params,
+                time: 0.25,
+                layer_size: size,
+                seed: 11,
+                adjustment: false,
+                env: EffectEnv { host: Some(&host), ..Default::default() },
+            };
+            let cpu = (spec.render)(&ctx(), buf.clone());
+            let out =
+                effectcraft_render::Accelerator::effects(g, &[effectcraft_render::FxStep { spec, ctx: ctx() }], &buf, None).expect("the GPU runs the effect");
+            assert_eq!((out.offset, out.scale), (cpu.offset, cpu.scale), "{id}: geometry");
+            let d = diff(&cpu.img, &out.img, 1e-3);
+            assert!(
+                d.over as f64 <= allow * d.total as f64,
+                "{id} {vals:?} aux {aux_scale} scale {scale} offset {offset:?}: {} of {} pixels over 1e-3 (max {}); worst {:?}",
+                d.over,
+                d.total,
+                d.max,
+                d.worst
+            );
+        }
+    }
+}
+
+/// Footage frames from [`Pattern`] with [`aux_scene`] channels.
+struct AuxSource;
+
+impl FootageSource for AuxSource {
+    fn frame(&self, item: ItemId, f: &Footage, t: Tick) -> Option<Arc<Image>> {
+        Pattern.frame(item, f, t)
+    }
+    fn aux(&self, _item: ItemId, f: &Footage, _t: Tick) -> Option<Arc<AuxChannels>> {
+        Some(Arc::new(aux_scene(f.width, f.height, 1.0)))
+    }
+}
+
+fn compare(s: &Scene, o: RenderOpts) -> Option<crate::tests::Diff> {
+    let g = gpu()?;
+    let cpu = Renderer::new(&s.p, &AuxSource, RenderOpts { backend: Backend::Cpu, ..o }).comp_frame_cpu(s.cid, Tick::ZERO);
+    let mut r = Renderer::new(&s.p, &AuxSource, RenderOpts { backend: Backend::Gpu, ..o });
+    r.accel = Some(g);
+    let img = g.render(&r, s.cid, Tick::ZERO).expect("the GPU renders the frame");
+    let mut d = diff(&cpu, &img, tolerance(s.p.settings.bit_depth));
+    d.quantized = s.p.settings.bit_depth != BitDepth::Bpc32;
+    Some(d)
+}
+
+/// Direct, then on a rotated footage layer over a background at 8 and 32 bpc (full and half
+/// resolution).
+fn case(id: &str, vals: &[(&str, Value)]) {
+    direct(id, vals, 0.0);
+    composited(id, vals, 0.0);
+}
+
+fn composited(id: &str, vals: &[(&str, Value)], allow: f64) {
+    for depth in [BitDepth::Bpc8, BitDepth::Bpc32] {
+        let mut s = Scene::new(depth);
+        let bg = s.solid([0.15, 0.1, 0.2], 97, 61);
+        let bg_id = s.push(bg);
+        let mut l = s.footage(70, 44);
+        let mut vals = vals.to_vec();
+        for v in vals.iter_mut() {
+            if v.1 == Value::Layer(Some(0)) {
+                v.1 = Value::Layer(Some(bg_id.0));
+            }
+        }
+        s.effect(&mut l, id, &vals);
+        set(&mut l, "transform/rotation", Value::Scalar(8.0));
+        s.push(l);
+        check(&format!("{id} {vals:?} {depth:?}"), compare(&s, opts()), allow);
+        check(&format!("{id} {vals:?} {depth:?} half"), compare(&s, RenderOpts { scale: 0.5, ..opts() }), allow);
+    }
+}
+
+fn e(v: u32) -> Value {
+    Value::Enum(v)
+}
+
+fn on() -> Value {
+    Value::Bool(true)
+}
+
+/// #474: every effect done here reads aux channels, so the session gives the media layer its
+/// footage ([`effectcraft_effects::reads_aux`]).
+#[test]
+fn every_effect_here_reads_aux() {
+    assert!(crate::fx_depth::IDS.iter().all(|i| effectcraft_effects::reads_aux(i)));
+}
+
+#[test]
+fn channel_extract() {
+    case("ec.3d.channelextract", &[("blackPoint", n(0.0)), ("whitePoint", n(1200.0))]);
+    case("ec.3d.channelextract", &[("whitePoint", n(400.0)), ("clampOutput", Value::Bool(false)), ("invertDepthMap", on())]);
+    case("ec.3d.channelextract", &[("blackPoint", n(900.0)), ("whitePoint", n(100.0))]);
+    case("ec.3d.channelextract", &[("channel", e(1)), ("whitePoint", n(5.0))]);
+    case("ec.3d.channelextract", &[("channel", e(2)), ("whitePoint", n(1.0))]);
+    case("ec.3d.channelextract", &[("channel", e(3)), ("whitePoint", n(1.0))]);
+    case("ec.3d.channelextract", &[("channel", e(4)), ("whitePoint", n(1.0)), ("antialias", on())]);
+    case("ec.3d.channelextract", &[("channel", e(5)), ("whitePoint", n(1.0))]);
+    case("ec.3d.channelextract", &[("channel", e(6))]);
+    case("ec.3d.channelextract", &[("channel", e(7)), ("whitePoint", n(2.0))]);
+    case("ec.3d.channelextract", &[("blackPoint", n(0.0)), ("whitePoint", n(1000.0)), ("antialias", on())]);
+}
+
+#[test]
+fn depth_matte_fog_and_dof() {
+    case("ec.3d.depthmatte", &[("depth", n(500.0))]);
+    case("ec.3d.depthmatte", &[("depth", n(400.0)), ("feather", n(300.0)), ("invert", on())]);
+    case("ec.3d.fog3d", &[]);
+    case("ec.3d.fog3d", &[("fogColor", c(0.3, 0.5, 0.9)), ("fogStartDepth", n(200.0)), ("fogEndDepth", n(900.0)), ("scatteringDensity", n(10.0))]);
+    case("ec.3d.fog3d", &[("foggyBackground", Value::Bool(false)), ("fogOpacity", n(70.0))]);
+    composited("ec.3d.fog3d", &[("gradientLayer", Value::Layer(Some(0))), ("layerContribution", n(60.0))], 0.0);
+    case("ec.3d.depthoffield", &[("focalPlane", n(400.0)), ("maximumRadius", n(8.0))]);
+    case("ec.3d.depthoffield", &[("focalPlane", n(200.0)), ("maximumRadius", n(5.0)), ("focalPlaneThickness", n(150.0)), ("focalBias", n(80.0))]);
+}
+
+#[test]
+fn ids_and_cryptomatte() {
+    case("ec.3d.idmatte", &[("idSelection", n(2.0))]);
+    case("ec.3d.idmatte", &[("idSelection", n(3.0)), ("feather", n(3.0)), ("useCoverage", on()), ("invert", on())]);
+    case("ec.3d.idmatte", &[("auxChannel", e(1)), ("idSelection", n(1.0))]);
+    case("ec.3d.identifier", &[]);
+    case("ec.3d.identifier", &[("id", n(2.0))]);
+    case("ec.3d.identifier", &[("display", e(1)), ("id", n(4.0))]);
+    case("ec.3d.identifier", &[("display", e(2)), ("id", n(1.0))]);
+    case("ec.3d.identifier", &[("display", e(3)), ("channelType", e(1))]);
+    case("ec.3d.cryptomatte", &[("selection", Value::Str("beta, delta".into()))]);
+    case("ec.3d.cryptomatte", &[("selection", Value::Str("*a".into())), ("display", e(0))]);
+    case("ec.3d.cryptomatte", &[("selection", Value::Str("gamma".into())), ("display", e(1))]);
+    case("ec.3d.cryptomatte", &[("selection", Value::Str("alpha".into())), ("matteOnly", on())]);
+}
+
+/// The GPU skips the ID colours for displays that do not read them
+/// ([`effectcraft_effects::CryptoOutput::for_display`]): every display × Matte Only must still match
+/// the CPU effect, so a shader that starts reading RGB in another mode fails here. Matte Only is
+/// checked both ways: the matte in RGB over alpha 1 (#3127) and, for older projects, in alpha too.
+#[test]
+fn cryptomatte_every_display_matches_the_cpu() {
+    for display in 0..3 {
+        for (matte_only, in_alpha) in [(false, false), (true, false), (true, true)] {
+            case(
+                "ec.3d.cryptomatte",
+                &[
+                    ("selection", Value::Str("beta, delta".into())),
+                    ("display", e(display)),
+                    ("matteOnly", Value::Bool(matte_only)),
+                    (effectcraft_effects::MATTE_ONLY_IN_ALPHA, Value::Bool(in_alpha)),
+                ],
+            );
+        }
+    }
+}
+
+/// Cryptomatte alone on a `scale` buffer of the 70 × 44 layer over `host`, on the GPU and the
+/// CPU: (GPU, CPU, the Cryptomatte planes the GPU uploaded, the uploads counted by the context).
+fn crypto_direct(host: &AuxHost, vals: &[(&str, Value)], scale: f64) -> Option<(Image, Image, Vec<(effectcraft_effects::CryptoOutput, u32, u32, usize)>, u64)> {
+    let g = gpu()?;
+    let spec = effectcraft_effects::find("ec.3d.cryptomatte").unwrap();
+    let size = [70.0, 44.0];
+    let mut params =
+        effectcraft_effects::Params { values: spec.params.iter().map(|ps| (ps.id.to_string(), effectcraft_effects::default_value(ps, size))).collect() };
+    for (k, v) in vals {
+        params.values.insert(k.to_string(), v.clone());
+    }
+    let (w, h) = ((size[0] * scale) as u32, (size[1] * scale) as u32);
+    let buf = effectcraft_effects::Buf { img: pattern(5, w, h), offset: [0.0; 2], scale };
+    let ctx = || effectcraft_effects::EffectCtx {
+        params: &params,
+        time: 0.0,
+        layer_size: size,
+        seed: 0,
+        adjustment: false,
+        env: EffectEnv { host: Some(host), ..Default::default() },
+    };
+    let cpu = (spec.render)(&ctx(), buf.clone());
+    let planes = || crate::fx_depth::PLANE_UPLOADS.lock().unwrap().len();
+    let (before, uploads) = (planes(), g.ctx.transfer_stats().uploads);
+    let out = effectcraft_render::Accelerator::effects(g, &[effectcraft_render::FxStep { spec, ctx: ctx() }], &buf, None).expect("the GPU runs the effect");
+    let uploads = g.ctx.transfer_stats().uploads - uploads;
+    let uploaded = crate::fx_depth::PLANE_UPLOADS.lock().unwrap()[before..].to_vec();
+    Some((out.img, cpu.img, uploaded, uploads))
+}
+
+/// #3334: at full resolution the GPU's Cryptomatte is bit-identical to the CPU effect (whose
+/// full-resolution path is unchanged) in the displays whose output is the plane or one product
+/// with it (Matte Only, Colors, Matte); the Preview tint within rounding. It uploads one plane:
+/// the matte as R32F at source resolution (the Colors display its RGBA pixels), and nothing
+/// else of the channels (the context's own uploads are the layer's buffer alone).
+#[test]
+fn cryptomatte_full_resolution_uploads_only_the_matte_and_is_bit_identical() {
+    use effectcraft_effects::CryptoOutput;
+    let host = AuxHost(Arc::new(aux_scene(70, 44, 1.0)));
+    for (vals, output, exact) in [
+        (vec![("matteOnly", on())], CryptoOutput::Matte, true),
+        (vec![("display", e(0))], CryptoOutput::Colors, true),
+        (vec![("display", e(1))], CryptoOutput::Matte, true),
+        (vec![("display", e(2))], CryptoOutput::Matte, false),
+    ] {
+        let mut vals = vals;
+        vals.push(("selection", Value::Str("beta, delta".into())));
+        let Some((gpu_img, cpu_img, planes, uploads)) = crypto_direct(&host, &vals, 1.0) else { return };
+        let bytes = 70 * 44 * output.channels() * 4;
+        assert_eq!(planes, [(output, 70, 44, bytes)], "{vals:?}: one plane, at source resolution");
+        assert_eq!(uploads, 1, "{vals:?}: the layer's buffer, no channel");
+        if exact {
+            for (i, (g, c)) in gpu_img.data.iter().zip(&cpu_img.data).enumerate() {
+                assert_eq!(g.map(f32::to_bits), c.map(f32::to_bits), "{vals:?}: pixel {i}");
+            }
+        } else {
+            let d = diff(&cpu_img, &gpu_img, 1e-6);
+            assert_eq!(d.over, 0, "{vals:?}: max {}, worst {:?}", d.max, d.worst);
+        }
+    }
+}
+
+/// #3334: at half resolution the GPU uploads the box-filtered matte (a quarter of the pixels,
+/// four bytes each) and shows what the CPU effect shows.
+#[test]
+fn cryptomatte_half_resolution_uploads_the_filtered_matte() {
+    use effectcraft_effects::CryptoOutput;
+    let host = AuxHost(Arc::new(aux_scene(70, 44, 1.0)));
+    let vals = [("selection", Value::Str("beta, delta".into())), ("matteOnly", on())];
+    let Some((gpu_img, cpu_img, planes, uploads)) = crypto_direct(&host, &vals, 0.5) else { return };
+    assert_eq!(planes, [(CryptoOutput::Matte, 35, 22, 35 * 22 * 4)]);
+    assert_eq!(uploads, 1);
+    for (i, (g, c)) in gpu_img.data.iter().zip(&cpu_img.data).enumerate() {
+        assert_eq!(g.map(f32::to_bits), c.map(f32::to_bits), "pixel {i}");
+    }
+    assert!(gpu_img.data.iter().any(|p| p[0] > 0.0 && p[0] < 1.0), "partial coverage where objects meet");
+}
+
+/// #3334: the finished planes are kept per footage frame (its channels), layer, selection,
+/// output and render scale: the same frame again makes none; another selection, output or
+/// scale makes its own. Once the frame's channels are gone, its planes are the first the memory
+/// accountant drops, at no cost.
+#[test]
+fn cryptomatte_planes_are_kept_per_frame_and_selection() {
+    use crate::fx_depth::matte_cache;
+    use effectcraft_effects::CryptoOutput;
+    crate::tests::hold_gpu_lock();
+    let a = Arc::new(aux_scene(70, 44, 1.0));
+    let sel = vec![crypto_hash("beta")];
+    let made = matte_cache::made();
+    let one = matte_cache::plane(&a, "CryptoObject", &sel, CryptoOutput::Matte, 1.0);
+    assert_eq!(matte_cache::made(), made + 1);
+    let again = matte_cache::plane(&a, "CryptoObject", &sel, CryptoOutput::Matte, 1.0);
+    assert!(Arc::ptr_eq(&one, &again) && matte_cache::made() == made + 1, "kept");
+    matte_cache::plane(&a, "CryptoObject", &[crypto_hash("gamma")], CryptoOutput::Matte, 1.0);
+    matte_cache::plane(&a, "CryptoObject", &sel, CryptoOutput::Colors, 1.0);
+    matte_cache::plane(&a, "CryptoObject", &sel, CryptoOutput::Matte, 0.5);
+    assert_eq!(matte_cache::made(), made + 4, "one per selection, output and scale");
+    // Another frame (other channels, equal values) makes its own.
+    let other = Arc::new(aux_scene(70, 44, 1.0));
+    matte_cache::plane(&other, "CryptoObject", &sel, CryptoOutput::Matte, 1.0);
+    assert_eq!(matte_cache::made(), made + 5);
+    // The frame's channels go: its planes are worth nothing.
+    drop(other);
+    let holder = matte_cache::holder();
+    let next = holder.oldest().unwrap();
+    assert_eq!(next.cost_us, 0, "{next:?}");
+    let kept = matte_cache::kept();
+    assert_eq!(holder.drop_oldest(), 70 * 44 * 4);
+    assert_eq!(matte_cache::kept(), kept - 1);
+    assert!(Arc::ptr_eq(&one, &matte_cache::plane(&a, "CryptoObject", &sel, CryptoOutput::Matte, 1.0)), "the live frame's plane stays");
+}
+
+/// #3301 review: a plane over the cache's own byte limit is not kept by a render without a
+/// common budget (nothing would trim it); with a budget that holds it, it is kept and the budget
+/// trims it.
+#[test]
+fn a_plane_over_the_byte_limit_is_kept_only_under_a_budget() {
+    use crate::fx_depth::matte_cache;
+    use effectcraft_effects::CryptoOutput;
+    crate::tests::hold_gpu_lock();
+    let sel = vec![crypto_hash("beta")];
+    let a = Arc::new(aux_scene(70, 44, 1.0));
+    // (one Matte plane: 70 × 44 × 4 bytes, over a 100-byte limit)
+    let first = matte_cache::plane_held_to(&a, "CryptoObject", &sel, CryptoOutput::Matte, 100, usize::MAX);
+    let again = matte_cache::plane_held_to(&a, "CryptoObject", &sel, CryptoOutput::Matte, 100, usize::MAX);
+    assert!(!Arc::ptr_eq(&first, &again), "no budget: an oversized plane is not kept");
+    let b = Arc::new(aux_scene(70, 44, 1.0));
+    let first = matte_cache::plane_held_to(&b, "CryptoObject", &sel, CryptoOutput::Matte, 100, 1 << 30);
+    let again = matte_cache::plane_held_to(&b, "CryptoObject", &sel, CryptoOutput::Matte, 100, 1 << 30);
+    assert!(Arc::ptr_eq(&first, &again), "a budget that holds it: kept");
+}
+
+/// #3750 review: a plane a render still holds is not offered to the memory accountant, even
+/// once its frame's channels are gone (dropping it would free nothing while the render holds it).
+#[test]
+fn a_held_plane_of_gone_channels_is_not_offered() {
+    use crate::fx_depth::matte_cache;
+    use effectcraft_effects::CryptoOutput;
+    crate::tests::hold_gpu_lock();
+    let gone = Arc::new(aux_scene(70, 44, 1.0));
+    let held = matte_cache::plane(&gone, "CryptoObject", &[crypto_hash("beta")], CryptoOutput::Matte, 1.0);
+    drop(gone);
+    let holder = matte_cache::holder();
+    // (everything nobody holds goes; at most as many rounds as planes kept)
+    for _ in 0..=matte_cache::kept() {
+        if holder.drop_oldest() == 0 {
+            break;
+        }
+    }
+    assert!(matte_cache::keeps(&held), "the held plane was offered and dropped");
+}
+
+/// #3750 review: when renders hold every plane kept, a new plane is handed out but not kept, so
+/// the cache never stays over its entry limit (32) once they let go.
+#[test]
+fn the_entry_limit_holds_while_renders_hold_every_plane() {
+    use crate::fx_depth::matte_cache;
+    use effectcraft_effects::CryptoOutput;
+    crate::tests::hold_gpu_lock();
+    let a = Arc::new(aux_scene(70, 44, 1.0));
+    let held: Vec<_> = (0..40u32).map(|i| matte_cache::plane_held_to(&a, "CryptoObject", &[i], CryptoOutput::Matte, usize::MAX, usize::MAX)).collect();
+    assert!(matte_cache::kept() <= 32, "{} planes kept", matte_cache::kept());
+    drop(held);
+}
+
+/// #3750 review: a plane over the cache's byte limit kept under a common budget is kept also
+/// while a render holds another plane (only the entry limit, or a plane within the byte limit
+/// that can't fit beside the held ones, hands a new plane out without keeping it).
+#[test]
+fn an_oversized_plane_is_kept_beside_a_held_one_under_a_budget() {
+    use crate::fx_depth::matte_cache;
+    use effectcraft_effects::CryptoOutput;
+    crate::tests::hold_gpu_lock();
+    let a = Arc::new(aux_scene(70, 44, 1.0));
+    // (each Matte plane: 70 × 44 × 4 bytes, over a 100-byte limit; the budget holds them)
+    let neighbour = matte_cache::plane_held_to(&a, "CryptoObject", &[crypto_hash("beta")], CryptoOutput::Matte, 100, 1 << 30);
+    let first = matte_cache::plane_held_to(&a, "CryptoObject", &[crypto_hash("gamma")], CryptoOutput::Matte, 100, 1 << 30);
+    let again = matte_cache::plane_held_to(&a, "CryptoObject", &[crypto_hash("gamma")], CryptoOutput::Matte, 100, 1 << 30);
+    assert!(Arc::ptr_eq(&first, &again), "kept beside the held plane");
+    drop(neighbour);
+}
+
+#[test]
+fn extractor() {
+    case("ec.3d.extractor", &[("red", Value::Str("Z".into())), ("green", Value::Str("UV.U".into())), ("whitePoint", n(1000.0))]);
+    case(
+        "ec.3d.extractor",
+        &[("red", Value::Str("G".into())), ("blue", Value::Str("Coverage".into())), ("alpha", Value::Str("UV.V".into())), ("unMult", on())],
+    );
+    case("ec.3d.extractor", &[("red", Value::Str("A".into())), ("blackPoint", n(0.2)), ("whitePoint", n(0.8)), ("clip", on())]);
+    case("ec.3d.extractor", &[("green", Value::Str("".into())), ("alpha", Value::Str("nothing".into()))]);
+    // `(copy)` reads the input's own channel, not the footage's R plane of aux_scene.
+    let copy = || Value::Str(effectcraft_effects::EXTRACTOR_COPY.into());
+    case("ec.3d.extractor", &[("red", copy()), ("green", Value::Str("Coverage".into())), ("alpha", copy())]);
+}

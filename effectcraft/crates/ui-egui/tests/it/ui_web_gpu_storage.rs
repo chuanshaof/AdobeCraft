@@ -61,7 +61,7 @@ impl RemoteFrames for GpuWorker {
     fn start(&self, job: RemoteJob, done: RemoteDone) {
         // The page reads a hit from the disk cache instead of asking the worker.
         if let Some(k) = job.disk_key
-            && let Some(f) = self.disk.lock().unwrap().get(&k).and_then(|e| disk_cache::read_frame_entry(e))
+            && let Some(f) = self.disk.lock().unwrap().get(&k).and_then(|e| disk_cache::read_frame_entry(e, None))
         {
             return done(Ok(RemoteFrame { width: f.width, height: f.height, rgba: f.rgba, ms: 0.0 }));
         }
@@ -91,8 +91,11 @@ impl RemoteFrames for GpuWorker {
         match out.into_iter().next() {
             Some((FrameReply::Frame { width, height, ms, passes, gpu, .. }, Some(rgba))) => {
                 self.rendered.lock().unwrap().push((passes, gpu));
-                if let Some(k) = job.disk_key {
-                    self.disk.lock().unwrap().insert(k, disk_cache::frame_entry(width, height, &rgba));
+                if let Some(k) = job.disk_key
+                    && let Some(files) = server.take_files()
+                    && let Some(entry) = disk_cache::frame_entry(width, height, &rgba, &files, None)
+                {
+                    self.disk.lock().unwrap().insert(k, entry);
                 }
                 done(Ok(RemoteFrame { width, height, rgba, ms }))
             }
@@ -116,12 +119,13 @@ fn source(s: &Session, gpu: Option<Gpu>) -> RenderSource {
 fn cpu_pixels(f: &FrameImage) -> Vec<egui::Color32> {
     match f {
         FrameImage::Cpu(c) => c.pixels.clone(),
-        FrameImage::Gpu(_) => panic!("expected a CPU frame"),
+        FrameImage::Gpu(_) | FrameImage::CpuF16(_) => panic!("expected an 8-bit CPU frame"),
     }
 }
 
 #[test]
 fn gpu_worker_renders_effect_frames_and_the_disk_cache_survives_a_reload() {
+    let _device = crate::gpu_test::lock();
     let (Some(page_gpu), Some(worker_gpu)) = (Gpu::headless(), Gpu::headless_deferred()) else {
         eprintln!("no GPU adapter: skipped");
         return;
@@ -211,7 +215,8 @@ impl StorageHost for Storage {
 fn send(h: &mut Harness<'_, EffectcraftApp>, method: &str, params: Value) {
     let ctx = h.ctx.clone();
     let (req, _rx) = ControlRequest::new(method, params);
-    if let Outcome::Done(v) = control::handle(h.state_mut(), &ctx, &req) {
+    let now = h.state().now();
+    if let Outcome::Done(v) = control::handle(h.state_mut(), &ctx, &req, now) {
         assert!(v["ok"] != false, "{method}: {v}");
     }
     // kittest doesn't call `raw_input_hook`: feed the synthetic click in.

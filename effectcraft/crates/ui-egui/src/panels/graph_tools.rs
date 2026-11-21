@@ -34,8 +34,9 @@ struct BoxDrag {
     last: [f64; 2],
 }
 
+/// The `egui::Id` of the transform-box drag in progress ([`BoxDrag`]).
 fn box_id() -> egui::Id {
-    egui::Id::new("graph-transform-box")
+    egui::Id::unique("graph-transform-box")
 }
 
 /// Bounds of the selected keys: (t0, v0, t1, v1).
@@ -70,6 +71,7 @@ pub(crate) fn transform_box(
     vmap: &dyn Fn(f32) -> f64,
     speed: bool,
     handles: bool,
+    pal: &super::graph::GraphPalette,
     actions: &mut Actions,
 ) {
     if !app.ui.timeline.graph_transform_box {
@@ -78,9 +80,9 @@ pub(crate) fn transform_box(
     let Some(b) = bounds(keys) else { return };
     let r = Rect::from_min_max(pos2(tm.x(b[0]), ymap(b[3])), pos2(tm.x(b[2]), ymap(b[1]))).expand(6.0);
     let value_ok = !speed && keys.iter().all(|k| k.editable);
-    let col = Color32::from_rgb(0xd8, 0xd8, 0xd8);
+    let col = pal.box_line;
     let ctx = ui.ctx().clone();
-    let drag_id = egui::Id::new("graph-dragging");
+    let drag_id = egui::Id::unique("graph-dragging");
     let hp = handle_points(r);
     let data = |q: Pos2| [tm.t(q.x), vmap(q.y)];
     // Which data point each handle sits on, and its opposite.
@@ -100,7 +102,7 @@ pub(crate) fn transform_box(
     let mut resp_any: Option<egui::Response> = None;
     if !handles {
         p.rect_stroke(r, 0.0, Stroke::new(1.0, col.gamma_multiply(0.7)), StrokeKind::Middle);
-        let resp = ui.interact(r, egui::Id::new("graph-box-inside"), Sense::drag());
+        let resp = ui.interact(r, egui::Id::unique("graph-box-inside"), Sense::drag());
         app.auto.add("timeline.graph.transformBox", r, "Transform box");
         if resp.drag_started()
             && let Some(o) = ui.input(|i| i.pointer.press_origin())
@@ -115,9 +117,9 @@ pub(crate) fn transform_box(
                 continue;
             }
             let hr = Rect::from_center_size(*h, vec2(7.0, 7.0));
-            p.rect_filled(hr, 0.0, Color32::from_gray(0x20));
+            p.rect_filled(hr, 0.0, pal.box_fill);
             p.rect_stroke(hr, 0.0, Stroke::new(1.0, col), StrokeKind::Middle);
-            let resp = ui.interact(hr.expand(2.0), egui::Id::new(("graph-box-handle", i)), Sense::drag());
+            let resp = ui.interact(hr.expand(2.0), egui::Id::unique(("graph-box-handle", i)), Sense::drag());
             app.auto.add(&format!("timeline.graph.transformBox.{i}"), hr, "Transform box handle");
             if resp.drag_started() {
                 let opp = [2, 3, 0, 1, 6, 7, 4, 5][i];
@@ -254,8 +256,9 @@ struct AltScale {
     span: Option<f64>,
 }
 
+/// The `egui::Id` of the Timeline Alt-drag group scale in progress ([`AltScale`]).
 fn alt_id() -> egui::Id {
-    egui::Id::new("timeline-alt-scale")
+    egui::Id::unique("timeline-alt-scale")
 }
 
 /// Selected keys' comp-time range.

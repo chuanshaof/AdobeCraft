@@ -42,7 +42,8 @@ pub struct CharXf {
     pub stroke_hsb: [f64; 3],
     pub stroke_opacity: f64,
     pub stroke_width: f64,
-    /// Tracking (1/1000 em) added before / after the character.
+    /// Tracking (pixels: an animator's Tracking Amount, as After Effects) added before / after
+    /// the character.
     pub track_before: f64,
     pub track_after: f64,
     /// Line Anchor (percent) and the selection weight it was set with.
@@ -197,6 +198,35 @@ pub fn in_index_units(layer: &Layer, uid: effectcraft_project::Uid) -> bool {
 
 /// Selection of every glyph by an animator's selectors, per dimension.
 pub fn animator_selection(ctx: &EvalCtx, layer: &Layer, anim: &PropGroup, lay: &TextLayout) -> Vec<[f64; 3]> {
+    animator_selection_within(ctx, layer, anim, lay, &SelectorBudget::new())
+}
+
+/// The Expression Selector evaluations one layer's animators may run in all: counted, not timed,
+/// so the same frame renders the same on every machine.
+pub struct SelectorBudget(std::cell::Cell<usize>);
+
+impl SelectorBudget {
+    pub fn new() -> SelectorBudget {
+        SelectorBudget(std::cell::Cell::new(MAX_SELECTOR_EVALS))
+    }
+
+    /// Take one evaluation; `false` when none are left.
+    fn take(&self) -> bool {
+        let left = self.0.get();
+        self.0.set(left.saturating_sub(1));
+        left > 0
+    }
+}
+
+impl Default for SelectorBudget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// [`animator_selection`] drawing its Expression Selector evaluations from `budget`, which the
+/// caller shares across the layer's animators.
+pub fn animator_selection_within(ctx: &EvalCtx, layer: &Layer, anim: &PropGroup, lay: &TextLayout, budget: &SelectorBudget) -> Vec<[f64; 3]> {
     let sels: Vec<&PropGroup> = anim.sub("selectors").map(|s| s.groups().filter(|g| g.enabled).collect()).unwrap_or_default();
     if sels.is_empty() {
         // No selectors: every character is fully affected.
@@ -242,13 +272,38 @@ pub fn animator_selection(ctx: &EvalCtx, layer: &Layer, anim: &PropGroup, lay: &
             }
             "expressionSelector" => {
                 let Some(prop) = sel.get("amount") else { continue };
-                let stat = ctx.v3(layer, sel, "amount", [100.0; 3]);
+                // Evaluated per character (`textIndex`): the layer's cache key holds the amount
+                // for the first character only, so the buffer must not outlive the session.
+                if prop.has_expression()
+                    && let Some(log) = ctx.reads
+                {
+                    log.mark_unkeyed();
+                }
+                // The keyframed amount, read without running its expression (the fallback when the
+                // expression cannot run); an Essential Property override still applies.
+                let stat = if prop.has_expression() {
+                    // The expression is not run here, but an Essential Property override still wins over the base value.
+                    match ctx.property_overrides.iter().rev().find(|o| o.layer == layer.id && o.prop == prop.uid) {
+                        Some(o) => o.value(layer, prop, ctx.time),
+                        None => prop.value_at(layer.layer_time(ctx.time)),
+                    }
+                } else {
+                    ctx.value(layer, prop)
+                }
+                .as_vec3();
+                // One allowance for the whole layer (`budget`, shared by its animators): the
+                // expression runs per character, so a slow expression on a long text is stopped
+                // once it has failed or the layer's evaluations pass MAX_SELECTOR_EVALS.
+                let stopped = std::cell::Cell::new(false);
                 Box::new(move |i, n, prev| {
                     let pv = prev.map(|x| x * 100.0);
                     // Without an expression engine: the static amount scales the selection.
                     let fallback = [0, 1, 2].map(|d| stat[d] * prev[d]);
-                    let r = match ctx.expr.filter(|_| prop.has_expression()) {
-                        Some(h) => h.eval_text_selector(ctx, layer, prop, i, n, pv).unwrap_or(fallback),
+                    let r = match ctx.expr.filter(|_| prop.has_expression() && !stopped.get() && budget.take()) {
+                        Some(h) => h.eval_text_selector(ctx, layer, prop, i, n, pv).unwrap_or_else(|_| {
+                            stopped.set(true);
+                            fallback
+                        }),
                         None => fallback,
                     };
                     r.map(|x| (x / 100.0).clamp(-1.0, 1.0))
@@ -274,24 +329,30 @@ pub fn animator_selection(ctx: &EvalCtx, layer: &Layer, anim: &PropGroup, lay: &
     acc
 }
 
+/// The most Expression Selector evaluations one layer's animators run across all its characters
+/// (a text of 32,768 characters under one expression selector, or fewer under several).
+const MAX_SELECTOR_EVALS: usize = 32_768;
 /// Evaluate animators for every glyph.
 pub fn char_transforms(ctx: &EvalCtx, layer: &Layer, text: &PropGroup, lay: &TextLayout) -> Vec<CharXf> {
     let mut out = vec![CharXf::default(); lay.glyphs.len()];
     let Some(anims) = text.sub("animators") else { return out };
+    let budget = SelectorBudget::new();
     for anim in anims.groups().filter(|g| g.enabled) {
         let Some(props) = anim.sub("properties") else { continue };
-        let sel = animator_selection(ctx, layer, anim, lay);
+        let sel = animator_selection_within(ctx, layer, anim, lay, &budget);
         let get = |m: &str| props.get(m).map(|p| ctx.value(layer, p).components());
         let get1 = |m: &str| props.get(m).map(|p| ctx.value(layer, p).as_f64());
         let c3 = |v: Vec<f64>, d: f64| [v.first().copied().unwrap_or(d), v.get(1).copied().unwrap_or(d), v.get(2).copied().unwrap_or(d)];
         let pos = get("position").map(|v| c3(v, 0.0));
         let anchor = get("anchor").map(|v| c3(v, 0.0));
         let scale = get("scale").map(|v| c3(v, 100.0));
-        let rot = get1("rotation");
-        let rx = get1("rotationX");
-        let ry = get1("rotationY");
-        let skew = get1("skew");
-        let skew_axis = get1("skewAxis");
+        let angles = CharacterAngles {
+            rotation: get1("rotation"),
+            rotation_x: get1("rotationX"),
+            rotation_y: get1("rotationY"),
+            skew: get1("skew"),
+            skew_axis: get1("skewAxis"),
+        };
         let op = get1("opacity");
         let fill = props.get("fillColor").map(|p| ctx.value(layer, p).as_color());
         let stroke = props.get("strokeColor").map(|p| ctx.value(layer, p).as_color());
@@ -338,23 +399,12 @@ pub fn char_transforms(ctx: &EvalCtx, layer: &Layer, text: &PropGroup, lay: &Tex
                     c.scale[d] *= 1.0 + (s[d] / 100.0 - 1.0) * k3[d];
                 }
             }
-            if let Some(r) = rot {
-                c.rotation += r * k;
-            }
-            if let Some(r) = rx {
-                c.rotation_x += r * k;
-            }
-            if let Some(r) = ry {
-                c.rotation_y += r * k;
-            }
-            if let Some(s) = skew {
-                c.skew += s * k;
-            }
-            if let Some(a) = skew_axis {
-                c.skew_axis = a;
-            }
+            angles.apply(c, k);
             if let Some(o) = op {
-                c.opacity *= 1.0 + (o / 100.0 - 1.0) * k;
+                // Blend toward this animator's value, so a later animator can show characters an
+                // earlier one hid (Lottie files rely on it: Opacity 0 % on every character, then
+                // animators at 100 % that sweep in). With one animator this is the same as before.
+                c.opacity += (o - c.opacity) * k;
             }
             if let Some(f) = fill {
                 c.fill = Some(f);
@@ -381,17 +431,7 @@ pub fn char_transforms(ctx: &EvalCtx, layer: &Layer, text: &PropGroup, lay: &Tex
             if let Some(w) = sw {
                 c.stroke_width += w * k;
             }
-            if let Some(t) = tracking {
-                let t = t * k;
-                match tracking_type {
-                    1 => c.track_before += t,
-                    2 => c.track_after += t,
-                    _ => {
-                        c.track_before += t * 0.5;
-                        c.track_after += t * 0.5;
-                    }
-                }
-            }
+            apply_tracking(c, tracking, tracking_type, k);
             if let Some(a) = line_anchor
                 && k.abs() >= c.line_anchor_k
             {
@@ -430,6 +470,50 @@ pub fn char_transforms(ctx: &EvalCtx, layer: &Layer, text: &PropGroup, lay: &Tex
         }
     }
     out
+}
+
+/// Optional animator orientation properties; an omitted property leaves the glyph unchanged.
+struct CharacterAngles {
+    rotation: Option<f64>,
+    rotation_x: Option<f64>,
+    rotation_y: Option<f64>,
+    skew: Option<f64>,
+    skew_axis: Option<f64>,
+}
+
+impl CharacterAngles {
+    fn apply(&self, c: &mut CharXf, k: f64) {
+        if let Some(r) = self.rotation {
+            c.rotation += r * k;
+        }
+        if let Some(r) = self.rotation_x {
+            c.rotation_x += r * k;
+        }
+        if let Some(r) = self.rotation_y {
+            c.rotation_y += r * k;
+        }
+        if let Some(s) = self.skew {
+            c.skew += s * k;
+        }
+        if let Some(a) = self.skew_axis {
+            c.skew_axis = a;
+        }
+    }
+}
+
+/// Distribute selected tracking before and/or after a glyph according to Tracking Type.
+fn apply_tracking(c: &mut CharXf, tracking: Option<f64>, tracking_type: u32, k: f64) {
+    if let Some(t) = tracking {
+        let t = t * k;
+        match tracking_type {
+            1 => c.track_before += t,
+            2 => c.track_after += t,
+            _ => {
+                c.track_before += t * 0.5;
+                c.track_after += t * 0.5;
+            }
+        }
+    }
 }
 
 /// Character Offset / Character Value substitution (None = unchanged).
@@ -476,6 +560,16 @@ pub fn per_char_3d(ctx: &EvalCtx, layer: &Layer) -> bool {
     layer.is_3d() && layer.props.sub("text").is_some_and(|t| ctx.b(layer, t, "perChar3d"))
 }
 
+/// Animator blur can read glyph pixels beyond a viewport raster window. Conservatively
+/// keep the whole raster even when the current selector happens to select no characters.
+pub(crate) fn animator_blur(ctx: &EvalCtx, layer: &Layer) -> bool {
+    layer.props.group("text/animators").is_some_and(|anims| {
+        anims.groups().filter(|anim| anim.enabled).any(|anim| {
+            anim.sub("properties").and_then(|props| props.get("blur")).is_some_and(|blur| ctx.value(layer, blur).as_vec2().iter().any(|value| *value != 0.0))
+        })
+    })
+}
+
 /// One drawn character.
 #[derive(Clone, Debug)]
 pub struct PlacedGlyph {
@@ -487,6 +581,7 @@ pub struct PlacedGlyph {
     pub fill: [f32; 4],
     pub stroke: [f32; 4],
     pub stroke_width: f64,
+    pub join: effectcraft_path::Join,
     /// Faux Bold (or synthetic bold for a family without a bold face): how far the outline grows
     /// on every side, in character space (0 when not bold).
     pub bold: f64,
@@ -611,11 +706,73 @@ fn align_index(j: Justify) -> u8 {
     }
 }
 
+/// Note the font files `lay` is drawn with in [`EvalCtx::reads`] (#3184), each with its identity
+/// as its bytes were read, so a cache entry of the text is checked against them. What the
+/// files can't vouch for makes the list incomplete: a family that is not installed (installing
+/// it changes the text), a character drawn with a fallback face or with none (another installed
+/// font could take it), a font from memory.
+fn note_fonts(ctx: &EvalCtx, lay: &TextLayout) {
+    note_layout_fonts(ctx, &lay.styles, &lay.layout);
+}
+
+/// A character put in by Character Offset or Character Value (`ch`, in style `st`), outside a
+/// relayout: its outline and advance, with the font it is drawn with noted as [`note_fonts`] does
+/// (the run's face may not have it: a fallback face then draws it).
+fn substituted_glyph(ctx: &EvalCtx, st: &effectcraft_keyframe::CharStyle, ch: char) -> (BezPath, f64) {
+    if ctx.reads.is_some() {
+        // (the layout `char_glyph_style` makes, served from the layout cache there)
+        let lay = effectcraft_text::layout_text(&ch.to_string(), &effectcraft_text::text_style(st), &effectcraft_text::ParagraphStyle::default());
+        note_layout_fonts(ctx, std::slice::from_ref(st), &lay);
+    }
+    char_glyph_style(st, ch)
+}
+
+/// [`note_fonts`] for `layout`, whose glyphs' runs index `styles`.
+fn note_layout_fonts(ctx: &EvalCtx, styles: &[effectcraft_keyframe::CharStyle], layout: &effectcraft_text::Layout) {
+    use crate::reads::{FileStamp, ReadFile};
+    use effectcraft_text::fonts;
+    let Some(log) = ctx.reads else { return };
+    let resolved: Vec<fonts::Resolved> = styles.iter().map(|s| fonts::resolve(&s.font, &s.style)).collect();
+    if resolved.iter().any(|r| r.missing) {
+        log.mark_incomplete();
+    }
+    // Each run's face, glyphs or not: an empty paragraph's face sets its line's metrics (in a
+    // box, the first baseline that places every later line).
+    let mut faces: Vec<fonts::FaceId> = Vec::new();
+    for r in &resolved {
+        if !faces.contains(&r.face) {
+            faces.push(r.face);
+        }
+    }
+    for g in &layout.glyphs {
+        if g.id == 0 || resolved.get(g.run).is_none_or(|r| r.face != g.face) {
+            log.mark_incomplete();
+        }
+        if !faces.contains(&g.face) {
+            faces.push(g.face);
+        }
+    }
+    for id in faces {
+        let face = fonts::face(id);
+        match &face.info.data {
+            fonts::FaceData::Static(_) => {}
+            fonts::FaceData::Shared(_) => log.mark_incomplete(),
+            fonts::FaceData::File(_) => {
+                if let Some((path, meta)) = face.file_read() {
+                    let stamp = meta.map_or(FileStamp::Missing, FileStamp::of_metadata);
+                    log.note(ReadFile::new(path.to_string_lossy().as_ref(), stamp));
+                }
+            }
+        }
+    }
+}
+
 /// Lay out and animate a text layer.
 pub fn text_geom(ctx: &EvalCtx, layer: &Layer) -> Option<TextGeom> {
     let doc = source_text(ctx, layer)?;
     let text = layer.props.sub("text")?;
     let lay = layout_doc(&doc);
+    note_fonts(ctx, &lay);
     let xfs = char_transforms(ctx, layer, text, &lay);
     let three = per_char_3d(ctx, layer);
     let more = text.sub("moreOptions");
@@ -638,6 +795,7 @@ pub fn text_geom(ctx: &EvalCtx, layer: &Layer) -> Option<TextGeom> {
         // Same character count: the style runs still line up.
         let d2 = TextDoc { text: chars.into_iter().collect(), ..doc.clone() };
         let l2 = layout_doc(&d2);
+        note_fonts(ctx, &l2);
         let by_char: std::collections::HashMap<usize, CharXf> = lay.glyphs.iter().zip(&xfs).map(|(g, x)| (g.char_index, *x)).collect();
         let x2: Vec<CharXf> = l2.glyphs.iter().map(|g| by_char.get(&g.char_index).copied().unwrap_or_default()).collect();
         subs = vec![None; l2.glyphs.len()];
@@ -672,10 +830,12 @@ pub fn text_geom(ctx: &EvalCtx, layer: &Layer) -> Option<TextGeom> {
         let (mut la, mut la_k) = (50.0 * f64::from(align_index(justify)), 0.0);
         for gi in li_start..li_end {
             let x = &xfs[gi];
-            let em = lay.styles.get(lay.glyphs[gi].run).map_or(doc.size, |s| s.size) / 1000.0;
-            pen += x.track_before * em;
+            // An animator's Tracking Amount is in pixels, whatever the font size (After Effects
+            // 2026: Amount 30 adds 30 px between selected characters at 80 px and at 40 px), unlike
+            // the Character panel's tracking in 1/1000 em.
+            pen += x.track_before;
             shift[gi] = pen;
-            pen += x.track_after * em + vadv[gi];
+            pen += x.track_after + vadv[gi];
             if x.line_anchor_k > la_k {
                 la = x.line_anchor;
                 la_k = x.line_anchor_k;
@@ -760,7 +920,7 @@ pub fn text_geom(ctx: &EvalCtx, layer: &Layer) -> Option<TextGeom> {
         // Outline (substituted characters aligned in the original slot).
         let (outline, adv) = match subs[gi] {
             Some(c) => {
-                let (p, a) = char_glyph_style(st, c);
+                let (p, a) = substituted_glyph(ctx, st, c);
                 let dx = match x.char_align {
                     0 => 0.0,
                     2 => g.advance - a,
@@ -783,9 +943,12 @@ pub fn text_geom(ctx: &EvalCtx, layer: &Layer) -> Option<TextGeom> {
         };
         // Outline relative to the pivot.
         let local = kurbo::Affine::translate((o[0] - pivot[0], o[1] - pivot[1])) * outline;
-        let char_m = Mat4::rotate_z(x.rotation)
+        // Rx · Ry · Rz (Z turns first): the order After Effects gives a 3D layer's X / Y / Z
+        // Rotation too. #1876 moves layers to it with a helper, `Mat4::rotation_xyz`; once both
+        // land, this should call that helper (one convention, one place).
+        let char_m = Mat4::rotate_x(x.rotation_x)
             * Mat4::rotate_y(x.rotation_y)
-            * Mat4::rotate_x(x.rotation_x)
+            * Mat4::rotate_z(x.rotation)
             * Mat4::from_mat3_affine(&Mat3::skew_deg(-x.skew, x.skew_axis))
             * Mat4::scale(Vec3::from(x.scale) / 100.0)
             * Mat4::translate(-Vec3::from(x.anchor));
@@ -810,6 +973,7 @@ pub fn text_geom(ctx: &EvalCtx, layer: &Layer) -> Option<TextGeom> {
             fill,
             stroke,
             stroke_width: (base_stroke_w + x.stroke_width).max(0.0),
+            join: path_join(doc.line_join),
             bold: if g.synth_bold { FAUX_BOLD_RADIUS * g.size } else { 0.0 },
             apply_fill: st.apply_fill,
             char_index: g.char_index,
@@ -823,6 +987,15 @@ pub fn text_geom(ctx: &EvalCtx, layer: &Layer) -> Option<TextGeom> {
 /// and hit testing).
 pub fn glyph_paths(ctx: &EvalCtx, layer: &Layer) -> Vec<(BezPath, CharXf)> {
     text_geom(ctx, layer).map(|t| t.glyphs.iter().map(|g| (g.path(), g.xf)).collect()).unwrap_or_default()
+}
+
+fn path_join(j: effectcraft_keyframe::LineJoin) -> effectcraft_path::Join {
+    use effectcraft_keyframe::LineJoin;
+    match j {
+        LineJoin::Miter => effectcraft_path::Join::Miter,
+        LineJoin::Round => effectcraft_path::Join::Round,
+        LineJoin::Bevel => effectcraft_path::Join::Bevel,
+    }
 }
 
 /// One paint pass of a glyph: fill (false) or stroke (true).
@@ -891,7 +1064,7 @@ fn raster_pass(g: &PlacedGlyph, stroke: bool, paths: &[BezPath], m: &Mat3, rect:
         }
         outer
     } else if stroke {
-        let st = StrokeStyle { width: g.stroke_width, join: effectcraft_path::Join::Round, ..Default::default() };
+        let st = StrokeStyle { width: g.stroke_width, join: g.join, ..Default::default() };
         effectcraft_path::stroke_coverage(paths, &st, &mm, w, h)
     } else {
         grown_coverage(paths, &mm, w, h, bold)
@@ -1010,8 +1183,46 @@ fn draw_glyphs(geom: &TextGeom, img: &mut Image, to_px: &Mat3, s: f64, only: Opt
     }
 }
 
+/// Buffer pixels kept around a clip (see [`raster_window`]).
+const CLIP_PAD: f64 = 24.0;
+
+/// The buffer for content bounds `b` (layer space) at scale `s`: (width, height, layer → buffer
+/// offset), two pixels of padding around it. With `clip`, only the pixels of that grid inside
+/// `clip`, padded by [`CLIP_PAD`]: a whole-pixel window of the whole buffer's grid. Its pixels are
+/// the whole buffer's, except that a glyph cut by the window is rasterised from the window's edge:
+/// tiny-skia's 4 × 4 anti-aliasing then lands a sub-sample differently on a few edge pixels, up to
+/// a dozen rows in from that edge — inside the padding, out of the frame. `None` when `clip`
+/// misses the content.
+pub(crate) fn raster_window(b: kurbo::Rect, s: f64, clip: Option<kurbo::Rect>) -> Option<(u32, u32, [f64; 2])> {
+    let (full_w, full_h) = ((b.width() * s).ceil() + 4.0, (b.height() * s).ceil() + 4.0);
+    let full = [-b.x0 * s + 2.0, -b.y0 * s + 2.0];
+    let (x0, y0, x1, y1) = match clip {
+        None => (0.0, 0.0, full_w, full_h),
+        // Nothing shows (behind the camera).
+        Some(c) if c.area() <= 0.0 => return None,
+        Some(c) => (
+            (c.x0 * s + full[0] - CLIP_PAD).floor().max(0.0),
+            (c.y0 * s + full[1] - CLIP_PAD).floor().max(0.0),
+            (c.x1 * s + full[0] + CLIP_PAD).ceil().min(full_w),
+            (c.y1 * s + full[1] + CLIP_PAD).ceil().min(full_h),
+        ),
+    };
+    if !(x1 > x0 && y1 > y0) {
+        return None;
+    }
+    let w = ((x1 - x0) as u32).clamp(1, 16384);
+    let h = ((y1 - y0) as u32).clamp(1, 16384);
+    Some((w, h, [full[0] - x0, full[1] - y0]))
+}
+
 /// Render a text layer into a layer-space buffer at scale `s`.
 pub fn render(ctx: &EvalCtx, layer: &Layer, s: f64) -> Buf {
+    render_in(ctx, layer, s, None)
+}
+
+/// [`render`], only the part of the layer inside `clip` (layer space; the part the output shows,
+/// see `Renderer::raster_clip`).
+pub fn render_in(ctx: &EvalCtx, layer: &Layer, s: f64, clip: Option<kurbo::Rect>) -> Buf {
     let empty = || Buf { img: Image::new(1, 1), offset: [0.0; 2], scale: s };
     let Some(geom) = text_geom(ctx, layer) else { return empty() };
     let mut bounds: Option<kurbo::Rect> = None;
@@ -1025,9 +1236,7 @@ pub fn render(ctx: &EvalCtx, layer: &Layer, s: f64) -> Buf {
     }
     let Some(b) = bounds else { return empty() };
     let b = b.intersect(kurbo::Rect::new(-20000.0, -20000.0, 20000.0, 20000.0));
-    let w = ((b.width() * s).ceil() as u32 + 4).clamp(1, 16384);
-    let h = ((b.height() * s).ceil() as u32 + 4).clamp(1, 16384);
-    let offset = [-b.x0 * s + 2.0, -b.y0 * s + 2.0];
+    let Some((w, h, offset)) = raster_window(b, s, clip) else { return empty() };
     let mut img = Image::new(w, h);
     let base = Mat3::translate(vec2(offset[0], offset[1])) * Mat3::scale(vec2(s, s));
     draw_glyphs(&geom, &mut img, &base, s, None);

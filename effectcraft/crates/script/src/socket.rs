@@ -55,7 +55,7 @@ mod imp {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use super::*;
+    use super::{J, err, json};
 
     enum Sock {
         Stream { s: TcpStream, buf: Vec<u8>, eof: bool },
@@ -89,7 +89,7 @@ mod imp {
             Sock::Listener(_) => None,
         };
         let entry = Arc::new(Entry { sock: Mutex::new(s), wake, closed: AtomicBool::new(false) });
-        let mut t = table().lock().unwrap_or_else(|e| e.into_inner());
+        let mut t = table().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let id = t.next;
         t.next += 1;
         t.socks.insert(id, entry);
@@ -98,12 +98,12 @@ mod imp {
 
     /// The socket `id`, if open. The table is locked only for the lookup.
     fn get(id: u32) -> Option<Arc<Entry>> {
-        table().lock().unwrap_or_else(|e| e.into_inner()).socks.get(&id).cloned()
+        table().lock().unwrap_or_else(std::sync::PoisonError::into_inner).socks.get(&id).cloned()
     }
 
     /// Forget socket `id`; a call blocked on it fails at once.
     fn close(id: u32) {
-        let entry = table().lock().unwrap_or_else(|e| e.into_inner()).socks.remove(&id);
+        let entry = table().lock().unwrap_or_else(std::sync::PoisonError::into_inner).socks.remove(&id);
         if let Some(entry) = entry {
             entry.closed.store(true, Ordering::Release);
             if let Some(w) = &entry.wake {
@@ -142,7 +142,7 @@ mod imp {
 
     /// Fill a stream's buffer until `done(buf)` or the timeout / end of stream. Fails only when
     /// the read deadline can't be set.
-    fn fill(s: &mut TcpStream, buf: &mut Vec<u8>, eof: &mut bool, limit: Duration, done: impl Fn(&[u8]) -> bool) -> std::io::Result<()> {
+    fn fill(s: &mut TcpStream, buf: &mut Vec<u8>, eof: &mut bool, limit: Duration, mut done: impl FnMut(&[u8]) -> bool) -> std::io::Result<()> {
         let end = Instant::now() + limit;
         let mut chunk = [0u8; 4096];
         while !done(buf) && !*eof {
@@ -261,7 +261,7 @@ mod imp {
                         _ => err("the socket is not open"),
                     };
                 };
-                let mut sock = entry.sock.lock().unwrap_or_else(|e| e.into_inner());
+                let mut sock = entry.sock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 // Recheck after locking: close or a failed mode transition may have retired it
                 // while this caller waited with an Arc obtained from the table.
                 if entry.closed.load(Ordering::Acquire) {
@@ -322,7 +322,15 @@ mod imp {
                         }
                     }
                     ("readln", Sock::Stream { s, buf, eof }) => {
-                        if let Err(e) = fill(s, buf, eof, timeout(p), |b| b.contains(&b'\n')) {
+                        // Only the bytes that arrived since the last look are searched: a peer
+                        // sending no newline must not make every read rescan the whole buffer.
+                        let mut seen = 0;
+                        let newline = |b: &[u8]| {
+                            let hit = b.get(seen..).is_some_and(|new| new.contains(&b'\n'));
+                            seen = b.len();
+                            hit
+                        };
+                        if let Err(e) = fill(s, buf, eof, timeout(p), newline) {
                             return err(format!("cannot set the read timeout: {e}"));
                         }
                         let line: Vec<u8> = match buf.iter().position(|&c| c == b'\n') {
@@ -394,19 +402,33 @@ mod tests {
 
     /// Fill bounded socket buffers nonblocking, rather than assuming a 64 MiB write stalls.
     /// In particular, Windows may accept that entire write with its default send buffering.
+    /// Writes must stay blocked for [`SETTLED`] before the buffers count as full: on macOS the
+    /// accepted stream does not keep the listener's 4 KiB receive buffer (it gets about 114 KiB),
+    /// so the first `WouldBlock` only means the 4 KiB send buffer is full, and the send buffer then
+    /// drains into the peer's larger receive buffer.
     fn backpressure(id: u32) {
+        const SETTLED: Duration = Duration::from_millis(200);
         let mut stream = super::imp::test_stream(id);
         socket2::SockRef::from(&stream).set_send_buffer_size(4096).unwrap();
         stream.set_nonblocking(true).unwrap();
         let start = Instant::now();
         let chunk = [b'x'; 4096];
         let mut sent = 0;
+        let mut blocked_since = None;
         loop {
             assert!(sent < 16 * 1024 * 1024 && start.elapsed() < Duration::from_secs(5), "could not establish backpressure");
             match stream.write(&chunk) {
                 Ok(0) => panic!("peer closed while establishing backpressure"),
-                Ok(n) => sent += n,
-                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Ok(n) => {
+                    sent += n;
+                    blocked_since = None;
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    if blocked_since.get_or_insert_with(Instant::now).elapsed() >= SETTLED {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(e) => panic!("establishing backpressure: {e}"),
             }

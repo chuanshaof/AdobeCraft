@@ -270,7 +270,7 @@ fn line_get(horizontal: bool, line: i32, i: i32, n: i32, repeat: bool) -> vec4<f
 }
 
 // One box pass of radius r along rows (horizontal) or columns, as running sums over blocks of
-// `block` pixels (each block restarts its sum, as the CPU's vertical pass does).
+// `block` pixels (each block restarts its sum, as the CPU's vertical pass does; rows are one block).
 fn box_pass(gid: vec3<u32>, horizontal: bool) {
     let dims = out_dims();
     let r = i32(P.u[0].x);
@@ -289,8 +289,24 @@ fn box_pass(gid: vec3<u32>, horizontal: bool) {
     }
     let norm = 1.0 / f32(2 * r + 1);
     var acc = vec4<f32>(0.0);
-    for (var i = b0 - r; i <= b0 + r; i++) {
+    // The starting window, as the CPU sums it: the pixels inside the line once each, and the
+    // repeated edge pixels counted rather than visited (a radius far past the line, such as
+    // Gaussian Blur's at Blurriness 30000, would otherwise loop over it once per pixel).
+    let lo = b0 - r;
+    let hi = b0 + r;
+    for (var i = max(lo, 0); i <= min(hi, n - 1); i++) {
         acc += line_get(horizontal, line, i, n, repeat);
+    }
+    if (repeat) {
+        let before = f32(max(-lo, 0));
+        let after = f32(max(hi - (n - 1), 0));
+        // A zero count adds nothing (0 * NaN would be NaN).
+        if (before > 0.0) {
+            acc += line_get(horizontal, line, 0, n, repeat) * before;
+        }
+        if (after > 0.0) {
+            acc += line_get(horizontal, line, n - 1, n, repeat) * after;
+        }
     }
     let b1 = min(b0 + block, n);
     for (var i = b0; i < b1; i++) {
@@ -380,19 +396,31 @@ fn glow_bright(@builtin(global_invocation_id) gid: vec3<u32>) {
         l = a;
     }
     let k = clamp((l - thr) / max(1.0 - thr, 1e-3), 0.0, 1.0);
+    // Based on the colour channels the glow covers the layer's whole alpha (effects::misc::glow).
+    var ga = a;
+    if (P.u[0].y != 0u) {
+        ga = k * a;
+    }
     if (P.u[0].x != 0u) {
         let t = glow_ab_t(l);
         let ca = P.f[1].xyz;
         let cb = P.f[2].xyz;
         let c = ca + (cb - ca) * t;
-        textureStore(out, p, vec4<f32>(c * k * a, k * a));
+        textureStore(out, p, vec4<f32>(c * k * a, ga));
+    } else if (P.u[0].y != 0u) {
+        textureStore(out, p, vec4<f32>(px.xyz * k, ga));
     } else {
-        textureStore(out, p, px * k);
+        // Original colours, per channel (effects::misc::glow_bright_channel): gain 8.0 is
+        // effects::GLOW_GAIN, 0.0611 is effects::GLOW_KNEE (checked by the test
+        // glow_constants_match_the_cpu).
+        let c = max(8.0 * (px.xyz / a - vec3<f32>(thr - 0.0611)), vec3<f32>(0.0));
+        textureStore(out, p, vec4<f32>(c * a, ga));
     }
 }
 
 // Glow composite: original `src` with the blurred glow `aux`. u[0].x = 0 on top, 1 behind,
-// 2 none (glow only); f[0].x = intensity.
+// 2 none (glow only); u[0].y = based on alpha (intensity also scales the glow's alpha);
+// f[0].x = intensity.
 @compute @workgroup_size(16, 16)
 fn glow_combine(@builtin(global_invocation_id) gid: vec3<u32>) {
     let dims = out_dims();
@@ -401,7 +429,11 @@ fn glow_combine(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     var o = textureLoad(src, p, 0);
-    let g = textureLoad(aux, p, 0) * P.f[0].x;
+    let gs = textureLoad(aux, p, 0);
+    var g = vec4<f32>(gs.xyz * P.f[0].x, gs.w);
+    if (P.u[0].y != 0u) {
+        g.w = gs.w * P.f[0].x;
+    }
     if (P.u[0].x == 2u) {
         o = g;
     } else if (P.u[0].x == 1u) {
@@ -509,12 +541,25 @@ fn fade(t: f32) -> f32 {
 }
 
 fn value_noise(x: f32, y: f32, z: f32, seed: u32) -> f32 {
+    return value_noise_z(x, y, z, seed, true);
+}
+
+// effects::generate::value_noise_linear_z: z (evolution) interpolates linearly, x and y keep the
+// quintic fade (Turbulent Displace, #943).
+fn value_noise_linear_z(x: f32, y: f32, z: f32, seed: u32) -> f32 {
+    return value_noise_z(x, y, z, seed, false);
+}
+
+fn value_noise_z(x: f32, y: f32, z: f32, seed: u32, ease_z: bool) -> f32 {
     let x0 = floor(x);
     let y0 = floor(y);
     let z0 = floor(z);
     let fx = fade(x - x0);
     let fy = fade(y - y0);
-    let fz = fade(z - z0);
+    var fz = z - z0;
+    if (ease_z) {
+        fz = fade(fz);
+    }
     let ix = i32(x0);
     let iy = i32(y0);
     let iz = i32(z0);
@@ -589,7 +634,8 @@ fn straight(px: vec4<f32>) -> vec3<f32> {
 //  9 Gradient Ramp   f[0] = (sx, sy, ex, ey); f[1] = start colour; f[2] = end colour;
 //                    f[3] = (len2, scatter, blend); u[0] = (_, radial, seed)
 // 10 Fractal Noise   f[0] = (contrast, brightness, scale x, frac); f[1] = (ox, oy, sr, cr);
-//                    f[2] = (evo, blend, opacity, scale y); f[3] = (sub influence, 1 / sub scaling);
+//                    f[2] = (evo, blend, opacity, scale y); f[3] = (sub influence, 1 / sub scaling,
+//                    OCTAVE_SCALE_MAX);
 //                    u[0] = (_, kind, n_oct, seed); u[1] = (invert, overflow, normal blend)
 @compute @workgroup_size(16, 16)
 fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -827,6 +873,7 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
             let scale_y = P.f[2].w;
             let infl = P.f[3].x;
             let fmul = P.f[3].y;
+            let fmax = P.f[3].z;
             let frac = P.f[0].w;
             let ox = P.f[1].x;
             let oy = P.f[1].y;
@@ -859,7 +906,8 @@ fn pointwise(@builtin(global_invocation_id) gid: vec3<u32>) {
                 sum += n * amp * w;
                 norm += amp * w;
                 amp *= infl;
-                f *= fmul;
+                // noise3::next_octave: the frequency stays within OCTAVE_SCALE_MAX (#3486).
+                f = clamp(f * fmul, 1.0 / fmax, fmax);
             }
             var val = sum / max(norm, 1e-6);
             val = (val - 0.5) * contrast + 0.5 + brightness;

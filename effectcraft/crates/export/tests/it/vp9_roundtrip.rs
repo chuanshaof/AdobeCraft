@@ -1,8 +1,8 @@
-//! The VP9 intra encoder (`effectcraft-vp9enc`) round-trips through FilmCraft's VP9 decoder (and
+//! The VP9 intra encoder (`craft_video::vp9`) round-trips through craft-video's VP9 decoder (and
 //! ffmpeg as an external oracle when installed): sizes, lossless exactness, PSNR.
 
-use effectcraft_vp9enc::{EncoderConfig, Vp9Encoder};
-use filmcraft_vp9::{Decoder, Plane};
+use craft_video::vp9::decode::{Decoder, Picture, Plane};
+use craft_video::vp9::{EncoderConfig, Vp9Encoder};
 
 fn plane_u8(p: &Plane) -> Vec<u8> {
     match p {
@@ -40,8 +40,8 @@ fn source(w: usize, h: usize, kind: u32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     (y, u, v)
 }
 
-fn decode(frame: &[u8]) -> filmcraft_vp9::Picture {
-    let mut d = Decoder::new();
+fn decode(frame: &[u8]) -> Picture {
+    let mut d = Decoder::with_threads(1);
     let mut pics = d.decode(frame, 0).expect("decode");
     assert_eq!(pics.len(), 1);
     pics.remove(0)
@@ -130,8 +130,8 @@ fn ffmpeg_decodes_our_stream() {
     ivf.extend_from_slice(&(frame.len() as u32).to_le_bytes());
     ivf.extend_from_slice(&0u64.to_le_bytes());
     ivf.extend_from_slice(&frame);
-    let dir = std::env::temp_dir().join(format!("effectcraft-vp9-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let guard = tempfile::tempdir().unwrap();
+    let dir = guard.path().to_path_buf();
     let path = dir.join("a.ivf");
     std::fs::write(&path, &ivf).unwrap();
     let out = std::process::Command::new("ffmpeg")
@@ -179,7 +179,7 @@ fn moving(w: usize, h: usize, t: usize, kind: u32) -> (Vec<u8>, Vec<u8>, Vec<u8>
     (y, u, v)
 }
 
-fn planes_of(p: &filmcraft_vp9::Picture, w: usize, h: usize) -> [Vec<u8>; 3] {
+fn planes_of(p: &Picture, w: usize, h: usize) -> [Vec<u8>; 3] {
     let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
     [crop(&plane_u8(&p.y), p.y_stride, w, h), crop(&plane_u8(&p.u), p.uv_stride, cw, ch), crop(&plane_u8(&p.v), p.uv_stride, cw, ch)]
 }
@@ -189,7 +189,7 @@ fn planes_of(p: &filmcraft_vp9::Picture, w: usize, h: usize) -> [Vec<u8>; 3] {
 fn run_sequence(cfg: EncoderConfig, n: usize, kind: u32) -> (usize, f64) {
     let (w, h) = (cfg.width as usize, cfg.height as usize);
     let mut e = Vp9Encoder::new(cfg);
-    let mut d = Decoder::new();
+    let mut d = Decoder::with_threads(1);
     let (mut bytes, mut db) = (0usize, 0.0);
     for t in 0..n {
         let (y, u, v) = moving(w, h, t, kind);
@@ -291,8 +291,8 @@ fn ffmpeg_matches(w: usize, h: usize, frames: &[Vec<u8>], recon: &[[Vec<u8>; 3]]
         ivf.extend_from_slice(&(t as u64).to_le_bytes());
         ivf.extend_from_slice(f);
     }
-    let dir = std::env::temp_dir().join(format!("effectcraft-vp9-{name}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let guard = tempfile::Builder::new().prefix(&format!("effectcraft-vp9-{name}-")).tempdir().unwrap();
+    let dir = guard.path().to_path_buf();
     let path = dir.join("a.ivf");
     std::fs::write(&path, &ivf).unwrap();
     let out = std::process::Command::new("ffmpeg")
@@ -344,7 +344,7 @@ fn frames_never_end_in_a_superframe_marker() {
     }
     let Some((w, h, q, frames, recon)) = padded else { panic!("no frame needed the padding: widen the search") };
     // The padded frames decode exactly, with FilmCraft's decoder and with ffmpeg.
-    let mut d = Decoder::new();
+    let mut d = Decoder::with_threads(1);
     for (t, (f, r)) in frames.iter().zip(&recon).enumerate() {
         let mut pics = d.decode(f, t as i64).unwrap_or_else(|e| panic!("{w}x{h} q{q} frame {t}: {e:?}"));
         assert_eq!(planes_of(&pics.remove(0), w, h), *r, "{w}x{h} q{q} frame {t}");

@@ -12,7 +12,9 @@ fn harness() -> (Harness<'static, EffectcraftApp>, u64) {
     let mut s = Session::default();
     s.execute("comp.new", json!({"name": "Main", "width": 320, "height": 180, "duration": 4, "fps": 24})).unwrap();
     let comp = s.active_comp_id().unwrap().0;
-    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).build_eframe(|_| EffectcraftApp::new(s));
+    // Arabic, Hebrew, Devanagari and Thai names typed below need installed system faces: draw
+    // tofu on a host without them rather than failing the missing-glyph gate.
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 1000.0)).allow_missing_glyphs().build_eframe(|_| EffectcraftApp::new(s));
     h.run_steps(4);
     (h, comp)
 }
@@ -402,6 +404,94 @@ fn tab_commits_a_value_and_moves_to_the_next() {
     assert_eq!(value(&h, "effects/#2/slider"), [42.0]);
 }
 
+/// #3195: a value field reads typed arithmetic, as in After Effects: `960/2` sets 480, a leading
+/// `*` applies to the value shown, and text that is no number (a division by zero) keeps the
+/// value with no undo step. In the Timeline and in Effect Controls.
+#[test]
+fn typed_arithmetic_sets_a_value() {
+    let (mut h, _) = harness();
+    let (layer, transform) = {
+        let s = &mut h.state_mut().session;
+        let l = s.execute("layer.newSolid", json!({"name": "Plate", "color": "#406080"})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("layer.select", json!({"layers": [l]})).unwrap();
+        s.execute("effect.apply", json!({"layers": [l], "effect": "Point Control"})).unwrap();
+        s.execute("prop.set", json!({"layer": l, "path": "transform/position", "value": [160.0, 90.0]})).unwrap();
+        let tr = s.active_comp().unwrap().layer(effectcraft_engine::project::LayerId(l)).unwrap().props.sub("transform").unwrap().uid;
+        (l, tr)
+    };
+    h.state_mut().ui.timeline.open_layers.insert(layer);
+    h.state_mut().ui.timeline.open_groups.insert(transform);
+    h.state_mut().show_panel(effectcraft_ui_egui::dock::PanelKind::EffectControls);
+    h.run_steps(3);
+    let props =
+        |h: &Harness<'_, EffectcraftApp>| h.state().session.active_comp().unwrap().layer(effectcraft_engine::project::LayerId(layer)).unwrap().props.clone();
+    let value = |h: &Harness<'_, EffectcraftApp>, path: &str| props(h).prop(path).unwrap().value.components();
+    let position = props(&h).prop("transform/position").unwrap().uid;
+    assert_eq!(value(&h, "transform/position")[..2], [160.0, 90.0]);
+    let type_into = |h: &mut Harness<'_, EffectcraftApp>, id: &str, text: &str| {
+        // (Settle first: a click right after the last one's would count as part of a double click.)
+        h.run_steps(5);
+        let p = center(h, id);
+        click(h, p, 1);
+        type_text(h, text);
+        key(h, Key::Enter);
+    };
+    type_into(&mut h, &format!("timeline.prop.{position}.value.0"), "960/2");
+    assert_eq!(value(&h, "transform/position")[..2], [480.0, 90.0], "960/2 is 480");
+    type_into(&mut h, &format!("timeline.prop.{position}.value.1"), "*2");
+    assert_eq!(value(&h, "transform/position")[..2], [480.0, 180.0], "*2 doubles the value shown");
+    let undo = h.state().session.history.undo.len();
+    type_into(&mut h, &format!("timeline.prop.{position}.value.0"), "1/0");
+    assert_eq!(value(&h, "transform/position")[..2], [480.0, 180.0], "a division by zero keeps the value");
+    assert_eq!(h.state().session.history.undo.len(), undo, "and adds no undo step");
+    let point = props(&h).prop("effects/#1/point").unwrap().uid;
+    type_into(&mut h, &format!("effectControls.prop.{point}.value.1"), "(3+4)*2");
+    assert_eq!(value(&h, "effects/#1/point")[1], 14.0);
+}
+
+/// #3195: with several layers selected, a typed `+10` or `*2` takes each layer's own value one
+/// step on; it doesn't give them all the edited layer's result.
+#[test]
+fn a_typed_step_applies_to_each_selected_layer() {
+    let (mut h, _) = harness();
+    let (a, b, transform) = {
+        let s = &mut h.state_mut().session;
+        let mut ids = vec![];
+        for (name, opacity) in [("A", 40.0), ("B", 30.0)] {
+            let l = s.execute("layer.newSolid", json!({"name": name, "color": "#406080"})).unwrap()["layer"].as_u64().unwrap();
+            s.execute("prop.set", json!({"layer": l, "path": "transform/opacity", "value": opacity})).unwrap();
+            ids.push(l);
+        }
+        s.execute("layer.select", json!({"layers": ids})).unwrap();
+        let tr = s.active_comp().unwrap().layer(effectcraft_engine::project::LayerId(ids[0])).unwrap().props.sub("transform").unwrap().uid;
+        (ids[0], ids[1], tr)
+    };
+    h.state_mut().ui.timeline.open_layers.insert(a);
+    h.state_mut().ui.timeline.open_groups.insert(transform);
+    h.run_steps(3);
+    let opacity_of = |h: &Harness<'_, EffectcraftApp>, l: u64| {
+        h.state().session.active_comp().unwrap().layer(effectcraft_engine::project::LayerId(l)).unwrap().props.prop("transform/opacity").unwrap().value.as_f64()
+    };
+    let opacity = h.state().session.active_comp().unwrap().layer(effectcraft_engine::project::LayerId(a)).unwrap().props.prop("transform/opacity").unwrap().uid;
+    for (text, expected) in [("+10", (50.0, 40.0)), ("*2", (100.0, 80.0)), ("/4", (25.0, 20.0)), ("60", (60.0, 60.0))] {
+        let p = center(&h, &format!("timeline.prop.{opacity}.value"));
+        click(&mut h, p, 1);
+        type_text(&mut h, text);
+        key(&mut h, Key::Enter);
+        assert_eq!((opacity_of(&h, a), opacity_of(&h, b)), expected, "{text}");
+    }
+    // `+10` where the edited layer stops at 100: the others still add 10, not the 5 it moved.
+    for (l, v) in [(a, 95.0), (b, 30.0)] {
+        h.state_mut().session.execute("prop.set", json!({"layer": l, "path": "transform/opacity", "value": v})).unwrap();
+    }
+    h.run_steps(5);
+    let p = center(&h, &format!("timeline.prop.{opacity}.value"));
+    click(&mut h, p, 1);
+    type_text(&mut h, "+10");
+    key(&mut h, Key::Enter);
+    assert_eq!((opacity_of(&h, a), opacity_of(&h, b)), (100.0, 40.0));
+}
+
 /// A click at `p` with `modifiers` held.
 fn click_with(h: &mut Harness<'_, EffectcraftApp>, p: Pos2, modifiers: Modifiers) {
     h.input_mut().events.push(Event::PointerMoved(p));
@@ -436,8 +526,11 @@ fn ctrl_click_on_the_time_display_toggles_timecode_and_frames() {
     click_with(&mut h, at, Modifiers::COMMAND);
     assert_eq!(style(&h), TimeDisplayStyle::Timecode);
     assert_eq!(shown(&h, "timeline.timecode"), "0:00:01:06");
-    // A plain click changes nothing.
+    // A plain click leaves the display alone: it opens Go to Time (#3373), closed here.
     click_with(&mut h, at, Modifiers::NONE);
+    assert_eq!(style(&h), TimeDisplayStyle::Timecode);
+    key(&mut h, Key::Escape);
+    assert!(h.query_by_label("Go to Time").is_none(), "Go to Time closed");
     let at = center(&h, "timeline.timecode");
     click_with(&mut h, at, Modifiers::NONE);
     assert_eq!(style(&h), TimeDisplayStyle::Timecode);
@@ -632,6 +725,166 @@ fn an_expression_added_at_the_bottom_of_the_timeline_comes_into_view() {
     assert_eq!(expression(&h, layer, opacity).as_deref(), Some("25"));
 }
 
+/// #1460: Alt-clicking an effect property's stopwatch in Effect Controls adds an expression, as in
+/// the Timeline (it toggled the animation instead). Effect Controls has no expression field, so,
+/// as in After Effects, the property shows in the Timeline (its layer and effect twirled open,
+/// scrolled into view) with the new expression's editor taking the keyboard: typing replaces
+/// it. Another Alt-click removes it and leaves nothing holding the keyboard.
+#[test]
+fn alt_clicking_a_stopwatch_in_effect_controls_edits_the_expression_in_the_timeline() {
+    let (mut h, _) = harness();
+    let (layer, slider) = {
+        let s = &mut h.state_mut().session;
+        let l = s.execute("layer.newSolid", json!({"name": "Plate", "color": "#406080"})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("effect.apply", json!({"layers": [l], "effect": "Slider Control"})).unwrap();
+        // Layers above push it below the bottom of the Timeline.
+        for i in 0..40 {
+            s.execute("layer.newSolid", json!({"name": format!("Layer {i}"), "color": "#204060"})).unwrap();
+        }
+        s.execute("layer.select", json!({"layers": [l]})).unwrap();
+        let slider = s.active_comp().unwrap().layer(effectcraft_engine::project::LayerId(l)).unwrap().props.prop("effects/#1/slider").unwrap().uid;
+        (l, slider)
+    };
+    h.state_mut().show_panel(effectcraft_ui_egui::dock::PanelKind::EffectControls);
+    h.run_steps(3);
+    let editor = format!("timeline.prop.{slider}.expression");
+    assert!(h.state().auto.find(&format!("timeline.prop.{slider}.row")).is_none(), "the property is not in the Timeline yet");
+    let alt = Modifiers { alt: true, ..Modifiers::NONE };
+    let at = center(&h, &format!("effectControls.prop.{slider}.stopwatch"));
+    click_with(&mut h, at, alt);
+    assert!(expression(&h, layer, slider).is_some(), "an expression was added");
+    let key = h.state().session.active_comp().unwrap().layer(effectcraft_engine::project::LayerId(layer)).unwrap().props.find(slider).unwrap().is_animated();
+    assert!(!key, "Alt-click doesn't turn on keyframing");
+    assert!(h.state().ui.timeline.reveal_props.contains(&slider), "the property is revealed in the Timeline");
+    let rows = h.state().auto.find("timeline.scroll").expect("the Timeline is shown").rect;
+    let e = h.state().auto.find(&editor).expect("the Timeline draws the expression editor").rect;
+    assert!(e[1] >= rows[1] - 0.5 && e[1] + e[3] <= rows[1] + rows[3] + 0.5, "the editor is in view: {e:?} in {rows:?}");
+    type_text(&mut h, "42");
+    commit_expression(&mut h);
+    assert_eq!(expression(&h, layer, slider).as_deref(), Some("42"), "typing replaced the new expression");
+    // Alt-click again removes the expression and its editor with it (the keyboard stays free;
+    // the editor's focus request was taken when it was added, so this doesn't exercise the
+    // cancel path).
+    let at = center(&h, &format!("effectControls.prop.{slider}.stopwatch"));
+    click_with(&mut h, at, alt);
+    h.run_steps(5);
+    assert_eq!(expression(&h, layer, slider), None);
+    assert!(h.state().auto.find(&editor).is_none(), "the expression editor is gone");
+    assert!(!h.ctx.egui_wants_keyboard_input(), "nothing has the keyboard");
+}
+
+fn right_click(h: &mut Harness<'_, EffectcraftApp>, p: Pos2) {
+    h.input_mut().events.push(Event::PointerMoved(p));
+    h.step();
+    h.input_mut().events.push(Event::PointerButton { pos: p, button: PointerButton::Secondary, pressed: true, modifiers: Modifiers::NONE });
+    h.step();
+    h.input_mut().events.push(Event::PointerButton { pos: p, button: PointerButton::Secondary, pressed: false, modifiers: Modifiers::NONE });
+    h.run_steps(3);
+}
+
+/// Right-click Opacity's `target` (its stopwatch or name) in the Timeline, pick Add Expression
+/// and type `text` without another click: the new expression's editor has the keyboard.
+fn add_expression_from_menu(target: &str, text: &str) {
+    let (mut h, _) = harness();
+    let (layer, opacity, _) = open_transform(&mut h, "Plate");
+    let at = center(&h, &format!("timeline.prop.{opacity}.{target}"));
+    right_click(&mut h, at);
+    let item = format!("timeline.prop.{opacity}.menu.addExpression");
+    assert!(h.state().auto.find(&item).is_some(), "the {target}'s menu offers Add Expression");
+    let animated =
+        h.state().session.active_comp().unwrap().layer(effectcraft_engine::project::LayerId(layer)).unwrap().props.find(opacity).unwrap().is_animated();
+    assert!(!animated, "the right-click didn't toggle the stopwatch");
+    let at = center(&h, &item);
+    click(&mut h, at, 1);
+    assert!(expression(&h, layer, opacity).is_some(), "an expression was added from the {target}'s menu");
+    type_text(&mut h, text);
+    commit_expression(&mut h);
+    assert_eq!(expression(&h, layer, opacity).as_deref(), Some(text), "typing replaced the expression added from the {target}'s menu");
+}
+
+/// #3192: Linux window managers take Alt+click to move the window, so the stopwatch has a
+/// right-click menu whose Add Expression does what the Alt-click does: the expression is added
+/// and its editor takes the keyboard (the stopwatch itself isn't toggled).
+#[test]
+fn add_expression_from_the_stopwatch_menu_focuses_the_new_expression() {
+    add_expression_from_menu("stopwatch", "50");
+}
+
+/// #3192: Add Expression from the property name's menu opens the editor with the keyboard too,
+/// as the Alt-click does (it took another click).
+#[test]
+fn add_expression_from_the_name_menu_focuses_the_new_expression() {
+    add_expression_from_menu("name", "90");
+}
+
+/// A primary-button drag from `from` to `to` with `modifiers` held from the press to the release.
+fn drag_with(h: &mut Harness<'_, EffectcraftApp>, from: Pos2, to: Pos2, modifiers: Modifiers) {
+    h.input_mut().events.push(Event::PointerMoved(from));
+    h.input_mut().events.push(Event::ModifiersChanged(modifiers));
+    h.step();
+    h.input_mut().events.push(Event::PointerButton { pos: from, button: PointerButton::Primary, pressed: true, modifiers });
+    h.step();
+    for k in 1..=8 {
+        h.input_mut().events.push(Event::PointerMoved(from + (to - from) * (k as f32 / 8.0)));
+        h.step();
+    }
+    h.input_mut().events.push(Event::PointerButton { pos: to, button: PointerButton::Primary, pressed: false, modifiers });
+    h.step();
+    h.input_mut().events.push(Event::ModifiersChanged(Modifiers::NONE));
+    h.run_steps(3);
+}
+
+/// #1072: with Alt held as it drops, a pick whip refers to an effect's property by its index,
+/// `effect("Slider Control")(1)`, as in After Effects; without Alt, by its name. Onto Effect
+/// Controls or the Timeline, and into the expression being edited (with a dimension).
+#[test]
+fn an_alt_pick_whip_refers_to_an_effect_property_by_index() {
+    let (mut h, _) = harness();
+    let (layer, opacity, transform, effects) = {
+        let s = &mut h.state_mut().session;
+        let l = s.execute("layer.newSolid", json!({"name": "Plate", "color": "#406080"})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("layer.select", json!({"layers": [l]})).unwrap();
+        for fx in ["Slider Control", "Point Control"] {
+            s.execute("effect.apply", json!({"layers": [l], "effect": fx})).unwrap();
+        }
+        let props = s.active_comp().unwrap().layer(effectcraft_engine::project::LayerId(l)).unwrap().props.clone();
+        let effects: Vec<u64> = std::iter::once(props.sub("effects").unwrap().uid).chain(props.sub("effects").unwrap().groups().map(|g| g.uid)).collect();
+        (l, props.sub("transform").unwrap().get("opacity").unwrap().uid, props.sub("transform").unwrap().uid, effects)
+    };
+    h.state_mut().ui.timeline.open_layers.insert(layer);
+    h.state_mut().ui.timeline.open_groups.insert(transform);
+    h.state_mut().ui.timeline.open_groups.extend(effects);
+    h.state_mut().show_panel(effectcraft_ui_egui::dock::PanelKind::EffectControls);
+    h.run_steps(3);
+    let props =
+        |h: &Harness<'_, EffectcraftApp>| h.state().session.active_comp().unwrap().layer(effectcraft_engine::project::LayerId(layer)).unwrap().props.clone();
+    let (slider, point) = (props(&h).prop("effects/#1/slider").unwrap().uid, props(&h).prop("effects/#2/point").unwrap().uid);
+    let expr = |h: &Harness<'_, EffectcraftApp>| props(h).find(opacity).unwrap().expr.clone().map(|e| e.text);
+    let alt = Modifiers { alt: true, ..Modifiers::NONE };
+    let whip = |h: &mut Harness<'_, EffectcraftApp>, target: &str, modifiers: Modifiers| {
+        let (from, to) = (center(h, &format!("timeline.prop.{opacity}.propertyPickWhip")), center(h, target));
+        drag_with(h, from, to, modifiers);
+    };
+    whip(&mut h, &format!("effectControls.prop.{slider}.value"), alt);
+    assert_eq!(expr(&h).as_deref(), Some("effect(\"Slider Control\")(1)"), "Alt onto Effect Controls");
+    let undo = h.state().session.history.undo.len();
+    whip(&mut h, &format!("effectControls.prop.{slider}.value"), Modifiers::NONE);
+    assert_eq!(expr(&h).as_deref(), Some("effect(\"Slider Control\")(\"Slider\")"), "without Alt, by name");
+    assert_eq!(h.state().session.history.undo.len(), undo + 1, "one undo step");
+    whip(&mut h, &format!("timeline.prop.{slider}.name"), alt);
+    assert_eq!(expr(&h).as_deref(), Some("effect(\"Slider Control\")(1)"), "Alt onto the Timeline");
+    // Into the expression being edited, at the cursor, with the value it was dropped on.
+    let p = center(&h, &format!("timeline.prop.{opacity}.expression"));
+    click(&mut h, p, 1);
+    key(&mut h, Key::End);
+    type_text(&mut h, " + ");
+    let (from, to) = (center(&h, &format!("timeline.prop.{opacity}.pickWhip")), center(&h, &format!("effectControls.prop.{point}.value.1")));
+    drag_with(&mut h, from, to, alt);
+    assert_eq!(expr(&h).as_deref(), Some("effect(\"Slider Control\")(1) + effect(\"Point Control\")(1)[1]"));
+    h.state_mut().session.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(expr(&h).as_deref(), Some("effect(\"Slider Control\")(1)"), "undone in one step");
+}
+
 /// #1434: with several 3D layers selected, typing a Z Position sets Z on each of them; their X
 /// and Y stay their own. Every selected layer used to take the typed layer's whole Position, so
 /// they stacked on top of it and seemed to disappear.
@@ -675,4 +928,18 @@ fn typing_one_component_with_several_layers_selected_keeps_their_other_component
     key(&mut h, Key::Enter);
     assert_eq!(pos(&h, a), [40.0, 50.0, -300.0]);
     assert_eq!(pos(&h, b), [200.0, 120.0, -300.0], "B keeps its own X and Y");
+}
+
+/// #3373: a click on the Composition panel's time display opens Go to Time, as in After Effects;
+/// Ctrl/Cmd+click still switches between timecode and frames.
+#[test]
+fn clicking_the_viewer_time_display_opens_go_to_time() {
+    let (mut h, _) = harness();
+    h.state_mut().session.execute("time.set", json!({"frame": 30})).unwrap();
+    h.run_steps(2);
+    assert!(h.query_by_label("Go to Time").is_none(), "set up: no dialog yet");
+    let at = center(&h, "viewer.timecode");
+    click(&mut h, at, 1);
+    h.run_steps(2);
+    assert!(h.query_by_label("Go to Time").is_some(), "the dialog is open");
 }

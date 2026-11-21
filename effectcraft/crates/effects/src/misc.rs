@@ -3,7 +3,7 @@
 use effectcraft_color::luminance;
 use effectcraft_keyframe::Value;
 use effectcraft_project::ParamUi;
-use effectcraft_raster::{Image, gaussian_blur, hash_noise};
+use effectcraft_raster::{Image, gaussian_blur, gaussian_blur_unbounded_at, hash_noise};
 use rayon::prelude::*;
 
 use crate::{Buf, EffectCtx, EffectSpec, col, num, p, popup, slider};
@@ -34,6 +34,9 @@ fn gaussian(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let repeat = ctx.params.b("repeatEdge");
     if !repeat && !ctx.adjustment {
         b.pad((s * 3.0).ceil() as u32);
+    } else if repeat && !ctx.adjustment {
+        // The edge it repeats is the layer's, not the painted content's (#1205).
+        b.cover(ctx.layer_size);
     }
     let (sx, sy) = (s * kx, s * ky);
     // Small sigmas: integer-radius box passes would step (and do nothing below ~0.6 px), so sample the kernel (#1939).
@@ -60,6 +63,9 @@ fn box_blur(ctx: &EffectCtx, mut b: Buf) -> Buf {
     if !repeat && !ctx.adjustment {
         let reach = if frac > 0.0 { r + 1 } else { r };
         b.pad((reach * it) as u32 + 1);
+    } else if repeat && !ctx.adjustment {
+        // The edge it repeats is the layer's, not the painted content's (#1205).
+        b.cover(ctx.layer_size);
     }
     let edge = repeat || ctx.adjustment;
     let lo = effectcraft_raster::box_blur(&b.img, r * kx as usize, r * ky as usize, it, edge);
@@ -142,6 +148,28 @@ pub fn glow_ab_t(l: f32, looping: u32, loops: f32, phase: f32, mid: f32) -> f32 
     t.max(0.0).powf(0.5f32.ln() / m.ln())
 }
 
+/// Glow's blur: a Gaussian of σ = 0.384 × Glow Radius. Fitted to After Effects 2026 (cases
+/// 807 and 808, Glow Radius 10 and 30 on a grey solid): the edge profile of the glow's
+/// coverage is an erfc step of that σ within 1.7/255 (it was σ = radius / 2).
+pub fn glow_sigma(radius: f64) -> f64 {
+    (radius * 0.384).max(0.5)
+}
+
+/// Glow's bright pass for the original colours, per channel of the straight colour `v`:
+/// `8 × (v − threshold + 0.0611)`, nothing below. Fitted to After Effects 2026 renders of grey
+/// 0.65 / 0.8 / 0.9 / 1, orange and light-blue solids at Threshold 40 / 60 / 80 % and Radius 10
+/// / 30 (36 channel values, exact to the 8-bit capture): the glow is linear in each channel,
+/// its gain is the same at every threshold and radius, and channels below the threshold add
+/// nothing (an orange solid glows red only).
+pub fn glow_bright_channel(v: f32, thr: f32) -> f32 {
+    (GLOW_GAIN * (v - thr + GLOW_KNEE)).max(0.0)
+}
+
+/// [`glow_bright_channel`]'s gain and threshold offset. `kernels.wgsl` repeats both as literals;
+/// the GPU test `glow_constants_match_the_cpu` checks that they are these.
+pub const GLOW_GAIN: f32 = 8.0;
+pub const GLOW_KNEE: f32 = 0.0611;
+
 /// Glow Operation options (blend modes the glow is applied with).
 pub const GLOW_OPERATIONS: [&str; 17] = [
     "Normal",
@@ -205,23 +233,31 @@ fn glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
         // Glow Based On: brightness from the colours, or from the alpha channel.
         let l = if alpha_based { a } else { luminance(px[0] / a, px[1] / a, px[2] / a) };
         let k = ((l - thr) / (1.0 - thr).max(1e-3)).clamp(0.0, 1.0);
+        // Based on the colour channels, the glow's coverage is the layer's whole alpha, below
+        // the threshold too: After Effects darkens what lies under a dim layer's edge (glow_alpha).
+        let ga = if alpha_based { k * a } else { a };
         if let Some(map) = &arbitrary {
             let t = glow_ab_t(l, looping, loops, phase, mid);
             let c = map.iter().map(|cv| cv.as_ref().map_or(t, |cv| cv.eval(t))).collect::<Vec<f32>>();
-            *px = [c[0] * k * a, c[1] * k * a, c[2] * k * a, k * a];
+            *px = [c[0] * k * a, c[1] * k * a, c[2] * k * a, ga];
         } else if use_colors {
             let t = glow_ab_t(l, looping, loops, phase, mid);
             let c = [ca[0] + (cb[0] - ca[0]) * t, ca[1] + (cb[1] - ca[1]) * t, ca[2] + (cb[2] - ca[2]) * t];
-            *px = [c[0] * k * a, c[1] * k * a, c[2] * k * a, k * a];
+            *px = [c[0] * k * a, c[1] * k * a, c[2] * k * a, ga];
+        } else if alpha_based {
+            *px = [px[0] * k, px[1] * k, px[2] * k, ga];
         } else {
-            *px = px.map(|v| v * k);
+            // Original colours: each channel of the straight colour against the threshold.
+            let c = [px[0] / a, px[1] / a, px[2] / a].map(|v| glow_bright_channel(v, thr) * a);
+            *px = [c[0], c[1], c[2], ga];
         }
     });
-    let s = (radius / 2.0).max(0.5);
+    let s = glow_sigma(radius);
     let blurred = gaussian_blur(&bright, s * kx, s * ky, false);
     let mode = ctx.params.e("operation");
     b.img.data.par_iter_mut().zip(blurred.data.par_iter()).for_each(|(o, g)| {
-        let g = g.map(|v| v * intensity);
+        // Intensity scales the glow's colour; with the colour channels its coverage stays.
+        let g = [g[0] * intensity, g[1] * intensity, g[2] * intensity, if alpha_based { g[3] * intensity } else { g[3] }];
         match mode {
             // Behind: the glow shows only where the original is transparent.
             1 => {
@@ -247,6 +283,12 @@ fn glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
     b
 }
 
+/// The margin Drop Shadow asks for around a layer: its Distance and its blur's reach (three
+/// boxes of radius about σ = Softness / 2), both in buffer pixels. Shared with the GPU path.
+pub fn drop_shadow_pad(dist: f64, soft: f64) -> u32 {
+    ((dist + soft * 1.5).ceil() as u32).saturating_add(2)
+}
+
 fn drop_shadow(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let color = ctx.params.color("color");
     let opacity = ctx.params.f("opacity") as f32 / 100.0;
@@ -254,22 +296,41 @@ fn drop_shadow(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let dist = ctx.params.f("distance") * b.scale;
     let soft = ctx.params.f("softness") * b.scale;
     let only = ctx.params.b("shadowOnly");
-    let pad = (dist + soft * 1.5).ceil() as u32 + 2;
+    let pad = drop_shadow_pad(dist, soft);
+    // Whether the buffer holds the whole blur. The pixel budget (#2261) cuts the margin of a
+    // large Softness (After Effects' range reaches 30000, #3464); the shadow is then blurred
+    // before it is moved, as if the buffer went on with transparency, rather than dropping what
+    // the move or the blur takes past the buffer's edge, which would leave it far too faint or
+    // gone. An adjustment layer's buffer is the composition, as before.
+    let mut holds_blur = true;
     if !ctx.adjustment {
+        let (w0, h0) = (b.img.width, b.img.height);
         b.pad(pad);
+        let need = pad.saturating_mul(2);
+        holds_blur = b.img.width.saturating_sub(w0) >= need && b.img.height.saturating_sub(h0) >= need;
     }
     let (dx, dy) = (dir.sin() * dist, -dir.cos() * dist);
-    let mut sh = Image::new(b.img.width, b.img.height);
     let src = &b.img;
-    sh.rows_mut().for_each(|(y, row)| {
-        for (x, px) in row.iter_mut().enumerate() {
-            let a = src.sample_bilinear(x as f64 + 0.5 - dx, y as f64 + 0.5 - dy)[3] * opacity * color[3];
-            *px = [color[0] * a, color[1] * a, color[2] * a, a];
-        }
-    });
-    if soft > 0.0 {
-        sh = gaussian_blur(&sh, soft / 2.0, soft / 2.0, false);
-    }
+    let shadow = |sh: &mut Image, (dx, dy): (f64, f64)| {
+        sh.rows_mut().for_each(|(y, row)| {
+            for (x, px) in row.iter_mut().enumerate() {
+                let a = src.sample_bilinear(x as f64 + 0.5 - dx, y as f64 + 0.5 - dy)[3] * opacity * color[3];
+                *px = [color[0] * a, color[1] * a, color[2] * a, a];
+            }
+        });
+    };
+    let mut sh = if soft > 0.0 && !holds_blur {
+        // Only the fraction of the move is sampled (into one more column and row); the blur
+        // moves the rest.
+        let (ix, iy) = (dx.floor(), dy.floor());
+        let mut near = Image::new(src.width.saturating_add(1), src.height.saturating_add(1));
+        shadow(&mut near, (dx - ix, dy - iy));
+        gaussian_blur_unbounded_at(&near, soft / 2.0, soft / 2.0, [ix as i64, iy as i64], src.width, src.height)
+    } else {
+        let mut sh = Image::new(src.width, src.height);
+        shadow(&mut sh, (dx, dy));
+        if soft > 0.0 { gaussian_blur(&sh, soft / 2.0, soft / 2.0, false) } else { sh }
+    };
     if !only {
         sh.data.par_iter_mut().zip(b.img.data.par_iter()).for_each(|(s, o)| {
             let k = 1.0 - o[3];
@@ -502,16 +563,83 @@ fn noise(ctx: &EffectCtx, mut b: Buf) -> Buf {
     b
 }
 
-fn linear_wipe(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    let done = ctx.params.f("completion") / 100.0;
-    let ang = ctx.params.f("angle").to_radians();
-    let feather = (ctx.params.f("feather") * b.scale).max(0.001);
-    let (w, h) = (b.img.width as f64, b.img.height as f64);
-    // Direction the wipe travels: angle 90° wipes left→right.
+/// Linear Wipe's geometry: the direction the wipe travels (angle 90° wipes left → right) and the
+/// range of `x·dx + y·dy` over a `w` × `h` buffer's corners.
+pub fn linear_wipe_axis(angle_deg: f64, w: f64, h: f64) -> ([f64; 2], f64, f64) {
+    let ang = angle_deg.to_radians();
     let (dx, dy) = (ang.sin(), -ang.cos());
     let corners = [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)];
-    let proj: Vec<f64> = corners.iter().map(|(x, y)| x * dx + y * dy).collect();
-    let (lo, hi) = (proj.iter().cloned().fold(f64::INFINITY, f64::min), proj.iter().cloned().fold(f64::NEG_INFINITY, f64::max));
+    let proj = corners.map(|(x, y)| x * dx + y * dy);
+    let (lo, hi) = (proj.iter().copied().fold(f64::INFINITY, f64::min), proj.iter().copied().fold(f64::NEG_INFINITY, f64::max));
+    ([dx, dy], lo, hi)
+}
+
+/// Linear Wipe's Feather (`feather` pixels at preview `scale`) as the Gaussian sigma that
+/// softens the edge of a `w` × `h` buffer. After Effects' feathered edge is the hard wipe
+/// blurred with the layer's edges repeated; our importer sample (Feather 16 at 77°, 2026-11-05)
+/// matches three box passes of radius 6 per axis, sigma 6.35..6.6, so sigma = Feather / 2.5
+/// (pinned at Feather 16 only, #3125). Capped at twice the buffer's longer side, past which
+/// a blur with repeated edges no longer changes and the running sums only cost time.
+pub fn linear_wipe_sigma(feather: f64, scale: f64, w: f64, h: f64) -> f64 {
+    let s = feather * scale / 2.5;
+    if s.is_finite() && s > 0.0 { s.min(2.0 * w.max(h).max(1.0)) } else { 0.0 }
+}
+
+fn linear_wipe(ctx: &EffectCtx, b: Buf) -> Buf {
+    if ctx.params.b("legacyFeather") {
+        return linear_wipe_legacy(ctx, b);
+    }
+    linear_wipe_blurred(ctx, b)
+}
+
+/// After Effects' Linear Wipe (#3125): the edge sits at `lo + completion·(hi − lo)` whatever the
+/// feather (0 % keeps the layer, 100 % clears it), anti-aliased by pixel coverage, and Feather
+/// blurs that hard matte with the layer's edges repeated (so the feather leans opaque where it
+/// meets the layer's sides, as After Effects' does).
+fn linear_wipe_blurred(ctx: &EffectCtx, mut b: Buf) -> Buf {
+    let done = ctx.params.f("completion") / 100.0;
+    if done.is_nan() || done <= 0.0 {
+        return b;
+    }
+    if done >= 1.0 {
+        b.img.data.iter_mut().for_each(|px| *px = [0.0; 4]);
+        return b;
+    }
+    let (w, h) = (b.img.width as f64, b.img.height as f64);
+    let ([dx, dy], lo, hi) = linear_wipe_axis(ctx.params.f("angle"), w, h);
+    let edge = lo + (hi - lo) * done;
+    if !(edge.is_finite() && dx.is_finite() && dy.is_finite()) {
+        return b;
+    }
+    let mut mask = Image::new(b.img.width, b.img.height);
+    mask.rows_mut().for_each(|(y, row)| {
+        for (x, px) in row.iter_mut().enumerate() {
+            let d = (x as f64 + 0.5) * dx + (y as f64 + 0.5) * dy;
+            *px = [((d - edge) + 0.5).clamp(0.0, 1.0) as f32; 4];
+        }
+    });
+    let sigma = linear_wipe_sigma(ctx.params.f("feather"), b.scale, w, h);
+    // Three box passes per axis (the measured shape; the GPU runs the same passes). Below
+    // Feather ~2 they leave the anti-aliased edge alone.
+    if sigma > 1e-3 {
+        mask = gaussian_blur(&mask, sigma, sigma, true);
+    }
+    for (px, m) in b.img.data.iter_mut().zip(mask.data.iter()) {
+        let k = m[3].clamp(0.0, 1.0);
+        for c in px.iter_mut() {
+            *c *= k;
+        }
+    }
+    b
+}
+
+/// Linear Wipe as EffectCraft drew it before #3125 (projects saved then keep it): a linear ramp
+/// Feather pixels wide, the travel extended by the feather at both ends.
+fn linear_wipe_legacy(ctx: &EffectCtx, mut b: Buf) -> Buf {
+    let done = ctx.params.f("completion") / 100.0;
+    let feather = (ctx.params.f("feather") * b.scale).max(0.001);
+    let (w, h) = (b.img.width as f64, b.img.height as f64);
+    let ([dx, dy], lo, hi) = linear_wipe_axis(ctx.params.f("angle"), w, h);
     let edge = lo - feather + (hi - lo + 2.0 * feather) * done;
     b.img.rows_mut().for_each(|(y, row)| {
         for (x, px) in row.iter_mut().enumerate() {
@@ -525,22 +653,67 @@ fn linear_wipe(ctx: &EffectCtx, mut b: Buf) -> Buf {
     b
 }
 
+/// Standard normal CDF Φ (Abramowitz & Stegun 7.1.26 erf, |error| < 1.5e-7).
+fn norm_cdf(z: f64) -> f64 {
+    let x = z.abs() / std::f64::consts::SQRT_2;
+    let t = 1.0 / (1.0 + 0.327_591_1 * x);
+    let poly = t * (0.254_829_592 + t * (-0.284_496_736 + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
+    let erf = 1.0 - poly * (-x * x).exp();
+    if z >= 0.0 { 0.5 * (1.0 + erf) } else { 0.5 * (1.0 - erf) }
+}
+
+/// Radial Wipe's wiped wedge relative to the Start Angle: (first ray, span), degrees clockwise
+/// from up. Clockwise (0) wipes from the start angle on, Counterclockwise (1) back from it,
+/// Both (2) half each way.
+pub fn radial_wipe_wedge(wipe: u32, done: f64) -> (f64, f64) {
+    let span = done.clamp(0.0, 1.0) * 360.0;
+    match wipe {
+        1 => (-span, span),
+        2 => (-span / 2.0, span),
+        _ => (0.0, span),
+    }
+}
+
+/// Radial Wipe's feather: a Gaussian of σ = 0.4 × Feather pixels across both edges of the wedge
+/// (After Effects 2026, Feather 20: the edge profile is the same width in pixels at every
+/// radius, σ = 8.0 px, mean error 0.0002 over the frame).
+pub fn radial_wipe_sigma(feather: f64) -> f64 {
+    feather.max(0.0) * 0.4
+}
+
+/// Visible fraction of a pixel at `(ux, uy)` from the centre (y down) for a wiped wedge from
+/// `ray0` (absolute degrees clockwise from up) over `span` degrees: the signed distance to the
+/// wedge's nearer edge, through the feather's Gaussian.
+pub fn radial_wipe_alpha(ux: f64, uy: f64, ray0: f64, span: f64, sigma: f64) -> f64 {
+    let a = (ux.atan2(-uy).to_degrees() - ray0).rem_euclid(360.0);
+    let wiped = a < span;
+    let ray_dist = |deg: f64| {
+        let (s, c) = deg.to_radians().sin_cos();
+        // Ray direction (sin, −cos) in y-down pixels.
+        let along = ux * s - uy * c;
+        if along > 0.0 { (ux * c + uy * s).abs() } else { ux.hypot(uy) }
+    };
+    let d = ray_dist(ray0).min(ray_dist(ray0 + span));
+    let sd = if wiped { -d } else { d };
+    if sigma < 1e-3 {
+        return if wiped { 0.0 } else { 1.0 };
+    }
+    norm_cdf(sd / sigma)
+}
+
 fn radial_wipe(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    let done = ctx.params.f("completion") / 100.0;
+    let done = (ctx.params.f("completion") / 100.0).clamp(0.0, 1.0);
+    if done <= 0.0 {
+        return b;
+    }
     let start = ctx.params.f("startAngle");
     let c = b.to_px(ctx.params.v2("center"));
-    let dir = ctx.params.e("wipe");
-    let feather = (ctx.params.f("feather")).max(0.01);
+    let (w0, span) = radial_wipe_wedge(ctx.params.e("wipe"), done);
+    let sigma = radial_wipe_sigma(ctx.params.f("feather")) * b.scale;
+    let full = done >= 1.0;
     b.img.rows_mut().for_each(|(y, row)| {
         for (x, px) in row.iter_mut().enumerate() {
-            let a = ((x as f64 + 0.5 - c.0).atan2(-(y as f64 + 0.5 - c.1)).to_degrees() - start).rem_euclid(360.0);
-            // Both: the wipe opens in both directions from the start angle at once.
-            let (a, edge) = match dir {
-                1 => (360.0 - a, done * 360.0),
-                2 => (a.min(360.0 - a), done * 180.0),
-                _ => (a, done * 360.0),
-            };
-            let k = ((a - edge) / feather + 0.5).clamp(0.0, 1.0) as f32;
+            let k = if full { 0.0 } else { radial_wipe_alpha(x as f64 + 0.5 - c.0, y as f64 + 0.5 - c.1, start + w0, span, sigma) as f32 };
             for ch in px.iter_mut() {
                 *ch *= k;
             }
@@ -549,16 +722,49 @@ fn radial_wipe(ctx: &EffectCtx, mut b: Buf) -> Buf {
     b
 }
 
+/// Venetian Blinds: how much of a pixel at phase `d` (0..`width`) a band of `done × width`
+/// covers, its two edges softened by a Gaussian of σ = Feather / 2 (σ in the units of `width`).
+/// Fitted to After Effects 2026 (Completion 40, Direction 30, Width 50, Feather 5 on 960 × 540
+/// and 480 × 270 layers): band from phase 0 to done × width, both edges Gaussian, within 6/255.
+pub fn venetian_cover(d: f64, width: f64, done: f64, sigma: f64) -> f64 {
+    let band = done * width;
+    if sigma < 1e-3 {
+        return if d < band { 1.0 } else { 0.0 };
+    }
+    // Wider than a few blinds the stripes blur into an even veil.
+    if sigma > 8.0 * width {
+        return done.clamp(0.0, 1.0);
+    }
+    let n = ((4.0 * sigma / width).ceil() as i64 + 1).clamp(1, 40);
+    let mut t = 0.0;
+    for k in -n..=n {
+        let u = d + k as f64 * width;
+        t += norm_cdf(u / sigma) - norm_cdf((u - band) / sigma);
+    }
+    t.clamp(0.0, 1.0)
+}
+
+/// Venetian Blinds' phase origin in layer pixels: the layer centre plus 0.6 px (fitted to the
+/// AE renders above; the stripes are measured from the layer's centre, not its corner).
+pub fn venetian_origin(layer_size: [f64; 2]) -> [f64; 2] {
+    [layer_size[0] / 2.0 + 0.6, layer_size[1] / 2.0 + 0.6]
+}
+
 fn venetian(ctx: &EffectCtx, mut b: Buf) -> Buf {
-    let done = ctx.params.f("completion") / 100.0;
+    let done = (ctx.params.f("completion") / 100.0).clamp(0.0, 1.0);
+    if done <= 0.0 {
+        return b;
+    }
     let ang = ctx.params.f("direction").to_radians();
     let width = (ctx.params.f("width") * b.scale).max(1.0);
-    let feather = (ctx.params.f("feather") * b.scale).max(0.001);
+    let sigma = ctx.params.f("feather").max(0.0) * b.scale / 2.0;
     let (dx, dy) = (ang.cos(), ang.sin());
+    let (ox, oy) = b.to_px(venetian_origin(ctx.layer_size));
     b.img.rows_mut().for_each(|(y, row)| {
+        let ry = (y as f64 + 0.5 - oy) * dy;
         for (x, px) in row.iter_mut().enumerate() {
-            let d = ((x as f64 + 0.5) * dx + (y as f64 + 0.5) * dy).rem_euclid(width);
-            let k = ((d - done * width) / feather + 0.5).clamp(0.0, 1.0) as f32;
+            let d = ((x as f64 + 0.5 - ox) * dx + ry).rem_euclid(width);
+            let k = (1.0 - venetian_cover(d, width, done, sigma)) as f32;
             for c in px.iter_mut() {
                 *c *= k;
             }
@@ -575,7 +781,7 @@ pub fn specs() -> Vec<EffectSpec> {
             "Gaussian Blur",
             "Blur & Sharpen",
             vec![
-                p("blurriness", "Blurriness", num(0.0), slider(0.0, 3000.0, 0.0, 50.0, 1)),
+                p("blurriness", "Blurriness", num(0.0), slider(0.0, 30000.0, 0.0, 50.0, 1)),
                 p("dimensions", "Blur Dimensions", Value::Enum(0), dims()),
                 p("repeatEdge", "Repeat Edge Pixels", Value::Bool(false), ParamUi::Checkbox),
             ],
@@ -605,7 +811,8 @@ pub fn specs() -> Vec<EffectSpec> {
             "Radial Blur",
             "Blur & Sharpen",
             vec![
-                p("amount", "Amount", num(10.0), slider(0.0, 100.0, 0.0, 100.0, 1)),
+                // After Effects accepts 0..1000; its slider shows 0..100 (#3467).
+                p("amount", "Amount", num(10.0), slider(0.0, 1000.0, 0.0, 100.0, 1)),
                 p("center", "Center", Value::Vec2([0.5, 0.5]), ParamUi::Point),
                 p("type", "Type", Value::Enum(0), popup(&["Spin", "Zoom"])),
                 // Our blur is always fully anti-aliased; the choice is kept for compatibility.
@@ -613,7 +820,7 @@ pub fn specs() -> Vec<EffectSpec> {
             ],
             radial,
         ),
-        spec("ec.blur.sharpen", "Sharpen", "Blur & Sharpen", vec![p("amount", "Sharpen Amount", num(0.0), slider(0.0, 500.0, 0.0, 100.0, 0))], sharpen),
+        spec("ec.blur.sharpen", "Sharpen", "Blur & Sharpen", vec![p("amount", "Sharpen Amount", num(0.0), slider(0.0, 4000.0, 0.0, 100.0, 0))], sharpen),
         spec(
             "ec.blur.unsharp",
             "Unsharp Mask",
@@ -690,7 +897,7 @@ pub fn specs() -> Vec<EffectSpec> {
                 p("opacity", "Opacity", num(50.0), slider(0.0, 100.0, 0.0, 100.0, 0)),
                 p("direction", "Direction", num(135.0), ParamUi::Angle),
                 p("distance", "Distance", num(5.0), slider(0.0, 32000.0, 0.0, 120.0, 1)),
-                p("softness", "Softness", num(0.0), slider(0.0, 1000.0, 0.0, 250.0, 1)),
+                p("softness", "Softness", num(0.0), slider(0.0, 30000.0, 0.0, 250.0, 1)),
                 p("shadowOnly", "Shadow Only", Value::Bool(false), ParamUi::Checkbox),
             ],
             drop_shadow,
@@ -724,6 +931,8 @@ pub fn specs() -> Vec<EffectSpec> {
                 p("completion", "Transition Completion", num(0.0), slider(0.0, 100.0, 0.0, 100.0, 0)),
                 p("angle", "Wipe Angle", num(90.0), ParamUi::Angle),
                 p("feather", "Feather", num(0.0), slider(0.0, 32000.0, 0.0, 500.0, 1)),
+                // Projects saved before #3125 keep the earlier linear feather ramp.
+                p("legacyFeather", "Legacy Feather", Value::Bool(false), ParamUi::Hidden),
             ],
             linear_wipe,
         ),
@@ -736,7 +945,7 @@ pub fn specs() -> Vec<EffectSpec> {
                 p("startAngle", "Start Angle", num(0.0), ParamUi::Angle),
                 p("center", "Wipe Center", Value::Vec2([0.5, 0.5]), ParamUi::Point),
                 p("wipe", "Wipe", Value::Enum(0), popup(&["Clockwise", "Counterclockwise", "Both"])),
-                p("feather", "Feather", num(0.0), slider(0.0, 360.0, 0.0, 50.0, 1)),
+                p("feather", "Feather", num(0.0), slider(0.0, 32000.0, 0.0, 50.0, 1)),
             ],
             radial_wipe,
         ),
@@ -747,8 +956,8 @@ pub fn specs() -> Vec<EffectSpec> {
             vec![
                 p("completion", "Transition Completion", num(0.0), slider(0.0, 100.0, 0.0, 100.0, 0)),
                 p("direction", "Direction", num(90.0), ParamUi::Angle),
-                p("width", "Width", num(30.0), slider(2.0, 1000.0, 2.0, 200.0, 0)),
-                p("feather", "Feather", num(0.0), slider(0.0, 100.0, 0.0, 100.0, 1)),
+                p("width", "Width", num(30.0), slider(1.0, 32000.0, 2.0, 200.0, 0)),
+                p("feather", "Feather", num(0.0), slider(0.0, 32000.0, 0.0, 100.0, 1)),
             ],
             venetian,
         ),
@@ -776,6 +985,72 @@ mod tests {
         (16..24).map(|x| out.img.get(x, 4)[0]).collect()
     }
 
+    fn wipe(vals: &[(&str, Value)]) -> effectcraft_raster::Image {
+        let card = effectcraft_raster::Image::filled(320, 180, [1.0, 1.0, 1.0, 1.0]);
+        run_fx("ec.transition.linearwipe", vals, card, 0.0, EffectEnv::default()).img
+    }
+
+    /// #3125: After Effects 2026's Linear Wipe on our 320 × 180 importer sample (2026-11-05,
+    /// `linwipe-01-set-all`): Completion 10, Wipe Angle 77, Feather 16. Alpha (8-bit) of rows
+    /// 150 and 120 from x = 8, where the feathered edge crosses the layer away from its sides.
+    #[test]
+    fn linear_wipe_feather_matches_after_effects() {
+        const ROW150: [u8; 48] = [
+            0, 0, 0, 0, 0, 1, 2, 3, 6, 9, 12, 17, 23, 31, 39, 49, 61, 73, 86, 100, 115, 129, 144, 158, 172, 185, 198, 208, 218, 226, 233, 239, 244, 247, 250,
+            252, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        ];
+        const ROW120: [u8; 48] = [
+            3, 5, 8, 12, 17, 23, 30, 39, 49, 60, 72, 85, 99, 114, 128, 143, 157, 171, 184, 197, 208, 217, 226, 233, 239, 243, 247, 250, 252, 253, 254, 255,
+            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+        ];
+        let vals = [("completion", num(10.0)), ("angle", num(77.0)), ("feather", num(16.0))];
+        let out = wipe(&vals);
+        for (y, row) in [(150, &ROW150), (120, &ROW120)] {
+            for (i, &ae) in row.iter().enumerate() {
+                let x = 8 + i as i64;
+                let a = out.get(x, y)[3] * 255.0;
+                assert!((a - ae as f32).abs() <= 2.5, "({x}, {y}): {a} vs After Effects {ae}");
+            }
+        }
+        // Where the edge meets the layer's left side the feather leans opaque, as in After
+        // Effects (179 at (0, 30); a profile across the edge alone gives about 110).
+        assert!(out.get(0, 30)[3] * 255.0 > 160.0, "{}", out.get(0, 30)[3] * 255.0);
+        // Projects saved before keep the old linear ramp, which put the edge 13 px further left.
+        let legacy = wipe(&[vals.as_slice(), &[("legacyFeather", Value::Bool(true))]].concat());
+        assert!((legacy.get(23, 150)[3] * 255.0 - 129.0).abs() > 100.0);
+    }
+
+    /// #3125: without feather After Effects' edge sits at Completion × the layer's extent along
+    /// the wipe (9.5 % of 320 px = 30.4, `linwipe-04-keys`; 22 % = 70.4, `linwipe-05-expr`); the
+    /// edge pixel is anti-aliased (After Effects 143 / 255, coverage gives 0.6). 0 % keeps the
+    /// layer and 100 % clears it whatever the feather (`linwipe-02-min`, `linwipe-03-max`).
+    #[test]
+    fn linear_wipe_edge_follows_completion() {
+        for (c, col) in [(9.5, 30), (22.0, 70)] {
+            let out = wipe(&[("completion", num(c)), ("angle", num(90.0))]);
+            for y in [0, 90, 179] {
+                assert_eq!(out.get(col - 1, y)[3], 0.0, "{c}");
+                assert_eq!(out.get(col + 1, y)[3], 1.0, "{c}");
+                assert!((out.get(col, y)[3] - 143.0 / 255.0).abs() < 0.05, "{c}: {}", out.get(col, y)[3]);
+            }
+        }
+        let max = wipe(&[("completion", num(100.0)), ("feather", num(32000.0))]);
+        assert!(max.data.iter().all(|p| p[3] == 0.0));
+        let min = wipe(&[("completion", num(0.0)), ("feather", num(32000.0))]);
+        assert!(min.data.iter().all(|p| p[3] == 1.0));
+    }
+
+    /// Hostile values: a huge feather is capped (no slow or oversized blur), NaN does not spread.
+    #[test]
+    fn linear_wipe_survives_hostile_values() {
+        let out = wipe(&[("completion", num(50.0)), ("feather", num(1e12))]);
+        assert!(out.data.iter().all(|p| p[3].is_finite()));
+        let out = wipe(&[("completion", num(50.0)), ("angle", num(f64::NAN)), ("feather", num(f64::NAN))]);
+        assert!(out.data.iter().all(|p| p[3].is_finite()));
+        let out = wipe(&[("completion", num(f64::NAN))]);
+        assert!(out.data.iter().all(|p| p[3] == 1.0));
+    }
+
     #[test]
     fn small_gaussian_blurriness_is_continuous() {
         // #1939: 0.9 used to be identical to 0, and 1.2 / 1.6 / 2.0 identical to each other.
@@ -785,6 +1060,134 @@ mod tests {
         assert_ne!(row(1.2), row(1.6));
         assert_ne!(row(1.6), row(2.0));
         assert_ne!(row(2.0), row(2.4));
+    }
+
+    /// #3464: Softness takes After Effects' valid range, 0..30000; the slider still shows 0..250.
+    #[test]
+    fn drop_shadow_softness_takes_the_after_effects_range() {
+        let spec = crate::find("ec.perspective.dropshadow").unwrap();
+        let ui = &spec.params.iter().find(|p| p.id == "softness").unwrap().ui;
+        assert_eq!(*ui, slider(0.0, 30000.0, 0.0, 250.0, 1));
+    }
+
+    /// #3464: a Softness far past the range (an expression can set one) used to overflow the
+    /// padding's `u32` (a panic in debug builds). It renders, finite.
+    #[test]
+    fn drop_shadow_takes_a_huge_softness() {
+        for softness in [1e12, f64::INFINITY] {
+            let layer = effectcraft_raster::Image::filled(8, 8, [1.0, 1.0, 1.0, 1.0]);
+            let out = run_fx("ec.perspective.dropshadow", &[("softness", num(softness))], layer, 0.0, EffectEnv::default());
+            assert!(out.img.data.iter().flatten().all(|v| v.is_finite()), "softness {softness}");
+        }
+    }
+
+    /// #3464: with the margin cut, a Distance that takes the whole layer past the buffer's edge
+    /// still leaves the shadow's blur inside it. A 64 × 48 layer moved 3000 px right, Softness
+    /// 8000: at the layer's centre the shadow is the Gaussian's share there (it was 0 when the
+    /// layer was moved out of the buffer before the blur).
+    #[test]
+    fn drop_shadow_moved_past_a_cut_margin_keeps_its_blur() {
+        let (w, h, dist, softness) = (64u32, 48u32, 3000.0, 8000.0);
+        let layer = effectcraft_raster::Image::filled(w, h, [1.0, 1.0, 1.0, 1.0]);
+        let vals = [("softness", num(softness)), ("opacity", num(100.0)), ("distance", num(dist)), ("direction", num(90.0)), ("shadowOnly", Value::Bool(true))];
+        let out = run_fx("ec.perspective.dropshadow", &vals, layer, 0.0, EffectEnv::default());
+        assert!(out.offset[0] + f64::from(w) + dist > f64::from(out.img.width), "the move takes the layer past the buffer");
+        let sigma = softness / 2.0;
+        // The Gaussian's share of a `len`-pixel side, at `d` pixels from its centre.
+        let share = |len: u32, d: f64| {
+            let sum: f64 = (0..len).map(|i| (-((f64::from(i) + 0.5 - f64::from(len) / 2.0 + d) / sigma).powi(2) / 2.0).exp()).sum();
+            sum / (sigma * (2.0 * std::f64::consts::PI).sqrt())
+        };
+        let want = share(w, dist) * share(h, 0.0);
+        let at = |v: f64, half: u32| (v + f64::from(half)) as i64;
+        let got = f64::from(out.img.get(at(out.offset[0], w / 2), at(out.offset[1], h / 2))[3]);
+        assert!((0.85..1.1).contains(&(got / want)), "centre alpha {got}, Gaussian {want}");
+    }
+
+    /// #3464: past the padding budget (#2261) the shadow keeps its whole blur (σ = Softness / 2)
+    /// up to the buffer's edge. A 64 × 48 layer's shadow at its centre is the Gaussian's share
+    /// of the layer, less the 6 % three boxes' peak is under a Gaussian's; dropping what the
+    /// boxes spread past the buffer left it at 0.11 of that at 8000.
+    #[test]
+    fn drop_shadow_keeps_its_blur_past_the_padding_budget() {
+        let (w, h) = (64u32, 48u32);
+        for softness in [500.0, 4000.0, 8000.0, 30000.0] {
+            let layer = effectcraft_raster::Image::filled(w, h, [1.0, 1.0, 1.0, 1.0]);
+            let vals = [("softness", num(softness)), ("opacity", num(100.0)), ("distance", num(0.0)), ("shadowOnly", Value::Bool(true))];
+            let out = run_fx("ec.perspective.dropshadow", &vals, layer, 0.0, EffectEnv::default());
+            assert!(out.img.data.iter().flatten().all(|v| v.is_finite()), "softness {softness}");
+            let sigma = softness / 2.0;
+            let share = |len: u32| {
+                let sum: f64 = (0..len).map(|i| (-((f64::from(i) + 0.5 - f64::from(len) / 2.0) / sigma).powi(2) / 2.0).exp()).sum();
+                sum / (sigma * (2.0 * std::f64::consts::PI).sqrt())
+            };
+            let want = share(w) * share(h);
+            let at = |v: f64, half: u32| (v + f64::from(half)) as i64;
+            let got = f64::from(out.img.get(at(out.offset[0], w / 2), at(out.offset[1], h / 2))[3]);
+            assert!((0.85..1.02).contains(&(got / want)), "softness {softness}: centre alpha {got}, Gaussian {want}");
+        }
+    }
+
+    /// #3460: Blurriness goes up to After Effects' 30000. There the padding stays within the
+    /// effect pixel budget, every pixel stays finite, and Repeat Edge Pixels still repeats the
+    /// layer's edges: a layer white on the left and black on the right blurs to an even grey.
+    #[test]
+    fn gaussian_blur_at_the_highest_blurriness_is_bounded() {
+        for repeat in [false, true] {
+            let out = run_fx("ec.blur.gaussian", &[("blurriness", num(30000.0)), ("repeatEdge", Value::Bool(repeat))], edge(), 0.0, EffectEnv::default());
+            let (w, h) = (out.img.width, out.img.height);
+            assert!(f64::from(w) * f64::from(h) <= crate::pixel_budget(40.0, 8.0), "repeat {repeat}: {w} x {h}");
+            assert!(out.img.data.iter().flatten().all(|v| v.is_finite()), "repeat {repeat}");
+            if repeat {
+                assert_eq!((w, h), (40, 8));
+                for p in &out.img.data {
+                    assert!(p[..3].iter().all(|v| (v - 0.5).abs() < 0.01) && (p[3] - 1.0).abs() < 1e-4, "{p:?}");
+                }
+            }
+        }
+    }
+
+    /// #3466: Sharpen Amount takes After Effects' valid range, 0..4000, and keeps its 0..100
+    /// slider. `prop.set` and the value editors clamp to the hard range.
+    #[test]
+    fn sharpen_amount_takes_the_after_effects_range() {
+        let spec = crate::find("ec.blur.sharpen").unwrap();
+        let ui = &spec.params.iter().find(|p| p.id == "amount").unwrap().ui;
+        assert!(
+            matches!(ui, ParamUi::Slider { min, max, slider_min, slider_max, .. }
+                if *min == 0.0 && *max == 4000.0 && *slider_min == 0.0 && *slider_max == 100.0),
+            "{ui:?}"
+        );
+    }
+
+    /// #3466: at the new top of the range the render stays linear in Amount and finite on 32 bpc
+    /// over-range input: colour moves away from the blur by Amount / 50 of the difference
+    /// (2000 → 4000 doubles it), never below 0, and alpha is untouched.
+    #[test]
+    fn sharpen_is_linear_and_finite_up_to_amount_4000() {
+        let mut img = edge();
+        for y in 0..8 {
+            for x in 0..20 {
+                img.set(x, y, [1000.0, 1000.0, 1000.0, 1.0]);
+            }
+        }
+        let sharpen = |a: f64| run_fx("ec.blur.sharpen", &[("amount", num(a))], img.clone(), 0.0, EffectEnv::default()).img;
+        let (half, top) = (sharpen(2000.0), sharpen(4000.0));
+        for y in 0..8 {
+            for x in 0..40 {
+                let (i, h, t) = (img.get(x, y), half.get(x, y), top.get(x, y));
+                assert_eq!(t[3], i[3], "alpha at {x}");
+                for c in 0..3 {
+                    assert!(t[c].is_finite() && t[c] >= 0.0, "({x}, {y}): {t:?}");
+                    if t[c] > 0.0 && h[c] > 0.0 {
+                        let (dh, dt) = (h[c] - i[c], t[c] - i[c]);
+                        assert!((dt - 2.0 * dh).abs() <= 1e-3 * dt.abs().max(1.0), "({x}, {y}): {dh} {dt}");
+                    }
+                }
+            }
+        }
+        // The bright side of the edge moves 80 × its difference from the blur: far past 10 × the input.
+        assert!(top.get(19, 4)[0] > 1000.0 * 10.0, "{:?}", top.get(19, 4));
     }
 
     #[test]
@@ -805,6 +1208,235 @@ mod tests {
             }
         }
         img
+    }
+
+    /// After Effects 2026 (cases 524, 807, 808, 809): Glow on a 50 % grey solid, which is below
+    /// the 60 % threshold, still covers a blurred copy of the layer's alpha with black, so the
+    /// red layer underneath darkens outside the edge. The halo is the same at Intensity 1 and 3
+    /// and with Composite Original On Top or Behind; its width follows Glow Radius.
+    #[test]
+    fn glow_halo_matches_after_effects() {
+        let grey = effectcraft_raster::Image::filled(200, 120, [0.5, 0.5, 0.5, 1.0]);
+        // AE's red under the halo at 0.5, 1.5, 3.5, 5.5 and 7.5 px outside the left edge
+        // (radius 10) and at 0.5, 5.5, 10.5, 20.5 px (radius 30); halo alpha = 1 − red.
+        let r10 = [(0.5, 140.0), (1.5, 165.0), (3.5, 208.0), (5.5, 234.0), (7.5, 248.0)];
+        let r30 = [(0.5, 132.0), (5.5, 173.0), (10.5, 208.0), (20.5, 245.0)];
+        for (radius, intensity, operation, profile) in [(10.0, 1.0, 1, &r10[..]), (10.0, 3.0, 1, &r10[..]), (10.0, 1.0, 0, &r10[..]), (30.0, 1.0, 1, &r30[..])]
+        {
+            let set = [
+                ("based", Value::Enum(1)),
+                ("threshold", num(60.0)),
+                ("radius", num(radius)),
+                ("intensity", num(intensity)),
+                ("operation", Value::Enum(operation)),
+            ];
+            let o = run_fx("ec.stylize.glow", &set, grey.clone(), 0.0, EffectEnv::default());
+            for &(d, red) in profile {
+                // Layer x = −d (pixel centre), mid-height; over AE's red: R = 1 − α, colour 0.
+                let (bx, by) = o.to_px([-d, 60.0]);
+                let p = o.img.get(bx.floor() as i64, by.floor() as i64);
+                let ae = 1.0 - red / 255.0;
+                assert!((p[3] - ae).abs() < 3.0 / 255.0, "radius {radius} intensity {intensity} op {operation} at {d} px: alpha {} vs AE {ae}", p[3]);
+                assert!(p[0].abs() < 1e-6, "the halo is black: {p:?}");
+            }
+        }
+    }
+
+    /// After Effects 2026, Glow at Threshold 60 %, Radius 10, Intensity 0.25 on 200 × 200
+    /// solids over red: the glow 1.5 px outside the left edge, premultiplied (the green / blue
+    /// channels of the render, where the red background adds nothing), and its alpha 0.353.
+    #[test]
+    fn glow_brightness_matches_after_effects() {
+        // (solid colour, channel, AE glow value 0..255)
+        let cases = [
+            ([0.65, 0.65, 0.65], 1, 20.0),
+            ([0.8, 0.8, 0.8], 1, 47.0),
+            ([0.9, 0.9, 0.9], 1, 65.0),
+            ([1.0, 1.0, 1.0], 1, 83.0),
+            ([1.0, 0.5, 0.0], 1, 0.0),
+            ([0.2, 0.6, 1.0], 1, 11.0),
+            ([0.2, 0.6, 1.0], 2, 83.0),
+        ];
+        for (c, ch, ae) in cases {
+            let img = effectcraft_raster::Image::filled(200, 200, [c[0], c[1], c[2], 1.0]);
+            let set = [("threshold", num(60.0)), ("radius", num(10.0)), ("intensity", num(0.25))];
+            let o = run_fx("ec.stylize.glow", &set, img, 0.0, EffectEnv::default());
+            let (bx, by) = o.to_px([-1.5, 100.0]);
+            let p = o.img.get(bx.floor() as i64, by.floor() as i64);
+            assert!((p[ch] * 255.0 - ae).abs() <= 2.5, "{c:?} channel {ch}: {} vs AE {ae}", p[ch] * 255.0);
+            assert!((p[3] - 0.353).abs() < 3.0 / 255.0, "{c:?}: alpha {}", p[3]);
+        }
+        // Intensity scales the colour linearly: white at Intensity 1 is 3.7 × its alpha.
+        let white = effectcraft_raster::Image::filled(200, 200, [1.0, 1.0, 1.0, 1.0]);
+        let o = run_fx("ec.stylize.glow", &[("threshold", num(60.0)), ("radius", num(10.0))], white, 0.0, EffectEnv::default());
+        let (bx, by) = o.to_px([-1.5, 100.0]);
+        let p = o.img.get(bx.floor() as i64, by.floor() as i64);
+        assert!((p[1] / p[3] - 3.69).abs() < 0.05, "{p:?}");
+    }
+
+    /// After Effects 2026: Radial Blur keeps the layer's edges. Zoom 20 on a flat grey 960 × 540
+    /// solid (case 713) leaves it flat and opaque to the edge (EffectCraft faded the edges toward
+    /// transparency, letting the red layer below show through); on a full-frame horizontal ramp
+    /// (case 829, centre [960, 540]) row 540 reads 2/255 at x = 2 and 253/255 at x = 1917.
+    #[test]
+    fn radial_blur_keeps_the_layer_edges_as_after_effects() {
+        let zoom = |c: [f64; 2]| [("amount", num(20.0)), ("type", Value::Enum(1)), ("center", Value::Vec2(c))];
+        let grey = effectcraft_raster::Image::filled(960, 540, [0.5, 0.5, 0.5, 1.0]);
+        let o = run_fx("ec.blur.radial", &zoom([600.0, 300.0]), grey, 0.0, EffectEnv::default());
+        for (x, y) in [(0, 270), (1, 270), (959, 270), (480, 0), (480, 539), (0, 0), (959, 539)] {
+            let p = o.img.get(x, y);
+            assert!((p[3] - 1.0).abs() < 1e-4 && (p[0] - 0.5).abs() < 1e-4, "({x}, {y}): {p:?}");
+        }
+        let mut ramp = effectcraft_raster::Image::new(1920, 1080);
+        ramp.rows_mut().for_each(|(_, row)| {
+            for (x, px) in row.iter_mut().enumerate() {
+                let v = (x as f32 + 0.5) / 1920.0;
+                *px = [v, v, v, 1.0];
+            }
+        });
+        let o = run_fx("ec.blur.radial", &zoom([960.0, 540.0]), ramp, 0.0, EffectEnv::default());
+        for (x, ae) in [(2, 2.0), (1917, 253.0)] {
+            let p = o.img.get(x, 540);
+            assert!((p[0] * 255.0 - ae).abs() <= 2.0 && (p[3] - 1.0).abs() < 1e-4, "x {x}: {p:?} vs AE {ae}");
+        }
+    }
+
+    /// Amount takes After Effects' valid range up to 1000 (#3467), Zoom 1000 a spread of 10.
+    /// Zoom samples along the ray from the centre through the pixel, never past the centre: on a
+    /// layer white left of the centre and black right of it, the right half stays black (scales
+    /// below 0 sampled the white half mirrored through the centre). Both Antialiasing settings (the
+    /// renderer does not read it yet; the test keeps both covered).
+    #[test]
+    fn radial_blur_zoom_at_the_largest_amount_stays_on_its_side_of_the_centre() {
+        let mut img = effectcraft_raster::Image::filled(64, 32, [0.0, 0.0, 0.0, 1.0]);
+        img.rows_mut().for_each(|(_, row)| row.iter_mut().take(32).for_each(|px| *px = [1.0, 1.0, 1.0, 1.0]));
+        for aa in 0..2 {
+            let vals = [("amount", num(1000.0)), ("type", Value::Enum(1)), ("center", Value::Vec2([32.5, 16.5])), ("antialiasing", Value::Enum(aa))];
+            let o = run_fx("ec.blur.radial", &vals, img.clone(), 0.0, EffectEnv::default());
+            for y in 0..32 {
+                for x in 33..64 {
+                    let p = o.img.get(x, y);
+                    assert!(p[0].abs() < 1e-5 && (p[3] - 1.0).abs() < 1e-5, "aa {aa} ({x}, {y}): {p:?}");
+                }
+            }
+        }
+    }
+
+    /// Spin and Zoom at both ends of Amount (0..1000) and both Antialiasing settings give finite
+    /// colours over an opaque layer and keep it opaque (#3467). It guards the newly accepted
+    /// values; it passed before the Zoom fix too.
+    #[test]
+    fn radial_blur_is_finite_across_the_amount_range() {
+        let mut img = effectcraft_raster::Image::new(48, 40);
+        img.rows_mut().for_each(|(y, row)| {
+            for (x, px) in row.iter_mut().enumerate() {
+                *px = [x as f32 / 47.0, y as f32 / 39.0, 0.5, 1.0];
+            }
+        });
+        for ty in 0..2 {
+            for aa in 0..2 {
+                for amount in [0.0, 100.0, 200.0, 1000.0] {
+                    let vals = [("amount", num(amount)), ("type", Value::Enum(ty)), ("center", Value::Vec2([10.0, 30.0])), ("antialiasing", Value::Enum(aa))];
+                    let o = run_fx("ec.blur.radial", &vals, img.clone(), 0.0, EffectEnv::default());
+                    assert_eq!((o.img.width, o.img.height), (48, 40));
+                    for p in &o.img.data {
+                        assert!(p.iter().all(|v| v.is_finite()) && (p[3] - 1.0).abs() < 1e-5, "type {ty} aa {aa} amount {amount}: {p:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// After Effects 2026, Venetian Blinds Completion 40, Direction 30, Width 50, Feather 5 on
+    /// an opaque 480 × 270 layer: alpha (0..255) along row y = 135. The transparent band starts
+    /// at the layer centre's phase, both edges are Gaussian (σ = Feather / 2).
+    #[test]
+    fn venetian_blinds_match_after_effects() {
+        let img = effectcraft_raster::Image::filled(480, 270, [0.5, 0.5, 0.5, 1.0]);
+        let vals = [("completion", Value::Scalar(40.0)), ("direction", Value::Scalar(30.0)), ("width", Value::Scalar(50.0)), ("feather", Value::Scalar(5.0))];
+        let o = run_fx("ec.transition.venetian", &vals, img, 0.0, EffectEnv::default());
+        let ae = [
+            (200, 5.0),
+            (203, 47.0),
+            (206, 145.0),
+            (209, 228.0),
+            (212, 253.0),
+            (224, 255.0),
+            (236, 238.0),
+            (239, 168.0),
+            (242, 66.0),
+            (245, 10.0),
+            (251, 0.0),
+            (257, 2.0),
+            (260, 31.0),
+        ];
+        for (x, a) in ae {
+            let got = o.img.get(x, 135)[3] * 255.0;
+            assert!((got - a).abs() <= 6.0, "x {x}: alpha {got} vs AE {a}");
+        }
+        // No completion leaves the layer; full completion clears it; no feather is a hard edge.
+        let full = [("completion", Value::Scalar(100.0)), ("feather", Value::Scalar(5.0))];
+        let img = effectcraft_raster::Image::filled(40, 20, [0.5, 0.5, 0.5, 1.0]);
+        assert!(run_fx("ec.transition.venetian", &full, img.clone(), 0.0, EffectEnv::default()).img.data.iter().all(|p| p[3] < 1e-4));
+        assert_eq!(run_fx("ec.transition.venetian", &[("completion", Value::Scalar(0.0))], img.clone(), 0.0, EffectEnv::default()).img, img);
+        let hard = run_fx(
+            "ec.transition.venetian",
+            &[("completion", Value::Scalar(50.0)), ("width", Value::Scalar(10.0)), ("feather", Value::Scalar(0.0))],
+            img,
+            0.0,
+            EffectEnv::default(),
+        );
+        assert!(hard.img.data.iter().all(|p| p[3] == 0.0 || p[3] == 1.0));
+        // A feather far wider than the blinds is an even veil.
+        assert_eq!(venetian_cover(3.0, 10.0, 0.5, 1e9), 0.5);
+    }
+
+    /// After Effects 2026, Radial Wipe Completion 40, Start Angle 30, Wipe Counterclockwise,
+    /// Feather 20, centre (800, 500): visible fraction at pixel offsets from the centre on both
+    /// edges (8-bit captures of dark steps, so ±0.05).
+    #[test]
+    fn radial_wipe_feather_matches_after_effects() {
+        let img = effectcraft_raster::Image::filled(400, 300, [1.0, 1.0, 1.0, 1.0]);
+        let vals = [
+            ("completion", Value::Scalar(40.0)),
+            ("startAngle", Value::Scalar(30.0)),
+            ("center", Value::Vec2([200.0, 150.0])),
+            ("wipe", Value::Enum(1)),
+            ("feather", Value::Scalar(20.0)),
+        ];
+        let o = run_fx("ec.transition.radialwipe", &vals, img.clone(), 0.0, EffectEnv::default());
+        let ae = [
+            ((-50, 34), 0.922),
+            ((-52, 30), 0.797),
+            ((-54, 26), 0.609),
+            ((-55, 24), 0.5),
+            ((-56, 22), 0.406),
+            ((-57, 19), 0.266),
+            ((-58, 15), 0.125),
+            ((-104, 60), 0.951),
+            ((-108, 53), 0.732),
+            ((-111, 45), 0.341),
+            ((-114, 37), 0.062),
+            ((22, -56), 0.156),
+            ((26, -54), 0.312),
+            ((30, -52), 0.531),
+            ((34, -50), 0.729),
+            ((37, -47), 0.875),
+            ((53, -108), 0.177),
+            ((67, -99), 0.875),
+        ];
+        for ((dx, dy), a) in ae {
+            let got = o.img.get(200 + dx, 150 + dy)[3];
+            assert!((got - a).abs() < 0.05, "offset ({dx}, {dy}): {got} vs AE {a}");
+        }
+        // 0 % leaves the layer, 100 % clears it, Feather 0 is a hard edge.
+        let at = |c: f64, f: f64| {
+            let v = [("completion", Value::Scalar(c)), ("feather", Value::Scalar(f))];
+            run_fx("ec.transition.radialwipe", &v, img.clone(), 0.0, EffectEnv::default()).img
+        };
+        assert_eq!(at(0.0, 20.0), img);
+        assert!(at(100.0, 20.0).data.iter().all(|p| p[3] == 0.0));
+        assert!(at(50.0, 0.0).data.iter().all(|p| p[3] == 0.0 || p[3] == 1.0));
     }
 
     #[test]

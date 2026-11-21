@@ -111,6 +111,7 @@ pub const COMPLETIONS: &[&str] = &[
     "ease",
     "easeIn",
     "easeOut",
+    "bezier",
     "clamp",
     "random",
     "gaussRandom",
@@ -331,8 +332,16 @@ fn layout(text: &str, font: FontId, base: Color32, sx: &Syntax, p: &Scripting, b
     job
 }
 
+/// The scripting preferences, text colour and row count an [`editor`] is drawn with.
+pub struct EditorOpts<'a> {
+    pub prefs: &'a Scripting,
+    pub color: Color32,
+    pub rows: usize,
+}
+
 /// The editor: returns the response; `buf` is edited in place.
-pub fn editor(ui: &mut egui::Ui, id: egui::Id, buf: &mut String, rect: Rect, p: &Scripting, color: Color32, rows: usize, t: &Tokens) -> egui::Response {
+pub fn editor(ui: &mut egui::Ui, id: egui::Id, buf: &mut String, rect: Rect, opts: EditorOpts, t: &Tokens) -> egui::Response {
+    let EditorOpts { prefs: p, color, rows } = opts;
     let size = (p.editor_font_size.clamp(8, 40) as f32) * 0.9;
     let font = Tokens::mono(size);
     // Line numbers in a gutter on the left.
@@ -410,20 +419,7 @@ pub fn editor(ui: &mut egui::Ui, id: egui::Id, buf: &mut String, rect: Rect, p: 
 #[cfg(test)]
 mod contrast_tests {
     use super::*;
-    use crate::theme::ThemeKind;
-
-    /// WCAG contrast ratio of two opaque sRGB colours.
-    fn contrast(a: Color32, b: Color32) -> f32 {
-        let lum = |c: Color32| {
-            let f = |v: u8| {
-                let v = v as f32 / 255.0;
-                if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
-            };
-            0.2126 * f(c.r()) + 0.7152 * f(c.g()) + 0.0722 * f(c.b())
-        };
-        let (x, y) = (lum(a), lum(b));
-        (x.max(y) + 0.05) / (x.min(y) + 0.05)
-    }
+    use crate::theme::{ThemeKind, contrast_ratio as contrast};
 
     /// #644: on every theme, effect names stay readable on Effect Controls' headers, and the
     /// expression field's text (every syntax colour, enabled and disabled expressions, matched

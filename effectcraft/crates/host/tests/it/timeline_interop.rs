@@ -54,10 +54,12 @@ fn still(p: &mut fp::Project, path: &str) -> fp::ItemId {
             codec: "png".into(),
             pixel_format: String::new(),
             color: Default::default(),
+            color_assumed: None,
             has_alpha: false,
             bitrate: None,
+            hdr: None,
         }),
-        audio: None,
+        audio_streams: Vec::new(),
         container: String::new(),
         start_timecode: None,
         file_size: None,
@@ -74,7 +76,7 @@ fn still(p: &mut fp::Project, path: &str) -> fp::ItemId {
         identity: None,
     };
     let name = path.rsplit('/').next().unwrap().to_string();
-    p.add_item(&name, fp::Label::Iris, fp::ItemKind::Media(clip), None)
+    p.add_item(&name, fp::Label::Iris, fp::ItemKind::Media(Box::new(clip)), None)
 }
 
 /// V1: red for 2 s; V2: blue at 50 % opacity and 50 % scale; a cross dissolve from red to green

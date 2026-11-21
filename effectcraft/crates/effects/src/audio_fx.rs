@@ -193,7 +193,7 @@ pub fn specs() -> Vec<EffectSpec> {
 
 /// Is `id` an audio effect (applied by the mixdown rather than the compositor)?
 pub fn is_audio_effect(id: &str) -> bool {
-    id.starts_with("ec.audio.")
+    effectcraft_project::is_audio_effect(id)
 }
 
 /// Does the effect produce sound on its own (so a layer without audio becomes audible)?
@@ -204,6 +204,12 @@ pub fn generates_audio(id: &str) -> bool {
 /// Does the effect play the layer's audio backwards (a time mapping the mixer applies)?
 pub fn reverses(id: &str) -> bool {
     id == "ec.audio.backwards"
+}
+
+/// Does each output sample depend only on the input sample at the same time (no state), so the
+/// mixer may run the effect in short pieces with parameters animated between them?
+pub fn per_sample(id: &str) -> bool {
+    matches!(id, "ec.audio.stereomixer" | "ec.audio.backwards")
 }
 
 /// Seconds of input history the effect needs before a block to reach the state it would have
@@ -238,7 +244,8 @@ pub fn preroll(id: &str, params: &Params) -> f64 {
 }
 
 /// Run audio effect `id` over interleaved stereo `buf` (L R L R …) at `rate` Hz, from a cleared
-/// state. `start` is the layer time (seconds) of the first sample (oscillator phase).
+/// state. `start` is the time (seconds) of the first sample since the layer's start, counted at
+/// comp speed whatever the layer's time stretch (oscillator phase).
 pub fn process(id: &str, params: &Params, buf: &mut [f32], rate: u32, start: f64) {
     if rate == 0 || buf.len() < 2 {
         return;

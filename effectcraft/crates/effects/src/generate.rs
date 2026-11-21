@@ -53,7 +53,8 @@ fn gradient_ramp(ctx: &EffectCtx, mut b: Buf) -> Buf {
 }
 
 /// Blending Mode options of the shape generators (Checkerboard, Grid, Circle): "None" shows the
-/// generated pattern only; the others composite it onto the layer like layer blending modes.
+/// generated pattern only, inside the layer's alpha (see [`gen_alpha`]); the others composite it
+/// onto the layer like layer blending modes.
 pub(crate) const GEN_BLEND_MODES: [&str; 20] = [
     "None",
     "Normal",
@@ -103,13 +104,24 @@ pub fn gen_mode(i: u32) -> Option<BlendMode> {
 }
 
 /// Composite a generated premultiplied pixel `g` onto the original `o` with blending mode
-/// index `mode` (into [`GEN_BLEND_MODES`]).
+/// index `mode` (into [`GEN_BLEND_MODES`]). None returns `g` as is: the caller keeps the layer's
+/// alpha in `g` with [`gen_alpha`].
 #[inline]
 pub(crate) fn gen_blend(o: Px, g: Px, mode: u32) -> Px {
     match gen_mode(mode) {
         None => g,
         Some(m) => blend_pixel(m, o, g, 0.5),
     }
+}
+
+/// The generated alpha `a` with Blending Mode None (`keep_alpha`, `gen_mode(mode).is_none()`):
+/// scaled by the layer's alpha `layer_a`, so the pattern stays inside the layer's shape and its
+/// masks, which are applied before effects (#1381, #3121). The other modes composite onto the
+/// layer as After Effects' blending modes do and keep `a`; their alpha outside the layer is not
+/// verified against After Effects. Mirrored by `gen_alpha` in `fx_generate.wgsl`.
+#[inline]
+pub(crate) fn gen_alpha(a: f32, layer_a: f32, keep_alpha: bool) -> f32 {
+    if keep_alpha { a * layer_a } else { a }
 }
 
 /// 4-Color Gradient's weights are inverse squared distances softened by Blend²: each point
@@ -121,13 +133,20 @@ pub fn four_color_softening(blend: f64, scale: f64) -> f64 {
     (b * b).max(1e-6)
 }
 
+/// 4-Color Gradient's Jitter (percent, up to After Effects' 500 %) as the dither's strength: 1 at
+/// 100 %, a few code values of noise per unit.
+pub fn four_color_jitter(jitter: f64) -> f32 {
+    (jitter / 100.0).clamp(0.0, 5.0) as f32
+}
+
 fn four_color(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let pts: Vec<((f64, f64), [f32; 4])> =
         (1..=4).map(|i| (b.to_px(ctx.params.v2(&format!("positionsColors/point{i}"))), ctx.params.color(&format!("positionsColors/color{i}")))).collect();
     let k = four_color_softening(ctx.params.f("blend"), b.scale);
-    let jitter = (ctx.params.f("jitter") / 100.0).clamp(0.0, 1.0) as f32;
+    let jitter = four_color_jitter(ctx.params.f("jitter"));
     let op = ctx.params.f("opacity") as f32 / 100.0;
     let mode = ctx.params.e("blendingMode");
+    let keep_alpha = gen_mode(mode).is_none();
     let seed = ctx.seed;
     b.img.rows_mut().for_each(|(y, row)| {
         for (x, px) in row.iter_mut().enumerate() {
@@ -149,7 +168,7 @@ fn four_color(ctx: &EffectCtx, mut b: Buf) -> Buf {
             }
             // None keeps the layer's alpha (#1381), as the Gradient Ramp does: the gradient fills
             // a shape or text, not its bounding box.
-            let a = if gen_mode(mode).is_none() { op * px[3] } else { op };
+            let a = gen_alpha(op, px[3], keep_alpha);
             *px = gen_blend(*px, [c[0] * a, c[1] * a, c[2] * a, a], mode);
         }
     });
@@ -179,6 +198,7 @@ fn checkerboard(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let c = ctx.params.color("color");
     let op = ctx.params.f("opacity") as f32 / 100.0;
     let mode = ctx.params.e("blendingMode");
+    let keep_alpha = gen_mode(mode).is_none();
     // Signed distance (in feather units) to the nearest cell edge, positive in even cells.
     let axis = |p: f64, size: f64, f: f64| -> f64 {
         let u = p / size;
@@ -191,8 +211,8 @@ fn checkerboard(ctx: &EffectCtx, mut b: Buf) -> Buf {
         for (x, px) in row.iter_mut().enumerate() {
             let sx = axis(x as f64 + 0.5 - anchor.0, w, fw);
             let sy = axis(y as f64 + 0.5 - anchor.1, h, fh);
-            let cov = ((0.5 + 0.5 * sx * sy) as f32).clamp(0.0, 1.0) * op;
-            *px = gen_blend(*px, [c[0] * cov, c[1] * cov, c[2] * cov, cov], mode);
+            let a = gen_alpha(((0.5 + 0.5 * sx * sy) as f32).clamp(0.0, 1.0) * op, px[3], keep_alpha);
+            *px = gen_blend(*px, [c[0] * a, c[1] * a, c[2] * a, a], mode);
         }
     });
     b
@@ -208,6 +228,7 @@ fn grid(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let c = ctx.params.color("color");
     let op = ctx.params.f("opacity") as f32 / 100.0;
     let mode = ctx.params.e("blendingMode");
+    let keep_alpha = gen_mode(mode).is_none();
     b.img.rows_mut().for_each(|(y, row)| {
         for (x, px) in row.iter_mut().enumerate() {
             let gx = (x as f64 + 0.5 - anchor.0).rem_euclid(w);
@@ -219,7 +240,7 @@ fn grid(ctx: &EffectCtx, mut b: Buf) -> Buf {
             if invert {
                 cov = 1.0 - cov;
             }
-            let a = cov * op;
+            let a = gen_alpha(cov * op, px[3], keep_alpha);
             *px = gen_blend(*px, [c[0] * a, c[1] * a, c[2] * a, a], mode);
         }
     });
@@ -256,6 +277,7 @@ fn circle(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let op = ctx.params.f("opacity") as f32 / 100.0;
     let invert = ctx.params.b("invert");
     let mode = ctx.params.e("blendingMode");
+    let keep_alpha = gen_mode(mode).is_none();
     b.img.rows_mut().for_each(|(y, row)| {
         for (x, px) in row.iter_mut().enumerate() {
             let d = ((x as f64 + 0.5 - c.0).powi(2) + (y as f64 + 0.5 - c.1).powi(2)).sqrt();
@@ -266,7 +288,7 @@ fn circle(ctx: &EffectCtx, mut b: Buf) -> Buf {
             if invert {
                 cov = 1.0 - cov;
             }
-            let a = cov * op;
+            let a = gen_alpha(cov * op, px[3], keep_alpha);
             *px = gen_blend(*px, [color[0] * a, color[1] * a, color[2] * a, a], mode);
         }
     });
@@ -292,10 +314,22 @@ pub(crate) fn fade(t: f32) -> f32 {
     t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
 }
 
-/// 3D value noise in 0..1 (z = evolution).
+/// 3D value noise in 0..1 (z = evolution). The quintic fade applies on all three axes, so z
+/// eases in and out of every integer.
 pub fn value_noise(x: f32, y: f32, z: f32, seed: u32) -> f32 {
+    value_noise_z(x, y, z, seed, true)
+}
+
+/// [`value_noise`] with the evolution axis z interpolated linearly (x and y keep the quintic
+/// fade). The fade's zero slope at every integer z made a small Evolution change almost invisible
+/// next to a whole revolution (#943, #1816); linear z moves the pattern at a constant rate.
+pub fn value_noise_linear_z(x: f32, y: f32, z: f32, seed: u32) -> f32 {
+    value_noise_z(x, y, z, seed, false)
+}
+
+fn value_noise_z(x: f32, y: f32, z: f32, seed: u32, ease_z: bool) -> f32 {
     let (x0, y0, z0) = (x.floor(), y.floor(), z.floor());
-    let (fx, fy, fz) = (fade(x - x0), fade(y - y0), fade(z - z0));
+    let (fx, fy, fz) = (fade(x - x0), fade(y - y0), if ease_z { fade(z - z0) } else { z - z0 });
     let (ix, iy, iz) = (x0 as i32, y0 as i32, z0 as i32);
     let l = |a: f32, b: f32, t: f32| a + (b - a) * t;
     let c = |dx: i32, dy: i32, dz: i32| lattice(ix + dx, iy + dy, iz + dz, seed);
@@ -337,8 +371,9 @@ pub fn specs() -> Vec<EffectSpec> {
                 p("positionsColors/color3", "Color 3", col(1.0, 0.0, 1.0), ParamUi::Color),
                 p("positionsColors/point4", "Point 4", pt(0.9, 0.9), ParamUi::Point),
                 p("positionsColors/color4", "Color 4", col(0.0, 0.0, 1.0), ParamUi::Color),
-                p("blend", "Blend", num(100.0), slider(1.0, 1000.0, 1.0, 1000.0, 1)),
-                p("jitter", "Jitter", num(0.0), slider(0.0, 100.0, 0.0, 100.0, 1)),
+                // After Effects' valid ranges (#3478, #3479); Blend keeps its lower minimum (1, not 5).
+                p("blend", "Blend", num(100.0), slider(1.0, 10000.0, 1.0, 1000.0, 1)),
+                p("jitter", "Jitter", num(0.0), slider(0.0, 500.0, 0.0, 100.0, 1)),
                 p("opacity", "Opacity", num(100.0), slider(0.0, 100.0, 0.0, 100.0, 1)),
                 p("blendingMode", "Blending Mode", Value::Enum(0), popup(&GEN_BLEND_MODES[..18])),
             ],
@@ -372,7 +407,7 @@ pub fn specs() -> Vec<EffectSpec> {
                 p("corner", "Corner", pt(0.1, 0.1), ParamUi::Point),
                 p("width", "Width", num(64.0), slider(1.0, 4000.0, 1.0, 400.0, 1)),
                 p("height", "Height", num(64.0), slider(1.0, 4000.0, 1.0, 400.0, 1)),
-                p("border", "Border", num(2.0), slider(0.0, 400.0, 0.0, 40.0, 1)),
+                p("border", "Border", num(2.0), slider(0.0, 2000.0, 0.0, 40.0, 1)),
                 p("feather/featherWidth", "Width", num(0.0), slider(0.0, 1000.0, 0.0, 50.0, 1)),
                 p("feather/featherHeight", "Height", num(0.0), slider(0.0, 1000.0, 0.0, 50.0, 1)),
                 p("invertGrid", "Invert Grid", Value::Bool(false), ParamUi::Checkbox),
@@ -414,6 +449,27 @@ mod generator_tests {
         Image::filled(32, 32, [1.0, 0.0, 0.0, 1.0])
     }
 
+    /// #943: the evolution axis is linear, so z moves the noise at a constant rate, while the
+    /// classic `value_noise` keeps its eased z (other effects and their pinned goldens use it).
+    #[test]
+    fn linear_z_value_noise_moves_at_a_constant_rate() {
+        for (x, y, seed) in [(0.3f32, 0.7f32, 5u32), (2.4, -1.6, 11), (-3.1, 4.9, 0)] {
+            let a = value_noise_linear_z(x, y, 0.0, seed);
+            let b = value_noise_linear_z(x, y, 1.0, seed);
+            for z in [0.1f32, 0.25, 0.5, 0.75, 0.9] {
+                let want = a + (b - a) * z;
+                let got = value_noise_linear_z(x, y, z, seed);
+                assert!((got - want).abs() < 1e-5, "({x}, {y}) z {z}: {got} vs {want}");
+            }
+            // Same lattice values at whole z, and x / y are untouched.
+            assert_eq!(value_noise_linear_z(x, y, 2.0, seed), value_noise(x, y, 2.0, seed));
+        }
+        // The eased version still has the old shape: at z = 0.25 it lags the linear one.
+        let (a, b) = (value_noise(0.3, 0.7, 0.0, 5), value_noise(0.3, 0.7, 1.0, 5));
+        let eased = value_noise(0.3, 0.7, 0.25, 5);
+        assert!((eased - (a + (b - a) * 0.25)).abs() > 1e-3);
+    }
+
     #[test]
     fn gradient_ramp_stays_inside_the_layer_alpha() {
         // #1063: a shape's transparent pixels stay transparent; the ramp fills only the shape.
@@ -430,6 +486,21 @@ mod generator_tests {
             }
             assert!(o.img.data.iter().any(|p| p[3] > 0.99), "blend {blend}: the ramp is drawn inside the shape");
         }
+    }
+
+    /// #3479: Jitter goes up to After Effects' 500 %, and more jitter dithers more (the dither
+    /// stopped growing at 100 %).
+    #[test]
+    fn four_color_jitter_grows_up_to_five_hundred_percent() {
+        let img = Image::filled(32, 32, [0.0, 0.0, 0.0, 1.0]);
+        let spread = |jitter: f64| {
+            let o = run_fx("ec.generate.fourcolor", &[("jitter", num(jitter))], img.clone(), 0.0, EffectEnv::default()).img;
+            let flat = run_fx("ec.generate.fourcolor", &[], img.clone(), 0.0, EffectEnv::default()).img;
+            o.data.iter().zip(&flat.data).map(|(a, b)| (a[0] - b[0]).abs()).fold(0.0f32, f32::max)
+        };
+        let (at100, at500) = (spread(100.0), spread(500.0));
+        assert!(at100 > 0.0 && at500 > 4.0 * at100, "{at100} {at500}");
+        assert!(at500 < 0.2, "a few code values: {at500}");
     }
 
     /// After Effects 2026, 4-Color Gradient defaults (yellow, green, magenta, blue at 10 % / 90 %
@@ -537,6 +608,47 @@ mod generator_tests {
         // Stencil Alpha: the layer shows only through the grid lines.
         let o = run_fx("ec.generate.grid", &[set[0].clone(), set[1].clone(), ("blendingMode", Value::Enum(18))], red(), 0.0, EffectEnv::default());
         assert!(o.img.get(0, 5)[0] > 0.9 && o.img.get(5, 5)[3] < 0.01);
+    }
+
+    /// With Blending Mode None, a shape generator's pattern shows only where the layer has alpha
+    /// (#1381, #3121: masks come before effects). `set` makes the pattern cover (5, 5) and (35, 5).
+    fn assert_none_stays_inside_the_layer_alpha(id: &str, set: &[(&'static str, Value)]) {
+        // Three bands: transparent, half and fully opaque, premultiplied.
+        let mut img = Image::filled(40, 24, [1.0, 0.0, 0.0, 1.0]);
+        for (i, p) in img.data.iter_mut().enumerate() {
+            let a = [0.0, 0.5, 1.0][i % 40 / 14];
+            *p = p.map(|c| c * a);
+        }
+        for op in [100.0, 50.0] {
+            let mut set = set.to_vec();
+            set.push(("opacity", num(op)));
+            let o = run_fx(id, &set, img.clone(), 0.0, EffectEnv::default());
+            let k = op as f32 / 100.0;
+            for (src, out) in img.data.iter().zip(&o.img.data) {
+                assert!(out[3] <= src[3] * k + 1e-6, "{id} opacity {op}: alpha {} became {}", src[3], out[3]);
+                assert!(out[..3].iter().all(|&c| c <= out[3] + 1e-6), "{id} opacity {op}: premultiplied colour above alpha");
+            }
+            assert!(o.img.get(5, 5)[3] < 1e-6, "{id} opacity {op}: the pattern shows where the layer is transparent");
+            assert!(o.img.get(35, 5)[3] > 0.9 * k, "{id} opacity {op}: the pattern shows on the opaque layer: {:?}", o.img.get(35, 5));
+        }
+    }
+
+    #[test]
+    fn grid_none_stays_inside_the_layer_alpha() {
+        // Inverted, the grid covers nearly every pixel, wherever the lines fall.
+        assert_none_stays_inside_the_layer_alpha("ec.generate.grid", &[("width", num(10.0)), ("border", num(2.0)), ("invertGrid", Value::Bool(true))]);
+    }
+
+    #[test]
+    fn checkerboard_none_stays_inside_the_layer_alpha() {
+        // 8-pixel squares from the anchor at 0: (5, 5) and (35, 5) lie in on squares.
+        assert_none_stays_inside_the_layer_alpha("ec.generate.checkerboard", &[("width", num(8.0))]);
+    }
+
+    #[test]
+    fn circle_none_stays_inside_the_layer_alpha() {
+        // A disk larger than the image covers every pixel.
+        assert_none_stays_inside_the_layer_alpha("ec.generate.circle", &[("center", Value::Vec2([20.0, 12.0])), ("radius", num(100.0))]);
     }
 
     #[test]

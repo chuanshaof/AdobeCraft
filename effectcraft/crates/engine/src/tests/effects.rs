@@ -1,0 +1,1494 @@
+//! Effect Controls operations: copy/paste, duplicate, reorder, remove (Delete), reset, and the
+//! Edit menu routing to them when effects are selected, all with undo.
+
+use effectcraft_keyframe::{Ease, Interp, Value as KV};
+use effectcraft_project::{Layer, LayerId, PropGroup};
+use effectcraft_time::Tick;
+use serde_json::json;
+
+use crate::Session;
+
+fn comp_with_two_solids() -> (Session, u64, u64) {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Main", "width": 640, "height": 360, "frameRate": 30, "duration": 10})).unwrap();
+    let a = s.execute("layer.newSolid", json!({"color": "#ff0000", "width": 200, "height": 100})).unwrap()["layer"].as_u64().unwrap();
+    let b = s.execute("layer.newSolid", json!({"color": "#00ff00", "width": 400, "height": 300})).unwrap()["layer"].as_u64().unwrap();
+    (s, a, b)
+}
+
+fn layer(s: &Session, id: u64) -> Layer {
+    s.active_comp().unwrap().layer(LayerId(id)).unwrap().clone()
+}
+
+fn fx_names(s: &Session, id: u64) -> Vec<String> {
+    layer(s, id).effects().map(|f| f.groups().map(|g| g.name.clone()).collect()).unwrap_or_default()
+}
+
+fn apply(s: &mut Session, lid: u64, effect: &str) -> u64 {
+    s.execute("effect.apply", json!({"layers": [lid], "effect": effect})).unwrap()["effects"][0].as_u64().unwrap()
+}
+
+fn select_effect(s: &mut Session, lid: u64, uid: u64) {
+    s.state.selected_layers = vec![LayerId(lid)];
+    s.state.selected_props = vec![(LayerId(lid), uid)];
+}
+
+fn effect_group(s: &Session, lid: u64, uid: u64) -> PropGroup {
+    layer(s, lid).effects().unwrap().groups().find(|g| g.uid == uid).unwrap().clone()
+}
+
+fn animate_effect(s: &mut Session, lid: u64, uid: u64, path: &str, keys: &[(f64, f64)]) {
+    let prop = effect_group(s, lid, uid).prop(path).unwrap().uid;
+    for &(time, value) in keys {
+        s.execute("prop.addKey", json!({"layer": lid, "prop": prop, "time": time, "timeBase": "comp", "value": value})).unwrap();
+    }
+}
+
+fn set_layer_clock(s: &mut Session, lid: u64, start: f64, stretch: f64) {
+    let cid = s.active_comp_id().unwrap();
+    let l = std::sync::Arc::make_mut(&mut s.project).comp_mut(cid).unwrap().layer_mut(LayerId(lid)).unwrap();
+    l.start_time = Tick::from_seconds_f64(start);
+    l.stretch = stretch;
+}
+
+#[test]
+fn copy_paste_effects_between_layers_with_undo() {
+    let (mut s, a, b) = comp_with_two_solids();
+    let blur = apply(&mut s, a, "Gaussian Blur");
+    let gid = layer(&s, a).effects().unwrap().groups().next().unwrap().get("blurriness").unwrap().uid;
+    s.execute("prop.set", json!({"layer": a, "prop": gid, "value": 12.5})).unwrap();
+    select_effect(&mut s, a, blur);
+    // Edit ▸ Copy with an effect selected copies the effect, not the layer.
+    s.execute("edit.copy", json!({})).unwrap();
+    assert_eq!(s.state.effect_clipboard.len(), 1);
+    assert!(s.state.clipboard.is_empty());
+    // Paste onto the other layer.
+    s.state.selected_layers = vec![LayerId(b)];
+    s.state.selected_props.clear();
+    let n_layers = s.active_comp().unwrap().layers.len();
+    s.execute("edit.paste", json!({})).unwrap();
+    assert_eq!(s.active_comp().unwrap().layers.len(), n_layers, "no layer pasted");
+    assert_eq!(fx_names(&s, b), vec!["Gaussian Blur"]);
+    let pasted = layer(&s, b).effects().unwrap().groups().next().unwrap().clone();
+    assert_ne!(pasted.uid, blur, "fresh uids");
+    assert_eq!(pasted.get("blurriness").unwrap().value, KV::Scalar(12.5));
+    // Pasting again names the second instance uniquely.
+    s.execute("effect.paste", json!({"layers": [b]})).unwrap();
+    assert_eq!(fx_names(&s, b), vec!["Gaussian Blur", "Gaussian Blur 2"]);
+    s.undo();
+    s.undo();
+    assert!(fx_names(&s, b).is_empty());
+    assert_eq!(fx_names(&s, a), vec!["Gaussian Blur"]);
+}
+
+/// #989: copying an animated effect aligns its first key to the destination CTI.
+#[test]
+fn pasted_effect_keys_start_at_the_playhead() {
+    let (mut s, a, b) = comp_with_two_solids();
+    let blur = apply(&mut s, a, "Gaussian Blur");
+    let uid = layer(&s, a).effects().unwrap().groups().next().unwrap().get("blurriness").unwrap().uid;
+    for (time, value) in [(1.0, 10.0), (3.0, 30.0)] {
+        s.execute("prop.addKey", json!({"layer": a, "prop": uid, "time": time, "value": value})).unwrap();
+    }
+    let source = layer(&s, a);
+    select_effect(&mut s, a, blur);
+    s.execute("edit.copy", json!({})).unwrap();
+    s.execute("time.set", json!({"time": 5.0})).unwrap();
+    s.execute("layer.select", json!({"layers": [b]})).unwrap();
+    let undo = s.history.undo.len();
+    s.execute("edit.paste", json!({})).unwrap();
+    let pasted = layer(&s, b);
+    let keys = &pasted.effects().unwrap().groups().next().unwrap().get("blurriness").unwrap().keys;
+    assert_eq!(keys.iter().map(|k| pasted.comp_time(k.time).seconds()).collect::<Vec<_>>(), vec![5.0, 7.0]);
+    assert_eq!(keys.iter().map(|k| k.value.as_f64()).collect::<Vec<_>>(), vec![10.0, 30.0]);
+    assert_eq!(layer(&s, a), source, "copy and paste do not edit the source");
+    assert_eq!(s.history.undo.len(), undo + 1, "the whole paste is one undo step");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert!(fx_names(&s, b).is_empty());
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(layer(&s, b), pasted);
+}
+
+#[test]
+fn pasted_effects_share_one_anchor_including_nested_parameters() {
+    let (mut s, a, b) = comp_with_two_solids();
+    let blur = apply(&mut s, a, "Gaussian Blur");
+    let fractal = apply(&mut s, a, "Fractal");
+    animate_effect(&mut s, a, blur, "blurriness", &[(1.0, 10.0), (3.0, 30.0)]);
+    animate_effect(&mut s, a, fractal, "mandelbrot/mandelbrotX", &[(2.0, 1.25), (4.0, 2.5)]);
+    animate_effect(&mut s, a, fractal, "mandelbrot/mandelbrotY", &[(3.0, 0.5), (5.0, 2.0)]);
+    let static_value = effect_group(&s, a, fractal).get("setChoice").unwrap().value.clone();
+    s.state.selected_props = vec![(LayerId(a), blur), (LayerId(a), fractal)];
+    s.execute("edit.copy", json!({})).unwrap();
+    s.execute("time.set", json!({"time": 5.0})).unwrap();
+    let reply = s.execute("effect.paste", json!({"layers": [b]})).unwrap();
+    for (index, path, times) in
+        [(0, "blurriness", vec![5.0, 7.0]), (1, "mandelbrot/mandelbrotX", vec![6.0, 8.0]), (1, "mandelbrot/mandelbrotY", vec![7.0, 9.0])]
+    {
+        let group = effect_group(&s, b, reply["effects"][index].as_u64().unwrap());
+        assert_eq!(group.prop(path).unwrap().keys.iter().map(|k| k.time.seconds()).collect::<Vec<_>>(), times, "{path}");
+    }
+    let group = effect_group(&s, b, reply["effects"][1].as_u64().unwrap());
+    assert_eq!(group.get("setChoice").unwrap().value, static_value, "unanimated controls stay unchanged");
+}
+
+#[test]
+fn pasted_effects_preserve_comp_timing_and_eased_values_on_stretched_layers() {
+    for (source_start, source_stretch) in [(2.0, 100.0), (1.0, 200.0), (8.0, -200.0)] {
+        for (target_start, target_stretch) in [(0.0, 100.0), (3.0, 200.0), (8.0, -100.0)] {
+            let (mut s, a, b) = comp_with_two_solids();
+            set_layer_clock(&mut s, a, source_start, source_stretch);
+            set_layer_clock(&mut s, b, target_start, target_stretch);
+            let blur = apply(&mut s, a, "Gaussian Blur");
+            animate_effect(&mut s, a, blur, "blurriness", &[(3.0, 10.0), (5.0, 30.0)]);
+            let uid = effect_group(&s, a, blur).get("blurriness").unwrap().uid;
+            let cid = s.active_comp_id().unwrap();
+            let pr = std::sync::Arc::make_mut(&mut s.project).comp_mut(cid).unwrap().layer_mut(LayerId(a)).unwrap().props.find_mut(uid).unwrap();
+            for key in &mut pr.keys {
+                key.in_interp = Interp::Bezier;
+                key.out_interp = Interp::Bezier;
+                key.in_ease = vec![Ease { speed: 7.0, influence: 0.25 }];
+                key.out_ease = vec![Ease { speed: 3.0, influence: 0.6 }];
+                key.label = 4;
+            }
+            let source = layer(&s, a);
+            let source_pr = source.props.find(uid).unwrap();
+            s.execute("effect.copy", json!({"layer": a, "effect": blur})).unwrap();
+            s.execute("time.set", json!({"time": 5.0})).unwrap();
+            let pasted = s.execute("effect.paste", json!({"layers": [b]})).unwrap()["effects"][0].as_u64().unwrap();
+            let target = layer(&s, b);
+            let target_group = target.effects().unwrap().groups().find(|g| g.uid == pasted).unwrap();
+            let target_pr = target_group.get("blurriness").unwrap();
+            let mut times: Vec<Tick> = target_pr.keys.iter().map(|k| target.comp_time(k.time)).collect();
+            times.sort();
+            assert_eq!(times, vec![Tick::from_seconds_f64(5.0), Tick::from_seconds_f64(7.0)]);
+            for offset in [0.0, 0.25, 0.75, 1.5, 2.0] {
+                let expected = source_pr.value_at(source.layer_time(Tick::from_seconds_f64(3.0 + offset))).as_f64();
+                let actual = target_pr.value_at(target.layer_time(Tick::from_seconds_f64(5.0 + offset))).as_f64();
+                assert!((expected - actual).abs() < 1e-8, "source {source_stretch} %, target {target_stretch} %, t={offset}: {expected} != {actual}");
+            }
+            assert!(target_pr.keys.iter().all(|k| k.label == 4));
+            assert_eq!(layer(&s, a), source);
+        }
+    }
+}
+
+#[test]
+fn pasted_spatial_effect_keys_preserve_the_eased_path_on_reversed_layers() {
+    for (source_stretch, target_stretch) in [(200.0, 100.0), (-200.0, 100.0), (100.0, -200.0)] {
+        let (mut s, a, b) = comp_with_two_solids();
+        set_layer_clock(&mut s, a, if source_stretch < 0.0 { 8.0 } else { 1.0 }, source_stretch);
+        set_layer_clock(&mut s, b, if target_stretch < 0.0 { 8.0 } else { 0.0 }, target_stretch);
+        let ramp = apply(&mut s, a, "Gradient Ramp");
+        let uid = effect_group(&s, a, ramp).get("start").unwrap().uid;
+        for (time, value) in [(3.0, [50.0, 25.0]), (5.0, [180.0, 75.0])] {
+            s.execute("prop.addKey", json!({"layer": a, "prop": uid, "time": time, "timeBase": "comp", "value": value})).unwrap();
+        }
+        let cid = s.active_comp_id().unwrap();
+        let pr = std::sync::Arc::make_mut(&mut s.project).comp_mut(cid).unwrap().layer_mut(LayerId(a)).unwrap().props.find_mut(uid).unwrap();
+        pr.spatial = true;
+        for key in &mut pr.keys {
+            key.in_interp = Interp::Bezier;
+            key.out_interp = Interp::Bezier;
+            key.in_ease = vec![Ease { speed: 15.0, influence: 0.25 }];
+            key.out_ease = vec![Ease { speed: 30.0, influence: 0.6 }];
+            key.spatial_auto = false;
+            key.spatial_in = [-10.0, -20.0, 0.0];
+            key.spatial_out = [20.0, 5.0, 0.0];
+        }
+        let source = layer(&s, a);
+        let source_pr = source.props.find(uid).unwrap();
+        s.execute("effect.copy", json!({"layer": a, "effect": ramp})).unwrap();
+        s.execute("time.set", json!({"time": 5.0})).unwrap();
+        let pasted = s.execute("effect.paste", json!({"layers": [b]})).unwrap()["effects"][0].as_u64().unwrap();
+        let target = layer(&s, b);
+        let group = target.effects().unwrap().groups().find(|g| g.uid == pasted).unwrap();
+        let target_pr = group.get("start").unwrap();
+        for offset in [0.0, 0.25, 0.75, 1.5, 2.0] {
+            let expected = source_pr.value_at(source.layer_time(Tick::from_seconds_f64(3.0 + offset))).components();
+            let actual = target_pr.value_at(target.layer_time(Tick::from_seconds_f64(5.0 + offset))).components();
+            assert_eq!(expected.len(), actual.len());
+            assert!(expected.iter().zip(&actual).all(|(a, b)| (a - b).abs() < 0.05), "path at {offset}: {expected:?} != {actual:?}");
+        }
+    }
+}
+
+#[test]
+fn effect_clipboard_is_a_snapshot_and_repeated_paste_uses_the_target_comps_cti() {
+    let (mut s, a, _) = comp_with_two_solids();
+    let original_comp = s.active_comp_id().unwrap();
+    let blur = apply(&mut s, a, "Gaussian Blur");
+    animate_effect(&mut s, a, blur, "blurriness", &[(1.0, 10.0), (3.0, 30.0)]);
+    s.execute("effect.copy", json!({"layer": a, "effect": blur})).unwrap();
+    let clipboard = s.state.effect_clipboard.clone();
+    // Changing the source after Copy must not change what the clipboard will paste.
+    animate_effect(&mut s, a, blur, "blurriness", &[(4.0, 99.0)]);
+    s.execute("time.set", json!({"time": 9.0})).unwrap();
+    let destination = s.execute("comp.new", json!({"name": "Destination", "frameRate": 24, "duration": 10})).unwrap()["comp"].as_u64().unwrap();
+    let b = s.execute("layer.newSolid", json!({"color": "#ffffff"})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("time.set", json!({"time": 4.0})).unwrap();
+    s.open_comp(original_comp);
+    for (cti, expected) in [(4.0, vec![4.0, 6.0]), (2.0, vec![2.0, 4.0])] {
+        s.state.times.insert(effectcraft_project::ItemId(destination), Tick::from_seconds_f64(cti));
+        let uid = s.execute("effect.paste", json!({"comp": destination, "layers": [b]})).unwrap()["effects"][0].as_u64().unwrap();
+        let l = s.project.comp(effectcraft_project::ItemId(destination)).unwrap().layer(LayerId(b)).unwrap();
+        let pr = l.effects().unwrap().groups().find(|g| g.uid == uid).unwrap().get("blurriness").unwrap();
+        assert_eq!(pr.keys.iter().map(|k| l.comp_time(k.time).seconds()).collect::<Vec<_>>(), expected);
+        assert_eq!(pr.keys.iter().map(|k| k.value.as_f64()).collect::<Vec<_>>(), vec![10.0, 30.0]);
+        assert_eq!(s.state.effect_clipboard, clipboard);
+    }
+}
+
+#[test]
+fn invalid_effect_paste_timing_leaves_every_target_and_history_unchanged() {
+    for stretch in [0.0, f64::NAN, f64::INFINITY, 1e-300, 1e300] {
+        let (mut s, a, b) = comp_with_two_solids();
+        let blur = apply(&mut s, a, "Gaussian Blur");
+        animate_effect(&mut s, a, blur, "blurriness", &[(1.0, 10.0), (3.0, 30.0)]);
+        s.execute("effect.copy", json!({"layer": a, "effect": blur})).unwrap();
+        set_layer_clock(&mut s, b, 0.0, stretch);
+        s.execute("time.set", json!({"time": 5.0})).unwrap();
+        let project = s.project.clone();
+        let clipboard = s.state.effect_clipboard.clone();
+        let undo = s.history.undo.len();
+        // A is valid and comes first; failure on B must roll back A's new effect too.
+        assert!(s.execute("effect.paste", json!({"layers": [a, b]})).is_err(), "{stretch}");
+        assert!(std::sync::Arc::ptr_eq(&s.project, &project));
+        assert_eq!(s.state.effect_clipboard, clipboard);
+        assert_eq!(s.history.undo.len(), undo);
+    }
+}
+
+#[test]
+fn invalid_effect_copy_keeps_the_previous_clipboard() {
+    let (mut s, a, _) = comp_with_two_solids();
+    let blur = apply(&mut s, a, "Gaussian Blur");
+    animate_effect(&mut s, a, blur, "blurriness", &[(1.0, 10.0), (3.0, 30.0)]);
+    s.execute("effect.copy", json!({"layer": a, "effect": blur})).unwrap();
+    let clipboard = s.state.effect_clipboard.clone();
+    set_layer_clock(&mut s, a, 0.0, 0.0);
+    assert!(s.execute("effect.copy", json!({"layer": a, "effect": blur})).is_err());
+    assert_eq!(s.state.effect_clipboard, clipboard);
+}
+
+#[test]
+fn effect_paste_keeps_exact_ntsc_frame_offsets() {
+    let (mut s, a, b) = comp_with_two_solids();
+    let cid = s.active_comp_id().unwrap();
+    let frame = effectcraft_time::FrameRate::new(30000, 1001).frame_duration();
+    let blur = apply(&mut s, a, "Gaussian Blur");
+    let uid = effect_group(&s, a, blur).get("blurriness").unwrap().uid;
+    let pr = std::sync::Arc::make_mut(&mut s.project).comp_mut(cid).unwrap().layer_mut(LayerId(a)).unwrap().props.find_mut(uid).unwrap();
+    pr.keys = vec![
+        effectcraft_keyframe::Keyframe::new(frame.mul_ratio(11, 1), KV::Scalar(10.0)),
+        effectcraft_keyframe::Keyframe::new(frame.mul_ratio(43, 1), KV::Scalar(30.0)),
+    ];
+    s.execute("effect.copy", json!({"layer": a, "effect": blur})).unwrap();
+    let cti = frame.mul_ratio(71, 1);
+    s.state.times.insert(cid, cti);
+    let pasted = s.execute("effect.paste", json!({"layers": [b]})).unwrap()["effects"][0].as_u64().unwrap();
+    let group = effect_group(&s, b, pasted);
+    assert_eq!(group.get("blurriness").unwrap().keys.iter().map(|k| k.time).collect::<Vec<_>>(), vec![cti, cti + frame.mul_ratio(32, 1)]);
+}
+
+#[test]
+fn overflowing_effect_paste_times_return_an_error_without_an_edit() {
+    let (mut s, a, b) = comp_with_two_solids();
+    let blur = apply(&mut s, a, "Gaussian Blur");
+    animate_effect(&mut s, a, blur, "blurriness", &[(1.0, 10.0), (3.0, 30.0)]);
+    s.execute("effect.copy", json!({"layer": a, "effect": blur})).unwrap();
+    let cid = s.active_comp_id().unwrap();
+    for cti in [Tick::MAX, Tick(i64::MAX)] {
+        s.state.times.insert(cid, cti);
+        let project = s.project.clone();
+        let undo = s.history.undo.len();
+        assert!(s.execute("effect.paste", json!({"layers": [b]})).is_err());
+        assert!(std::sync::Arc::ptr_eq(&s.project, &project));
+        assert_eq!(s.history.undo.len(), undo);
+    }
+}
+
+#[test]
+fn duplicate_reorder_and_delete_selected_effect() {
+    let (mut s, a, _) = comp_with_two_solids();
+    let blur = apply(&mut s, a, "Gaussian Blur");
+    apply(&mut s, a, "Invert");
+    select_effect(&mut s, a, blur);
+    // Edit ▸ Duplicate (Cmd+D) duplicates the selected effect right after it and selects the copy.
+    s.execute("edit.duplicate", json!({})).unwrap();
+    assert_eq!(fx_names(&s, a), vec!["Gaussian Blur", "Gaussian Blur 2", "Invert"]);
+    let dup = s.state.selected_props[0].1;
+    assert_ne!(dup, blur);
+    // Reorder: move Invert to the top.
+    s.execute("effect.reorder", json!({"layer": a, "effect": "Invert", "index": 1})).unwrap();
+    assert_eq!(fx_names(&s, a), vec!["Invert", "Gaussian Blur", "Gaussian Blur 2"]);
+    // Delete with the duplicate selected removes just that effect (not the layer).
+    s.execute("edit.clear", json!({})).unwrap();
+    assert_eq!(fx_names(&s, a), vec!["Invert", "Gaussian Blur"]);
+    assert!(s.active_comp().unwrap().layer(LayerId(a)).is_some());
+    s.undo();
+    assert_eq!(fx_names(&s, a), vec!["Invert", "Gaussian Blur", "Gaussian Blur 2"]);
+    s.undo();
+    assert_eq!(fx_names(&s, a), vec!["Gaussian Blur", "Gaussian Blur 2", "Invert"]);
+    s.undo();
+    assert_eq!(fx_names(&s, a), vec!["Gaussian Blur", "Invert"]);
+}
+
+#[test]
+fn reset_effect_restores_defaults_in_one_undo_step() {
+    let (mut s, _, b) = comp_with_two_solids();
+    let ramp = apply(&mut s, b, "Gradient Ramp");
+    let g = layer(&s, b).effects().unwrap().groups().next().unwrap().clone();
+    let start = g.get("start").unwrap().uid;
+    let shape = g.get("shape").unwrap().uid;
+    // Point defaults are fractions of the layer (400 × 300).
+    assert_eq!(g.get("start").unwrap().value, KV::Vec2([200.0, 0.0]));
+    s.execute("prop.set", json!({"layer": b, "prop": start, "value": [10.0, 20.0]})).unwrap();
+    s.execute("prop.set", json!({"layer": b, "prop": shape, "value": 1})).unwrap();
+    let undo_before = s.history.undo.len();
+    s.execute("effect.reset", json!({"layer": b, "effect": ramp})).unwrap();
+    assert_eq!(s.history.undo.len(), undo_before + 1);
+    let g = layer(&s, b).effects().unwrap().groups().next().unwrap().clone();
+    assert_eq!(g.get("start").unwrap().value, KV::Vec2([200.0, 0.0]));
+    assert_eq!(g.get("shape").unwrap().value, KV::Enum(0));
+    s.undo();
+    let g = layer(&s, b).effects().unwrap().groups().next().unwrap().clone();
+    assert_eq!(g.get("start").unwrap().value, KV::Vec2([10.0, 20.0]));
+}
+
+#[test]
+fn reset_restores_parameters_inside_twirl_down_groups() {
+    let (mut s, a, _) = comp_with_two_solids();
+    // Fractal and Scribble keep most parameters in groups (`mandelbrot/…`, `edgeOptions/…`).
+    for (effect, changes) in [
+        ("Fractal", [("setChoice", json!(1)), ("mandelbrot/mandelbrotX", json!(1.25)), ("fractalColor/hue", json!(90.0))]),
+        ("Scribble", [("scribble", json!(2)), ("edgeOptions/edgeWidth", json!(33.0)), ("strokeOptions/spacing", json!(9.0))]),
+    ] {
+        let fx = apply(&mut s, a, effect);
+        let group = |s: &Session| layer(s, a).effects().unwrap().groups().find(|g| g.uid == fx).unwrap().clone();
+        let defaults: Vec<_> = changes.iter().map(|(id, _)| group(&s).prop(id).unwrap().value.clone()).collect();
+        for (id, v) in &changes {
+            let uid = group(&s).prop(id).unwrap().uid;
+            s.execute("prop.set", json!({"layer": a, "prop": uid, "value": v})).unwrap();
+            assert_ne!(group(&s).prop(id).unwrap().value, defaults[changes.iter().position(|(i, _)| i == id).unwrap()], "{effect} {id} changed");
+        }
+        s.execute("effect.reset", json!({"layer": a, "effect": fx})).unwrap();
+        for ((id, _), d) in changes.iter().zip(&defaults) {
+            assert_eq!(&group(&s).prop(id).unwrap().value, d, "{effect} {id} back to its default");
+        }
+    }
+}
+
+#[test]
+fn reset_keys_animated_params_at_the_cti() {
+    let (mut s, a, _) = comp_with_two_solids();
+    let blur = apply(&mut s, a, "Gaussian Blur");
+    let uid = layer(&s, a).effects().unwrap().groups().next().unwrap().get("blurriness").unwrap().uid;
+    s.execute("prop.toggleAnimation", json!({"layer": a, "prop": uid})).unwrap();
+    s.execute("prop.set", json!({"layer": a, "prop": uid, "value": 30.0})).unwrap();
+    s.execute("time.set", json!({"time": 2.0})).unwrap();
+    s.execute("effect.reset", json!({"layer": a, "effect": blur})).unwrap();
+    let pr = layer(&s, a).effects().unwrap().groups().next().unwrap().get("blurriness").unwrap().clone();
+    assert_eq!(pr.keys.len(), 2, "a key at the CTI with the default value");
+    assert_eq!(pr.keys[1].value, KV::Scalar(0.0));
+}
+
+#[test]
+fn tint_swaps_only_its_colors_in_one_undo_step() {
+    let (mut s, a, b) = comp_with_two_solids();
+    let first = apply(&mut s, a, "Tint");
+    let target = apply(&mut s, a, "Tint");
+    let other = apply(&mut s, b, "Tint");
+    for (path, value) in [("black", json!([1.0, 0.0, 0.0, 1.0])), ("white", json!([0.0, 0.25, 1.0, 1.0])), ("amount", json!(45.0))] {
+        s.execute("prop.set", json!({"layer": a, "path": format!("effects/#2/{path}"), "value": value})).unwrap();
+    }
+    let before_a = layer(&s, a);
+    let before_b = layer(&s, b);
+    let n = s.history.undo.len();
+    s.execute("effect.swapTintColors", json!({"layer": a, "effect": target})).unwrap();
+    let swapped = layer(&s, a);
+    let g = swapped.props.find_group(target).unwrap();
+    assert_eq!(g.prop("black").unwrap().value, KV::Color([0.0, 0.25, 1.0, 1.0]));
+    assert_eq!(g.prop("white").unwrap().value, KV::Color([1.0, 0.0, 0.0, 1.0]));
+    assert_eq!(g.prop("amount").unwrap().value, KV::Scalar(45.0));
+    assert_eq!(swapped.props.find_group(first), before_a.props.find_group(first));
+    assert_eq!(layer(&s, b).props.find_group(other), before_b.props.find_group(other));
+    assert_eq!(s.history.undo.len(), n + 1);
+    assert!(s.undo());
+    assert_eq!(layer(&s, a).props, before_a.props);
+    assert!(s.redo());
+    assert_eq!(layer(&s, a).props, swapped.props);
+}
+
+#[test]
+fn tint_swap_keys_animated_colors_at_layer_time() {
+    let (mut s, a, _) = comp_with_two_solids();
+    let target = apply(&mut s, a, "Tint");
+    s.execute("prop.set", json!({"layer": a, "path": "effects/#1/black", "value": [1.0, 0.0, 0.0, 1.0]})).unwrap();
+    s.execute("prop.set", json!({"layer": a, "path": "effects/#1/white", "value": [0.0, 0.0, 1.0, 1.0]})).unwrap();
+    s.execute("prop.toggleAnimation", json!({"layer": a, "path": "effects/#1/black"})).unwrap();
+    s.execute("time.set", json!({"time": 2.0})).unwrap();
+    s.execute("prop.set", json!({"layer": a, "path": "effects/#1/black", "value": [0.0, 1.0, 0.0, 1.0]})).unwrap();
+    s.execute("layer.timeStretch", json!({"layers": [a], "percent": 200.0})).unwrap();
+    // At comp time 2s the stretched layer is at 1s, between its unchanged 0s and 2s keys.
+    let before = layer(&s, a);
+    let g = before.props.find_group(target).unwrap();
+    let lt = before.layer_time(s.time());
+    let expected = g.prop("black").unwrap().value_at(lt);
+    let keys = g.prop("black").unwrap().keys.clone();
+    select_effect(&mut s, a, target);
+    s.execute("effect.swapTintColors", json!({})).unwrap();
+    let after = layer(&s, a);
+    let g = after.props.find_group(target).unwrap();
+    let black = g.prop("black").unwrap();
+    assert_eq!(black.keys.len(), 3);
+    assert_eq!(black.keys[0], keys[0]);
+    assert_eq!(black.keys[2], keys[1]);
+    assert_eq!(black.keys[1].time, lt);
+    assert_eq!(black.keys[1].value, KV::Color([0.0, 0.0, 1.0, 1.0]));
+    assert_eq!(g.prop("white").unwrap().value, expected);
+    assert!(g.prop("white").unwrap().keys.is_empty());
+    assert!(s.undo());
+    assert_eq!(layer(&s, a).props, before.props);
+}
+
+#[test]
+fn tint_swap_rejects_invalid_targets_without_editing() {
+    let mut empty = Session::default();
+    assert!(empty.execute("effect.swapTintColors", json!({})).is_err());
+    let (mut s, a, _) = comp_with_two_solids();
+    let blur = apply(&mut s, a, "Gaussian Blur");
+    let tint = apply(&mut s, a, "Tint");
+    for params in [
+        json!({"layer": a, "effect": blur}),
+        json!({"layer": a, "effect": "missing"}),
+        json!({"layer": a, "effect": []}),
+        json!({"layer": a, "effect": 1.5}),
+        json!({"layer": a, "effect": 0}),
+        json!(false),
+    ] {
+        let before = layer(&s, a);
+        let n = s.history.undo.len();
+        assert!(s.execute("effect.swapTintColors", params).is_err());
+        assert_eq!(layer(&s, a).props, before.props);
+        assert_eq!(s.history.undo.len(), n);
+    }
+    // A damaged project's colour parameter must also fail atomically.
+    let cid = s.active_comp_id().unwrap();
+    s.edit("Break Tint", None, |p, _| {
+        p.comp_mut(cid).unwrap().layer_mut(LayerId(a)).unwrap().props.find_group_mut(tint).unwrap().prop_mut("white").unwrap().value = KV::Scalar(1.0);
+        Ok(())
+    })
+    .unwrap();
+    let before = layer(&s, a);
+    let n = s.history.undo.len();
+    assert!(s.execute("effect.swapTintColors", json!({"layer": a, "effect": tint})).is_err());
+    assert_eq!(layer(&s, a).props, before.props);
+    assert_eq!(s.history.undo.len(), n);
+}
+
+#[test]
+fn copy_layers_clears_effect_clipboard() {
+    let (mut s, a, b) = comp_with_two_solids();
+    let blur = apply(&mut s, a, "Gaussian Blur");
+    select_effect(&mut s, a, blur);
+    s.execute("effect.copy", json!({})).unwrap();
+    s.state.selected_props.clear();
+    s.state.selected_layers = vec![LayerId(b)];
+    s.execute("edit.copy", json!({})).unwrap();
+    assert!(s.state.effect_clipboard.is_empty());
+    let n = s.active_comp().unwrap().layers.len();
+    s.execute("edit.paste", json!({})).unwrap();
+    assert_eq!(s.active_comp().unwrap().layers.len(), n + 1, "layer pasted");
+}
+
+#[test]
+fn layer_params_get_a_source_companion() {
+    let (mut s, a, _) = comp_with_two_solids();
+    apply(&mut s, a, "ec.channel.blend");
+    let g = layer(&s, a).effects().unwrap().groups().next().unwrap().clone();
+    let layer_params: Vec<_> = g.props().filter(|p| matches!(p.ui, effectcraft_project::ParamUi::Layer)).map(|p| p.match_id.clone()).collect();
+    assert!(!layer_params.is_empty());
+    for id in layer_params {
+        let src = g.get(&effectcraft_effects::layer_source_id(&id)).expect("companion");
+        assert_eq!(src.value, KV::Enum(2), "Effects & Masks by default");
+        assert!(matches!(src.ui, effectcraft_project::ParamUi::Hidden));
+    }
+}
+
+/// Projects saved before parameters were renamed, regrouped, added or had their popups
+/// reordered open with their instances brought up to date (`effectcraft_effects::migrate`).
+#[test]
+fn opening_an_old_project_upgrades_effect_instances() {
+    use effectcraft_effects::migrate::PARAM_ID_ALIASES;
+    use effectcraft_project::{Node, ParamUi, PropGroup};
+    let (mut s, a, _) = comp_with_two_solids();
+    apply(&mut s, a, "ec.blur.gaussian");
+    // One instance of every effect with renamed parameter ids.
+    let mut aliased: Vec<&str> = PARAM_ID_ALIASES.iter().map(|(e, _, _)| *e).collect();
+    aliased.dedup();
+    for e in &aliased {
+        apply(&mut s, a, e);
+    }
+    // Rewrite the saved instances the way an older version wrote them.
+    fn take(g: &mut PropGroup, path: &str) -> Option<effectcraft_project::Property> {
+        match path.split_once('/') {
+            None => {
+                let i = g.children.iter().position(|c| matches!(c, Node::Prop(p) if p.match_id == path))?;
+                match g.children.remove(i) {
+                    Node::Prop(p) => Some(p),
+                    Node::Group(_) => None,
+                }
+            }
+            Some((first, rest)) => take(g.sub_mut(first)?, rest),
+        }
+    }
+    let mut old = (*s.project).clone();
+    let cid = s.active_comp_id().unwrap();
+    {
+        let comp = std::sync::Arc::make_mut(match &mut old.items.get_mut(&cid).unwrap().kind {
+            effectcraft_project::ItemKind::Comp(c) => c,
+            _ => panic!("not a composition"),
+        });
+        let l = comp.layers.find_mut(|l| l.id == LayerId(a)).unwrap();
+        for n in &mut l.props.sub_mut("effects").unwrap().children {
+            let Node::Group(g) = n else { continue };
+            if g.match_id == "ec.blur.gaussian" {
+                // Repeat Edge Pixels did not exist yet, Blurriness had another name, the popup
+                // listed its options in reverse.
+                take(g, "repeatEdge").unwrap();
+                g.get_mut("blurriness").unwrap().name = "Old Blurriness".into();
+                let d = g.get_mut("dimensions").unwrap();
+                let ParamUi::Popup { options } = &d.ui else { panic!("dimensions is a popup") };
+                d.ui = ParamUi::Popup { options: options.iter().rev().cloned().collect() };
+                d.value = KV::Enum(0);
+            }
+            for (e, old_id, new_id) in PARAM_ID_ALIASES {
+                if g.match_id == *e {
+                    let mut p = take(g, new_id).unwrap_or_else(|| panic!("{e}: no {new_id}"));
+                    // Put it back at its old path (which may be inside a group).
+                    let (path, leaf) = old_id.rsplit_once('/').map(|(p, l)| (Some(p), l)).unwrap_or((None, old_id));
+                    p.match_id = leaf.to_string();
+                    let mut at: &mut PropGroup = g;
+                    for seg in path.into_iter().flat_map(|p| p.split('/')) {
+                        if at.sub(seg).is_none() {
+                            at.children.push(PropGroup::new(1_000_000 + at.children.len() as u64, seg, seg).into());
+                        }
+                        at = at.sub_mut(seg).unwrap();
+                    }
+                    at.children.push(p.into());
+                }
+            }
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("ec-upgrade-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("old.ecproj").to_string_lossy().to_string();
+    std::fs::write(&path, old.to_json()).unwrap();
+    let mut s2 = Session::default();
+    s2.execute("file.open", json!({"path": path})).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+    let l = s2.project.comp(cid).unwrap().layer(LayerId(a)).unwrap().clone();
+    let fx = l.effects().unwrap();
+    let spec = effectcraft_effects::find("ec.blur.gaussian").unwrap();
+    let sp = |id: &str| spec.params.iter().find(|p| p.id == id).unwrap();
+    let blur = fx.groups().find(|g| g.match_id == "ec.blur.gaussian").unwrap();
+    assert_eq!(blur.get("blurriness").unwrap().name, sp("blurriness").name);
+    assert!(blur.get("repeatEdge").is_some(), "missing parameter added");
+    let dims = blur.get("dimensions").unwrap();
+    let ParamUi::Popup { options } = &sp("dimensions").ui else { panic!() };
+    assert_eq!(dims.value, KV::Enum(options.len() as u32 - 1), "popup value remapped by label");
+    assert_eq!(dims.ui, sp("dimensions").ui);
+    for (e, old_id, new_id) in PARAM_ID_ALIASES {
+        let g = fx.groups().find(|g| g.match_id == *e).unwrap();
+        let at = |id: &str| {
+            let (path, leaf) = id.rsplit_once('/').map(|(p, l)| (Some(p), l)).unwrap_or((None, id));
+            let mut node = Some(g);
+            for seg in path.into_iter().flat_map(|p| p.split('/')) {
+                node = node.and_then(|n| n.sub(seg));
+            }
+            node.and_then(|n| n.get(leaf)).is_some()
+        };
+        assert!(!at(old_id), "{e}: {old_id} still present");
+        let (path, leaf) = new_id.rsplit_once('/').map(|(p, l)| (Some(p), l)).unwrap_or((None, new_id));
+        let mut node = Some(g);
+        for seg in path.into_iter().flat_map(|p| p.split('/')) {
+            node = node.and_then(|n| n.sub(seg));
+        }
+        assert!(node.and_then(|n| n.get(leaf)).is_some(), "{e}: {old_id} not moved to {new_id}");
+    }
+    // The upgraded project renders.
+    let _ = s2.render(cid, s2.time(), Default::default());
+}
+
+/// A project saved before schema 2 (#227): effect points on a shape layer were measured from
+/// its origin. Opening converts them to effect space so points that were set keep their place
+/// in the comp; points at their default become the layer centre; layers with a source
+/// rectangle, adjustment layers (their effects see the comp below as it is) and expression
+/// controls keep their values. Saving writes schema 2, and opening that again changes nothing.
+#[test]
+fn opening_a_schema_1_project_moves_shape_layer_effect_points_into_effect_space() {
+    let mut s = Session::default();
+    s.execute("comp.new", json!({"name": "Main", "width": 200, "height": 100, "frameRate": 30, "duration": 2})).unwrap();
+    let shape = s.execute("layer.newShape", json!({"kind": "rect", "size": [180, 80]})).unwrap()["layer"].as_u64().unwrap();
+    let solid = s.execute("layer.newSolid", json!({"color": "#0000ff", "width": 200, "height": 100})).unwrap()["layer"].as_u64().unwrap();
+    let point = |s: &Session, lid: u64, fx: u64, id: &str| -> KV {
+        let l = layer(s, lid);
+        let g = l.effects().unwrap().groups().find(|g| g.uid == fx).unwrap();
+        g.props().find(|p| p.match_id == id || (id.is_empty() && p.ui == effectcraft_project::ParamUi::Point)).unwrap().value.clone()
+    };
+    let set = |s: &mut Session, lid: u64, fx: u64, id: &str, v: [f64; 2]| {
+        let l = layer(s, lid);
+        let g = l.effects().unwrap().groups().find(|g| g.uid == fx).unwrap();
+        let uid = g.props().find(|p| p.match_id == id || (id.is_empty() && p.ui == effectcraft_project::ParamUi::Point)).unwrap().uid;
+        s.execute("prop.set", json!({"layer": lid, "prop": uid, "value": v})).unwrap();
+    };
+    let twirl = apply(&mut s, shape, "Twirl");
+    set(&mut s, shape, twirl, "center", [-30.0, -10.0]);
+    let bulge = apply(&mut s, shape, "Bulge");
+    let control = apply(&mut s, shape, "Point Control");
+    set(&mut s, shape, control, "", [5.0, 5.0]);
+    let on_solid = apply(&mut s, solid, "Twirl");
+    set(&mut s, solid, on_solid, "center", [30.0, 20.0]);
+    let adjust = s.execute("layer.newShape", json!({"kind": "rect", "size": [50, 50]})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("layer.setSwitch", json!({"layers": [adjust], "switch": "adjustment", "value": true})).unwrap();
+    let on_adjust = apply(&mut s, adjust, "Twirl");
+    set(&mut s, adjust, on_adjust, "center", [40.0, 30.0]);
+    assert_eq!(point(&s, shape, bulge, "center"), KV::Vec2([100.0, 50.0]), "Bulge's default centre");
+
+    let old = s.project.to_file_json().unwrap().replacen("\"schema\": 2", "\"schema\": 1", 1);
+    assert!(old.contains("\"schema\": 1"));
+    let dir = std::env::temp_dir().join(format!("ec-effect-space-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("old.ecproj").to_string_lossy().to_string();
+    std::fs::write(&path, old).unwrap();
+    let mut s2 = Session::default();
+    s2.execute("file.open", json!({"path": path})).unwrap();
+    assert_eq!(s2.project.schema, effectcraft_project::SCHEMA_VERSION);
+    let check = |s2: &Session| {
+        assert_eq!(point(s2, shape, twirl, "center"), KV::Vec2([70.0, 40.0]), "a set point keeps its place in the comp");
+        assert_eq!(point(s2, shape, bulge, "center"), KV::Vec2([100.0, 50.0]), "a default point becomes the layer centre");
+        assert_eq!(point(s2, shape, control, ""), KV::Vec2([5.0, 5.0]), "expression controls keep their values");
+        assert_eq!(point(s2, solid, on_solid, "center"), KV::Vec2([30.0, 20.0]), "a solid's effect space is its layer space");
+        assert_eq!(point(s2, adjust, on_adjust, "center"), KV::Vec2([40.0, 30.0]), "an adjustment layer's effects see the comp");
+    };
+    check(&s2);
+    // Saved as schema 2 and opened again: nothing moves twice.
+    s2.execute("file.save", json!({"path": path})).unwrap();
+    let mut s3 = Session::default();
+    s3.execute("file.open", json!({"path": path})).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+    check(&s3);
+}
+
+/// Writes `s`'s project as a build before Cineon Converter version 2 saved it: schema 2, and no
+/// hidden Version parameter on Cineon Converter instances. Returns the folder and the file.
+fn save_before_cineon_version_2(s: &Session, name: &str) -> (std::path::PathBuf, String) {
+    fn drop_version(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::Object(o) => {
+                if o.get("match") == Some(&json!("ec.utility.cineon"))
+                    && let Some(serde_json::Value::Array(children)) = o.get_mut("children")
+                {
+                    children.retain(|c| c["match"] != json!("version"));
+                }
+                o.values_mut().for_each(drop_version);
+            }
+            serde_json::Value::Array(a) => a.iter_mut().for_each(drop_version),
+            _ => {}
+        }
+    }
+    let mut old: serde_json::Value = serde_json::from_str(&s.project.to_file_json().unwrap()).unwrap();
+    old["schema"] = json!(2);
+    drop_version(&mut old);
+    let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("old.ecproj").to_string_lossy().to_string();
+    std::fs::write(&path, old.to_string()).unwrap();
+    (dir, path)
+}
+
+/// Opening a project with a Cineon Converter saved before version 2 leaves the text of every
+/// expression as it was saved: one on an unrelated property (a wiggle) and one on Gamma.
+#[test]
+fn opening_an_old_cineon_converter_project_keeps_expression_text() {
+    let (mut s, a, b) = comp_with_two_solids();
+    let fx = apply(&mut s, a, "Cineon Converter");
+    let wiggle = "wiggle(2, 10)";
+    let on_gamma = "value + time / 10";
+    s.execute("prop.setExpression", json!({"layer": b, "path": "transform/position", "expression": wiggle})).unwrap();
+    let gamma = effect_group(&s, a, fx).prop("gamma").unwrap().uid;
+    s.execute("prop.setExpression", json!({"layer": a, "prop": gamma, "expression": on_gamma})).unwrap();
+    let (dir, path) = save_before_cineon_version_2(&s, "ec-cineon-expressions");
+    let mut s2 = Session::default();
+    s2.execute("file.open", json!({"path": path})).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+    let position = layer(&s2, b).props.prop("transform/position").and_then(|p| p.expr.clone()).map(|e| e.text);
+    assert_eq!(position.as_deref(), Some(wiggle));
+    let gamma = effect_group(&s2, a, fx).prop("gamma").and_then(|p| p.expr.clone()).map(|e| e.text);
+    assert_eq!(gamma.as_deref(), Some(on_gamma));
+}
+
+/// Cineon Converter version 1's Log to Linear: the linear value raised to `1.7 / gamma` (no
+/// Highlight Rolloff).
+fn cineon_version_1(v: f32, gamma: f32) -> f32 {
+    let off = 10f32.powf((95.0 - 685.0) * 0.002 / 0.6);
+    ((10f32.powf((v * 1023.0 - 685.0) * 0.002 / 0.6) - off) / (1.0 - off)).max(0.0).powf(1.7 / gamma)
+}
+
+fn cineon_version_2(v: f32, gamma: f32) -> f32 {
+    let offset = 10f32.powf((95.0 - 685.0) * 0.002 / 0.6).powf(1.0 / gamma);
+    let exposure = 10f32.powf((v * 1023.0 - 685.0) * 0.002 / 0.6).powf(1.0 / gamma);
+    ((exposure - offset) / (1.0 - offset)).max(0.0)
+}
+
+/// A project saved before Cineon Converter version 2 opens with each instance at version 1,
+/// where Gamma 1.7 gives linear output: Gamma and its keyframes keep their saved values, and the
+/// frames render as they did. Saving and opening again changes nothing. A Cineon Converter
+/// applied after that is version 2, where Gamma 1 gives linear output.
+#[test]
+fn opening_an_old_cineon_converter_project_keeps_what_it_renders() {
+    let mut s = Session::default();
+    // 32 bpc, so frames are not rounded to 8-bit steps.
+    s.execute("file.projectSettings", json!({"bitDepth": 32})).unwrap();
+    s.execute("comp.new", json!({"name": "Main", "width": 8, "height": 8, "frameRate": 30, "duration": 2})).unwrap();
+    let animated = s.execute("layer.newSolid", json!({"color": [0.4, 0.5, 0.6], "width": 8, "height": 8})).unwrap()["layer"].as_u64().unwrap();
+    let cid = s.active_comp_id().unwrap();
+    let input = s.render(cid, Tick::ZERO, Default::default()).get(4, 4);
+    let fx = apply(&mut s, animated, "Cineon Converter");
+    s.execute("prop.set", json!({"layer": animated, "path": "effects/#1/highlightRolloff", "value": 0.0})).unwrap();
+    animate_effect(&mut s, animated, fx, "gamma", &[(0.0, 2.2), (1.0, 3.4)]);
+    let still = s.execute("layer.newSolid", json!({"color": [0.4, 0.5, 0.6], "width": 8, "height": 8})).unwrap()["layer"].as_u64().unwrap();
+    let still_fx = apply(&mut s, still, "Cineon Converter");
+    s.execute("prop.set", json!({"layer": still, "path": "effects/#1/gamma", "value": 2.2})).unwrap();
+    s.execute("layer.setSwitch", json!({"layers": [still], "switch": "video", "value": false})).unwrap();
+
+    let (dir, path) = save_before_cineon_version_2(&s, "ec-cineon-render");
+    let mut s2 = Session::default();
+    s2.execute("file.open", json!({"path": path})).unwrap();
+    let check = |s2: &Session| {
+        let prop = |lid: u64, uid: u64, id: &str| effect_group(s2, lid, uid).prop(id).unwrap().clone();
+        assert_eq!(prop(animated, fx, "version").value, KV::Scalar(1.0));
+        assert_eq!(prop(still, still_fx, "version").value, KV::Scalar(1.0));
+        let keys: Vec<f64> = prop(animated, fx, "gamma").keys.iter().map(|k| k.value.as_f64()).collect();
+        assert_eq!(keys, [2.2, 3.4]);
+        assert_eq!(prop(still, still_fx, "gamma").value, KV::Scalar(2.2));
+        for (t, gamma) in [(0.0, 2.2), (0.5, 2.8), (1.0, 3.4)] {
+            let got = s2.render(cid, Tick::from_seconds_f64(t), Default::default()).get(4, 4);
+            for c in 0..3 {
+                let want = cineon_version_1(input[c], gamma);
+                assert!((got[c] - want).abs() < 1e-4, "{t} s, channel {c}: {} rendered, {want} before", got[c]);
+            }
+        }
+    };
+    check(&s2);
+    s2.execute("file.save", json!({"path": path})).unwrap();
+    let mut s3 = Session::default();
+    s3.execute("file.open", json!({"path": path})).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+    check(&s3);
+    // A new instance on top is version 2 with Gamma 1.7.
+    let top = s3.execute("layer.newSolid", json!({"color": [0.4, 0.5, 0.6], "width": 8, "height": 8})).unwrap()["layer"].as_u64().unwrap();
+    let top_fx = apply(&mut s3, top, "Cineon Converter");
+    s3.execute("prop.set", json!({"layer": top, "path": "effects/#1/highlightRolloff", "value": 0.0})).unwrap();
+    assert_eq!(effect_group(&s3, top, top_fx).prop("version").unwrap().value, KV::Scalar(2.0));
+    assert_eq!(effect_group(&s3, top, top_fx).prop("gamma").unwrap().value, KV::Scalar(1.7));
+    let got = s3.render(cid, Tick::ZERO, Default::default()).get(4, 4);
+    for c in 0..3 {
+        let want = cineon_version_2(input[c], 1.7);
+        assert!((got[c] - want).abs() < 1e-4, "channel {c}: {} rendered, {want}", got[c]);
+    }
+}
+
+/// A precomp layer that overrides an exposed Gamma of an old Cineon Converter keeps its saved
+/// value, and the nested version 1 instance renders it as before.
+#[test]
+fn opening_an_old_project_keeps_an_overridden_cineon_gamma() {
+    let mut s = Session::default();
+    s.execute("file.projectSettings", json!({"bitDepth": 32})).unwrap();
+    s.execute("comp.new", json!({"name": "Inner", "width": 8, "height": 8, "frameRate": 30, "duration": 2})).unwrap();
+    let inner = s.active_comp_id().unwrap();
+    let solid = s.execute("layer.newSolid", json!({"color": [0.4, 0.5, 0.6], "width": 8, "height": 8})).unwrap()["layer"].as_u64().unwrap();
+    let input = s.render(inner, Tick::ZERO, Default::default()).get(4, 4);
+    apply(&mut s, solid, "Cineon Converter");
+    s.execute("prop.set", json!({"layer": solid, "path": "effects/#1/highlightRolloff", "value": 0.0})).unwrap();
+    s.execute("prop.set", json!({"layer": solid, "path": "effects/#1/gamma", "value": 1.7})).unwrap();
+    let control = s.execute("essential.addProperty", json!({"layer": solid, "path": "effects/#1/gamma"})).unwrap()["controls"][0].as_u64().unwrap();
+    s.execute("comp.new", json!({"name": "Main", "width": 8, "height": 8, "frameRate": 30, "duration": 2})).unwrap();
+    let main = s.active_comp_id().unwrap();
+    let inst = s.execute("layer.addItem", json!({"item": inner.0})).unwrap()["layer"].as_u64().unwrap();
+    s.execute("essential.set", json!({"layer": inst, "control": control, "value": 2.2})).unwrap();
+
+    let (dir, path) = save_before_cineon_version_2(&s, "ec-cineon-essential");
+    let mut s2 = Session::default();
+    s2.execute("file.open", json!({"path": path})).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+    let c = s2.execute("essential.instance", json!({"comp": main.0, "layer": inst})).unwrap()["controls"][0].clone();
+    assert_eq!(c["overridden"], json!(true), "{c}");
+    assert_eq!(c["value"].as_f64(), Some(2.2), "{c}");
+    let got = s2.render(main, Tick::ZERO, Default::default()).get(4, 4);
+    for ch in 0..3 {
+        let want = cineon_version_1(input[ch], 2.2);
+        assert!((got[ch] - want).abs() < 1e-4, "channel {ch}: {} rendered, {want} before", got[ch]);
+    }
+}
+
+/// A project saved by this build opens in a build from before Cineon Converter version 2 as
+/// `docs/architecture.md` describes. The file is still schema 2. That build's registry has no
+/// Version parameter: opening keeps the saved one, and Gamma is read on version 1's scale. A
+/// version 1 instance holds its Gamma as saved before, so it renders there as it did; a version 2
+/// instance's Gamma 1.7 renders there as a version 1 Gamma of 1.7.
+#[test]
+fn a_project_saved_now_opens_in_an_older_build_as_documented() {
+    let mut s = Session::default();
+    s.execute("file.projectSettings", json!({"bitDepth": 32})).unwrap();
+    s.execute("comp.new", json!({"name": "Main", "width": 8, "height": 8, "frameRate": 30, "duration": 2})).unwrap();
+    let cid = s.active_comp_id().unwrap();
+    let old = s.execute("layer.newSolid", json!({"color": [0.4, 0.5, 0.6], "width": 8, "height": 8})).unwrap()["layer"].as_u64().unwrap();
+    let input = s.render(cid, Tick::ZERO, Default::default()).get(4, 4);
+    let old_fx = apply(&mut s, old, "Cineon Converter");
+    s.execute("prop.set", json!({"layer": old, "path": "effects/#1/highlightRolloff", "value": 0.0})).unwrap();
+    s.execute("prop.set", json!({"layer": old, "path": "effects/#1/gamma", "value": 2.2})).unwrap();
+    let (dir, path) = save_before_cineon_version_2(&s, "ec-cineon-older-build");
+    let mut s2 = Session::default();
+    s2.execute("file.open", json!({"path": path})).unwrap();
+    let new = s2.execute("layer.newSolid", json!({"color": [0.4, 0.5, 0.6], "width": 8, "height": 8})).unwrap()["layer"].as_u64().unwrap();
+    let new_fx = apply(&mut s2, new, "Cineon Converter");
+    s2.execute("prop.set", json!({"layer": new, "path": "effects/#1/highlightRolloff", "value": 0.0})).unwrap();
+    s2.execute("file.save", json!({"path": path})).unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+    assert_eq!(saved["schema"], json!(2));
+
+    // The saved Cineon Converter groups, read with the older registry's Cineon Converter.
+    fn groups(v: &serde_json::Value, out: &mut Vec<PropGroup>) {
+        match v {
+            serde_json::Value::Object(o) => {
+                if o.get("match") == Some(&json!("ec.utility.cineon")) {
+                    out.push(serde_json::from_value(v.clone()).unwrap());
+                }
+                o.values().for_each(|c| groups(c, out));
+            }
+            serde_json::Value::Array(a) => a.iter().for_each(|c| groups(c, out)),
+            _ => {}
+        }
+    }
+    let mut saved_groups = vec![];
+    groups(&saved, &mut saved_groups);
+    let spec = effectcraft_effects::find("ec.utility.cineon").unwrap();
+    let older = effectcraft_effects::EffectSpec {
+        params: spec
+            .params
+            .iter()
+            .filter(|p| p.id != "version")
+            .map(|p| effectcraft_effects::ParamSpec { id: p.id, name: p.name, default: p.default.clone(), ui: p.ui.clone() })
+            .collect(),
+        ..*spec
+    };
+    let opened_in_older = |uid: u64| {
+        let mut g = saved_groups.iter().find(|g| g.uid == uid).unwrap().clone();
+        let mut next = 1_000_000;
+        effectcraft_effects::migrate::upgrade_instance(&older, &mut g, &mut effectcraft_project::build::Ids(&mut next), [8.0, 8.0]);
+        (g.get("version").map(|p| p.value.clone()), g.get("gamma").unwrap().value.clone())
+    };
+    assert_eq!(opened_in_older(old_fx), (Some(KV::Scalar(1.0)), KV::Scalar(2.2)));
+    assert_eq!(opened_in_older(new_fx), (Some(KV::Scalar(2.0)), KV::Scalar(1.7)));
+
+    // This build renders the version 1 instance as the older build does: Gamma 2.2 read as a
+    // version 1 Gamma. The older build reads the new instance's Gamma 1.7 on the version 1 scale.
+    let got_new = s2.render(cid, Tick::ZERO, Default::default()).get(4, 4);
+    s2.execute("layer.setSwitch", json!({"layers": [new], "switch": "video", "value": false})).unwrap();
+    let got_old = s2.render(cid, Tick::ZERO, Default::default()).get(4, 4);
+    for c in 0..3 {
+        let want = cineon_version_1(input[c], 2.2);
+        assert!((got_old[c] - want).abs() < 1e-4, "channel {c}: {} rendered, {want} in the older build", got_old[c]);
+        let want_new = cineon_version_2(input[c], 1.7);
+        assert!((got_new[c] - want_new).abs() < 1e-4, "channel {c}: {} rendered, {want_new}", got_new[c]);
+        assert!((cineon_version_1(input[c], 1.7) - want_new).abs() > 1e-3, "channel {c}: the older build renders Gamma 1.7 differently");
+    }
+}
+
+/// Reset on a version 1 Cineon Converter keeps its Version, so its other Gamma keyframes render
+/// as before, and keys Gamma to version 1's linear Gamma (1.7) at the current time.
+#[test]
+fn resetting_an_old_cineon_converter_keeps_its_version() {
+    let mut s = Session::default();
+    s.execute("file.projectSettings", json!({"bitDepth": 32})).unwrap();
+    s.execute("comp.new", json!({"name": "Main", "width": 8, "height": 8, "frameRate": 30, "duration": 2})).unwrap();
+    let cid = s.active_comp_id().unwrap();
+    let l = s.execute("layer.newSolid", json!({"color": [0.4, 0.5, 0.6], "width": 8, "height": 8})).unwrap()["layer"].as_u64().unwrap();
+    let input = s.render(cid, Tick::ZERO, Default::default()).get(4, 4);
+    let fx = apply(&mut s, l, "Cineon Converter");
+    s.execute("prop.set", json!({"layer": l, "path": "effects/#1/highlightRolloff", "value": 0.0})).unwrap();
+    animate_effect(&mut s, l, fx, "gamma", &[(0.0, 2.2), (1.0, 3.4)]);
+    let (dir, path) = save_before_cineon_version_2(&s, "ec-cineon-reset");
+    let mut s2 = Session::default();
+    s2.execute("file.open", json!({"path": path})).unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+    s2.execute("time.set", json!({"time": 1.5})).unwrap();
+    s2.execute("effect.reset", json!({"layer": l, "effect": fx})).unwrap();
+    let g = effect_group(&s2, l, fx);
+    assert_eq!(g.prop("version").unwrap().value, KV::Scalar(1.0));
+    let keys: Vec<f64> = g.prop("gamma").unwrap().keys.iter().map(|k| k.value.as_f64()).collect();
+    assert_eq!(keys, [2.2, 3.4, 1.7]);
+    let got = s2.render(cid, Tick::ZERO, Default::default()).get(4, 4);
+    for c in 0..3 {
+        let want = cineon_version_1(input[c], 2.2);
+        assert!((got[c] - want).abs() < 1e-4, "channel {c}: {} rendered, {want} before", got[c]);
+    }
+}
+
+/// Removes what a build before Cineon Converter version 2 did not write into an animation
+/// preset: format 1, and no `cineonVersion` on its properties.
+fn preset_before_cineon_version_2(preset: &serde_json::Value) -> serde_json::Value {
+    let mut old = preset.clone();
+    old["effectcraftAnimationPreset"] = json!(1);
+    for p in old["properties"].as_array_mut().unwrap() {
+        p.as_object_mut().unwrap().remove("cineonVersion");
+    }
+    old
+}
+
+/// A Cineon Converter's Gamma saved alone in an animation preset records its instance's
+/// version, and applying it sets the Version of the instance it lands on. A preset saved before
+/// format 4 records none, and its Gamma lands on the instance as a version 1 value.
+#[test]
+fn cineon_gamma_presets_carry_the_version() {
+    let (mut s, a, _) = comp_with_two_solids();
+    let fx = apply(&mut s, a, "Cineon Converter");
+    s.execute("prop.set", json!({"layer": a, "path": "effects/#1/gamma", "value": 1.3})).unwrap();
+    s.execute("prop.select", json!({"layer": a, "path": "effects/#1/gamma"})).unwrap();
+    let file = std::env::temp_dir().join(format!("ec-cineon-gamma-preset-{}.ecpreset", std::process::id()));
+    let saved = s.execute("anim.savePreset", json!({"path": file})).unwrap();
+    assert_eq!(saved["properties"], json!(1));
+    let preset: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    std::fs::remove_file(file).unwrap();
+    assert_eq!(preset["effectcraftAnimationPreset"], json!(4));
+    assert_eq!(preset["properties"][0]["path"], json!("effects/ec.utility.cineon/gamma"));
+    assert_eq!(preset["properties"][0]["cineonVersion"], json!(2.0));
+    let get = |s: &Session, id: &str| layer(s, a).effects().unwrap().groups().next().unwrap().get(id).unwrap().value.clone();
+
+    s.execute("prop.set", json!({"layer": a, "path": "effects/#1/version", "value": 1.0})).unwrap();
+    s.execute("prop.set", json!({"layer": a, "path": "effects/#1/gamma", "value": 4.0})).unwrap();
+    let r = s.execute("anim.applyPreset", json!({"preset": preset.clone(), "layers": [a]})).unwrap();
+    assert_eq!((&r["applied"], &r["skipped"]), (&json!(1), &json!([])), "{r}");
+    assert_eq!((get(&s, "gamma"), get(&s, "version")), (KV::Scalar(1.3), KV::Scalar(2.0)));
+
+    s.execute("anim.applyPreset", json!({"preset": preset_before_cineon_version_2(&preset), "layers": [a]})).unwrap();
+    assert_eq!((get(&s, "gamma"), get(&s, "version")), (KV::Scalar(1.3), KV::Scalar(1.0)));
+
+    // Format 2 already had relative effect keys and format 3 whole text animators, but their
+    // Gammas had no version tag.
+    for format in [2, 3] {
+        s.execute("anim.applyPreset", json!({"preset": preset.clone(), "layers": [a]})).unwrap();
+        assert_eq!(get(&s, "version"), KV::Scalar(2.0), "format {format}");
+        let mut untagged = preset.clone();
+        untagged["effectcraftAnimationPreset"] = json!(format);
+        untagged["properties"][0].as_object_mut().unwrap().remove("cineonVersion");
+        s.execute("anim.applyPreset", json!({"preset": untagged, "layers": [a]})).unwrap();
+        assert_eq!((get(&s, "gamma"), get(&s, "version")), (KV::Scalar(1.3), KV::Scalar(1.0)), "format {format}");
+    }
+
+    // A whole Cineon Converter from a preset saved before version 2 is applied as version 1,
+    // and a Gamma preset applied to it later sets its Version.
+    select_effect(&mut s, a, fx);
+    let file = std::env::temp_dir().join(format!("ec-cineon-effect-preset-{}.ecpreset", std::process::id()));
+    s.execute("anim.savePreset", json!({"path": file})).unwrap();
+    let mut effect: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    std::fs::remove_file(file).unwrap();
+    effect["effects"][0]["children"].as_array_mut().unwrap().retain(|c| c["match"] != json!("version"));
+    s.execute("anim.applyPreset", json!({"preset": effect, "layers": [a]})).unwrap();
+    let second = |s: &Session, id: &str| layer(s, a).effects().unwrap().groups().nth(1).unwrap().get(id).map(|p| p.value.clone());
+    assert_eq!(second(&s, "version"), Some(KV::Scalar(1.0)));
+    let mut onto_second = preset;
+    for p in onto_second["properties"].as_array_mut().unwrap() {
+        p["path"] = json!(p["path"].as_str().unwrap().replace("ec.utility.cineon", "ec.utility.cineon#2"));
+    }
+    s.execute("anim.applyPreset", json!({"preset": onto_second, "layers": [a]})).unwrap();
+    assert_eq!((second(&s, "gamma"), second(&s, "version")), (Some(KV::Scalar(1.3)), Some(KV::Scalar(2.0))));
+}
+
+/// A Gamma preset records the Version its Cineon Converter has at the time it is saved. Applied
+/// to a Cineon Converter whose Version is keyframed, it keeps the keys and is converted to the
+/// one version they hold, or skipped when they hold several. A nested Cineon Converter's
+/// keyframed Version counts only when its keys that play hold one value.
+#[test]
+fn cineon_gamma_presets_follow_a_keyframed_version() {
+    let (mut s, a, _) = comp_with_two_solids();
+    apply(&mut s, a, "Cineon Converter");
+    for (time, value) in [(0.0, 2.0), (1.0, 1.0)] {
+        s.execute("prop.addKey", json!({"layer": a, "path": "effects/#1/version", "time": time, "value": value})).unwrap();
+    }
+    s.execute("time.set", json!({"time": 2.0})).unwrap();
+    s.execute("prop.set", json!({"layer": a, "path": "effects/#1/gamma", "value": 1.3})).unwrap();
+    s.execute("prop.select", json!({"layer": a, "path": "effects/#1/gamma"})).unwrap();
+    let file = std::env::temp_dir().join(format!("ec-cineon-keyed-version-{}.ecpreset", std::process::id()));
+    s.execute("anim.savePreset", json!({"path": file})).unwrap();
+    let preset: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    std::fs::remove_file(file).unwrap();
+    assert_eq!(preset["properties"][0]["cineonVersion"], json!(1.0));
+
+    // Applied to a Cineon Converter whose Version keys hold more than one version, the Gamma is
+    // skipped and the keys stay.
+    let get = |s: &Session, id: &str| layer(s, a).effects().unwrap().groups().next().unwrap().get(id).unwrap().clone();
+    let keys = get(&s, "version").keys;
+    s.execute("prop.set", json!({"layer": a, "path": "effects/#1/gamma", "value": 4.0})).unwrap();
+    let err = s.execute("anim.applyPreset", json!({"preset": preset.clone(), "layers": [a]})).unwrap_err();
+    assert!(err.to_string().contains("nothing in this preset fits"), "{err}");
+    assert_eq!((get(&s, "gamma").value, get(&s, "version").keys), (KV::Scalar(4.0), keys));
+
+    // When the keys hold one version, the Gamma is converted to it and the keys stay.
+    s.execute("prop.addKey", json!({"layer": a, "path": "effects/#1/version", "time": 0.0, "value": 1.0})).unwrap();
+    let keys = get(&s, "version").keys;
+    let mut version_2 = preset;
+    version_2["properties"][0]["cineonVersion"] = json!(2.0);
+    let r = s.execute("anim.applyPreset", json!({"preset": version_2.clone(), "layers": [a]})).unwrap();
+    assert_eq!((&r["applied"], &r["skipped"]), (&json!(1), &json!([])), "{r}");
+    let gamma = get(&s, "gamma").value.as_f64();
+    assert!((gamma - 1.3 * 1.7).abs() < 1e-9, "{gamma}");
+    assert_eq!(get(&s, "version").keys, keys);
+
+    // Keys of one value that ease with a speed move the Version between them, so the Gamma is
+    // skipped. A muted key of another value does not count, and neither does the ease of a key
+    // with no other key that plays.
+    let cid = s.active_comp_id().unwrap();
+    let fx = layer(&s, a).effects().unwrap().groups().next().unwrap().uid;
+    let edit_keys = |s: &mut Session, f: &dyn Fn(&mut [effectcraft_keyframe::Keyframe])| {
+        s.edit("keys", None, |project, _| {
+            let pr = project.comp_mut(cid).unwrap().layer_mut(LayerId(a)).unwrap().props.find_group_mut(fx).unwrap().get_mut("version").unwrap();
+            f(&mut pr.keys);
+            Ok(())
+        })
+        .unwrap();
+    };
+    edit_keys(&mut s, &|keys| {
+        keys[0].out_interp = Interp::Bezier;
+        keys[0].out_ease = vec![Ease { speed: 3.0, influence: 50.0 }];
+    });
+    let mut with_gamma = version_2.clone();
+    with_gamma["properties"].as_array_mut().unwrap().push(json!({"path": "transform/opacity", "value": KV::Scalar(80.0), "keys": []}));
+    let r = s.execute("anim.applyPreset", json!({"preset": with_gamma, "layers": [a]})).unwrap();
+    assert_eq!(r["skipped"], json!(["effects/ec.utility.cineon/gamma"]), "{r}");
+    edit_keys(&mut s, &|keys| {
+        keys[1].value = KV::Scalar(2.0);
+        keys[1].muted = true;
+    });
+    s.execute("prop.set", json!({"layer": a, "path": "effects/#1/gamma", "value": 4.0})).unwrap();
+    s.execute("anim.applyPreset", json!({"preset": version_2.clone(), "layers": [a]})).unwrap();
+    let gamma = get(&s, "gamma").value.as_f64();
+    assert!((gamma - 1.3 * 1.7).abs() < 1e-9, "{gamma}");
+
+    // A preset that holds the Version after the Gamma sets the Version, and the Gamma lands as
+    // saved.
+    edit_keys(&mut s, &|keys| keys[1].muted = false);
+    let mut both = version_2;
+    both["properties"].as_array_mut().unwrap().push(json!({"path": "effects/ec.utility.cineon/version", "value": KV::Scalar(2.0), "keys": []}));
+    let r = s.execute("anim.applyPreset", json!({"preset": both.clone(), "layers": [a]})).unwrap();
+    assert_eq!((&r["applied"], &r["skipped"]), (&json!(2), &json!([])), "{r}");
+    let version = get(&s, "version");
+    assert_eq!((get(&s, "gamma").value, version.value, version.keys.len()), (KV::Scalar(1.3), KV::Scalar(2.0), 0));
+    // Listed before the Gamma, the preset's Version stays as the preset has it.
+    let mut first = both.clone();
+    let props = first["properties"].as_array_mut().unwrap();
+    let saved_version = props.pop().unwrap();
+    props.insert(0, saved_version);
+    props[0]["value"] = json!(KV::Scalar(1.0));
+    s.execute("anim.applyPreset", json!({"preset": first.clone(), "layers": [a]})).unwrap();
+    assert_eq!((get(&s, "gamma").value, get(&s, "version").value), (KV::Scalar(1.3), KV::Scalar(1.0)));
+    // A Version of another type is skipped, and the Gamma sets the Version it was saved with.
+    first["properties"][0]["value"] = json!(KV::Bool(true));
+    s.execute("anim.applyPreset", json!({"preset": first, "layers": [a]})).unwrap();
+    assert_eq!(get(&s, "version").value, KV::Scalar(2.0));
+
+    // A Version that an expression sets has no version to record or convert to.
+    s.execute("prop.setExpression", json!({"layer": a, "path": "effects/#1/version", "expression": "1"})).unwrap();
+    s.execute("prop.select", json!({"layer": a, "path": "effects/#1/gamma"})).unwrap();
+    let file = std::env::temp_dir().join(format!("ec-cineon-version-expression-{}.ecpreset", std::process::id()));
+    s.execute("anim.savePreset", json!({"path": file})).unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    std::fs::remove_file(file).unwrap();
+    assert_eq!(saved["properties"][0]["cineonVersion"], json!(null));
+    let mut tagged = saved;
+    tagged["properties"][0]["cineonVersion"] = json!(2.0);
+    tagged["properties"].as_array_mut().unwrap().push(json!({"path": "transform/opacity", "value": KV::Scalar(80.0), "keys": []}));
+    let r = s.execute("anim.applyPreset", json!({"preset": tagged, "layers": [a]})).unwrap();
+    assert_eq!(r["skipped"], json!(["effects/ec.utility.cineon/gamma"]), "{r}");
+
+    // A Gamma exposed from a nested comp records a keyframed Version only when its keys all
+    // hold one value.
+    for (second, recorded) in [(1.0, json!(null)), (2.0, json!(2.0))] {
+        let mut s = Session::default();
+        s.execute("comp.new", json!({"name": "Inner", "width": 8, "height": 8, "frameRate": 30, "duration": 2})).unwrap();
+        let inner = s.active_comp_id().unwrap();
+        let solid = s.execute("layer.newSolid", json!({"width": 8, "height": 8})).unwrap()["layer"].as_u64().unwrap();
+        apply(&mut s, solid, "Cineon Converter");
+        for (time, value) in [(0.0, 2.0), (1.0, second)] {
+            s.execute("prop.addKey", json!({"layer": solid, "path": "effects/#1/version", "time": time, "value": value})).unwrap();
+        }
+        let control = s.execute("essential.addProperty", json!({"layer": solid, "path": "effects/#1/gamma"})).unwrap()["controls"][0].as_u64().unwrap();
+        s.execute("comp.new", json!({"name": "Main", "width": 8, "height": 8, "frameRate": 30, "duration": 2})).unwrap();
+        let instance = s.execute("layer.addItem", json!({"item": inner.0})).unwrap()["layer"].as_u64().unwrap();
+        let path = format!("essential/{}", effectcraft_project::essential::match_id(control));
+        s.execute("prop.select", json!({"layer": instance, "path": path})).unwrap();
+        let file = std::env::temp_dir().join(format!("ec-cineon-keyed-nested-{}-{second}.ecpreset", std::process::id()));
+        s.execute("anim.savePreset", json!({"path": file})).unwrap();
+        let preset: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        std::fs::remove_file(file).unwrap();
+        assert_eq!(preset["properties"][0]["cineonVersion"], recorded, "second key {second}");
+    }
+}
+
+/// A Gamma exposed through Essential Properties (directly, or again from a middle comp) is
+/// converted to the version of the Cineon Converter it drives when the preset was saved with
+/// another version, or before version 2. A control that also drives another property keeps the
+/// saved value.
+#[test]
+fn presets_convert_exposed_cineon_gamma_to_the_driven_version() {
+    for nested in [false, true] {
+        for mixed in [false, true] {
+            let mut s = Session::default();
+            s.execute("comp.new", json!({"name": "Inner", "width": 8, "height": 8, "frameRate": 30, "duration": 2})).unwrap();
+            let mut source = s.active_comp_id().unwrap();
+            let solid = s.execute("layer.newSolid", json!({"width": 8, "height": 8})).unwrap()["layer"].as_u64().unwrap();
+            apply(&mut s, solid, "Cineon Converter");
+            let mut control = s.execute("essential.addProperty", json!({"layer": solid, "path": "effects/#1/gamma"})).unwrap()["controls"][0].as_u64().unwrap();
+            if mixed {
+                s.execute("essential.linkProperty", json!({"control": control, "layer": solid, "path": "transform/opacity"})).unwrap();
+            }
+            if nested {
+                s.execute("comp.new", json!({"name": "Middle", "width": 8, "height": 8, "frameRate": 30, "duration": 2})).unwrap();
+                let middle = s.active_comp_id().unwrap();
+                let instance = s.execute("layer.addItem", json!({"item": source.0})).unwrap()["layer"].as_u64().unwrap();
+                let path = format!("essential/{}", effectcraft_project::essential::match_id(control));
+                control = s.execute("essential.addProperty", json!({"layer": instance, "path": path})).unwrap()["controls"][0].as_u64().unwrap();
+                source = middle;
+            }
+            s.execute("comp.new", json!({"name": "Main", "width": 8, "height": 8, "frameRate": 30, "duration": 2})).unwrap();
+            let instance = s.execute("layer.addItem", json!({"item": source.0})).unwrap()["layer"].as_u64().unwrap();
+            let path = format!("essential/{}", effectcraft_project::essential::match_id(control));
+            s.execute("essential.set", json!({"layer": instance, "control": control, "value": 2.2})).unwrap();
+            s.execute("prop.select", json!({"layer": instance, "path": path})).unwrap();
+            let file = std::env::temp_dir().join(format!("ec-cineon-exposed-preset-{}-{nested}-{mixed}.ecpreset", std::process::id()));
+            s.execute("anim.savePreset", json!({"path": file})).unwrap();
+            let preset: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+            std::fs::remove_file(file).unwrap();
+            assert_eq!(preset["properties"][0]["path"], json!(path));
+            let recorded = if mixed { json!(null) } else { json!(2.0) };
+            assert_eq!(preset["properties"][0]["cineonVersion"], recorded, "nested={nested}, mixed={mixed}");
+            let mut as_version_1 = preset.clone();
+            as_version_1["properties"][0]["cineonVersion"] = json!(1.0);
+            let cases = [(preset.clone(), 2.2), (preset_before_cineon_version_2(&preset), 2.2 / 1.7), (as_version_1, 2.2 / 1.7)];
+            for (i, (preset, converted)) in cases.into_iter().enumerate() {
+                s.execute("essential.set", json!({"layer": instance, "control": control, "value": 0.5})).unwrap();
+                let result = s.execute("anim.applyPreset", json!({"preset": preset, "layers": [instance]})).unwrap();
+                assert_eq!(result["skipped"], json!([]));
+                let value = s.execute("prop.get", json!({"layer": instance, "path": path})).unwrap()["value"].as_f64().unwrap();
+                let expected = if mixed { 2.2 } else { converted };
+                assert!((value - expected).abs() < 1e-9, "nested={nested}, mixed={mixed}, case {i}: {value} != {expected}");
+            }
+            // With an expression, a Gamma saved on another version is skipped. It is the only
+            // property in the preset, so nothing is applied and the command reports that.
+            let mut with_expression = preset_before_cineon_version_2(&preset);
+            with_expression["properties"][0]["expression"] = json!({"text": "1.7", "enabled": true});
+            s.execute("essential.set", json!({"layer": instance, "control": control, "value": 0.5})).unwrap();
+            let steps = s.history.undo.len();
+            let result = s.execute("anim.applyPreset", json!({"preset": with_expression.clone(), "layers": [instance]}));
+            if mixed {
+                assert_eq!(result.unwrap()["skipped"], json!([]), "nested={nested}");
+            } else {
+                assert!(result.unwrap_err().to_string().contains("nothing in this preset fits"), "nested={nested}");
+                assert_eq!(s.history.undo.len(), steps, "nested={nested}");
+                // Beside a property that fits, the Gamma is listed as skipped.
+                let mut with_opacity = with_expression;
+                with_opacity["properties"].as_array_mut().unwrap().push(json!({"path": "transform/opacity", "value": KV::Scalar(80.0), "keys": []}));
+                let result = s.execute("anim.applyPreset", json!({"preset": with_opacity, "layers": [instance]})).unwrap();
+                assert_eq!((&result["applied"], &result["skipped"]), (&json!(1), &json!([path])), "nested={nested}");
+            }
+            let value = s.execute("prop.get", json!({"layer": instance, "path": path})).unwrap()["value"].as_f64().unwrap();
+            assert!((value - if mixed { 2.2 } else { 0.5 }).abs() < 1e-9, "nested={nested}, mixed={mixed}: {value}");
+        }
+    }
+}
+
+/// #410: `effect.warning` reports what an OCIO effect can't render as asked (Effect Controls
+/// shows it under the effect's name): a transform of its custom config that passes colours
+/// through, a colour space the config lacks or a config it can't read; nothing for the
+/// built-in config.
+#[test]
+fn ocio_effect_warns_about_unsupported_config_transforms() {
+    let (mut s, a, _) = comp_with_two_solids();
+    let fx = apply(&mut s, a, "OCIO Color Space Transform");
+    let warning = |s: &mut Session| s.execute("effect.warning", json!({"layer": a, "effect": fx})).unwrap()["warning"].clone();
+    assert!(warning(&mut s).is_null(), "built-in config");
+    let set = |s: &mut Session, param: &str, value: serde_json::Value| {
+        let uid = layer(s, a).effects().unwrap().groups().next().unwrap().get(param).unwrap().uid;
+        s.execute("prop.set", json!({"layer": a, "prop": uid, "value": value})).unwrap();
+    };
+    let config = "ocio_profile_version: 2\ncolorspaces:\n  - !<ColorSpace>\n    name: lin\n  - !<ColorSpace>\n    name: graded\n    from_scene_reference: !<GradingToneTransform> {}\n";
+    set(&mut s, "config", json!(1));
+    set(&mut s, "configFile", json!(config));
+    set(&mut s, "sourceName", json!("lin"));
+    set(&mut s, "destinationName", json!("graded"));
+    let w = warning(&mut s);
+    assert!(w.as_str().is_some_and(|w| w.contains("GradingToneTransform")), "{w}");
+    set(&mut s, "destinationName", json!("lin"));
+    assert!(warning(&mut s).is_null());
+    set(&mut s, "destinationName", json!("nowhere"));
+    assert!(warning(&mut s).as_str().is_some_and(|w| w.contains("no color space `nowhere`")));
+    set(&mut s, "configFile", json!("/no/such/config.ocio"));
+    assert!(warning(&mut s).as_str().is_some_and(|w| w.starts_with("Can't read the OCIO config")));
+}
+
+#[test]
+fn effect_colour_labels_set_clear_undo_and_round_trip() {
+    let (mut s, a, _) = comp_with_two_solids();
+    let blur = apply(&mut s, a, "Gaussian Blur");
+    let label = |s: &Session| layer(s, a).effects().unwrap().groups().next().unwrap().label;
+    assert_eq!(label(&s), None);
+    s.execute("effect.setLabel", json!({"layer": a, "effect": blur, "label": "Blue"})).unwrap();
+    assert_eq!(label(&s), Some(effectcraft_color::Label::Blue));
+    // Duplicates keep the label.
+    s.execute("effect.duplicate", json!({"layer": a, "effect": blur})).unwrap();
+    assert_eq!(layer(&s, a).effects().unwrap().groups().filter(|g| g.label.is_some()).count(), 2);
+    s.undo();
+    // It saves with the project and survives a reload.
+    let json = s.project.to_file_json().unwrap();
+    let back = effectcraft_project::Project::from_json(&json).unwrap();
+    let l = back.comp(s.active_comp_id().unwrap()).unwrap().layer(LayerId(a)).unwrap().clone();
+    assert_eq!(l.effects().unwrap().groups().next().unwrap().label, Some(effectcraft_color::Label::Blue));
+    // None (or index 0) clears it; the change undoes.
+    s.execute("effect.setLabel", json!({"layer": a, "effect": blur, "label": 0})).unwrap();
+    assert_eq!(label(&s), None);
+    s.undo();
+    assert_eq!(label(&s), Some(effectcraft_color::Label::Blue));
+    assert!(s.execute("effect.setLabel", json!({"layer": a, "effect": blur, "label": "Chartreuse"})).is_err());
+    assert!(s.execute("effect.setLabel", json!({"layer": a, "effect": blur, "label": 99})).is_err());
+    // A project saved before labels existed has none.
+    let old = json.replace("\"label\":\"Blue\"", "\"x\":0").replace("\"label\": \"Blue\"", "\"x\": 0");
+    assert_ne!(old, json, "the replace removed the effect's label");
+    let old = effectcraft_project::Project::from_json(&old).unwrap();
+    let l = old.comp(s.active_comp_id().unwrap()).unwrap().layer(LayerId(a)).unwrap().clone();
+    assert_eq!(l.effects().unwrap().groups().next().unwrap().label, None);
+}
+
+/// #1746: a preset saved from an effect property (`effects/ec.control.slider/slider`, `#2` for the second
+/// instance) applies back to the same layer instead of landing in `skipped`.
+#[test]
+fn preset_round_trips_effect_properties_by_match_name() {
+    let (mut s, a, _) = comp_with_two_solids();
+    apply(&mut s, a, "Slider Control");
+    apply(&mut s, a, "Slider Control");
+    let slider = |s: &Session, n: usize| match layer(s, a).effects().unwrap().groups().nth(n).unwrap().get("slider").unwrap().value {
+        KV::Scalar(v) => v,
+        ref other => panic!("not a scalar: {other:?}"),
+    };
+    for (n, value) in [(1, 30.0), (2, 70.0)] {
+        s.execute("prop.set", json!({"layer": a, "path": format!("effects/#{n}/slider"), "value": value})).unwrap();
+    }
+    for n in [1, 2] {
+        let path = std::env::temp_dir().join(format!("ec-1746-{}-{n}.ecpreset", std::process::id())).to_string_lossy().to_string();
+        s.execute("prop.select", json!({"layer": a, "path": format!("effects/#{n}/slider")})).unwrap();
+        s.execute("anim.savePreset", json!({"path": path})).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let want = if n == 1 { "effects/ec.control.slider/slider" } else { "effects/ec.control.slider#2/slider" };
+        assert!(saved.contains(want), "{saved}");
+        s.execute("prop.set", json!({"layer": a, "path": format!("effects/#{n}/slider"), "value": 0.0})).unwrap();
+        let r = s.execute("anim.applyPreset", json!({"path": path, "layers": [a]})).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(r["applied"], 1, "{r}");
+        assert_eq!(r["skipped"], json!([]), "{r}");
+        assert_eq!(slider(&s, n - 1), if n == 1 { 30.0 } else { 70.0 });
+    }
+}
+
+/// An animation preset saved by an earlier version gets the upgrade a project gets on open: a
+/// Change to Color saved with its single Tolerance applies with the Tolerance group, that value
+/// as its Hue and the added parameters at their legacy defaults, and a lone property saved at the
+/// old id applies to the new one.
+#[test]
+fn applying_an_old_preset_upgrades_its_effects_and_property_paths() {
+    let (mut s, a, b) = comp_with_two_solids();
+    apply(&mut s, a, "Change to Color");
+    let mut old = layer(&s, a).effects().unwrap().groups().next().unwrap().clone();
+    old.children.retain(|c| c.match_id() != "toleranceGroup");
+    old.children.push(effectcraft_project::Property::new(0, "tolerance", "Tolerance", KV::Scalar(12.0)).into());
+    let preset = json!({"effectcraftAnimationPreset": 1, "name": "old", "properties": [], "effects": [old]});
+    let r = s.execute("anim.applyPreset", json!({"preset": preset, "layers": [b]})).unwrap();
+    assert_eq!(r["applied"], 1, "{r}");
+    let l = layer(&s, b);
+    let g = l.effects().unwrap().groups().next().unwrap();
+    assert!(g.get("tolerance").is_none(), "the old Tolerance is still there");
+    let tol = g.sub("toleranceGroup").expect("no Tolerance group");
+    assert_eq!(tol.get("hue").unwrap().value, KV::Scalar(12.0));
+    assert_eq!(tol.get("lightness").unwrap().value, KV::Scalar(100.0));
+    assert_eq!(tol.get("saturation").unwrap().value, KV::Scalar(100.0));
+    let path = "effects/ec.color.changetocolor/tolerance";
+    let preset = json!({"effectcraftAnimationPreset": 1, "name": "old", "properties": [{"path": path, "value": KV::Scalar(30.0), "keys": []}], "effects": []});
+    let r = s.execute("anim.applyPreset", json!({"preset": preset, "layers": [a]})).unwrap();
+    assert_eq!(r["applied"], 1, "{r}");
+    assert_eq!(r["skipped"], json!([]), "{r}");
+    let l = layer(&s, a);
+    let hue = l.effects().unwrap().groups().next().unwrap().sub("toleranceGroup").unwrap().get("hue").unwrap().value.clone();
+    assert_eq!(hue, KV::Scalar(30.0));
+}
+
+/// Save the selected effects and properties as a preset, then apply it to `target` at `at`.
+fn save_and_apply_preset(s: &mut Session, name: &str, selected: Vec<(LayerId, u64)>, target: u64, at: f64) -> serde_json::Value {
+    let path = std::env::temp_dir().join(format!("ec-1971-{name}-{}.ecpreset", std::process::id())).to_string_lossy().to_string();
+    s.state.selected_props = selected;
+    s.execute("anim.savePreset", json!({"path": path})).unwrap();
+    s.execute("time.set", json!({"time": at})).unwrap();
+    let r = s.execute("anim.applyPreset", json!({"path": path, "layers": [target]}));
+    let _ = std::fs::remove_file(&path);
+    r.unwrap()
+}
+
+/// The comp times of the keys at `path` on `lid`'s `n`th effect (0-based), or on the layer when
+/// `n` is `None`.
+fn key_times(s: &Session, lid: u64, n: Option<usize>, path: &str) -> Vec<f64> {
+    let l = layer(s, lid);
+    let group = match n {
+        Some(n) => l.effects().unwrap().groups().nth(n).unwrap().clone(),
+        None => l.props.clone(),
+    };
+    group.prop(path).unwrap().keys.iter().map(|k| l.comp_time(k.time).seconds()).collect()
+}
+
+/// #1971: a saved effect's keys start at the playhead of the layer it's applied to, as a saved
+/// property's do, nested controls included, an effect without keys still applies, and the whole
+/// apply is one undo step.
+#[test]
+fn preset_effect_keys_start_at_the_playhead() {
+    let (mut s, a, b) = comp_with_two_solids();
+    let blur = apply(&mut s, a, "Gaussian Blur");
+    let fractal = apply(&mut s, a, "Fractal");
+    let slider = apply(&mut s, a, "Slider Control");
+    animate_effect(&mut s, a, blur, "blurriness", &[(5.0, 10.0), (5.5, 30.0), (6.0, 10.0)]);
+    animate_effect(&mut s, a, fractal, "mandelbrot/mandelbrotX", &[(5.5, 1.25), (7.0, 2.5)]);
+    let before = layer(&s, b);
+    let undo = s.history.undo.len();
+    let r = save_and_apply_preset(&mut s, "effects", vec![(LayerId(a), blur), (LayerId(a), fractal), (LayerId(a), slider)], b, 0.5);
+    assert_eq!(r["applied"], 3, "{r}");
+    assert_eq!(key_times(&s, b, Some(0), "blurriness"), vec![0.5, 1.0, 1.5]);
+    assert_eq!(key_times(&s, b, Some(1), "mandelbrot/mandelbrotX"), vec![1.0, 2.5]);
+    assert_eq!(s.history.undo.len(), undo + 1, "the whole apply is one undo step");
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(layer(&s, b), before);
+}
+
+/// #1971: effects and properties saved together keep their relative timing: the earliest key of
+/// either starts at the playhead.
+#[test]
+fn preset_effects_and_properties_share_one_anchor() {
+    let (mut s, a, b) = comp_with_two_solids();
+    let blur = apply(&mut s, a, "Gaussian Blur");
+    animate_effect(&mut s, a, blur, "blurriness", &[(5.0, 10.0), (6.0, 30.0)]);
+    for (time, value) in [(4.0, -12.0), (7.0, 12.0)] {
+        s.execute("prop.addKey", json!({"layer": a, "path": "transform/rotation", "time": time, "timeBase": "comp", "value": value})).unwrap();
+    }
+    let rotation = layer(&s, a).props.prop("transform/rotation").unwrap().uid;
+    save_and_apply_preset(&mut s, "mixed", vec![(LayerId(a), blur), (LayerId(a), rotation)], b, 1.0);
+    assert_eq!(key_times(&s, b, None, "transform/rotation"), vec![1.0, 4.0]);
+    assert_eq!(key_times(&s, b, Some(0), "blurriness"), vec![2.0, 3.0]);
+}
+
+/// #1971: on a stretched layer a saved effect's keys land where a saved property's keys do.
+#[test]
+fn preset_effect_keys_follow_a_stretched_layer_like_properties() {
+    let (mut s, a, b) = comp_with_two_solids();
+    let blur = apply(&mut s, a, "Gaussian Blur");
+    animate_effect(&mut s, a, blur, "blurriness", &[(5.0, 10.0), (6.0, 30.0)]);
+    for (time, value) in [(5.0, -12.0), (6.0, 12.0)] {
+        s.execute("prop.addKey", json!({"layer": a, "path": "transform/rotation", "time": time, "timeBase": "comp", "value": value})).unwrap();
+    }
+    let rotation = layer(&s, a).props.prop("transform/rotation").unwrap().uid;
+    set_layer_clock(&mut s, b, 1.0, 200.0);
+    save_and_apply_preset(&mut s, "stretched", vec![(LayerId(a), blur), (LayerId(a), rotation)], b, 2.0);
+    let property = key_times(&s, b, None, "transform/rotation");
+    assert_eq!(property.first(), Some(&2.0), "the property's keys start at the playhead");
+    assert_eq!(key_times(&s, b, Some(0), "blurriness"), property, "and the effect's keys land with them");
+}
+
+/// #1971: a preset saved before effect keys were stored relative to the earliest key (version 1)
+/// has its effects' keys at the source layer's times; they also start at the playhead.
+#[test]
+fn old_preset_effect_keys_start_at_the_playhead() {
+    let (mut s, a, b) = comp_with_two_solids();
+    let blur = apply(&mut s, a, "Gaussian Blur");
+    animate_effect(&mut s, a, blur, "blurriness", &[(5.0, 10.0), (6.0, 30.0)]);
+    let old = json!({
+        "effectcraftAnimationPreset": 1,
+        "name": "shake",
+        "properties": [],
+        "effects": [serde_json::to_value(effect_group(&s, a, blur)).unwrap()],
+    });
+    s.execute("time.set", json!({"time": 0.5})).unwrap();
+    s.execute("anim.applyPreset", json!({"preset": old, "layers": [b]})).unwrap();
+    assert_eq!(key_times(&s, b, Some(0), "blurriness"), vec![0.5, 1.5]);
+}
+
+/// #2064: `prop.addKey` accepts the `effects/<match name>[#n]/<property>` path that
+/// `essential.list` reports.
+#[test]
+fn add_key_resolves_effect_match_name_paths() {
+    let (mut s, a, _) = comp_with_two_solids();
+    apply(&mut s, a, "Slider Control");
+    apply(&mut s, a, "Slider Control");
+    let slider = |s: &Session, n: usize| match layer(s, a).effects().unwrap().groups().nth(n).unwrap().get("slider").unwrap().value {
+        KV::Scalar(v) => v,
+        ref other => panic!("not a scalar: {other:?}"),
+    };
+    for (path, n, value) in [("effects/ec.control.slider/slider", 0, 30.0), ("effects/ec.control.slider#2/slider", 1, 70.0)] {
+        let reply = s.execute("prop.addKey", json!({"layer": a, "path": path, "time": 0, "value": value})).unwrap();
+        assert_eq!(reply, json!(1), "{path}");
+        let got = s.execute("prop.get", json!({"layer": a, "path": path, "time": 0})).unwrap();
+        assert_eq!(got["value"], json!(value), "{path}");
+        assert_eq!(got["keys"].as_array().unwrap().len(), 1, "{path}");
+        assert_eq!(slider(&s, n), 0.0, "the static value stays put; the key carries {value}");
+    }
+}
+
+/// #1746: Edit ▸ Copy of an effect property writes the same `effects/ec.blur.gaussian/blurriness` path,
+/// and Paste (the value, or Copy Expression Only) sets that property of the other layer's effect.
+#[test]
+fn copied_effect_property_pastes_onto_the_same_effect() {
+    let (mut s, a, b) = comp_with_two_solids();
+    apply(&mut s, a, "Gaussian Blur");
+    apply(&mut s, b, "Gaussian Blur");
+    s.execute("prop.set", json!({"layer": a, "path": "effects/#1/blurriness", "value": 12.5})).unwrap();
+    s.execute("prop.select", json!({"layer": a, "path": "effects/#1/blurriness"})).unwrap();
+    s.execute("edit.copy", json!({})).unwrap();
+    s.execute("layer.select", json!({"layers": [b]})).unwrap();
+    let r = s.execute("edit.paste", json!({})).unwrap();
+    assert_eq!(r["values"], 1, "{r}");
+    assert_eq!(layer(&s, b).props.prop("effects/#1/blurriness").unwrap().value, KV::Scalar(12.5));
+    s.execute("prop.setExpression", json!({"layer": a, "path": "effects/#1/blurriness", "expression": "time * 10"})).unwrap();
+    s.execute("prop.select", json!({"layer": a, "path": "effects/#1/blurriness"})).unwrap();
+    s.execute("edit.copyExpressionOnly", json!({})).unwrap();
+    s.execute("layer.select", json!({"layers": [b]})).unwrap();
+    let r = s.execute("edit.paste", json!({})).unwrap();
+    assert_eq!(r["expressions"], 1, "{r}");
+    assert_eq!(layer(&s, b).props.prop("effects/#1/blurriness").unwrap().expr.as_ref().unwrap().text, "time * 10");
+}
+
+/// Effect helpers run native code: a script starts them only with Allow Scripts to Write Files
+/// and Access Network on (as for File.execute()); the user always can.
+#[test]
+fn scripts_start_effect_helpers_only_with_file_access() {
+    let mut s = Session {
+        helpers: Some(crate::HelperHooks {
+            scan: |_| json!({"paths": [], "helpers": [], "loaded": [], "errors": []}),
+            load: |_| Ok(json!({"loaded": [], "errors": []})),
+            list: || json!({"helpers": [], "blocked": []}),
+        }),
+        ..Default::default()
+    };
+    for (id, params) in [("effect.helpers.scan", json!({})), ("effect.helpers.load", json!({"path": "/plug-ins/x.ofx"}))] {
+        let e = s.execute_for_script(id, params.clone()).unwrap_err().to_string();
+        assert!(e.contains("Allow Scripts to Write Files"), "{id}: {e}");
+        assert!(s.execute(id, params).is_ok(), "{id}: the user starts helpers");
+    }
+    assert!(s.execute_for_script("effect.helpers.list", json!({})).is_ok(), "listing starts nothing");
+    s.execute("prefs.set", json!({"key": "scripting.allowScriptsWriteFiles", "value": true})).unwrap();
+    assert!(s.execute_for_script("effect.helpers.scan", json!({})).is_ok());
+}

@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::support::write_tone;
 use effectcraft_color::Label;
 use effectcraft_export::render_queue::{
     AudioOutput, CodecProfile, OpusApplication, OutputFormat, OutputModule, RateControlMode, RenderSettings, TimeSpan, WebmVideoCodec,
@@ -123,7 +124,15 @@ fn ffprobe_video(path: &Path) -> Option<String> {
         .output()
         .expect("ffprobe");
     assert!(out.status.success() && out.stderr.is_empty(), "ffprobe rejected {}: {}", path.display(), String::from_utf8_lossy(&out.stderr));
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // An ffprobe whose build lacks this codec's decoder (distro "free" builds) only parses the
+    // container: pix_fmt and the counted frames come back unknown/N/A, describing the build
+    // rather than our output. Skip the oracle, as when ffprobe is absent.
+    if s.contains("|unknown|") || s.ends_with("|N/A") {
+        eprintln!("ffprobe cannot decode this codec here: skipping the oracle ({s})");
+        return None;
+    }
+    Some(s)
 }
 
 /// Decode every frame with ffmpeg (no errors allowed) and check frames 0, 4, 5 and the last.
@@ -140,7 +149,14 @@ fn ffmpeg_check(path: &Path, decoder: Option<&str>, tol: f32) {
         cmd.args(["-c:v", d]);
     }
     let out = cmd.arg("-i").arg(path).args(["-pix_fmt", "rgba"]).arg(dir.join("f%03d.png")).output().expect("ffmpeg");
-    assert!(out.status.success() && out.stderr.is_empty(), "ffmpeg ({decoder:?}) failed on {}: {}", path.display(), String::from_utf8_lossy(&out.stderr));
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    // Same as ffprobe: an ffmpeg without this codec's decoder cannot judge our output, so the
+    // oracle skips instead of failing (the in-repo decode above already proved the frames).
+    if !out.status.success() && err.contains("no decoder found") {
+        eprintln!("ffmpeg cannot decode this codec here: skipping the oracle decode ({err})");
+        return;
+    }
+    assert!(out.status.success() && err.is_empty(), "ffmpeg ({decoder:?}) failed on {}: {}", path.display(), err);
     for k in [0, 4, 5, FRAMES - 1] {
         let img = image::open(dir.join(format!("f{:03}.png", k + 1))).expect("ffmpeg frame").to_rgba8();
         check_frame(&Image::from_rgba8(img.width(), img.height(), img.as_raw()), k, tol);
@@ -283,31 +299,4 @@ fn webm_low_bitrate_opus_modes() {
 fn rms(v: impl Iterator<Item = f32>) -> f32 {
     let (s, n) = v.fold((0.0f64, 0usize), |(s, n), x| (s + (x as f64) * (x as f64), n + 1));
     (s / n.max(1) as f64).sqrt() as f32
-}
-
-/// 16-bit stereo WAV with a 440 Hz sine at amplitude 0.5 (left) and silence (right).
-fn write_tone(path: &Path, secs: f64) {
-    let sr = 48_000u32;
-    let n = (secs * sr as f64) as usize;
-    let mut data = Vec::with_capacity(n * 4);
-    for i in 0..n {
-        let s = (0.5 * (2.0 * std::f64::consts::PI * 440.0 * i as f64 / sr as f64).sin() * 32767.0).round() as i16;
-        data.extend_from_slice(&s.to_le_bytes());
-        data.extend_from_slice(&0i16.to_le_bytes());
-    }
-    let mut w = Vec::new();
-    w.extend_from_slice(b"RIFF");
-    w.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
-    w.extend_from_slice(b"WAVEfmt ");
-    w.extend_from_slice(&16u32.to_le_bytes());
-    w.extend_from_slice(&1u16.to_le_bytes());
-    w.extend_from_slice(&2u16.to_le_bytes());
-    w.extend_from_slice(&sr.to_le_bytes());
-    w.extend_from_slice(&(sr * 4).to_le_bytes());
-    w.extend_from_slice(&4u16.to_le_bytes());
-    w.extend_from_slice(&16u16.to_le_bytes());
-    w.extend_from_slice(b"data");
-    w.extend_from_slice(&(data.len() as u32).to_le_bytes());
-    w.extend_from_slice(&data);
-    std::fs::write(path, w).expect("write wav");
 }

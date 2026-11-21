@@ -1,7 +1,7 @@
 //! Footage import against ffmpeg as an external oracle.
 //!
-//! Fixtures are generated with ffmpeg into `target/fixtures/media` (never committed); every test
-//! skips (passes with a note) when ffmpeg is not installed. Decoded frames are compared with
+//! Oracle fixtures are generated with ffmpeg into `target/fixtures/media` (never committed);
+//! tests using them skip when ffmpeg is not installed. Decoded frames are compared with
 //! frames ffmpeg extracts to PNG (PSNR, premultiplied RGBA).
 
 use std::path::{Path, PathBuf};
@@ -24,9 +24,40 @@ fn have_ffmpeg() -> bool {
     *HAVE.get_or_init(|| Command::new("ffmpeg").arg("-version").output().is_ok_and(|o| o.status.success()))
 }
 
+/// An H.264 encoder this ffmpeg build actually ships, or `None` when it has none. Distro "free"
+/// builds often omit `libx264` (the one named historically here) but ship an alternative, so pick
+/// the first present by name rather than hard-coding one that may be absent. These tests only
+/// need *an* H.264 encoder to make an oracle fixture; the encoder identity is irrelevant.
+fn h264_encoder() -> Option<&'static str> {
+    static ENC: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *ENC.get_or_init(|| {
+        let out = Command::new("ffmpeg").args(["-hide_banner", "-encoders"]).output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        ["libx264", "libopenh264", "h264_nvenc", "h264_vaapi", "h264_qsv", "h264_v4l2m2m", "h264_amf"]
+            .into_iter()
+            .find(|name| text.lines().any(|l| l.split_whitespace().any(|tok| tok == *name)))
+    })
+}
+
 /// Run ffmpeg to produce `name` (once; written to a temp name and renamed so concurrent test
 /// processes never see a partial file). `None` when ffmpeg is unavailable.
 fn ffmpeg_fixture(name: &str, args: &[&str]) -> Option<PathBuf> {
+    ffmpeg_fixture_inner(name, args, true)
+}
+
+/// Like [`ffmpeg_fixture`] for a fixture this build of ffmpeg may fail to make: an encoder found
+/// in the `-encoders` listing can still not run here (the hardware backends need their device,
+/// Fedora's `libopenh264` is the `noopenh264` stub), and fixtures built from one, like
+/// [`h264_mp4`], should skip with a note rather than fail on the packager's choice of ffmpeg —
+/// the same way every test here skips when ffmpeg is missing altogether.
+fn try_ffmpeg_fixture(name: &str, args: &[&str]) -> Option<PathBuf> {
+    ffmpeg_fixture_inner(name, args, false)
+}
+
+fn ffmpeg_fixture_inner(name: &str, args: &[&str], must_succeed: bool) -> Option<PathBuf> {
     if !have_ffmpeg() {
         eprintln!("ffmpeg not found: skipping");
         return None;
@@ -39,7 +70,14 @@ fn ffmpeg_fixture(name: &str, args: &[&str]) -> Option<PathBuf> {
     let ext = out.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
     let tmp = out.with_file_name(format!("tmp-{}-{:?}.{ext}", std::process::id(), std::thread::current().id()).replace(['(', ')'], ""));
     let st = Command::new("ffmpeg").args(["-hide_banner", "-loglevel", "error", "-y"]).args(args).arg(&tmp).status().expect("run ffmpeg");
-    assert!(st.success(), "ffmpeg failed for {name}");
+    if !st.success() {
+        let _ = std::fs::remove_file(&tmp);
+        if must_succeed {
+            panic!("ffmpeg failed for {name}");
+        }
+        eprintln!("this ffmpeg build cannot make {name}: skipping");
+        return None;
+    }
     if std::fs::rename(&tmp, &out).is_err() {
         // Another test made it first; on Windows the rename fails while that test has it open.
         let _ = std::fs::remove_file(&tmp);
@@ -48,39 +86,35 @@ fn ffmpeg_fixture(name: &str, args: &[&str]) -> Option<PathBuf> {
     Some(out)
 }
 
+/// Video options the chosen H.264 encoder actually accepts. `libx264` keeps its constant-quality
+/// `-preset`/`-crf` pair; `libopenh264` rejects both (it takes a bitrate), and the hardware
+/// backends take a bitrate too — without this, a build whose picked encoder is not libx264 failed
+/// the fixture and silently skipped every check gated on it.
+fn h264_video_options(enc: &str) -> Vec<&'static str> {
+    if enc == "libx264" { vec!["-preset", "medium", "-crf", "18"] } else { vec!["-b:v", "2M"] }
+}
+
 fn h264_mp4() -> Option<PathBuf> {
-    ffmpeg_fixture(
-        "testsrc2_1080p.mp4",
-        &[
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=1920x1080:rate=30:duration=2",
-            "-f",
-            "lavfi",
-            "-i",
-            "sine=frequency=440:sample_rate=48000:duration=2",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-preset",
-            "medium",
-            "-crf",
-            "18",
-            "-colorspace",
-            "bt709",
-            "-color_primaries",
-            "bt709",
-            "-color_trc",
-            "bt709",
-            "-c:a",
-            "aac",
-            "-ac",
-            "2",
-            "-shortest",
-        ],
-    )
+    // Made with whatever encoder this build has listed: a listed encoder can still fail at run
+    // time (the hardware ones without their device), so this may skip rather than fail.
+    let enc = h264_encoder()?;
+    let mut args: Vec<&'static str> = vec![
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=1920x1080:rate=30:duration=2",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:sample_rate=48000:duration=2",
+        "-c:v",
+        enc,
+        "-pix_fmt",
+        "yuv420p",
+    ];
+    args.extend(h264_video_options(enc));
+    args.extend(["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-c:a", "aac", "-ac", "2", "-shortest"]);
+    try_ffmpeg_fixture("testsrc2_1080p.mp4", &args)
 }
 
 fn prores_mov() -> Option<PathBuf> {
@@ -172,9 +206,14 @@ fn tone_wav() -> Option<PathBuf> {
 
 /// Frame `n` of `src` as RGBA PNG extracted by ffmpeg (Y'CbCr → RGB with the BT.709 matrix).
 fn reference_frame(src: &Path, n: usize) -> Image {
+    reference_frame_in(src, n, "bt709")
+}
+
+/// [`reference_frame`] of a movie whose Y'CbCr is in `matrix` (`bt601` for Motion JPEG).
+fn reference_frame_in(src: &Path, n: usize, matrix: &str) -> Image {
     let stem = src.file_stem().expect("stem").to_string_lossy().to_string();
     let name = format!("ref_{stem}_{n}.png");
-    let vf = format!("select='eq(n\\,{n})',scale=in_color_matrix=bt709:in_range=auto:out_range=pc:flags=bilinear+accurate_rnd+full_chroma_int,format=rgba");
+    let vf = format!("select='eq(n\\,{n})',scale=in_color_matrix={matrix}:in_range=auto:out_range=pc:flags=bilinear+accurate_rnd+full_chroma_int,format=rgba");
     let p = ffmpeg_fixture(&name, &["-i", src.to_str().expect("utf8"), "-vf", &vf, "-fps_mode", "passthrough", "-frames:v", "1"]).expect("ffmpeg");
     load_png(&p)
 }
@@ -281,7 +320,10 @@ fn h264_audio_samples() {
 /// H.264 + AAC at 44.1 kHz in MP4 (ffmpeg writes an edit list that skips the AAC priming):
 /// 440 Hz left, a 200 → 1000 Hz sweep right, 29.97 fps.
 fn aac_44k_mp4() -> Option<PathBuf> {
-    ffmpeg_fixture(
+    // Made with whatever encoder this build has listed: a listed encoder can still fail at run
+    // time (the hardware ones without their device), so this may skip rather than fail.
+    let enc = h264_encoder()?;
+    try_ffmpeg_fixture(
         "aac_44k.mp4",
         &[
             "-f",
@@ -293,7 +335,7 @@ fn aac_44k_mp4() -> Option<PathBuf> {
             "-i",
             "aevalsrc=0.5*sin(2*PI*440*t)|0.5*sin(2*PI*(200+400*t/3)*t):s=44100:d=3",
             "-c:v",
-            "libx264",
+            enc,
             "-pix_fmt",
             "yuv420p",
             "-c:a",
@@ -343,7 +385,10 @@ fn resampled_audio_read_in_frame_pieces_matches_ffmpeg() {
 /// The H.264 fixture with the rotation part of its video track header's matrix (`[a b; c d]`,
 /// 16.16 fixed point) replaced: what a phone writes for a movie shot with the camera turned.
 fn turned_mp4(p: &Path, abcd: [i32; 4]) -> Arc<[u8]> {
-    let mut bytes = std::fs::read(p).expect("read");
+    turn_mp4_bytes(std::fs::read(p).expect("read"), abcd)
+}
+
+fn turn_mp4_bytes(mut bytes: Vec<u8>, abcd: [i32; 4]) -> Arc<[u8]> {
     // (The video track comes first; a version 0 `tkhd` has its matrix 44 bytes after the type.)
     let at = bytes.windows(4).position(|w| w == b"tkhd").expect("tkhd");
     assert_eq!(bytes[at + 4], 0, "a version 0 tkhd");
@@ -419,6 +464,88 @@ fn prores_4444_with_alpha() {
     assert!(pool.frame_at(&g, Tick::ZERO).expect("frame").data.iter().all(|p| p[3] == 1.0));
 }
 
+/// The alpha mode follows the coded frame, even when a MOV writer signals an inconsistent depth.
+#[test]
+fn prores_alpha_uses_coded_frame_not_mov_depth() {
+    use craft_media::isobmff::{self, Brand, FourCc, Mp4Writer, SampleEntry, TrackConfig, WriteSample, WriterOptions};
+    use craft_video::prores::{ChromaFormat, Encoder, Frame, Profile};
+
+    let profile = Profile::P4444;
+    let mut encoder = Encoder::new(profile, 16, 16);
+    let mut frame = Frame::new(16, 16, ChromaFormat::Yuv444, 16, true).unwrap();
+    for row in frame.alpha.as_mut().unwrap().as_chunks_mut::<16>().0 {
+        row[..8].fill(0);
+    }
+    for (depth, mode) in [(24, AlphaMode::Straight), (32, AlphaMode::Ignore)] {
+        if mode == AlphaMode::Ignore {
+            frame.alpha = None;
+        }
+        let packet = encoder.encode(&frame).unwrap();
+        let mut entry = SampleEntry::prores(FourCc(profile.fourcc()), 16, 16);
+        entry.video.as_mut().unwrap().depth = depth;
+        let mut writer = Mp4Writer::new(std::io::Cursor::new(Vec::new()), WriterOptions::new(Brand::Mov)).unwrap();
+        let output_track = writer.add_track(TrackConfig::new(entry, 24)).unwrap();
+        writer.write_sample(output_track, WriteSample { data: &packet, duration: 1, composition_offset: 0, is_sync: true }).unwrap();
+        let bytes: Arc<[u8]> = writer.finish().unwrap().into_inner().into();
+
+        let mov = isobmff::open(bytes.as_ref()).unwrap();
+        assert_eq!(mov.tracks[0].video().unwrap().depth, depth);
+        let name = format!("prores4444_depth{depth}.mov");
+        let footage = probe_bytes(&name, bytes.clone()).expect("probe ProRes 4444");
+        assert_eq!(footage.codec, "ProRes", "must exercise the shared reader, not legacy fallback");
+        assert_eq!(footage.alpha, mode, "MOV depth {depth}");
+
+        let pool = MediaPool::new();
+        pool.add_bytes(&name, bytes);
+        let image = pool.frame_at(&footage, Tick::ZERO).expect("decode ProRes 4444");
+        assert_eq!((image.width, image.height), (16, 16));
+        let left_alpha = if mode == AlphaMode::Straight { 0.0 } else { 1.0 };
+        assert!((image.data[0][3] - left_alpha).abs() < 0.02);
+        assert!(image.data[15][3] > 0.97);
+    }
+}
+
+/// A synthetic asymmetrical aperture and rotation must determine what the shared importer shows.
+#[test]
+fn mov_renders_clean_aperture_before_display_rotation() {
+    use craft_media::isobmff::{self, Brand, CleanAperture, FourCc, Mp4Writer, SampleEntry, TrackConfig, WriteSample, WriterOptions};
+    use craft_video::prores::{ChromaFormat, Encoder, Frame, Profile};
+
+    let profile = Profile::P4444;
+    let mut frame = Frame::new(16, 16, ChromaFormat::Yuv444, 16, true).unwrap();
+    // Our generated alpha value uniquely labels each source coordinate.
+    for (i, p) in frame.alpha.as_mut().unwrap().iter_mut().enumerate() {
+        *p = i as u16 * 257;
+    }
+    let packet = Encoder::new(profile, 16, 16).encode(&frame).unwrap();
+    let mut entry = SampleEntry::prores(FourCc(profile.fourcc()), 16, 16);
+    let clean_aperture = CleanAperture { width: (8, 1), height: (12, 1), horiz_offset: (2, 1), vert_offset: (-1, 1) };
+    entry.video.as_mut().unwrap().clean_aperture = Some(clean_aperture);
+    let mut writer = Mp4Writer::new(std::io::Cursor::new(Vec::new()), WriterOptions::new(Brand::Mov)).unwrap();
+    let track = writer.add_track(TrackConfig::new(entry, 24)).unwrap();
+    writer.write_sample(track, WriteSample { data: &packet, duration: 1, composition_offset: 0, is_sync: true }).unwrap();
+    let bytes = turn_mp4_bytes(writer.finish().unwrap().into_inner(), [0, 0x1_0000, -0x1_0000, 0]);
+
+    let mov = isobmff::open(bytes.as_ref()).unwrap();
+    assert_eq!(mov.tracks[0].video().unwrap().clean_aperture, Some(clean_aperture));
+    assert_eq!(mov.tracks[0].display_rotation(), Some(1));
+    let name = "turned_clean_aperture.mov";
+    let footage = probe_bytes(name, bytes.clone()).expect("probe the cropped MOV");
+    assert_eq!(footage.codec, "ProRes", "must exercise the shared reader, not legacy fallback");
+    assert_eq!((footage.width, footage.height), (12, 8));
+
+    let pool = MediaPool::new();
+    pool.add_bytes(name, bytes);
+    let image = pool.frame_at(&footage, Tick::ZERO).expect("render the cropped MOV");
+    assert_eq!((image.width, image.height), (12, 8));
+    for (x, y) in [(0, 0), (11, 0), (0, 7), (11, 7), (4, 3)] {
+        // Rotate 90° after cropping the source box (6, 1, 8, 12).
+        let source = (6 + y, 12 - x);
+        let expected = (source.0 + 16 * source.1) as f32 / 255.0;
+        assert!((image.data[y * 12 + x][3] - expected).abs() < 0.002, "pixel {x},{y} must come from {source:?}");
+    }
+}
+
 #[test]
 fn vp9_webm_frames() {
     let Some(p) = vp9_webm() else { return };
@@ -476,12 +603,12 @@ fn dnxhd_mxf() -> Option<PathBuf> {
     )
 }
 
-/// MXF is importable footage (After Effects imports it), whatever the extension's case.
+/// MXF and AVI are importable footage (After Effects imports them), whatever the extension's case.
 #[test]
-fn mxf_is_importable() {
-    assert!(effectcraft_media::is_importable(Path::new("/media/A001C003.mxf")));
-    assert!(effectcraft_media::is_importable(Path::new("/media/A001C003.MXF")));
-    assert!(!effectcraft_media::is_importable(Path::new("/media/A001C003.avi")), "no AVI demuxer yet");
+fn mxf_and_avi_are_importable() {
+    for name in ["A001C003.mxf", "A001C003.MXF", "capture.avi", "CAPTURE.AVI"] {
+        assert!(effectcraft_media::is_importable(&Path::new("/media").join(name)), "{name}");
+    }
 }
 
 #[test]
@@ -527,6 +654,124 @@ fn mxf_dnxhd_frames() {
     }
 }
 
+fn mjpeg_avi() -> Option<PathBuf> {
+    ffmpeg_fixture(
+        "testsrc2_mjpeg_pcm.avi",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=640x360:rate=25:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=2",
+            "-c:v",
+            "mjpeg",
+            "-q:v",
+            "2",
+            "-pix_fmt",
+            "yuvj420p",
+            "-c:a",
+            "pcm_s16le",
+            "-ac",
+            "2",
+        ],
+    )
+}
+
+#[test]
+fn avi_mjpeg_with_pcm_audio() {
+    let Some(p) = mjpeg_avi() else { return };
+    let f = probe(&p).expect("probe");
+    assert_eq!(f.kind, FootageKind::Video);
+    assert_eq!((f.width, f.height), (640, 360));
+    assert_eq!(f.frame_rate, FrameRate::FPS_25);
+    assert!((f.duration.seconds() - 2.0).abs() < 0.1, "duration {:?}", f.duration.seconds());
+    assert!(f.has_video && f.has_audio);
+    assert_eq!(f.codec, "Motion JPEG");
+    let pool = MediaPool::new();
+    for n in [0usize, 1, 30, 7, 49] {
+        let img = pool.frame_at(&f, t_of(f.frame_rate, n as i64)).expect("frame");
+        let db = psnr(&img, &reference_frame_in(&p, n, "bt601"));
+        assert!(db > 35.0, "frame {n}: {db:.2} dB");
+    }
+    let s = pool.audio_samples(&f, Tick(TICKS_PER_SECOND / 2), 4800, 48_000);
+    assert_eq!(s.len(), 9600);
+    let rms = (s.iter().map(|v| v * v).sum::<f32>() / s.len() as f32).sqrt();
+    assert!((rms - 0.0625).abs() < 0.01, "rms {rms}");
+}
+
+/// An AVI whose video FilmCraft can't decode imports, and says why it shows no picture (as an
+/// unsupported stream in any other container does), rather than failing as a broken file.
+#[test]
+fn avi_with_an_unsupported_codec_says_so() {
+    let Some(p) = ffmpeg_fixture("testsrc2_xvid.avi", &["-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25:duration=1", "-c:v", "mpeg4", "-vtag", "XVID"])
+    else {
+        return;
+    };
+    let f = probe(&p).expect("a valid AVI imports");
+    assert_eq!((f.kind, f.width, f.height), (FootageKind::Video, 320, 180));
+    let pool = MediaPool::new();
+    if pool.frame(ItemId(1), &f, Tick::ZERO).is_some() {
+        // FilmCraft decodes MPEG-4 Part 2 now: nothing to report
+        assert_eq!(pool.problem(&f), None);
+        return;
+    }
+    let why = pool.problem(&f).expect("a failed frame leaves a reason");
+    assert!(why.contains("MPEG-4 Part 2") && why.contains("isn't supported"), "{why}");
+}
+
+/// A file that only looks like an AVI is an import error that says so.
+#[test]
+fn an_invalid_avi_is_an_import_error() {
+    let e = probe_bytes("broken.avi", Arc::from(&b"RIFF\x10\0\0\0AVI LIST\0\0\0\0garbage"[..])).expect_err("not an AVI");
+    assert!(e.to_string().contains("invalid AVI"), "{e}");
+}
+
+/// A damaged AVI imports: a truncated recording as far as it goes, and a packet that doesn't
+/// decode loses its own frame only, with a reason that says the file is damaged rather than
+/// unsupported.
+#[test]
+fn a_damaged_avi_loses_only_what_is_damaged() {
+    let Some(p) = mjpeg_avi() else { return };
+    let bytes = std::fs::read(&p).expect("read");
+    let full = probe(&p).expect("probe");
+    let pool = MediaPool::new();
+
+    let cut: Arc<[u8]> = bytes[..bytes.len() / 3].into();
+    let f = probe_bytes("cut.avi", cut.clone()).expect("a truncated AVI imports");
+    assert!(f.duration > Tick::ZERO && f.duration < full.duration, "{:?} of {:?}", f.duration, full.duration);
+    pool.add_bytes("cut.avi", cut);
+    let last = f.frame_rate.frame_at(f.duration - Tick(1));
+    assert!(pool.frame(ItemId(1), &f, t_of(f.frame_rate, last)).is_some(), "its last frame");
+
+    // Garble the JPEG data of the video chunk of frame 10.
+    let mut bad = bytes.clone();
+    let mut at = bad.windows(4).position(|w| w == b"movi").expect("movi") + 4;
+    let mut video = 0;
+    while let Some(head) = bad.get(at..at + 8) {
+        let size = u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as usize;
+        if &head[2..4] == b"dc" {
+            if video == 10 {
+                bad[at + 8 + 200..at + 8 + size.min(3000)].iter_mut().enumerate().for_each(|(i, b)| *b = if i % 7 == 0 { 0xFF } else { 0 });
+                break;
+            }
+            video += 1;
+        }
+        at += 8 + size + size % 2;
+    }
+    assert_eq!(video, 10, "found frame 10's chunk");
+    let f = probe_bytes("bad.avi", bad.clone().into()).expect("a damaged AVI imports");
+    pool.add_bytes("bad.avi", bad.into());
+    assert!(pool.frame(ItemId(2), &f, t_of(f.frame_rate, 10)).is_none(), "the damaged frame");
+    for n in [9, 11, 30] {
+        assert!(pool.frame(ItemId(2), &f, t_of(f.frame_rate, n)).is_some(), "frame {n}");
+    }
+    let why = pool.problem(&f).expect("a failed frame leaves a reason");
+    assert!(why.contains("can't be decoded") && !why.contains("isn't supported"), "{why}");
+}
+
 #[test]
 fn png_sequence_import() {
     let Some(first) = png_sequence() else { return };
@@ -550,10 +795,11 @@ fn png_sequence_import() {
     assert_eq!(*img, load_png(&first.with_file_name("seq_0004.png")));
 }
 
-/// A gap in a sequence's numbering shows colour bars, as in After Effects; in Force
-/// Alphabetical Order the files play back to back (#297).
+/// A gap in a sequence's numbering holds the previous frame, as After Effects 2026 does (files
+/// 1, 2, 4, 5 show frame 2 at frame 3); in Force Alphabetical Order the files play back to back
+/// (#297).
 #[test]
-fn sequence_gaps_show_placeholders() {
+fn sequence_gaps_hold_the_previous_frame() {
     let dir = fixtures().join(format!("gap-seq-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("mkdir");
     // Frames 1, 2 and 4: frame 3 is missing. Each frame is a flat grey of its number.
@@ -571,11 +817,8 @@ fn sequence_gaps_show_placeholders() {
     let at = |f: &Footage, n: i64| pool.frame_at(f, t_of(f.frame_rate, n)).expect("frame");
     let level = |img: &Image| (img.get(0, 0)[0] * 255.0).round() as u32;
     assert_eq!(level(&at(&f, 1)), 100);
-    // The placeholder: colour bars across the frame, starting with 75 % white.
-    let bars = at(&f, 2);
-    assert_eq!((bars.width, bars.height), (8, 4));
-    assert_eq!(bars.get(0, 0), [0.75, 0.75, 0.75, 1.0]);
-    assert_eq!(bars.get(7, 3), [0.0, 0.0, 0.75, 1.0], "blue on the right");
+    // The gap holds frame 2.
+    assert_eq!(level(&at(&f, 2)), 100);
     assert_eq!(level(&at(&f, 3)), 200);
     f.alphabetical = true;
     f.sync_sequence_duration();
@@ -589,8 +832,8 @@ fn sequence_gaps_show_placeholders() {
 /// parallax project's 21120-px plates were decoded and resampled for every frame at Quarter).
 #[test]
 fn stills_at_reduced_sizes_are_resampled_once() {
-    let dir = std::env::temp_dir().join(format!("ec-still-size-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let guard = tempfile::tempdir().expect("temp dir");
+    let dir = guard.path().to_path_buf();
     let p = dir.join("plate.png");
     let px = |x: u32, y: u32| {
         image::Rgba([(x * 7 % 256) as u8, (y * 13 % 256) as u8, ((x ^ y) % 256) as u8, if (x + y).is_multiple_of(5) { 0 } else { 255 - (x % 128) as u8 }])
@@ -878,7 +1121,7 @@ fn flac_audio_of_any_shape_reads_in_device_blocks() {
         // ffmpeg's sine source has an amplitude of 1/8 (mono is duplicated). The fixture carries
         // channels 0 and 1 at full level and the others at half, so a multichannel file sounds as
         // its stereo downmix (tests/it/downmix.rs checks that matrix channel by channel).
-        let gains = effectcraft_media::downmix::stereo_gains(channels as usize, false);
+        let gains = effectcraft_media::downmix::stereo_gains(channels as usize);
         let side = |s: usize| gains.iter().enumerate().map(|(c, g)| f64::from(g[s]) * if c < 2 { 1.0 } else { 0.5 }).sum::<f64>();
         let want = 0.125 * ((side(0).powi(2) + side(1).powi(2)) / 2.0).sqrt() / 2f64.sqrt();
         let rms = (sum / n.max(1) as f64).sqrt();
@@ -1098,7 +1341,7 @@ fn a_called_off_read_does_not_decode() {
 /// footage reports it (not a black frame without a word).
 #[test]
 fn an_unsupported_stream_reports_why_it_shows_no_picture() {
-    let Some(p) = ffmpeg_fixture(
+    let Some(p) = try_ffmpeg_fixture(
         "h264_high422_10bit.mp4",
         &["-f", "lavfi", "-i", "testsrc=size=320x180:rate=24:duration=1", "-c:v", "libx264", "-profile:v", "high422", "-pix_fmt", "yuv422p10le"],
     ) else {
@@ -1121,4 +1364,528 @@ fn an_unsupported_stream_reports_why_it_shows_no_picture() {
     assert_eq!(pool.problem(&f).as_deref(), Some(why.as_str()));
     pool.forget(&f.path);
     assert_eq!(pool.problem(&f), None);
+}
+
+#[test]
+fn the_h264_fixture_options_fit_the_picked_encoder() {
+    assert_eq!(h264_video_options("libx264"), ["-preset", "medium", "-crf", "18"]);
+    for enc in ["libopenh264", "h264_nvenc", "h264_vaapi", "h264_qsv"] {
+        let options = h264_video_options(enc);
+        assert!(!options.iter().any(|o| *o == "-preset" || *o == "-crf"), "{enc} rejects preset/crf: {options:?}");
+        assert!(options.contains(&"-b:v"), "{enc} gets a bitrate: {options:?}");
+    }
+}
+
+/// #781: software MP4/H.264 route on a B-frame fixture: backward seek across GOPs, cooperative
+/// cancellation, VUI/container color resolution, and draft mode for reduced-resolution playback.
+#[test]
+fn h264_bframe_route_backward_seek_cancel_color_and_draft() {
+    use std::sync::atomic::AtomicBool;
+    if h264_encoder() != Some("libx264") {
+        return;
+    }
+    let Some(p) = try_ffmpeg_fixture(
+        "h264_bframes_bt709.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x180:rate=24:duration=1",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-bf",
+            "2",
+            "-g",
+            "12",
+            "-pix_fmt",
+            "yuv420p",
+            "-colorspace",
+            "bt709",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-color_range",
+            "tv",
+        ],
+    ) else {
+        return;
+    };
+    let f = probe(&p).expect("probe");
+    assert_eq!((f.width, f.height), (320, 180));
+    assert_eq!(f.color_profile, Some(effectcraft_project::ColorSpace::Rec709));
+
+    let pool = MediaPool::new();
+    // Forward decode into second GOP, then backward seek across GOP boundary and within GOP.
+    let f18 = pool.frame(ItemId(1), &f, t_of(f.frame_rate, 18)).expect("frame 18");
+    let f13 = pool.frame(ItemId(1), &f, t_of(f.frame_rate, 13)).expect("frame 13");
+    let f7 = pool.frame(ItemId(1), &f, t_of(f.frame_rate, 7)).expect("frame 7");
+    let f0 = pool.frame(ItemId(1), &f, t_of(f.frame_rate, 0)).expect("frame 0");
+    for img in [&f18, &f13, &f7, &f0] {
+        assert_eq!((img.width, img.height), (320, 180));
+    }
+    // Verify backward-seeked frame 7 matches a fresh pool decode of frame 7.
+    let fresh_f7 = MediaPool::new().frame(ItemId(1), &f, t_of(f.frame_rate, 7)).expect("fresh frame 7");
+    assert!(psnr(&f7, &fresh_f7) > 55.0, "backward seek frame 7 must match fresh decode");
+
+    // Draft mode at reduced resolution.
+    let draft = pool.frame_at_size(ItemId(1), &f, t_of(f.frame_rate, 5), 160, 90).expect("draft frame");
+    let full = pool.frame(ItemId(1), &f, t_of(f.frame_rate, 5)).expect("full frame");
+    assert_eq!((draft.width, draft.height), (160, 90));
+    assert!(psnr(&draft, &effectcraft_raster::resample(&full, 160, 90)) > 40.0, "draft frame matches resampled full frame");
+
+    // Cooperative cancellation.
+    let off = Arc::new(AtomicBool::new(true));
+    let mut cancelled = Some(Arc::clone(&f0));
+    pool.cancellable(&off, &mut || cancelled = pool.frame(ItemId(1), &f, t_of(f.frame_rate, 20)));
+    assert!(cancelled.is_none(), "cancelled read must not decode");
+    let on = Arc::new(AtomicBool::new(false));
+    let mut resumed = None;
+    pool.cancellable(&on, &mut || resumed = pool.frame(ItemId(1), &f, t_of(f.frame_rate, 20)));
+    assert_eq!(resumed.map(|i| (i.width, i.height)), Some((320, 180)));
+}
+
+fn assert_seek_draft_cancel_parity(p: &Path, expected_size: (u32, u32), expected_color: Option<effectcraft_project::ColorSpace>) {
+    use std::sync::atomic::AtomicBool;
+    let f = probe(p).expect("probe");
+    assert_eq!((f.width, f.height), expected_size);
+    if let Some(c) = expected_color {
+        assert_eq!(f.color_profile, Some(c));
+    }
+
+    let pool = MediaPool::new();
+    let f18 = pool.frame(ItemId(1), &f, t_of(f.frame_rate, 18)).expect("frame 18");
+    let f13 = pool.frame(ItemId(1), &f, t_of(f.frame_rate, 13)).expect("frame 13");
+    let f7 = pool.frame(ItemId(1), &f, t_of(f.frame_rate, 7)).expect("frame 7");
+    let f0 = pool.frame(ItemId(1), &f, t_of(f.frame_rate, 0)).expect("frame 0");
+    for img in [&f18, &f13, &f7, &f0] {
+        assert_eq!((img.width, img.height), expected_size);
+    }
+    let fresh_f7 = MediaPool::new().frame(ItemId(1), &f, t_of(f.frame_rate, 7)).expect("fresh frame 7");
+    assert!(psnr(&f7, &fresh_f7) > 55.0, "backward seek frame 7 must match fresh decode");
+
+    let (dw, dh) = (expected_size.0 / 2, expected_size.1 / 2);
+    let draft = pool.frame_at_size(ItemId(1), &f, t_of(f.frame_rate, 5), dw, dh).expect("draft frame");
+    let full = pool.frame(ItemId(1), &f, t_of(f.frame_rate, 5)).expect("full frame");
+    assert_eq!((draft.width, draft.height), (dw, dh));
+    assert!(psnr(&draft, &effectcraft_raster::resample(&full, dw, dh)) > 40.0, "draft frame matches resampled full frame");
+
+    let off = Arc::new(AtomicBool::new(true));
+    let mut cancelled = Some(Arc::clone(&f0));
+    pool.cancellable(&off, &mut || cancelled = pool.frame(ItemId(1), &f, t_of(f.frame_rate, 20)));
+    assert!(cancelled.is_none(), "cancelled read must not decode");
+    let on = Arc::new(AtomicBool::new(false));
+    let mut resumed = None;
+    pool.cancellable(&on, &mut || resumed = pool.frame(ItemId(1), &f, t_of(f.frame_rate, 20)));
+    assert_eq!(resumed.map(|i| (i.width, i.height)), Some(expected_size));
+}
+
+#[test]
+fn hevc_bframe_route_backward_seek_cancel_color_and_draft() {
+    let Some(p) = try_ffmpeg_fixture(
+        "hevc_bframes_bt709.mp4",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x180:rate=24:duration=1",
+            "-c:v",
+            "libx265",
+            "-preset",
+            "fast",
+            "-x265-params",
+            "keyint=12:bframes=2:log-level=error",
+            "-pix_fmt",
+            "yuv420p",
+            "-colorspace",
+            "bt709",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-color_range",
+            "tv",
+        ],
+    ) else {
+        return;
+    };
+    assert_seek_draft_cancel_parity(&p, (320, 180), Some(effectcraft_project::ColorSpace::Rec709));
+}
+
+#[test]
+fn vp9_webm_route_backward_seek_cancel_and_draft() {
+    let Some(p) = vp9_webm() else { return };
+    assert_seek_draft_cancel_parity(&p, (640, 360), None);
+}
+
+#[test]
+fn draft_and_full_quality_cache_do_not_bleed() {
+    if h264_encoder() != Some("libx264") {
+        return;
+    }
+    let Some(p) = try_ffmpeg_fixture(
+        "h264_draft_full_cache.mp4",
+        &["-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=1", "-c:v", "libx264", "-preset", "fast", "-bf", "2", "-g", "12", "-pix_fmt", "yuv420p"],
+    ) else {
+        return;
+    };
+    let f = probe(&p).expect("probe");
+    let pool = MediaPool::new();
+    let t = t_of(f.frame_rate, 7);
+    // Request draft at `t` first, then full quality at the exact same `t` and a neighbour in the same GOP.
+    let draft = pool.frame_at_size(ItemId(1), &f, t, 160, 90).expect("draft frame");
+    assert_eq!((draft.width, draft.height), (160, 90));
+    let full = pool.frame_at(&f, t).expect("full frame after draft");
+    let full_next = pool.frame_at(&f, t_of(f.frame_rate, 8)).expect("full neighbour after draft");
+    let fresh = MediaPool::new().frame_at(&f, t).expect("fresh full frame");
+    let fresh_next = MediaPool::new().frame_at(&f, t_of(f.frame_rate, 8)).expect("fresh full neighbour");
+    assert!(psnr(&full, &fresh) > 55.0, "full frame after draft must match fresh full decode");
+    assert!(psnr(&full_next, &fresh_next) > 55.0, "full GOP neighbour after draft must not reuse draft references");
+}
+
+#[test]
+fn rotated_mp4_matches_reference_orientation() {
+    if h264_encoder() != Some("libx264") {
+        return;
+    }
+    let Some(p) = try_ffmpeg_fixture(
+        "h264_rotate_90.mp4",
+        &["-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=0.5", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-metadata:s:v:0", "rotate=90"],
+    ) else {
+        return;
+    };
+    let f = probe(&p).expect("probe rotated mp4");
+    assert_eq!((f.width, f.height), (180, 320), "90-degree rotated mp4 swaps width and height");
+    let pool = MediaPool::new();
+    let img = pool.frame_at(&f, Tick::ZERO).expect("rotated frame");
+    assert_eq!((img.width, img.height), (180, 320));
+    assert!(psnr(&img, &reference_frame(&p, 0)) > 35.0, "rotated frame pixels match ffmpeg auto-rotated reference");
+}
+
+#[test]
+fn webm_alpha_falls_back_to_filmcraft_preserving_alpha() {
+    let Some(p) = try_ffmpeg_fixture(
+        "vp9_alpha_fallback.webm",
+        &["-f", "lavfi", "-i", "format=rgba,geq=r='255':g='0':b='0':a='255*X/W':s=128x64:r=24", "-t", "0.25", "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p"],
+    ) else {
+        return;
+    };
+    let f = probe(&p).expect("probe webm alpha");
+    assert_eq!(f.alpha, AlphaMode::Straight, "WebM alpha_mode=1 must preserve Straight alpha");
+    let pool = MediaPool::new();
+    let img = pool.frame_at(&f, Tick::ZERO).expect("webm alpha frame");
+    assert!(img.data[0][3] < 0.05 && img.data[127][3] > 0.95, "alpha ramp preserved via fallback");
+}
+
+#[test]
+fn filmcraft_fallback_handles_mjpeg_mov() {
+    let Some(p) = try_ffmpeg_fixture("mjpeg_fallback.mov", &["-f", "lavfi", "-i", "testsrc2=size=160x120:rate=24:duration=0.25", "-c:v", "mjpeg", "-q:v", "3"])
+    else {
+        return;
+    };
+    let f = probe(&p).expect("probe mjpeg fallback");
+    assert_eq!((f.width, f.height), (160, 120));
+    let pool = MediaPool::new();
+    let img = pool.frame_at(&f, Tick::ZERO).expect("mjpeg fallback frame");
+    assert_eq!((img.width, img.height), (160, 120));
+}
+
+/// A cold seek and uninterrupted playback must cross the same audible boundary. The PCM is
+/// contiguous, so the test isolates reset positioning from separately handled timestamp gaps.
+#[test]
+fn matroska_cold_seek_applies_codec_delay_once() {
+    assert_matroska_cold_seek_codec_delay(8_250_000); // Exactly 396 samples, but 8 indexed ticks.
+}
+
+#[test]
+fn matroska_cold_seek_matches_fractional_codec_delay_rounding() {
+    assert_matroska_cold_seek_codec_delay(8_260_000); // 396.48 samples, also 8 indexed ticks.
+}
+
+fn assert_matroska_cold_seek_codec_delay(delay_ns: i64) {
+    use craft_media::matroska::{self, MkvWriter, MuxOptions, TrackKind, TrackSpec};
+    use craft_video::prores::{ChromaFormat, Encoder, Frame, Profile};
+
+    const RATE: u32 = 48_000;
+    const PACKET_FRAMES: usize = 4_800;
+    const PACKET_NS: i64 = 100_000_000;
+    const CHANGE_PACKET: i64 = 32;
+    const HALF_WINDOW: usize = 192;
+
+    let profile = Profile::P4444;
+    let black = Frame::new(16, 16, ChromaFormat::Yuv444, 10, false).unwrap();
+    let picture = Encoder::new(profile, 16, 16).encode(&black).unwrap();
+    let mut video = TrackSpec::new(TrackKind::Video, "V_PRORES");
+    video.video_size = Some((16, 16));
+    video.codec_private = profile.fourcc().to_vec();
+    video.default_duration_ns = Some(4_000_000_000);
+
+    let mut audio = TrackSpec::new(TrackKind::Audio, "A_PCM/INT/LIT");
+    audio.audio = Some((f64::from(RATE), 1, Some(16)));
+    audio.codec_delay_ns = delay_ns as u64;
+    audio.default_duration_ns = Some(PACKET_NS as u64);
+    let mut mux = MkvWriter::new(std::io::Cursor::new(Vec::new()), vec![video, audio], MuxOptions::default()).unwrap();
+    mux.write_frame(0, 0, true, &picture, None).unwrap();
+    let silent = vec![0; PACKET_FRAMES * 2];
+    let signal = 16_384i16.to_le_bytes().repeat(PACKET_FRAMES);
+    for n in 0..40 {
+        let pcm = if n < CHANGE_PACKET { &silent } else { &signal };
+        mux.write_frame(1, n * PACKET_NS - delay_ns, true, pcm, None).unwrap();
+    }
+    let bytes = mux.finish().unwrap().into_inner();
+    let mkv = matroska::open(bytes.as_slice()).unwrap();
+    assert_eq!(mkv.tracks[1].samples[0].pts, -8);
+
+    // Distinct files and pools keep the two decoder states independent.
+    let dir = tempfile::tempdir().unwrap();
+    let warm_path = dir.path().join("sequential.mkv");
+    let cold_path = dir.path().join("cold.mkv");
+    std::fs::write(&warm_path, &bytes).unwrap();
+    std::fs::write(&cold_path, &bytes).unwrap();
+    let warm = probe(&warm_path).unwrap();
+    let cold = probe(&cold_path).unwrap();
+    for f in [&warm, &cold] {
+        assert!(f.has_audio);
+        assert_eq!(f.codec, "ProRes", "exercise the shared Matroska route, not legacy fallback");
+    }
+
+    let warm_pool = MediaPool::new();
+    for n in 0..CHANGE_PACKET - 1 {
+        let t = Tick::from_units(n * PACKET_FRAMES as i64, i64::from(RATE));
+        let _ = warm_pool.audio_samples(&warm, t, PACKET_FRAMES, RATE);
+    }
+    let boundary = CHANGE_PACKET * PACKET_FRAMES as i64 - delay_ns * i64::from(RATE) / 1_000_000_000;
+    let t = Tick::from_units(boundary - HALF_WINDOW as i64, i64::from(RATE));
+    let sequential = warm_pool.audio_samples(&warm, t, 2 * HALF_WINDOW, RATE);
+    assert_eq!(sequential.len(), 4 * HALF_WINDOW);
+    assert!(sequential[..2 * HALF_WINDOW].iter().all(|s| s.abs() < 1e-6));
+    assert!(sequential[2 * HALF_WINDOW..].iter().all(|s| s.abs() > 0.1));
+
+    let seek = MediaPool::new().audio_samples(&cold, t, 2 * HALF_WINDOW, RATE);
+    assert_eq!(seek, sequential, "cold seek must not shift the signal boundary");
+}
+
+#[test]
+fn matroska_opus_audio_timing_and_seek() {
+    let Some(p) = try_ffmpeg_fixture(
+        "vp9_opus_timing.webm",
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x120:rate=24:duration=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=1",
+            "-c:v",
+            "libvpx-vp9",
+            "-c:a",
+            "libopus",
+        ],
+    ) else {
+        return;
+    };
+    let f = probe(&p).expect("probe webm with opus");
+    assert!(f.has_audio, "opus audio stream detected");
+    let pool = MediaPool::new();
+    let start_audio = pool.audio_samples(&f, Tick::ZERO, 4800, 48_000);
+    assert_eq!(start_audio.len(), 9600);
+    let rms_start = (start_audio.iter().map(|v| v * v).sum::<f32>() / start_audio.len() as f32).sqrt();
+    assert!((rms_start - 0.0625).abs() < 0.02, "opus audio at t=0 rms {rms_start}");
+    let seek_audio = pool.audio_samples(&f, Tick(TICKS_PER_SECOND / 2), 4800, 48_000);
+    assert_eq!(seek_audio.len(), 9600);
+    let rms_seek = (seek_audio.iter().map(|v| v * v).sum::<f32>() / seek_audio.len() as f32).sqrt();
+    assert!((rms_seek - 0.0625).abs() < 0.02, "opus audio after seek rms {rms_seek}");
+}
+
+#[test]
+fn audio_only_isobmff_and_matroska_route_through_craft_audio() {
+    for (file, codec, args) in [
+        ("audio_only_aac.m4a", "aac", &["-c:a", "aac"][..]),
+        ("audio_only_alac.m4a", "alac", &["-c:a", "alac"][..]),
+        ("audio_only_opus.webm", "libopus", &["-c:a", "libopus"][..]),
+    ] {
+        let mut ffmpeg_args = vec!["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=1"];
+        ffmpeg_args.extend_from_slice(args);
+        let Some(p) = try_ffmpeg_fixture(file, &ffmpeg_args) else {
+            continue;
+        };
+        let f = probe(&p).expect(codec);
+        assert_eq!(f.kind, FootageKind::Audio, "{file} must probe as Audio");
+        assert!(!f.has_video, "{file} has no video");
+        assert!(f.has_audio, "{file} has audio");
+        assert!(f.duration >= Tick(TICKS_PER_SECOND * 9 / 10), "{file} duration {:?}", f.duration);
+        let pool = MediaPool::new();
+        let start = pool.audio_samples(&f, Tick::ZERO, 4800, 48_000);
+        let seek = pool.audio_samples(&f, Tick(TICKS_PER_SECOND / 2), 4800, 48_000);
+        assert_eq!(start.len(), 9600);
+        assert_eq!(seek.len(), 9600);
+        let rms_seek = (seek.iter().map(|v| v * v).sum::<f32>() / seek.len() as f32).sqrt();
+        assert!((rms_seek - 0.0625).abs() < 0.02, "{file} seek rms {rms_seek}");
+    }
+}
+
+fn read_audio_sequential(pool: &MediaPool, f: &Footage, total_frames: usize, chunk_frames: usize, rate: u32) -> Vec<f32> {
+    let mut out = Vec::with_capacity(total_frames * 2);
+    let mut pos = 0usize;
+    while pos < total_frames {
+        let len = chunk_frames.min(total_frames - pos);
+        let t = Tick::from_units(pos as i64, i64::from(rate));
+        out.extend_from_slice(&pool.audio_samples(f, t, len, rate));
+        pos += len;
+    }
+    out
+}
+
+fn slice_rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    (samples.iter().map(|v| v * v).sum::<f32>() / samples.len() as f32).sqrt()
+}
+
+fn assert_samples_close(a: &[f32], b: &[f32], tol: f32, ctx: &str) {
+    assert_eq!(a.len(), b.len(), "{ctx}: length mismatch");
+    let max_diff = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    assert!(max_diff <= tol, "{ctx}: max_diff {max_diff} > {tol}");
+}
+
+#[test]
+fn mkv_and_mp4_aac_play_continuously_without_crackle_and_seek_matches_sequential() {
+    let Some(mp4_path) =
+        try_ffmpeg_fixture("aac_1546_pair.mp4", &["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2", "-c:a", "aac", "-b:a", "128k"])
+    else {
+        return;
+    };
+    let mp4_str = mp4_path.to_string_lossy().into_owned();
+    let Some(mkv_path) = try_ffmpeg_fixture("aac_1546_pair.mkv", &["-i", &mp4_str, "-c:a", "copy"]) else {
+        return;
+    };
+
+    let mp4 = probe(&mp4_path).expect("probe mp4");
+    let mkv = probe(&mkv_path).expect("probe mkv");
+    let rate = 48_000u32;
+    let total_frames = 80_000usize;
+
+    let mp4_seq = read_audio_sequential(&MediaPool::new(), &mp4, total_frames, 4096, rate);
+    let mkv_seq = read_audio_sequential(&MediaPool::new(), &mkv, total_frames, 4096, rate);
+
+    // After the initial priming window (0.1s), MKV and MP4 must match without crackle.
+    let skip = 4800 * 2;
+    assert_samples_close(&mp4_seq[skip..], &mkv_seq[skip..], 0.01, "mkv vs mp4 sequential");
+
+    // Cold seeks on fresh MediaPools at t=0.5s and t=1.0s must match sequential playback.
+    for seek_frame in [24_000usize, 48_000usize] {
+        let t = Tick::from_units(seek_frame as i64, i64::from(rate));
+        let cold = MediaPool::new().audio_samples(&mkv, t, 4800, rate);
+        let start = seek_frame * 2;
+        assert_samples_close(&cold, &mkv_seq[start..start + 4800 * 2], 1e-4, "mkv cold seek vs sequential");
+    }
+
+    // Backward seek after reading near the end must also match sequential playback.
+    let back_pool = MediaPool::new();
+    let _ = back_pool.audio_samples(&mkv, Tick::from_units(60_000, i64::from(rate)), 4800, rate);
+    let backward = back_pool.audio_samples(&mkv, Tick::from_units(24_000, i64::from(rate)), 4800, rate);
+    assert_samples_close(&backward, &mkv_seq[24_000 * 2..24_000 * 2 + 4800 * 2], 1e-4, "mkv backward seek vs sequential");
+}
+
+fn build_gapped_aac_mkv(out_path: &Path, gap_at_pkt: usize, gap_ns: i64, start_offset_ns: i64) -> Option<()> {
+    let mp4_path =
+        try_ffmpeg_fixture("aac_1546_pair.mp4", &["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2", "-c:a", "aac", "-b:a", "128k"])?;
+    let bytes: std::sync::Arc<[u8]> = std::sync::Arc::from(std::fs::read(&mp4_path).ok()?);
+    let mp4 = craft_media::isobmff::open(bytes.clone()).ok()?;
+    let track_idx = mp4.tracks.iter().position(|t| t.kind == craft_media::isobmff::TrackKind::Audio)?;
+    let track = &mp4.tracks[track_idx];
+    let asc = match &track.entries.first()?.codec {
+        craft_media::isobmff::CodecConfig::Aac(a) => a.asc.clone(),
+        _ => return None,
+    };
+
+    let mut spec = craft_media::matroska::TrackSpec::new(craft_media::matroska::TrackKind::Audio, "A_AAC");
+    spec.codec_private = asc;
+    spec.audio = Some((48_000.0, u64::from(track.audio().map_or(2, |a| a.channels)), None));
+    let mut writer = craft_media::matroska::MkvWriter::new(std::io::Cursor::new(Vec::new()), vec![spec], craft_media::matroska::MuxOptions::default()).ok()?;
+
+    let pkt_count = track.samples.len().min(60);
+    for i in 0..pkt_count {
+        let pkt = mp4.read_sample(&*bytes, track_idx, i).ok()?;
+        let base_ns = (i as i64 * 1024 * 1_000_000_000) / 48_000;
+        let extra = if i >= gap_at_pkt { gap_ns } else { 0 };
+        writer.write_frame(0, start_offset_ns + base_ns + extra, true, &pkt, None).ok()?;
+    }
+    let mkv_bytes = writer.finish().ok()?.into_inner();
+    std::fs::write(out_path, mkv_bytes).ok()?;
+    Some(())
+}
+
+#[test]
+fn audio_real_silence_gap_honored_on_sequential_and_seek() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mkv_path = dir.path().join("real_gap.mkv");
+    // 24 packets (~0.512s) at 0, then a 500 ms silence gap before packet 24.
+    if build_gapped_aac_mkv(&mkv_path, 24, 500_000_000, 0).is_none() {
+        return;
+    }
+
+    let f = probe(&mkv_path).expect("probe gapped mkv");
+    let rate = 48_000u32;
+    let total_frames = 72_000usize;
+    let seq = read_audio_sequential(&MediaPool::new(), &f, total_frames, 4096, rate);
+
+    // Pre-gap tone (0.1s..0.4s), silence gap (0.55s..0.95s), post-gap tone (1.1s..1.4s).
+    assert!(slice_rms(&seq[4800 * 2..19_200 * 2]) > 0.04, "pre-gap tone expected");
+    assert!(slice_rms(&seq[26_400 * 2..45_600 * 2]) < 1e-4, "silence gap expected");
+    assert!(slice_rms(&seq[52_800 * 2..67_200 * 2]) > 0.04, "post-gap tone expected");
+
+    for seek_frame in [9_600usize, 30_000usize, 54_000usize] {
+        let t = Tick::from_units(seek_frame as i64, i64::from(rate));
+        let cold = MediaPool::new().audio_samples(&f, t, 4800, rate);
+        let start = seek_frame * 2;
+        assert_samples_close(&cold, &seq[start..start + 4800 * 2], 1e-4, "gap cold seek vs sequential");
+    }
+
+    let back_pool = MediaPool::new();
+    let _ = back_pool.audio_samples(&f, Tick::from_units(54_000, i64::from(rate)), 4800, rate);
+    for seek_frame in [30_000usize, 9_600usize] {
+        let backward = back_pool.audio_samples(&f, Tick::from_units(seek_frame as i64, i64::from(rate)), 4800, rate);
+        let start = seek_frame * 2;
+        assert_samples_close(&backward, &seq[start..start + 4800 * 2], 1e-4, "gap backward seek vs sequential");
+    }
+}
+
+#[test]
+fn audio_delayed_first_packet_honored_on_sequential_and_seek() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mkv_path = dir.path().join("delayed_first.mkv");
+    // First packet delayed by 500 ms.
+    if build_gapped_aac_mkv(&mkv_path, usize::MAX, 0, 500_000_000).is_none() {
+        return;
+    }
+
+    let f = probe(&mkv_path).expect("probe delayed mkv");
+    let rate = 48_000u32;
+    let total_frames = 57_600usize;
+    let seq = read_audio_sequential(&MediaPool::new(), &f, total_frames, 4096, rate);
+
+    // Leading silence (0..0.45s) and delayed tone (0.6s..1.0s).
+    assert!(slice_rms(&seq[..21_600 * 2]) < 1e-4, "leading silence expected");
+    assert!(slice_rms(&seq[28_800 * 2..48_000 * 2]) > 0.04, "delayed tone expected");
+
+    for seek_frame in [4_800usize, 30_000usize] {
+        let t = Tick::from_units(seek_frame as i64, i64::from(rate));
+        let cold = MediaPool::new().audio_samples(&f, t, 4800, rate);
+        let start = seek_frame * 2;
+        assert_samples_close(&cold, &seq[start..start + 4800 * 2], 1e-4, "delayed cold seek vs sequential");
+    }
+
+    let back_pool = MediaPool::new();
+    let _ = back_pool.audio_samples(&f, Tick::from_units(36_000, i64::from(rate)), 4800, rate);
+    for seek_frame in [30_000usize, 4_800usize] {
+        let backward = back_pool.audio_samples(&f, Tick::from_units(seek_frame as i64, i64::from(rate)), 4800, rate);
+        let start = seek_frame * 2;
+        assert_samples_close(&backward, &seq[start..start + 4800 * 2], 1e-4, "delayed backward seek vs sequential");
+    }
 }
